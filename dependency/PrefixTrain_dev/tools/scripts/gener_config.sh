@@ -1,0 +1,15 @@
+python generate_config.py \
+    --model-name gpt \
+    --model-size 1_3B \
+    --global-batch-size 1024 \
+    --micro-batch-size 2 \
+    --num-ops-in-each-stage 222 93  \
+    --num-gpus-list 4 4\
+    --model-parallel-size-of-each-op  1 1 \
+    --data-parallel-size-of-each-op  4 4\
+    --resharding-stages  0 0\
+    --recompute-ops  0 0\
+    --algo-of-each-op 0 0 \
+    --checkpoint-activations   0 0\
+    --save-path configs/metis \
+    --prefix metis-8gpu \

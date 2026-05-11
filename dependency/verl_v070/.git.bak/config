@@ -1,0 +1,10 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+	ignorecase = true
+	precomposeunicode = true
+[remote "origin"]
+	url = https://gh-proxy.com/https://github.com/verl-project/verl.git
+	fetch = +refs/tags/v0.7.0:refs/tags/v0.7.0

@@ -1,0 +1,20 @@
+profiler/profiled-time-eurosys
+profiler/profiled-time-miniset
+logs/
+external/
+results/
+**/__pycache__/
+**/build/
+*.so
+*.log
+*.pkl
+profiler/profiled-time-hete_11*
+*.csv
+*.json
+logs-large/
+pssh-2nodes.host
+test
+# our_scripts
+# our_scripts/aceso_gpt_execute_n2_g2.sh
+# our_scripts/aceso_gpt_search_n2_g2.sh
+local

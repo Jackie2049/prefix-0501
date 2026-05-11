@@ -1,0 +1,13 @@
+# To-Do List
+
+## search
+- [x] Support different machine order
+- [ ] Support data parallelism between machines
+- [ ] Optimize function predict_value_after_move
+- [ ] Optimize for using recompute only when the memory is not enough
+- [ ] Optimize for dec/inc_tp/dp operations that only consider the number of gpus
+- [ ] Optimize predict_stage_time for more accurate prediction
+
+
+## execute
+- [x] Support various parallelism

@@ -1,0 +1,48 @@
+
+## build from docker
+```bash
+docker build ./ -t aceso
+docker run -it -d --name=aceso-ae --net=host --ipc=host --gpus=all -v ./:/workspace/aceso aceso bash
+docker exec -it aceso-ae bash
+```
+
+#### issue
+```bash
+pip3 install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext"  ./
+
+error
+```
+run
+
+```bash
+pip3 install packaging>=22.0 # refer to https://github.com/pypa/setuptools/issues/4483
+```
+
+
+## GPT1.3B  
+### profile
+
+```bash
+cd profiler/
+bash our_scripts/profile_large_dist_p2p.sh
+bash profile_large_gpt.sh
+bash profile_large_p2p.sh
+```
+
+### search
+```bash
+bash our_scripts/aceso_gpt_search_n2_g2.sh
+```
+
+### execute
+``` bash 
+bash our_scripts/aceso_gpt_execute_n2_g2.sh
+```
+
+
+## ResNet
+### profile
+```bash
+cd profiler/
+bash our_scripts/profile_large_resnet.sh
+```
