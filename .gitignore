@@ -30,3 +30,6 @@ Thumbs.db
 # Data
 data/
 outputs/
+
+# Backup git directories
+.git.bak/
