@@ -13,9 +13,9 @@ This module has two layers:
 from __future__ import annotations
 
 import importlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Sequence, TypeVar
+from typing import Any, Iterator, Mapping, Sequence, TypeVar
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
@@ -28,12 +28,32 @@ from prefix_sharing.core.mapping import (
 )
 from prefix_sharing.core.metadata import PrefixSharingBatchMeta
 from prefix_sharing.core.planner import PrefixSharingPlanner
-from prefix_sharing.integrations.context import PrefixSharingRuntimeContext, prefix_sharing_context
+from prefix_sharing.integrations.context import (
+    PrefixSharingRuntimeContext,
+    current_prefix_sharing_context,
+    prefix_sharing_context,
+)
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.patch_manager import PatchHandle
 
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class DensePrefixLastRestoreSpec:
+    reuse_idx_in_batch: int
+    provider_idx_in_batch: int
+    provider_dense_pos: int
+    reuse_dense_pos: int
+
+
+@dataclass(frozen=True)
+class MegatronActorPreparedMicroBatch:
+    meta: PrefixSharingBatchMeta
+    backend: Any
+    kept_position_ids: Any
+    restore_positions: list[DensePrefixLastRestoreSpec]
 
 
 @dataclass(frozen=True)
@@ -97,7 +117,7 @@ class VerlMCoreBatchAdapter:
     ) -> Iterator[PrefixSharingRuntimeContext]:
         """Open the runtime context consumed by patched attention."""
 
-        with prefix_sharing_context(prepared.meta) as ctx:
+        with prefix_sharing_context(prepared.meta, backend=TorchReferenceBackend()) as ctx:
             yield ctx
 
     def restore_logprobs(
@@ -165,3 +185,190 @@ def prefix_sharing_enabled(
         yield handle
     finally:
         handle.disable()
+
+
+def prepare_megatron_actor_micro_batch(
+    batch: Any,
+    actor_config: Any,
+    model_config: Any,
+    *,
+    backend: Any | None = None,
+) -> tuple[Any, MegatronActorPreparedMicroBatch | None]:
+    """Trim one verl Megatron actor micro-batch in-place for prefix sharing.
+
+    The framework-facing contract is intentionally small: dependency/verl calls
+    this once after obtaining the micro-batch and then opens
+    :func:`megatron_actor_prefix_sharing_context` around its existing forward
+    call. Unsupported or disabled cases return ``(batch, None)``.
+    """
+
+    config = prefix_sharing_config_from_verl(actor_config)
+    if not config.enabled:
+        return batch, None
+    config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
+    if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
+        raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
+    if "multi_modal_inputs" in batch:
+        raise RuntimeError("prefix sharing phase 1 supports only text-only actor micro-batches")
+
+    attention_mask = batch["attention_mask"].to(bool)
+    input_ids = batch["input_ids"]
+    position_ids = batch["position_ids"]
+    if attention_mask.dim() != 2 or input_ids.dim() != 2 or position_ids.dim() != 2:
+        raise RuntimeError("prefix sharing phase 1 expects 2D input_ids/attention_mask/position_ids")
+
+    valid_indices = [attention_mask[row].nonzero(as_tuple=False).flatten() for row in range(input_ids.shape[0])]
+    sequences = [input_ids[row, indices].detach().cpu().tolist() for row, indices in enumerate(valid_indices)]
+    meta = PrefixSharingPlanner(config).plan(sequences)
+    if not meta.has_sharing:
+        return batch, None
+
+    prepared_batch = _clone_batch(batch)
+    new_attention_mask = attention_mask.clone()
+    new_attention_mask[:] = False
+    new_input_ids = input_ids.clone()
+    new_position_ids = position_ids.clone()
+    kept_position_rows = []
+
+    for row, indices in enumerate(valid_indices):
+        keep_start, keep_end = meta.input_keep_ranges[row]
+        kept_indices = indices[keep_start:keep_end]
+        new_attention_mask[row, kept_indices] = True
+        kept_position_rows.append(position_ids[row, kept_indices])
+
+    prepared_batch["input_ids"] = new_input_ids
+    prepared_batch["attention_mask"] = new_attention_mask
+    prepared_batch["position_ids"] = new_position_ids
+
+    restore_positions = []
+    for spec in meta.prefix_last_restore:
+        provider_indices = valid_indices[spec.provider_idx_in_batch]
+        reuse_indices = valid_indices[spec.reuse_idx_in_batch]
+        restore_positions.append(
+            DensePrefixLastRestoreSpec(
+                reuse_idx_in_batch=spec.reuse_idx_in_batch,
+                provider_idx_in_batch=spec.provider_idx_in_batch,
+                provider_dense_pos=int(provider_indices[spec.provider_prefix_last_pos].item()),
+                reuse_dense_pos=int(reuse_indices[spec.reuse_first_suffix_label_pos].item()),
+            )
+        )
+
+    kept_position_ids = _concat_tensors(kept_position_rows)
+    return prepared_batch, MegatronActorPreparedMicroBatch(
+        meta=meta,
+        backend=backend or TorchReferenceBackend(),
+        kept_position_ids=kept_position_ids,
+        restore_positions=restore_positions,
+    )
+
+
+@contextmanager
+def megatron_actor_prefix_sharing_context(
+    prepared: MegatronActorPreparedMicroBatch | None,
+) -> Iterator[PrefixSharingRuntimeContext | None]:
+    if prepared is None:
+        with nullcontext(None) as ctx:
+            yield ctx
+        return
+    with prefix_sharing_context(
+        prepared.meta,
+        backend=prepared.backend,
+        kept_position_ids=prepared.kept_position_ids,
+        restore_positions=prepared.restore_positions,
+    ) as ctx:
+        yield ctx
+
+
+def restore_megatron_actor_log_probs(
+    logits: Any,
+    labels: Any,
+    log_probs: Any,
+    vocab_parallel_log_probs_fn: Any,
+) -> Any:
+    """Restore reuser first-suffix logprob from provider prefix-last logits."""
+
+    ctx = current_prefix_sharing_context()
+    if ctx is None or not ctx.restore_positions:
+        return log_probs
+    restored = log_probs.clone()
+    for spec in ctx.restore_positions:
+        provider_logits = logits[
+            spec.provider_idx_in_batch : spec.provider_idx_in_batch + 1,
+            spec.provider_dense_pos : spec.provider_dense_pos + 1,
+            :,
+        ]
+        reuse_label = labels[
+            spec.reuse_idx_in_batch : spec.reuse_idx_in_batch + 1,
+            spec.reuse_dense_pos : spec.reuse_dense_pos + 1,
+        ]
+        restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
+        restored[spec.reuse_idx_in_batch, spec.reuse_dense_pos] = restored_value.reshape(())
+    return restored
+
+
+def prefix_sharing_config_from_verl(actor_config: Any) -> PrefixSharingConfig:
+    raw = _read_actor_value(actor_config, "prefix_sharing", None)
+    if raw is None:
+        raw = _read_actor_value(actor_config, "prefix_sharing_config", None)
+    if raw is None or raw is False:
+        return PrefixSharingConfig(enabled=False)
+    if raw is True:
+        return PrefixSharingConfig(enabled=True)
+    values = _to_plain_mapping(raw)
+    return PrefixSharingConfig(**values)
+
+
+def _clone_batch(batch: Any) -> Any:
+    if hasattr(batch, "clone"):
+        return batch.clone()
+    if hasattr(batch, "copy"):
+        return batch.copy()
+    return dict(batch)
+
+
+def _concat_tensors(tensors: Sequence[Any]) -> Any:
+    if not tensors:
+        raise RuntimeError("prefix sharing produced an empty packed query")
+    first = tensors[0]
+    torch = importlib.import_module("torch")
+    return torch.cat([tensor.to(first.device) for tensor in tensors], dim=0)
+
+
+def _read_actor_bool(config: Any, dotted_name: str, default: bool) -> bool:
+    value = _read_actor_value(config, dotted_name, default)
+    return bool(value)
+
+
+def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
+    current = config
+    for part in dotted_name.split("."):
+        if current is None:
+            return default
+        if isinstance(current, Mapping):
+            current = current.get(part, default)
+        else:
+            getter = getattr(current, "get", None)
+            if callable(getter):
+                current = getter(part, default)
+            else:
+                current = getattr(current, part, default)
+    return current
+
+
+def _to_plain_mapping(raw: Any) -> dict[str, Any]:
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(raw):
+            return dict(OmegaConf.to_container(raw, resolve=True))
+    except ModuleNotFoundError:
+        pass
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if hasattr(raw, "__dict__"):
+        return {
+            key: value
+            for key, value in vars(raw).items()
+            if not key.startswith("_")
+        }
+    raise TypeError("prefix_sharing config must be a bool, mapping, or OmegaConf object")

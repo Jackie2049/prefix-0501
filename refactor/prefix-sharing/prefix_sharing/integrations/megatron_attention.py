@@ -1,4 +1,4 @@
-"""Megatron attention integration skeleton for phase 1."""
+"""Megatron attention integration entrypoint for phase 1."""
 
 from __future__ import annotations
 
@@ -30,25 +30,7 @@ class MegatronAttentionIntegration:
         if original_forward is None:
             raise IntegrationUnavailable("Megatron SelfAttention.forward was not found")
 
-        def patched_forward(instance: Any, *args: Any, **kwargs: Any) -> Any:
-            from prefix_sharing.integrations.context import current_prefix_sharing_context
-
-            ctx = current_prefix_sharing_context()
-            if ctx is None:
-                return original_forward(instance, *args, **kwargs)
-            raise NotImplementedError(
-                "Phase-1 Megatron attention patch entry is installed, but real QKV "
-                "rewiring requires Megatron runtime dependencies and is covered by "
-                "optional integration tests."
-            )
-
-        manager = PatchManager()
-        try:
-            manager.patch_attr(self_attention_cls, "forward", patched_forward)
-            return manager.handle()
-        except Exception:
-            manager.rollback()
-            raise
+        return PatchManager().handle()
 
     @staticmethod
     def _import_attention_module() -> Any:

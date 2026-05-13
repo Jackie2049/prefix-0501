@@ -128,10 +128,7 @@ class TorchReferenceBackend:
                 q_start=prefix_len,
                 device=q_row.device,
             )
-            scores = q_row @ k_row.transpose(-1, -2) / math.sqrt(q_row.shape[-1])
-            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-            probs = torch.softmax(scores, dim=-1)
-            outputs.append(probs @ v_row)
+            outputs.append(_attention_row(q_row, k_row, v_row, mask))
         return torch.cat(outputs, dim=0)
 
 
@@ -149,3 +146,29 @@ def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any
     q_positions = torch.arange(q_start, q_start + q_len, device=device).unsqueeze(1)
     kv_positions = torch.arange(0, kv_len, device=device).unsqueeze(0)
     return kv_positions <= q_positions
+
+
+def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
+    torch = _torch()
+    scale = math.sqrt(q_row.shape[-1])
+    if q_row.dim() == 2:
+        scores = q_row @ k_row.transpose(-1, -2) / scale
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores, dim=-1)
+        return probs @ v_row
+    if q_row.dim() != 3:
+        raise ValueError("TorchReferenceBackend attention expects packed rows with 2 or 3 dims")
+
+    q_heads = q_row.shape[1]
+    kv_heads = k_row.shape[1]
+    if q_heads != kv_heads:
+        if q_heads % kv_heads != 0:
+            raise ValueError("query heads must be a multiple of kv heads for grouped-query attention")
+        repeat = q_heads // kv_heads
+        k_row = k_row.repeat_interleave(repeat, dim=1)
+        v_row = v_row.repeat_interleave(repeat, dim=1)
+
+    scores = torch.einsum("qhd,khd->hqk", q_row, k_row) / scale
+    scores = scores.masked_fill(~mask.unsqueeze(0), torch.finfo(scores.dtype).min)
+    probs = torch.softmax(scores, dim=-1)
+    return torch.einsum("hqk,khd->qhd", probs, v_row)

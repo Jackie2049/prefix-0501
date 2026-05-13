@@ -38,6 +38,31 @@ def test_torch_reference_backend_supports_q_len_different_from_kv_len():
     assert expanded_key.shape[0] == sum(meta.expanded_lengths_kv)
 
 
+def test_torch_reference_backend_supports_thd_grouped_query_attention():
+    meta = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2)).plan(
+        [[1, 2, 10], [1, 2, 20, 21]],
+        forward_id=1,
+        micro_batch_id=1,
+    )
+    backend = TorchReferenceBackend()
+    cache = PrefixKVCache()
+    query = torch.randn(sum(meta.kept_lengths_q), 4, 8)
+    key = torch.randn(sum(meta.kept_lengths_q), 2, 8)
+    value = torch.randn(sum(meta.kept_lengths_q), 2, 8)
+
+    expanded_key, expanded_value = backend.build_kv(
+        key,
+        value,
+        cache,
+        meta,
+        layer_id=0,
+    )
+    output = backend.attention(query, expanded_key, expanded_value, meta)
+
+    assert output.shape == query.shape
+    assert expanded_key.shape[1] == 2
+
+
 def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
     meta = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2)).plan(
         [[1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5]],

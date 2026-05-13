@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-05-14 补充 14：补齐 verl + Megatron Phase 1 真实代码入口
+
+### 背景
+
+用户要求在代码层面补齐 Phase 1 目标缺口，使 GPU / NPU / 真实框架测试成为唯一遗留项。为此重新阅读了 `dependency/verl_v070/verl/workers/actor/megatron_actor.py`、`dependency/megatron_v0150/megatron/core/transformer/attention.py`、Megatron RoPE / packed sequence 逻辑，并对照 PrefixTrain_dev 的 per-sample reuse relation 与 flash-preference / dpo-prefix-sharing 的 prefix sharing 形态。
+
+### 完成事项
+
+1. 补齐 verl actor 主路径入口：
+   - 在 `megatron_actor.py` 中新增极薄 import / helper 调用 / context manager。
+   - `prepare_megatron_actor_micro_batch()` 在 micro-batch 内生成 prefix-sharing plan，按 attention mask 裁掉 reuser prefix。
+   - `megatron_actor_prefix_sharing_context()` 把 meta、cache、backend、原始 position_ids、restore slot 传给 Megatron attention。
+   - `restore_megatron_actor_log_probs()` 从 provider prefix-last logits 恢复 reuser 第一个 suffix token logprob，保持 autograd 路径。
+
+2. 补齐 Megatron attention 真实 hook：
+   - 在 `Attention.forward()` packed THD squeeze 后、标准 RoPE 前新增 `maybe_run_prefix_sharing_attention()` 调用。
+   - `integrations/megatron_runtime.py` 负责按原始 position_ids 选择 RoPE 频率、构建 expanded KV、执行 reference attention、调用原始 output projection。
+   - 无 runtime context 时完全返回 Megatron 原路径。
+
+3. 补齐 backend 能力：
+   - `TorchReferenceBackend.attention()` 支持 packed THD `[T, H, D]`。
+   - 支持 Megatron GQA：当 query heads 是 KV heads 的整数倍时对 key/value 执行 repeat_interleave。
+
+4. 补充测试：
+   - 新增 packed THD + GQA reference backend optional 测试。
+   - 新增 verl Megatron runtime helper optional 测试，覆盖 mask 裁剪、kept position_ids、context restore slot、Prefix-Last Restore autograd。
+   - 本地执行：`29 passed, 4 skipped`。skip 原因均为当前环境缺少 `torch`、`torch_npu`、`verl`。
+
+### 当前结论
+
+代码层面 Phase 1 主链路缺口已补齐：core detector/planner/mapping、verl actor entry、runtime context、Megatron attention hook、RoPE 位置修正、KV injection、logprob restore 均已存在。当前唯一未闭环项是需要在真实 GPU / NPU / verl 环境中运行 small-scale actor logprob/update smoke test 与加速器测试。
+
+---
+
 ## 2026-05-14 补充 13：审计 Phase 1 完成度并补齐 mapping integration adapter
 
 ### 背景

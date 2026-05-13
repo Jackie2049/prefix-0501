@@ -11,6 +11,7 @@ from prefix_sharing.integrations.patch_manager import PatchManager
 from prefix_sharing.integrations.verl_mcore import (
     VerlMCoreBatchAdapter,
     VerlMCoreIntegration,
+    prefix_sharing_config_from_verl,
     prefix_sharing_enabled,
 )
 
@@ -105,6 +106,23 @@ def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
         [-2.0, -2.1, -2.2],
         [-9.0, -9.1],
     ]
+
+
+def test_prefix_sharing_config_from_verl_accepts_nested_actor_config():
+    config = prefix_sharing_config_from_verl(
+        {
+            "prefix_sharing": {
+                "enabled": True,
+                "min_prefix_len": 4,
+                "min_group_size": 3,
+                "boundary_strategy": "prefix_last_restore",
+            }
+        }
+    )
+
+    assert config.enabled is True
+    assert config.min_prefix_len == 4
+    assert config.min_group_size == 3
 
 
 def test_prefix_sharing_enabled_propagates_install_failure(monkeypatch):

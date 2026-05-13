@@ -800,6 +800,24 @@ class Attention(MegatronModule, ABC):
             value = value.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
+        try:
+            from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_attention
+
+            prefix_sharing_output = maybe_run_prefix_sharing_attention(
+                self,
+                query,
+                key,
+                value,
+                attention_mask,
+                rotary_pos_emb,
+                packed_seq_params,
+                mscale=_yarn_get_concentration_factor_from_config(self.config),
+            )
+        except ModuleNotFoundError:
+            prefix_sharing_output = None
+        if prefix_sharing_output is not None:
+            return prefix_sharing_output
+
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================

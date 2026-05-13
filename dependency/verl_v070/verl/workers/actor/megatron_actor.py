@@ -22,6 +22,7 @@ Note that our model doesn't have to be `MegatronModule` because we don't share e
 import itertools
 import logging
 import os
+from contextlib import nullcontext
 from functools import partial
 from typing import Iterable
 
@@ -56,6 +57,17 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
+
+try:
+    from prefix_sharing.integrations.verl_mcore import (
+        megatron_actor_prefix_sharing_context,
+        prepare_megatron_actor_micro_batch,
+        restore_megatron_actor_log_probs,
+    )
+except ModuleNotFoundError:
+    megatron_actor_prefix_sharing_context = None
+    prepare_megatron_actor_micro_batch = None
+    restore_megatron_actor_log_probs = None
 
 __all__ = ["MegatronPPOActor"]
 
@@ -570,6 +582,13 @@ class MegatronPPOActor(BasePPOActor):
             batch = next(batch_iter)
             batch = batch.to(get_device_id())
             batch = batch.contiguous()
+            prefix_sharing_prepared = None
+            if prepare_megatron_actor_micro_batch is not None:
+                batch, prefix_sharing_prepared = prepare_megatron_actor_micro_batch(
+                    batch,
+                    self.config,
+                    self.tf_config,
+                )
 
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
@@ -607,6 +626,8 @@ class MegatronPPOActor(BasePPOActor):
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
             if self.use_fused_kernels:
+                if prefix_sharing_prepared is not None:
+                    raise RuntimeError("prefix sharing phase 1 requires actor fused kernels to be disabled")
                 forward_fn = get_mcore_forward_fused_fn(self.hf_config)
                 if return_schedule_plan:
                     forward_fn = gptmodel_forward_1f1b_overlap
@@ -643,20 +664,29 @@ class MegatronPPOActor(BasePPOActor):
                         logits_bak = logits
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
+                    if restore_megatron_actor_log_probs is not None:
+                        log_probs = restore_megatron_actor_log_probs(
+                            logits_bak,
+                            label,
+                            log_probs,
+                            vocab_parallel_log_probs_from_logits,
+                        )
                     ret["log_probs"] = log_probs
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
-                output = forward_fn(
-                    model=model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    multi_modal_inputs=multi_modal_inputs,
-                    logits_processor=logits_processor,
-                    logits_processor_args=logits_processor_args,
-                    data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
-                )
+                prefix_context = megatron_actor_prefix_sharing_context or nullcontext
+                with prefix_context(prefix_sharing_prepared):
+                    output = forward_fn(
+                        model=model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        multi_modal_inputs=multi_modal_inputs,
+                        logits_processor=logits_processor,
+                        logits_processor_args=logits_processor_args,
+                        data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
+                    )
 
             if forward_only:
                 meta_info = None

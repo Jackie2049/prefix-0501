@@ -34,7 +34,7 @@
 - reuse 样本裁剪 prefix，仅计算 suffix query。
 - attention 内通过 KV injection 复用 provider prefix K/V。
 - logprob 对齐使用 Prefix-Last Restore，保证第一个 suffix token 的 next-token 语义正确。
-- 对 verl 和 Megatron 不做源码侵入式修改。
+- 对 verl 和 Megatron 的源码改动保持极小：只允许 import / 单个 helper 调用 / context manager 这类特性使能入口；核心逻辑必须沉淀在 `prefix_sharing.integrations`。
 - 本地 CPU 侧开发者测试必须通过；CUDA / CANN / verl 等依赖缺失的测试可作为 optional 测试保留但不强制运行。
 
 阶段一启动边界：
@@ -771,15 +771,16 @@ manager.disable_all()
 - patch 层保持薄，只调用 `core/`、`backend`、`context`。
 - 未来上游 PR 时，优先把 patch 点替换成正式 hook，避免重写核心逻辑。
 
-### 5.12 `integrations/megatron_attention.py`
+### 5.12 `integrations/megatron_attention.py` / `integrations/megatron_runtime.py`
 
 **定位**：Megatron SelfAttention 的执行接入点。
 
 职责：
 
-- 在 QKV projection 后、attention 前接入 prefix sharing backend。
+- 在 QKV projection 后、Megatron 标准 RoPE 前接入 prefix sharing backend。
 - 从当前 runtime context 读取 `meta` 和 `cache`。
-- 调用 backend 的 `apply_rope()`、`build_kv()`、`attention()`。
+- 按 verl micro-batch 传入的原始 `position_ids` 为压缩后的 packed THD query/key 重新选择 RoPE 频率，避免 reuser suffix 被错误当作 position 0 开始。
+- 调用 backend 的 `build_kv()`、`attention()` 和 Megatron 原始 output projection。
 - 在未启用 prefix sharing 或无共享关系时保持原路径行为。
 
 关键流程：
@@ -787,7 +788,7 @@ manager.disable_all()
 ```text
 hidden_states
   -> QKV projection
-  -> backend.apply_rope(query, key, meta)
+  -> positioned RoPE for kept tokens
   -> backend.build_kv(key, value, cache, meta)
   -> backend.attention(query, expanded_key, expanded_value, meta)
   -> output projection
@@ -798,7 +799,7 @@ hidden_states
 - 必须显式禁用 Phase 1 不支持的 fused path。
 - 必须处理 packed THD / no-padding 参数的语义对齐。
 - 必须保证 layer_id、tp_rank 正确进入 cache key。
-- 当前实现状态：已具备 patch 安装/卸载骨架和无上下文 fallback；真正的 Megatron QKV rewiring 尚未完成。只要进入 prefix sharing runtime context，当前 patch 仍会显式抛出 `NotImplementedError`，避免误以为真实 Megatron 链路已经可用。
+- 当前实现状态：`dependency/megatron_v0150/megatron/core/transformer/attention.py` 在 packed THD squeeze 后、标准 RoPE 前新增一个极薄 hook，调用 `maybe_run_prefix_sharing_attention()`；真实 RoPE 位置修正、KV expansion、GQA reference attention 和 output projection 都在 `prefix_sharing.integrations.megatron_runtime` / backend 中完成。无 runtime context 时返回原 Megatron 路径。
 
 ### 5.13 `integrations/megatron_rope.py`
 
@@ -823,6 +824,9 @@ hidden_states
 
 - `VerlMCoreBatchAdapter`
 - `VerlMCorePreparedBatch`
+- `prepare_megatron_actor_micro_batch()`
+- `megatron_actor_prefix_sharing_context()`
+- `restore_megatron_actor_log_probs()`
 - `VerlMCoreIntegration`
 - `enable_prefix_sharing()`
 - `prefix_sharing_enabled()`
@@ -834,6 +838,7 @@ hidden_states
 - 进入 `prefix_sharing_context()`，让 Megatron attention patch 可读取 meta/cache。
 - postprocess 阶段组装 logprob，执行 Prefix-Last Restore。
 - 保持 verl actor 原始 batch 顺序和返回格式。
+- 在 `dependency/verl_v070/verl/workers/actor/megatron_actor.py` 中仅保留最小使能入口：micro-batch 准备、forward context 和 logprob restore 调用。
 
 设计要求：
 
@@ -841,7 +846,7 @@ hidden_states
 - 无可复用 relation 时输出应等价于 baseline。
 - 多 micro-batch 之间 cache 不得污染。
 - 报错信息应能定位是 preprocess、attention、restore 还是 patch 约束失败。
-- 当前实现状态：`VerlMCoreBatchAdapter` 已经把 planner + mapping + Prefix-Last Restore 串成可测试的框架无关 preprocess/postprocess adapter；真实 verl actor 函数 patch 和真实 Megatron attention rewiring 尚未完成。
+- 当前实现状态：框架无关 adapter 与真实 verl actor helper 均已落地。启用 `config.prefix_sharing.enabled=True` 且 `config.megatron.use_remove_padding=True` 时，micro-batch 会按 attention mask 生成 plan，reuser prefix 位会从 attention mask 中移除，packed THD 位置表和 Prefix-Last Restore dense slot 会进入 runtime context。fused actor kernel、multi-modal batch、非 THD 路径仍按 Phase 1 约束显式拒绝。
 
 ---
 
@@ -961,6 +966,8 @@ with prefix_sharing_enabled(config):
 - patch manager 安装、卸载、幂等和回滚。
 - runtime context 与 backend 的协作。
 - reference backend 在 q_len != kv_len 下的 attention 语义。
+- reference backend 在 packed THD + grouped-query attention 下的 attention 语义。
+- verl Megatron actor runtime helper 的 mask 裁剪、position 传递、Prefix-Last Restore autograd 路径。
 - Prefix-Last Restore 的 autograd 路径。
 
 要求：
@@ -984,7 +991,7 @@ with prefix_sharing_enabled(config):
 - Megatron 单层/小层数模型前向/反向对齐。
 - verl actor logprob/update smoke test。
 
-当前测试不能证明真实 verl + Megatron Phase 1 业务链路已经完成；它只能证明 core pipeline、batch adapter、patch 生命周期和 reference backend 语义在本地依赖条件下成立。
+当前本地无 torch / verl / GPU / NPU，因此真实框架 smoke test 和加速器闭环以 optional 测试或待运行项保留；除这些环境依赖项外，Phase 1 代码层面的主链路入口、runtime context、Megatron attention hook 和 Prefix-Last Restore 已补齐。
 
 ### 8.4 精度验收
 
@@ -1023,7 +1030,7 @@ with prefix_sharing_enabled(config):
 - 在合理精度假设下 logprob/loss/grad 对齐。
 - patch 可启停，不污染非 prefix sharing 路径。
 
-当前实现距离该成功标准仍有缺口：真实 Megatron SelfAttention QKV rewiring、真实 verl actor preprocess/postprocess patch、真实框架环境下的 logprob/update smoke test 尚未完成。
+当前实现已补齐真实 Megatron SelfAttention hook 和真实 verl actor preprocess/postprocess 入口。剩余闭环缺口集中在真实 GPU / NPU / verl 环境下运行 small-scale actor logprob/update smoke test，并据实际 kernel 行为修正可能暴露的设备侧兼容问题。
 
 ### 9.2 阶段二：业务落地能力
 
