@@ -4,27 +4,346 @@
 
 ---
 
-## 2026-05-11 20:49 补充 5：方案升级为三层架构
+## 2026-05-13 18:00 补充 12：Phase 1 改为支持 per-sample reuse relation
 
 ### 背景
 
-对当前 One-Forward + KV Injection 设计进行二次审视后，确认核心方向可行，但旧方案存在工程边界不清的问题：
+用户明确要求 Phase 1 必须支持 PrefixTrain_dev 风格的 per-sample reuse relation：同一个 provider 可以面向不同 reuser 提供不同长度的 prefix 子序列复用，例如 `seq1` 复用 `seq0` 的 `0..5`，`seq2` 复用 `seq0` 的 `0..10`。这属于核心语义，不应采用“最长前缀优先、非重叠 group”的妥协方案。
+
+### 完成事项
+
+1. 改造 `TriePrefixDetector`：
+   - 新增 `PrefixReuseSpec`
+   - 检测结果以 `reuse_specs` 作为语义核心
+   - 采用在线 Trie：当前样本从历史样本中匹配最长可复用 prefix，再插入 Trie 作为后续 provider
+   - 支持同一 provider 服务多个不同 `prefix_len`
+   - `min_group_size` 在 relation 语义下仍生效：历史命中样本数加当前样本需达到阈值
+
+2. 改造 metadata / planner：
+   - `PrefixSharingBatchMeta` 新增 `reuse_specs`
+   - planner 基于 `provider_index[i] != i and prefix_lens[i] > 0` 判断 reuser
+   - `prefix_last_restore` 从 per-sample reuse relation 派生
+
+3. 改造 cache / reference backend：
+   - cache key 去掉 `group_id`
+   - provider 缓存完整 K/V
+   - reuser 按自己的 `prefix_len` 从 provider K/V 中切片构造 expanded KV
+   - reuser 构造出的完整 logical KV 会再次写入 cache，因此 reuser 也可以作为后续样本的 provider
+
+4. 更新文档：
+   - `doc-designs-final.md` 明确 per-sample reuse relation 是 Phase 1 核心语义
+   - `doc-glossary.md` 新增 Reuse Relation，并将 Prefix Group 降级为调试/统计视图
+
+5. 更新测试：
+   - 增加同一 provider 多长度复用场景
+   - 增加 reuser 继续作为后续 provider 的 transitive reuse 场景
+   - 增加 `min_group_size` relation 阈值场景
+   - 校验不同 reuser 的 `provider_prefix_last_pos` 分别指向不同 prefix-last 位置
+
+### 自测结果
+
+已运行：
+
+```bash
+python3 -m pytest tests/unit_test
+python3 -m pytest tests/system_test
+python3 -m pytest
+```
+
+结果：
+
+- 单元测试：`21 passed`
+- 系统测试：`1 passed`
+- 全量测试：`26 passed, 3 skipped`
+
+---
+
+## 2026-05-13 12:08 补充 11：将边界处理配置改为通用策略开关
+
+### 背景
+
+用户指出不应通过 `restore_mode` 来表达 prefix/suffix 边界处的 last-token 处理方式。该配置未来需要能够扩展到 `boundary_token`、`strict_suffix` 等策略；当前阶段只实现 Prefix-Last Restore，但开关语义不应绑定到 restore。
+
+### 完成事项
+
+1. 将 `PrefixSharingConfig.restore_mode` 改为更通用的 `boundary_strategy`。
+2. 当前阶段唯一允许值为 `prefix_last_restore`。
+3. 错误信息中明确后续可扩展策略包括 `boundary_token` 和 `strict_suffix`。
+4. 同步更新 `doc-designs-final.md` 和配置单元测试。
+5. 修正 `test_detector.py` 中嵌套列表场景的断言：当前 detector 以一层 token 序列为语义边界，不对嵌套列表做 flatten。
+
+### 自测结果
+
+已运行：
+
+```bash
+python3 -m pytest tests/unit_test
+python3 -m pytest
+```
+
+结果：
+
+- 单元测试：`17 passed`
+- 全量测试：`22 passed, 3 skipped`
+
+---
+
+## 2026-05-13 10:06 补充 10：按测试层级拆分目录
+
+### 背景
+
+用户要求将单元测试、集成测试、系统测试拆分到 `tests/` 下的不同目录，分别命名为 `unit_test`、`integrated_test`、`system_test`，便于后续按测试层级独立运行和维护。
+
+### 完成事项
+
+1. 调整测试目录：
+   - `tests/unit_test/`：配置、detector、planner、mapping、cache、context 等纯模块测试
+   - `tests/integrated_test/`：patch manager、integration unavailable、torch reference backend、加速器/框架 optional 测试
+   - `tests/system_test/`：阶段一 core 端到端语义流测试
+
+2. 更新 `pyproject.toml`：
+   - `testpaths = ["tests/unit_test", "tests/integrated_test", "tests/system_test"]`
+
+3. 清理旧 `tests/` 目录和测试生成缓存。
+
+### 自测结果
+
+已分别运行：
+
+```bash
+python3 -m pytest
+python3 -m pytest tests/unit_test
+python3 -m pytest tests/integrated_test
+python3 -m pytest tests/system_test
+```
+
+结果：
+
+- 全量：`22 passed, 3 skipped`
+- 单元测试：`17 passed`
+- 集成测试：`4 passed, 3 skipped`
+- 系统测试：`1 passed`
+
+3 个 skip 仍然来自本地缺少 `torch`、`torch_npu`、`verl`，符合当前无 GPU/NPU/真实框架环境的预期。
+
+---
+
+## 2026-05-13 01:19 补充 9：完成阶段一核心代码与开发者测试
+
+### 背景
+
+基于 `doc-designs-final.md` 和 Terminal Codex 主会话中的补充讨论，开始阶段一代码开发。阶段一目标是先完成 `verl + Megatron` RL MVP 所需的可迁移核心模块、reference backend、patch 框架和开发者自测。当前本地无 GPU / NPU，且未安装 PyTorch、verl、Megatron，因此加速器和真实框架测试先以 optional skip 形式落地。
+
+### 完成事项
+
+1. 新增 `prefix_sharing/` 包结构：
+   - `core/config.py`：`PrefixSharingConfig` 和阶段一硬约束校验
+   - `core/metadata.py`：`PrefixSharingBatchMeta`、`PrefixLastRestoreSpec`
+   - `core/detector.py`：`TriePrefixDetector`
+   - `core/planner.py`：prefix group 到可执行 metadata 的计划生成
+   - `core/mapping.py`：input / label / loss / Prefix-Last Restore 坐标映射
+   - `core/cache.py`：forward/backward 生命周期内的 `PrefixKVCache`
+   - `core/logprob.py`：Prefix-Last Restore 的 logits/logprob tensor 辅助函数，保持 provider prefix-last 梯度路径
+
+2. 新增 backend 层：
+   - `backends/base.py`：统一 backend capability 与接口
+   - `backends/torch_ref.py`：PyTorch reference attention / KV build 骨架
+   - `backends/cuda_ref.py`、`backends/cann_ref.py`：阶段一可运行参考后端占位，避免语义层绑定 CUDA TE
+
+3. 新增 integration 层：
+   - `integrations/context.py`：runtime context 与 cache 生命周期
+   - `integrations/patch_manager.py`：幂等 patch handle、卸载和回滚
+   - `integrations/megatron_attention.py`、`integrations/megatron_rope.py`、`integrations/verl_mcore.py`：非侵入式 patch 接入骨架和依赖缺失时的清晰报错
+
+4. 新增开发者测试：
+   - 配置约束测试
+   - Trie detector / planner / metadata 测试
+   - mapping / Prefix-Last Restore / cache / context 测试
+   - patch manager 和 integration unavailable 测试
+   - 纯 Python 阶段一系统流测试
+   - PyTorch reference backend、CUDA、CANN、真实 verl/Megatron optional 测试
+
+### 自测结果
+
+已运行：
+
+```bash
+python3 -m pytest
+python3 -m compileall prefix_sharing
+```
+
+结果：
+
+- `22 passed`
+- `3 skipped`
+- skip 原因：本地未安装 `torch`、`torch_npu`、`verl`
+- `compileall` 通过
+
+### 当前结论
+
+阶段一核心语义层、reference backend 接口、patch 框架和 CPU 可运行开发者测试已经完成。后续如进入真实 GPU / NPU 或 verl/Megatron 环境，需要继续启用 optional 测试并补齐真实 QKV rewiring 的集成细节。
+
+---
+
+## 2026-05-13 00:41 补充 8：新增提交后必须 push 的协作规则
+
+### 背景
+
+用户要求本项目所有修改在 commit 完成后都必须 push 到远程仓库。
+
+### 完成事项
+
+1. 更新 `CLAUDE.md` 和 `agents-readme.md`：
+   - 新增规则：每次 commit 完成后必须 push 到远程仓库。
+   - 同步修正文档清单，明确 `doc-design-history.md` 和 `doc-designs-final.md` 的职责。
+
+2. 本次规则变更完成后，将按新规则执行 commit 并 push。
+
+---
+
+## 2026-05-13 00:41 补充 7：拆分最终设计文档并收敛 Roadmap
+
+### 背景
+
+在继续讨论阶段规划后，确认最终 roadmap 需要按业务目标重新组织：
+
+- 阶段一聚焦 `verl + Megatron` RL MVP。
+- 阶段二聚焦业务落地所需的并行策略、硬件解耦和加速后端。
+- 阶段三扩展到 standalone Megatron / FSDP 的 SFT 和 pretrain。
+- 阶段四面向 verl / Megatron 上游 PR 与产品化。
+
+同时确认最终实现不再考虑 boundary mode；正式精度路径统一为 Prefix-Last Restore。
+
+### 完成事项
+
+1. 将 `doc-designs.md` 重命名为 `doc-design-history.md`。
+
+2. 新增 `doc-designs-final.md`，作为后续开发使用的最终设计文档，包含：
+   - 项目目标与阶段一非目标
+   - `One-Forward + KV Injection + Prefix-Last Restore` 核心方案
+   - 三层架构：`core/`、`integrations/`、`backends/`
+   - `PrefixSharingConfig`、`PrefixSharingBatchMeta`、`PrefixLastRestoreSpec`
+   - detector、planner、mapping、cache、backend 职责
+   - 阶段一 preprocess / attention / postprocess 数据流
+   - 非侵入式 patch 集成策略
+   - 三层精度验收方案
+   - 阶段一实施计划
+   - 四阶段 roadmap
+
+3. 更新 `doc-design-history.md` 顶部，记录最终方案收敛：
+   - 阶段一：`verl + Megatron` RL MVP
+   - 阶段二：并行策略、硬件解耦、加速后端，目标是业务可落地
+   - 阶段三：扩展到 FSDP / Megatron 的 SFT 和 pretrain
+   - 阶段四：上游 PR 与产品化
+
+### 当前结论
+
+当前已经完成需求、约束、总体架构、精度路径和 roadmap 的设计收敛。下一步可以基于 `doc-designs-final.md` 继续细化阶段一的接口签名、测试用例和开发任务拆分。
+
+---
+
+## 2026-05-12 19:24 补充 6：明确 next-token 边界问题与 Prefix-Last Restore 主线
+
+### 背景
+
+继续审视 prefix sharing 的 logprob 精度一致性时，发现一个关键边界问题：reuse 样本如果只保留 suffix query，虽然 suffix token 可以通过注入的 prefix KV attend 到 prefix，但模型不会产生被裁剪掉的 prefix-last query/output。
+
+对 causal LM：
+
+```
+output(P_last) -> predict S0
+output(S0)     -> predict S1
+```
+
+因此第一个 suffix token `S0` 的 logprob 依赖 prefix 最后一个 token 的输出。如果只计算：
+
+```
+Q = [S0, S1, S2]
+```
+
+则缺失：
+
+```
+output(P_last)
+```
+
+### 参考项目核对
+
+1. **dpo-prefix-sharing**
+   - 构造输入时使用 `prompt + chosen + prompt[-1:] + rejected`
+   - `prompt[-1:]` 本质是 boundary token，用来产生 `output(prompt_last) -> rejected_first`
+
+2. **flash-preference**
+   - 在第一层前 `to_shared()` 合并重复 prefix
+   - 在最后一层后 `to_unshared()` 把 prefix hidden states 复制回每条原始序列
+   - 本质是 Prefix Output Restore 方案，用恢复的 prefix-last output 计算第一个 suffix token logprob
+
+3. **PrefixTrain_dev**
+   - 主流程证明了 Trie 检测、prefix cache、KV/activation 复用可以跑通
+   - 但 loss 侧存在随机 label / PoC 痕迹，且有已知 detach bug
+   - 不能证明其已解决真实 causal LM next-token logprob 边界问题
+
+### 设计结论
+
+1. **Strict suffix mode 不作为最终精度一致方案**
+   - 只作为内部调试模式
+   - 可用于验证 KV injection、RoPE offset、metadata、backend 主链路
+   - 不能用于最终 actor logprob/update 精度验收
+
+2. **MVP 第一阶段主线采用 Prefix-Last Restore Mode**
+   - reuse 样本只计算 suffix query
+   - 从 provider 恢复 prefix-last 位置的 output/logit/logprob
+   - 用恢复的 prefix-last 输出计算第一个 response token logprob
+   - 与 verl Megatron actor 当前 `[-response_length - 1 : -1]` logprob 切片语义兼容
+
+3. **Boundary Token Mode 作为 fallback / 对照方案**
+   - 对齐 dpo-prefix-sharing 的 `prompt[-1:]` 思路
+   - 当某些后端难以做 output restore 时，可考虑额外保留 prefix-last query
+
+4. **Full Prefix Restore 作为后续扩展**
+   - 面向单独 Megatron SFT / pretrain 或完整序列 loss 场景
+   - 对齐 flash-preference 的完整 prefix hidden restore 思路
+
+### 文档更新
+
+更新 `doc-designs.md`：
+- 新增 `2026-05-12 19:24 关键分析：Next-Token 边界问题与 Restore Mode 决策`
+- 记录 strict suffix、boundary token、prefix output restore 的差异
+- 明确 MVP 主线为 `One-Forward + KV Injection + Prefix-Last Restore`
+
+---
+
+## 2026-05-11 21:31 补充 5：方案升级为三层架构
+
+### 背景
+
+当前工作树回到 `origin/main` 的 `3d8a657` 后，此前本地写入的三层架构设计记录不在当前文档中。重新审视后，确认需要将三层架构方案作为最新设计记录恢复到 `doc-designs.md` 顶部。
+
+旧 One-Forward + KV Injection 方案核心方向可行，但存在工程边界不清的问题：
 - 过度依赖 `position_ids`，但 verl mcore THD 普通 RoPE 路径实际传入 `position_ids=None`
 - RoPE patch 只覆盖 `_apply_rotary_pos_emb_thd()`，无法覆盖 `apply_rope_fusion=True` 时的 fused THD 路径
 - logits / label / loss mask / output restore 在 prefix token 被裁剪后缺少明确映射
 - 方案容易绑定 CUDA TransformerEngine，不利于同时支持 CUDA GPU 和 CANN NPU
-- cache 生命周期、backend 能力边界、MVP 约束需要显式化
+- cache 生命周期、backend 能力边界、MVP 约束、patch 接入边界需要显式化
 
 ### 完成事项
 
-1. 更新 `doc-designs.md`，新增最新设计章节：`2026-05-11 20:49 详细设计：三层架构 + Metadata + 后端适配方案`
+1. 更新 `doc-designs.md`，新增最新设计章节：`2026-05-11 21:31 详细设计：三层架构 + Metadata + 后端适配方案`
 
 2. 新设计将 prefix sharing 拆为三层：
-   - **通用语义层**：`PrefixSharingBatchMeta`、detector、planner、cache、mapping，不绑定具体硬件后端
-   - **模型集成层**：verl mcore preprocess/postprocess、Megatron attention hook、RoPE offset、logprob/loss 对齐
+   - **通用语义层**：`PrefixSharingBatchMeta`、detector、planner、mapping、cache，不绑定具体硬件后端
+   - **模型集成层**：MVP 完全通过 patch 接入 verl mcore preprocess/postprocess、Megatron attention hook、RoPE offset、logprob/loss 对齐
    - **后端适配层**：`TorchReferenceBackend`、CUDA backend、CANN NPU backend 等，通过统一接口消费 metadata
 
-3. 明确 MVP 约束：
+3. 明确 detector 策略：
+   - `TriePrefixDetector` 用于全自动识别共同前缀
+   - `PromptPrefixDetector` 用于预先知道共同前缀边界的场景
+
+4. 明确核心模块职责：
+   - `mapping.py` 负责原始序列与裁剪后序列的 input / label / loss / output 坐标映射
+   - `cache.py` 负责当前 forward/backward 生命周期内每层 prefix K/V 暂存和读取，不做检测、映射或后端选择
+
+5. 明确 MVP 约束：
    - 普通 text GPT / causal LM
    - PP=1
    - CP=1
@@ -32,24 +351,17 @@
    - `fused_single_qkv_rope=False`
    - 精度测试在 eval mode，或 train mode 关闭 dropout 且固定 RNG
 
-4. 明确未来扩展路径：
+6. 明确未来扩展路径：
    - CANN NPU 通过独立 backend 适配，不复用 CUDA TE 细节
    - CP / PP 作为专项 backend 或专项 plan 扩展
    - fused kernel 必须声明能力并对齐 `TorchReferenceBackend`
-
-### 关键设计决策
-
-- 保留 One-Forward + KV Injection 核心策略，不推翻旧方案的主方向
-- 新增 `PrefixSharingBatchMeta` 作为所有模块共享的唯一语义来源
-- 不再把 `position_ids` 作为 THD RoPE 修正的主要机制，改为 metadata 驱动 per-sequence RoPE offset
-- 不再假设 `PackedSeqParams` 支持独立字段就代表底层 kernel 语义已验证，每个 backend 必须单独验证 `q_len != kv_len`
-- PrefixTrain_dev 主流程代码只作为参考迁移对象，不再描述为可直接复用的可靠实现
+   - 当前 patch 接入未来迁移为 verl/Megatron 正式 extension hook 或 config branch
 
 ### 下一步
 
-- 按新设计先实现 `PrefixSharingConfig.validate()`、`PrefixSharingBatchMeta`、planner 和 `TorchReferenceBackend`
+- 按新设计先实现 `PrefixSharingConfig.validate()`、`PrefixSharingBatchMeta`、planner、mapping 和 `TorchReferenceBackend`
 - 用 reference backend 验证裁剪、RoPE offset、KV 注入、label/logprob/output mapping
-- 再进入 Megatron 单层 hook 和 verl logprob 集成
+- 再进入 Megatron 单层 hook 和 verl logprob patch 集成
 
 ---
 

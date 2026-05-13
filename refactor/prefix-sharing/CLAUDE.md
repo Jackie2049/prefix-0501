@@ -29,16 +29,6 @@ prefix-0501/
 - commit message 格式：`[type] <中文简要说明>`
 - type 取值：`feat`(特性)、`fix`(修复)、`chore`(琐事)、`test`(测试)、`doc`(文档)
 
-### ⚠️ Cursor Agent 特殊规则（重要）
-
-**如果当前 agent 来自 Cursor，则 commit 操作必须获得用户明确同意。** 这与其它 agent 的行为有本质不同：
-
-- **必须获得用户明确同意**后才能执行 `git commit`
-- 一旦 commit 完成，**必须立即执行 `git push`**，将修改推送到远程仓库
-- 或者等待**用户手动完成提交和推送**
-
-在任何情况下，Cursor agent 都不应在未获得用户明确指令的情况下自动执行 commit 操作。如果用户没有明确说"提交"，agent 应该只完成代码/文档修改并等待用户确认。但一旦用户同意提交，agent 应当完整执行 commit + push 流程。
-
 ## 代码分析规范
 
 - 分析 PoC（PrefixTrain_dev）等参考代码时，只关注**主流程中真正被调用的代码**，忽略死代码和未使用的函数

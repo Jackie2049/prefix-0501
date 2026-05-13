@@ -1,8 +1,0 @@
-0000000000000000000000000000000000000000 1a47f26f372631ad504f89d85e0f2529b0e459b6 Jackie2049 <jackie2049@foxmail.com> 1778406488 +0800	commit (initial): 初始化项目管理文档和 Claude Code 工作规范
-1a47f26f372631ad504f89d85e0f2529b0e459b6 f3e34f40b48245c38629be65bd35c902f4568fab Jackie2049 <jackie2049@foxmail.com> 1778406835 +0800	commit: 修正 prefix ≠ prompt 的错误假设
-f3e34f40b48245c38629be65bd35c902f4568fab 6fc43baeafa82a5da81f508b9edcc470a8a63fd3 Jackie2049 <jackie2049@foxmail.com> 1778406993 +0800	commit: 修正设计中的场景通用性问题
-6fc43baeafa82a5da81f508b9edcc470a8a63fd3 73d00518c1d1d25019df2a0dd06e2c11dde3aba2 Jackie2049 <jackie2049@foxmail.com> 1778407028 +0800	commit: 更新文档管理规范：记录抬头格式为 yyyy-mm-dd hh:mm <title>
-73d00518c1d1d25019df2a0dd06e2c11dde3aba2 6d1673c0051da5768dd6a8ed6627726f719e69d4 Jackie2049 <jackie2049@foxmail.com> 1778407293 +0800	commit: [chore] 更新 Git 提交规范：commit message 格式为 [type] <中文说明>
-6d1673c0051da5768dd6a8ed6627726f719e69d4 80c5c4fb91732307a13f0d4243ce642236ca7016 Jackie2049 <jackie2049@foxmail.com> 1778420948 +0800	commit: [doc] 方案从 Two-Phase Forward 改为 One-Forward + KV Injection
-80c5c4fb91732307a13f0d4243ce642236ca7016 3d8a657c63916225069c6a97f594fb006ba45bde Jackie2049 <jackie2049@foxmail.com> 1778428109 +0800	commit: [fix] 修正设计方案中的 RoPE 位置编码和 PP 兼容性问题
-3d8a657c63916225069c6a97f594fb006ba45bde 654f6f5631108b81a14fb06c36215f511b129a9a Jackie2049 <jackie2049@foxmail.com> 1778504070 +0800	commit: [doc] 更新prefix sharing三层架构设计

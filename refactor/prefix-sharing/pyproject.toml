@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+testpaths = ["tests/unit_test", "tests/integrated_test", "tests/system_test"]
+pythonpath = ["."]
+addopts = "-ra"
