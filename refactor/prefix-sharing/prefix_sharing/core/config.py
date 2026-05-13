@@ -32,7 +32,7 @@ class PrefixSharingConfig:
     backend: str = "torch_ref"
     min_prefix_len: int = 1  # Prefixes shorter than this won't be cached (too short = not worth it)
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
-    boundary_strategy: str = "restore_last_prefix_token"
+    boundary_strategy: str = "prefix_last_restore"
 
     supported_pp_size: int = 1  # Pipeline parallel size supported in phase 1 (1 = no PP)
     supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
@@ -55,10 +55,10 @@ class PrefixSharingConfig:
             return
         if self.detector != "trie":
             raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
-        if self.boundary_strategy != "restore_last_prefix_token":
+        if self.boundary_strategy != "prefix_last_restore":
             raise PrefixSharingConfigError(
                 "phase 1 currently implements only "
-                "boundary_strategy='restore_last_prefix_token'; future strategies may include "
+                "boundary_strategy='prefix_last_restore'; future strategies may include "
                 "'boundary_token' and 'strict_suffix'"
             )
         if self.min_prefix_len < 1:

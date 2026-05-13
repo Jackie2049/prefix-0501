@@ -798,6 +798,7 @@ hidden_states
 - 必须显式禁用 Phase 1 不支持的 fused path。
 - 必须处理 packed THD / no-padding 参数的语义对齐。
 - 必须保证 layer_id、tp_rank 正确进入 cache key。
+- 当前实现状态：已具备 patch 安装/卸载骨架和无上下文 fallback；真正的 Megatron QKV rewiring 尚未完成。只要进入 prefix sharing runtime context，当前 patch 仍会显式抛出 `NotImplementedError`，避免误以为真实 Megatron 链路已经可用。
 
 ### 5.13 `integrations/megatron_rope.py`
 
@@ -818,6 +819,14 @@ hidden_states
 
 **定位**：verl Megatron actor 主路径接入。
 
+核心类/函数：
+
+- `VerlMCoreBatchAdapter`
+- `VerlMCorePreparedBatch`
+- `VerlMCoreIntegration`
+- `enable_prefix_sharing()`
+- `prefix_sharing_enabled()`
+
 职责：
 
 - 在 micro-batch preprocess 阶段生成 `PrefixSharingBatchMeta`。
@@ -832,6 +841,7 @@ hidden_states
 - 无可复用 relation 时输出应等价于 baseline。
 - 多 micro-batch 之间 cache 不得污染。
 - 报错信息应能定位是 preprocess、attention、restore 还是 patch 约束失败。
+- 当前实现状态：`VerlMCoreBatchAdapter` 已经把 planner + mapping + Prefix-Last Restore 串成可测试的框架无关 preprocess/postprocess adapter；真实 verl actor 函数 patch 和真实 Megatron attention rewiring 尚未完成。
 
 ---
 
@@ -974,6 +984,8 @@ with prefix_sharing_enabled(config):
 - Megatron 单层/小层数模型前向/反向对齐。
 - verl actor logprob/update smoke test。
 
+当前测试不能证明真实 verl + Megatron Phase 1 业务链路已经完成；它只能证明 core pipeline、batch adapter、patch 生命周期和 reference backend 语义在本地依赖条件下成立。
+
 ### 8.4 精度验收
 
 对比对象：
@@ -1010,6 +1022,8 @@ with prefix_sharing_enabled(config):
 - small-scale RL actor 链路可运行。
 - 在合理精度假设下 logprob/loss/grad 对齐。
 - patch 可启停，不污染非 prefix sharing 路径。
+
+当前实现距离该成功标准仍有缺口：真实 Megatron SelfAttention QKV rewiring、真实 verl actor preprocess/postprocess patch、真实框架环境下的 logprob/update smoke test 尚未完成。
 
 ### 9.2 阶段二：业务落地能力
 
@@ -1059,3 +1073,37 @@ with prefix_sharing_enabled(config):
 - 最后独立提交：`af21cd0 [feat] 支持按样本前缀复用关系`
 
 后续开源 `prefix-sharing` 时，可以基于当前 `prefix-0501` 的 `refactor/prefix-sharing/` 路径拆分，也可以基于保留的独立仓库历史继续整理。
+
+---
+
+## 11. 当前实现审计结论
+
+截至当前版本，Phase 1 不能被描述为“已经完成 verl + Megatron RL MVP”。准确状态如下：
+
+已完成：
+
+- `core/config.py`：Phase 1 配置校验。
+- `core/prefix_detector.py`：per-sample reuse relation detector。
+- `core/planner.py`：metadata、裁剪范围、position offset、Prefix-Last Restore spec。
+- `core/mapping.py`：input / label / loss mask 裁剪与 Python list 级 logprob restore。
+- `core/logprob.py`：torch tensor 级 Prefix-Last Restore helper。
+- `core/cache.py`：forward/micro-batch/layer/provider/tp 维度的 K/V cache。
+- `backends/torch_ref.py`：reference attention backend，支持 q_len != kv_len 和 transitive reuse cache。
+- `integrations/patch_manager.py` 与 `integrations/context.py`：patch 生命周期与 runtime context。
+- `integrations/verl_mcore.py`：框架无关 batch adapter，已实际调用 mapping 完成 preprocess/postprocess。
+
+未完成：
+
+- Megatron `SelfAttention.forward()` 内真实 QKV projection 后的 rewiring。
+- 非 fused RoPE 在真实 Megatron packed 参数下的实际接线。
+- verl actor 真实 preprocess/postprocess 函数 patch。
+- 从 provider prefix-last logits 到 reuser first suffix label 的真实 verl tensor 路径接线。
+- 真实 verl + Megatron actor logprob/update smoke test。
+- GPU / NPU 环境下的 CUDA / CANN optional 测试。
+
+因此，当前代码可以支撑 Phase 1 的 core semantic 开发与本地 CPU 自测，但不能直接交付真实业务链路。后续开发优先级应是：
+
+1. 接入真实 verl actor micro-batch preprocess/postprocess，把 `VerlMCoreBatchAdapter` 返回的 trimmed payload 转换为 verl/Megatron 实际输入格式。
+2. 完成 Megatron attention patch 的 QKV rewiring，并在上下文存在时调用 backend，而不是抛出 `NotImplementedError`。
+3. 在安装了 torch、verl、Megatron 的环境中补真实 smoke test。
+4. 再进入 CUDA / CANN reference backend 和性能后端验证。

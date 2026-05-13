@@ -4,6 +4,45 @@
 
 ---
 
+## 2026-05-14 补充 13：审计 Phase 1 完成度并补齐 mapping integration adapter
+
+### 背景
+
+用户指出 `mapping.py` 虽然在详细设计中是 preprocess/postprocess 核心模块，但当前代码没有在 runtime / integration 主路径中使用。重新审计后确认：当前版本不能被表述为已经完成 `verl + Megatron` Phase 1 RL MVP；它完成的是 core semantic、reference backend、patch/context 骨架和本地 CPU 测试，真实 verl actor patch 与 Megatron QKV rewiring 仍未完成。
+
+### 完成事项
+
+1. 补齐 `integrations/verl_mcore.py` 的框架无关 batch adapter：
+   - 新增 `VerlMCoreBatchAdapter`
+   - 新增 `VerlMCorePreparedBatch`
+   - `prepare_micro_batch()` 调用 planner + mapping，实际裁剪 input / labels / loss masks
+   - `prepared_context()` 建立 runtime context，供 patched attention 消费
+   - `restore_logprobs()` 调用 mapping 的 Prefix-Last Restore
+
+2. 补齐公开入口：
+   - 新增 `enable_prefix_sharing()`
+   - 新增 `prefix_sharing_enabled()`
+   - 在 `integrations/__init__.py` 导出 adapter 和入口函数
+
+3. 修正配置语义不一致：
+   - `boundary_strategy` 当前唯一允许值统一为 `prefix_last_restore`
+   - `restore_last_prefix_token` 作为旧值不再通过校验
+
+4. 更新详细设计：
+   - 明确 `VerlMCoreBatchAdapter` 已经接入 mapping
+   - 明确 Megatron attention patch 仍未完成真实 QKV rewiring
+   - 新增“当前实现审计结论”，区分已完成和未完成项
+
+5. 补充测试：
+   - 集成测试覆盖 `VerlMCoreBatchAdapter` preprocess、context、restore
+   - 测试 `prefix_sharing_enabled()` 在 install 失败时传播错误
+
+### 当前结论
+
+当前代码可以支撑 Phase 1 的 core semantic 开发与本地 CPU 自测，但不能直接交付真实 `verl + Megatron` 业务链路。下一步必须补真实 verl actor preprocess/postprocess patch 和 Megatron SelfAttention QKV rewiring。
+
+---
+
 ## 2026-05-13 18:00 补充 12：Phase 1 改为支持 per-sample reuse relation
 
 ### 背景

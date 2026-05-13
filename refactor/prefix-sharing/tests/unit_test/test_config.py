@@ -46,6 +46,6 @@ def test_enabled_config_rejects_non_phase_one_modes():
     with pytest.raises(PrefixSharingConfigError, match="detector"):
         PrefixSharingConfig(enabled=True, detector="prompt").validate(ModelConfig())
     with pytest.raises(PrefixSharingConfigError, match="boundary_strategy"):
-        PrefixSharingConfig(enabled=True, boundary_strategy="prefix_last_restore").validate(ModelConfig())
+        PrefixSharingConfig(enabled=True, boundary_strategy="restore_last_prefix_token").validate(ModelConfig())
     with pytest.raises(PrefixSharingConfigError, match="integrate_mode"):
         PrefixSharingConfig(enabled=True).validate(ModelConfig(), integrate_mode="verl_fsdp")

@@ -1,4 +1,55 @@
-"""Coordinate mapping utilities for trimmed prefix-sharing batches."""
+"""Batch materialization after planning: slice sequences and align logprobs.
+
+This module sits **after** :mod:`prefix_sharing.core.planner` and consumes
+:class:`~prefix_sharing.core.metadata.PrefixSharingBatchMeta`. The planner encodes
+*which* token spans each row keeps on the Q path and how packed lengths line up;
+this module applies those decisions to concrete per-row data: it slices
+``input_ids``, ``labels``, and ``loss_masks`` into trimmed rows, builds a packed
+``flattened`` view with ``cu_seqlens`` for variable-length layouts, and—when
+``prefix_last_restore`` is non-empty—reassembles per-row logprobs so reuse rows
+include the provider's **prefix-last** prediction for the first suffix token.
+
+Core Responsibilities:
+    1. **Trim rows by metadata ranges**: for each batch index, take the contiguous
+       span prescribed by ``input_keep_ranges``, ``label_keep_ranges``, or
+       ``loss_mask_keep_ranges`` and validate bounds against the source row.
+    2. **Emit packed batch views**: return :class:`TrimmedBatch` with per-row
+       lists, a single concatenation in batch order, and cumulative lengths
+       ``[0, len_0, len_0+len_1, ...]`` suitable for packed execution conventions.
+    3. **Prefix-last restore for RL / logprob pipelines**: insert the provider
+       prefix-last logprob at the slot indicated by each
+       :class:`~prefix_sharing.core.planner.PrefixLastRestoreSpec`, and gather
+       those provider values for tests or tensor code that mirrors the same
+       indexing contract.
+
+Key Concepts:
+    - **Keep ranges**: half-open ``(start, end)`` slices applied row-wise; inputs,
+      labels, and masks may use different ranges when label/mask semantics differ
+      from raw tokens.
+    - **Reuse logprob gap**: on reuser rows the first kept Q position predicts the
+      *second* suffix token; the missing logprob for the *first* suffix token
+      comes from the provider row at ``prefix_len - 1`` (encoded in restore specs).
+
+Key Components:
+    - :class:`TrimmedBatch`: Immutable container for trimmed ``rows``,
+      ``flattened``, and ``cu_seqlens``.
+    - :func:`trim_batch`, :func:`trim_inputs`, :func:`trim_labels`,
+      :func:`trim_loss_masks`: Row slicing helpers; the ``trim_*`` entry points
+      wire the correct meta field into :func:`trim_batch`.
+    - :func:`restore_prefix_last_logprobs`: Mutates per-row copies to insert
+      provider prefix-last logprobs at ``output_slot`` for each restore spec.
+    - :func:`build_provider_prefix_last_values`: Tensor-agnostic gather of
+      provider prefix-last scalars indexed by ``reuse_idx_in_batch`` (CPU tests
+      and reference for device-side gathers).
+
+Design Principles:
+    - **Meta-driven only**: no layout heuristics here; all spans come from
+      ``PrefixSharingBatchMeta`` produced by the planner.
+    - **Sequence-generic**: type parameter ``T`` supports token ids, mask weights,
+      or other per-position scalars; logprob helpers are float-specific where needed.
+    - **Backend-agnostic**: returns Python lists; integration stacks map the same
+      indexing to tensors without changing metadata.
+"""
 
 from __future__ import annotations
 

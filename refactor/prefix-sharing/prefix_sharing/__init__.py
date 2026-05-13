@@ -8,6 +8,7 @@ from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigE
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec, TriePrefixDetector
 from prefix_sharing.core.metadata import PrefixSharingBatchMeta
 from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlanner
+from prefix_sharing.integrations.verl_mcore import enable_prefix_sharing, prefix_sharing_enabled
 
 __all__ = [
     "PrefixSharingBatchMeta",
@@ -17,4 +18,6 @@ __all__ = [
     "PrefixReuseSpec",
     "PrefixSharingPlanner",
     "TriePrefixDetector",
+    "enable_prefix_sharing",
+    "prefix_sharing_enabled",
 ]
