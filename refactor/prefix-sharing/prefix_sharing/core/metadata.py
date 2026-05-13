@@ -3,24 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec
 
+if TYPE_CHECKING:
+    from prefix_sharing.core.planner import PrefixLastRestoreSpec
+
 
 Range = tuple[int, int]
-
-
-@dataclass(frozen=True)
-class PrefixLastRestoreSpec:
-    """How to restore the prefix-last prediction slot for one reuse sample."""
-
-    reuse_batch_index: int
-    provider_batch_index: int
-    provider_prefix_last_pos: int
-    reuse_first_suffix_label_pos: int
-    output_slot: int
-    group_id: int
 
 
 @dataclass(frozen=True)
@@ -84,17 +75,17 @@ class PrefixSharingBatchMeta:
     def has_sharing(self) -> bool:
         return bool(self.reuse_specs)
 
-    def is_reuser(self, batch_index: int) -> bool:
-        return self.provider_index[batch_index] != batch_index and self.prefix_lens[batch_index] > 0
+    def is_reuser(self, idx_in_batch: int) -> bool:
+        return self.provider_index[idx_in_batch] != idx_in_batch and self.prefix_lens[idx_in_batch] > 0
 
-    def q_range_for_batch(self, batch_index: int) -> Range:
-        return self.cu_seqlens_q[batch_index], self.cu_seqlens_q[batch_index + 1]
+    def q_range_for_batch(self, idx_in_batch: int) -> Range:
+        return self.cu_seqlens_q[idx_in_batch], self.cu_seqlens_q[idx_in_batch + 1]
 
-    def kv_range_for_batch(self, batch_index: int) -> Range:
-        return self.cu_seqlens_kv[batch_index], self.cu_seqlens_kv[batch_index + 1]
+    def kv_range_for_batch(self, idx_in_batch: int) -> Range:
+        return self.cu_seqlens_kv[idx_in_batch], self.cu_seqlens_kv[idx_in_batch + 1]
 
-    def restore_for_reuse(self, batch_index: int) -> PrefixLastRestoreSpec | None:
+    def restore_for_reuse(self, idx_in_batch: int) -> PrefixLastRestoreSpec | None:
         for spec in self.prefix_last_restore:
-            if spec.reuse_batch_index == batch_index:
+            if spec.reuse_idx_in_batch == idx_in_batch:
                 return spec
         return None

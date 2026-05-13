@@ -212,15 +212,15 @@ class PrefixSharingConfig:
 ```python
 @dataclass(frozen=True)
 class PrefixReuseSpec:
-    reuse_batch_index: int
-    provider_batch_index: int
+    reuse_idx_in_batch: int
+    provider_idx_in_batch: int
     prefix_len: int
 ```
 
 含义：
 
-- `reuse_batch_index`：当前裁剪 prefix、复用别人 KV 的样本。
-- `provider_batch_index`：提供 prefix KV 的历史样本。
+- `reuse_idx_in_batch`：当前裁剪 prefix、复用别人 KV 的样本。
+- `provider_idx_in_batch`：提供 prefix KV 的历史样本。
 - `prefix_len`：reuser 从 provider 复用的 token 数量。
 
 关键规则：
@@ -303,8 +303,8 @@ class PrefixSharingBatchMeta:
 ```python
 @dataclass(frozen=True)
 class PrefixLastRestoreSpec:
-    reuse_batch_index: int
-    provider_batch_index: int
+    reuse_idx_in_batch: int
+    provider_idx_in_batch: int
     provider_prefix_last_pos: int
     reuse_first_suffix_label_pos: int
     output_slot: int
@@ -326,7 +326,7 @@ class PrefixKVCacheKey:
     forward_id: int
     micro_batch_id: int
     layer_id: int
-    provider_batch_index: int
+    provider_idx_in_batch: int
     tp_rank: int = 0
 
 @dataclass(frozen=True)
@@ -562,7 +562,7 @@ cache.close()
 
 职责：
 
-- 按 `forward_id`、`micro_batch_id`、`layer_id`、`provider_batch_index`、`tp_rank` 隔离 K/V。
+- 按 `forward_id`、`micro_batch_id`、`layer_id`、`provider_idx_in_batch`、`tp_rank` 隔离 K/V。
 - 保存 provider 或 reuser 的完整 logical K/V。
 - 为后续 reuser 提供可切片的 K/V。
 - 管理生命周期，防止 close 后继续读写。

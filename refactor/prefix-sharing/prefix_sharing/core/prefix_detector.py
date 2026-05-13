@@ -20,7 +20,7 @@ Key Concepts:
 
 Key Components:
     - PrefixReuseSpec: Represents one relation
-      ``reuser -> provider, prefix_len``.
+      ``(reuse_idx_in_batch, provider_idx_in_batch, prefix_len)``.
     - PrefixGroup: Compatibility/debug view grouping relations with identical
       ``(provider_index, prefix_len)``.
     - PrefixDetectionResult: Container for detection output with per-sequence
@@ -92,8 +92,10 @@ class PrefixGroup:
 
 @dataclass(frozen=True)
 class PrefixReuseSpec:
-    reuse_batch_index: int
-    provider_batch_index: int
+    """One reuse edge: reuser row ``reuse_idx_in_batch`` borrows KV from ``provider_idx_in_batch``."""
+
+    reuse_idx_in_batch: int
+    provider_idx_in_batch: int
     prefix_len: int
 
 
@@ -122,8 +124,8 @@ class PrefixDetectionResult:
 
         batch_size      == 3
         reuse_specs     == (
-            PrefixReuseSpec(1, 0, 3),
-            PrefixReuseSpec(2, 0, 5),
+            PrefixReuseSpec(reuse_idx_in_batch=1, provider_idx_in_batch=0, prefix_len=3),
+            PrefixReuseSpec(reuse_idx_in_batch=2, provider_idx_in_batch=0, prefix_len=5),
         )
         provider_index  == (0, 0, 0)
         prefix_lens     == (0, 3, 5)
@@ -199,8 +201,8 @@ class TriePrefixDetector(PrefixDetector):
                 and matched_group_size >= self.min_group_size
             ):
                 spec = PrefixReuseSpec(
-                    reuse_batch_index=index,
-                    provider_batch_index=matched_provider,
+                    reuse_idx_in_batch=index,
+                    provider_idx_in_batch=matched_provider,
                     prefix_len=matched,
                 )
                 reuse_specs.append(spec)

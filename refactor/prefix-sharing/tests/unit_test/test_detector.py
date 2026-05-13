@@ -49,7 +49,7 @@ def test_trie_detector_builds_per_sample_reuse_relations():
         ]
     )
 
-    assert [(s.reuse_batch_index, s.provider_batch_index, s.prefix_len) for s in result.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in result.reuse_specs] == [
         (1, 0, 3),
         (2, 0, 5),
         (4, 3, 2),
@@ -76,7 +76,7 @@ def test_trie_detector_allows_reuser_to_provide_longer_prefix_later():
         ]
     )
 
-    assert [(s.reuse_batch_index, s.provider_batch_index, s.prefix_len) for s in result.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in result.reuse_specs] == [
         (1, 0, 3),
         (2, 1, 4),
     ]
@@ -94,7 +94,7 @@ def test_trie_detector_respects_min_group_size_for_relation_threshold():
         ]
     )
 
-    assert [(s.reuse_batch_index, s.provider_batch_index, s.prefix_len) for s in result.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in result.reuse_specs] == [
         (2, 0, 2),
     ]
     assert result.provider_index == (0, 1, 0)

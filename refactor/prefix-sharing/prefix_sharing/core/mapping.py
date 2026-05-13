@@ -75,8 +75,8 @@ def restore_prefix_last_logprobs(
 
     restored = [list(row) for row in suffix_logprobs]
     for spec in meta.prefix_last_restore:
-        restored_value = provider_prefix_last_logprobs[spec.reuse_batch_index]
-        row = restored[spec.reuse_batch_index]
+        restored_value = provider_prefix_last_logprobs[spec.reuse_idx_in_batch]
+        row = restored[spec.reuse_idx_in_batch]
         if spec.output_slot < 0 or spec.output_slot > len(row):
             raise ValueError("restore output_slot out of range")
         row.insert(spec.output_slot, restored_value)
@@ -95,6 +95,6 @@ def build_provider_prefix_last_values(
 
     values: list[T | None] = [None] * meta.batch_size
     for spec in meta.prefix_last_restore:
-        provider_row = provider_values_by_batch[spec.provider_batch_index]
-        values[spec.reuse_batch_index] = provider_row[spec.provider_prefix_last_pos]
+        provider_row = provider_values_by_batch[spec.provider_idx_in_batch]
+        values[spec.reuse_idx_in_batch] = provider_row[spec.provider_prefix_last_pos]
     return values

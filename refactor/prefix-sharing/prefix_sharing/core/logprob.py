@@ -55,7 +55,7 @@ def restore_prefix_last_logprobs_tensor(
 
     restored_lengths = []
     rows = []
-    restore_by_batch = {spec.reuse_batch_index: spec for spec in meta.prefix_last_restore}
+    restore_by_batch = {spec.reuse_idx_in_batch: spec for spec in meta.prefix_last_restore}
     for batch_index in range(meta.batch_size):
         logical_len = meta.kept_lengths_q[batch_index]
         row = suffix_logprobs[batch_index, :logical_len]
@@ -86,8 +86,8 @@ def gather_provider_prefix_last_logits(logits_by_batch: Any, meta: PrefixSharing
         raise RuntimeError("gather_provider_prefix_last_logits requires PyTorch") from exc
     out = logits_by_batch.new_zeros((meta.batch_size, logits_by_batch.shape[-1]))
     for spec in meta.prefix_last_restore:
-        out[spec.reuse_batch_index] = logits_by_batch[
-            spec.provider_batch_index,
+        out[spec.reuse_idx_in_batch] = logits_by_batch[
+            spec.provider_idx_in_batch,
             spec.provider_prefix_last_pos,
         ]
     return out

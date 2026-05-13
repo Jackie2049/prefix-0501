@@ -15,7 +15,7 @@ def test_planner_builds_phase_one_metadata_and_restore_specs():
     assert meta.forward_id == 7
     assert meta.micro_batch_id == 3
     assert meta.original_lengths == [7, 6, 7, 3]
-    assert [(s.reuse_batch_index, s.provider_batch_index, s.prefix_len) for s in meta.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in meta.reuse_specs] == [
         (1, 0, 3),
         (2, 0, 5),
     ]
@@ -33,13 +33,13 @@ def test_planner_builds_phase_one_metadata_and_restore_specs():
 
     assert len(meta.prefix_last_restore) == 2
     first, second = meta.prefix_last_restore
-    assert first.reuse_batch_index == 1
-    assert first.provider_batch_index == 0
+    assert first.reuse_idx_in_batch == 1
+    assert first.provider_idx_in_batch == 0
     assert first.provider_prefix_last_pos == 2
     assert first.reuse_first_suffix_label_pos == 3
     assert first.output_slot == 0
-    assert second.reuse_batch_index == 2
-    assert second.provider_batch_index == 0
+    assert second.reuse_idx_in_batch == 2
+    assert second.provider_idx_in_batch == 0
     assert second.provider_prefix_last_pos == 4
     assert second.reuse_first_suffix_label_pos == 5
     assert second.output_slot == 0

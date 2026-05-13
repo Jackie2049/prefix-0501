@@ -11,7 +11,7 @@ class PrefixKVCacheKey:
     forward_id: int
     micro_batch_id: int
     layer_id: int
-    provider_batch_index: int
+    provider_idx_in_batch: int
     tp_rank: int = 0
 
 

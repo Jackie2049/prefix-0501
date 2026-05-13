@@ -17,8 +17,8 @@
 - Prefix Group 只作为调试、统计或后续执行优化视图，不是语义核心
 
 **相关代码**：
-- `PrefixReuseSpec.reuse_batch_index`
-- `PrefixReuseSpec.provider_batch_index`
+- `PrefixReuseSpec.reuse_idx_in_batch`
+- `PrefixReuseSpec.provider_idx_in_batch`
 - `PrefixReuseSpec.prefix_len`
 - `PrefixDetectionResult.reuse_specs`
 
@@ -36,7 +36,7 @@
 - 若历史样本本身也是 reuser，reference backend 会先构造并缓存它的完整 logical KV，使其仍可作为 provider
 
 **相关代码**：
-- `PrefixReuseSpec.provider_batch_index`
+- `PrefixReuseSpec.provider_idx_in_batch`
 - `PrefixDetectionResult.provider_index`
 - `PrefixDetectionResult.is_provider`
 
@@ -54,7 +54,7 @@
 
 **相关代码**：
 - 判断方式：`provider_index[index] != index and prefix_lens[index] > 0`
-- `PrefixReuseSpec.reuse_batch_index`
+- `PrefixReuseSpec.reuse_idx_in_batch`
 
 ---
 
@@ -141,7 +141,7 @@
 | 概念 | 类/变量名 | 字段名 | 布尔标记 |
 |------|-----------|--------|----------|
 | Provider | `provider` | `provider_index`, `provider_idx` | `is_provider` |
-| Reuser | `reuser` | `reuse_batch_index` | `is_reuser` (如有需要) |
+| Reuser | `reuser` | `reuse_idx_in_batch` | `is_reuser` (如有需要) |
 | 复用关系 | `PrefixReuseSpec` | `reuse_specs` | - |
 | 前缀组 | `PrefixGroup` | `groups`, `member_indices` | - |
 | 前缀长度 | `prefix_len` | `prefix_lens` | - |

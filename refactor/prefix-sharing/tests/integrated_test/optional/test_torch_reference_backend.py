@@ -44,7 +44,7 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
         forward_id=2,
         micro_batch_id=1,
     )
-    assert [(s.reuse_batch_index, s.provider_batch_index, s.prefix_len) for s in meta.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in meta.reuse_specs] == [
         (1, 0, 3),
         (2, 1, 4),
     ]

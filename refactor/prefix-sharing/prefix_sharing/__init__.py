@@ -6,8 +6,8 @@ Integrations install patches around verl/Megatron, but the semantics live here.
 
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec, TriePrefixDetector
-from prefix_sharing.core.metadata import PrefixSharingBatchMeta, PrefixLastRestoreSpec
-from prefix_sharing.core.planner import PrefixSharingPlanner
+from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlanner
 
 __all__ = [
     "PrefixSharingBatchMeta",

@@ -1,4 +1,53 @@
-"""Turn detection results into executable prefix-sharing metadata."""
+"""Prefix-sharing planning: turn detection output into batch metadata.
+
+This module sits between **prefix detection** (:mod:`prefix_sharing.core.prefix_detector`)
+and **downstream execution** (mapping, attention backends, RoPE). It does not
+discover shared prefixes; it consumes :class:`~prefix_sharing.core.prefix_detector.PrefixDetectionResult`
+and materializes per-row layout: what to keep on the Q path, cumulative sequence
+lengths for packed tensors, position offsets, and optional prefix-last restore
+hints for RL / logprob alignment.
+
+Core Responsibilities:
+    1. **Per-row layout after detection**: for each batch index, decide how that
+       row participates in packed execution—whether the Q path uses the full
+       sequence or only the post-prefix suffix, how long the row occupies on
+       the KV path, and which contiguous token spans to keep for inputs, labels,
+       and loss masks. Inputs are only ``provider_index``, ``prefix_lens``, and
+       per-row original length; the result is encoded as lengths, cumulative
+       seqlens, and keep ranges inside ``PrefixSharingBatchMeta``.
+    2. Set ``q_position_offsets`` so reuser rows preserve correct absolute positions
+       when the Q path only packs the suffix after a shared prefix.
+    3. Emit :class:`PrefixLastRestoreSpec` entries when a reuser has both a
+       non-zero prefix and a non-empty suffix.
+
+Key Concepts:
+    - Reuser (planner view): ``provider_index[i] != i`` and ``prefix_lens[i] > 0``.
+      The Q path keeps ``input_ids[i][prefix_len:original_len)``; KV expanded
+      length stays the full original length for backend conventions.
+    - Provider or standalone row: full sequence on the Q path; offsets zero.
+
+Key Components:
+    - :class:`PrefixSharingPlanner`: Optional embedded :class:`~prefix_sharing.core.prefix_detector.TriePrefixDetector`;
+      :meth:`~PrefixSharingPlanner.plan` runs detect-then-plan;
+      :meth:`~PrefixSharingPlanner.plan_from_detection` accepts precomputed detection
+      (tests or alternate detectors).
+    - :func:`_cumsum`: Computes cumulative lengths for ``cu_seqlens_q`` and ``cu_seqlens_kv``.
+
+Design Principles:
+    - Single layout source: all ranges and lengths derive from detector fields
+      plus original lengths; planner does not reinterpret group structure.
+    - Detector-agnostic planning: only ``PrefixDetectionResult`` + ``input_ids``
+      lengths matter in :meth:`~PrefixSharingPlanner.plan_from_detection`.
+    - Correlation hooks: optional ``forward_id`` and ``micro_batch_id`` for logging,
+      cache keys, and pipeline tracing (auto-assigned when omitted).
+
+Example:
+    >>> from prefix_sharing.core.config import PrefixSharingConfig
+    >>> planner = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=3))
+    >>> meta = planner.plan([[1, 2, 3, 4], [1, 2, 3, 5]], forward_id=1, micro_batch_id=1)
+    >>> meta.has_sharing
+    True
+"""
 
 from __future__ import annotations
 
@@ -8,7 +57,31 @@ from typing import Sequence
 
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, TriePrefixDetector
-from prefix_sharing.core.metadata import PrefixLastRestoreSpec, PrefixSharingBatchMeta
+
+
+@dataclass(frozen=True)
+class PrefixLastRestoreSpec:
+    """Plan for one reuse row's prefix-last prediction slot.
+
+    Under prefix sharing the reuser's query is trimmed to the suffix while prefix
+    KV is still supplied (e.g. via cache injection). The forward pass therefore
+    never materializes a query/output at the prefix-last index, yet the first
+    suffix token is still predicted in the *next-token* sense from that position:
+    its logprob must come from logits at ``prefix_len - 1``, not from the first
+    suffix timestep in the packed sequence. This spec records where to read that
+    value from the provider row and where to insert it when assembling per-row
+    response logprobs or logits (keeping autograd tied to the shared prefix).
+    """
+
+    reuse_idx_in_batch: int
+    provider_idx_in_batch: int
+    provider_prefix_last_pos: int
+    reuse_first_suffix_label_pos: int
+    output_slot: int
+    group_id: int
+
+
+from prefix_sharing.core.metadata import PrefixSharingBatchMeta  # noqa: E402
 
 
 _forward_ids = itertools.count(1)
@@ -102,8 +175,8 @@ class PrefixSharingPlanner:
                 if prefix_len > 0 and suffix_len > 0:
                     restore_specs.append(
                         PrefixLastRestoreSpec(
-                            reuse_batch_index=index,
-                            provider_batch_index=provider_index[index],
+                            reuse_idx_in_batch=index,
+                            provider_idx_in_batch=provider_index[index],
                             provider_prefix_last_pos=prefix_len - 1,
                             reuse_first_suffix_label_pos=prefix_len,
                             output_slot=0,
