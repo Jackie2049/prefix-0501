@@ -19,13 +19,13 @@ from typing import Any, Iterator, Mapping, Sequence, TypeVar
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.mapping import (
+from prefix_sharing.core.batch_trim import (
     TrimmedBatch,
-    restore_prefix_last_logprobs,
     trim_inputs,
     trim_labels,
     trim_loss_masks,
 )
+from prefix_sharing.core.logprob import restore_prefix_last_logprobs
 from prefix_sharing.core.metadata import PrefixSharingBatchMeta
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import (
@@ -92,7 +92,7 @@ class VerlMCoreBatchAdapter:
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> VerlMCorePreparedBatch:
-        """Plan prefix sharing and apply mapping trims to a micro-batch."""
+        """Plan prefix sharing and trim a micro-batch."""
 
         assert self.planner is not None
         meta = self.planner.plan(

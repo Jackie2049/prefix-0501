@@ -149,7 +149,7 @@ prefix_sharing/
 │   ├── metadata.py               # PrefixSharingBatchMeta / PrefixLastRestoreSpec
 │   ├── prefix_detector.py        # PrefixDetector / TriePrefixDetector / PrefixReuseSpec
 │   ├── planner.py                # 裁剪、offset、restore 计划
-│   ├── mapping.py                # input / label / mask / output 坐标映射
+│   ├── batch_trim.py             # input / label / mask 裁剪与 packed 视图
 │   ├── cache.py                  # PrefixKVCache 生命周期管理
 │   └── logprob.py                # Prefix-Last Restore logprob 工具
 ├── integrations/                 # 框架集成层
@@ -492,9 +492,9 @@ meta = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 - 无 sharing 时 metadata 等价于普通 packed batch。
 - per-sample relation 下不同 reuser 的 restore spec 各自独立。
 
-### 5.4 `core/mapping.py`
+### 5.4 `core/batch_trim.py`
 
-**定位**：把 planner 产生的区间应用到 input、label、mask、输出坐标上。
+**定位**：把 planner 产生的 keep range 应用到 input、label、mask 上，并生成 packed 视图。
 
 核心类/函数：
 
@@ -502,8 +502,6 @@ meta = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 - `trim_inputs()`
 - `trim_labels()`
 - `trim_loss_masks()`
-- `restore_packed_outputs()`
-- `iter_kept_ranges()`
 
 主要接口：
 
@@ -519,14 +517,14 @@ loss_masks = trim_loss_masks(loss_masks, meta)
 - 根据 `label_keep_ranges` 裁剪 labels。
 - 根据 `loss_mask_keep_ranges` 裁剪 loss mask / response mask。
 - 保持 batch 顺序不变。
-- 为 postprocess 阶段提供从 trimmed packed 输出回原始 batch 语义的坐标依据。
+- 输出 `rows`、`flattened`、`cu_seqlens`，供 integration 层映射到框架 tensor。
 
 核心规则：
 
 - provider 输出完整保留。
 - reuser 输出只来自 suffix query。
-- reuser 第一个 suffix token 的 logprob 不由 suffix output 直接产生，而由 `prefix_last_restore` 补齐。
-- mapping 层只处理坐标，不处理 logits 数值计算。
+- reuser 第一个 suffix token 的 logprob 不由 suffix output 直接产生，具体补齐由 `core/logprob.py` 负责。
+- batch trim 层只处理裁剪和 packed 视图，不处理 logits 数值计算。
 
 不负责：
 
@@ -594,6 +592,8 @@ cache.close()
 
 核心函数：
 
+- `restore_prefix_last_logprobs()`
+- `build_provider_prefix_last_values()`
 - `compute_token_logprobs_from_logits()`
 - `gather_provider_prefix_last_logits()`
 - `restore_prefix_last_logprobs_tensor()`
@@ -608,6 +608,7 @@ restored = restore_prefix_last_logprobs_tensor(suffix_logprobs, first_suffix_log
 
 职责：
 
+- 提供 Python list 版本的 Prefix-Last Restore，供 CPU 单元测试和框架无关 adapter 使用。
 - 从 provider 的 prefix-last 输出位置取 logits。
 - 根据 reuser 第一个 suffix label 计算对应 logprob。
 - 把该 logprob 放回 reuser 的 `output_slot=0`。
@@ -834,7 +835,7 @@ hidden_states
 职责：
 
 - 在 micro-batch preprocess 阶段生成 `PrefixSharingBatchMeta`。
-- 调用 mapping 裁剪 input、labels、loss mask、response mask。
+- 调用 `batch_trim` 裁剪 input、labels、loss mask、response mask。
 - 进入 `prefix_sharing_context()`，让 Megatron attention patch 可读取 meta/cache。
 - postprocess 阶段组装 logprob，执行 Prefix-Last Restore。
 - 保持 verl actor 原始 batch 顺序和返回格式。
@@ -860,7 +861,7 @@ hidden_states
 
 1. `TriePrefixDetector` 识别 per-sample reuse relation。
 2. `PrefixSharingPlanner` 生成 `PrefixSharingBatchMeta`。
-3. `mapping` 同步裁剪 input、label、loss mask、response mask。
+3. `batch_trim` 同步裁剪 input、label、loss mask、response mask。
 4. provider 样本保留完整 `[prefix | suffix]`。
 5. reuser 样本裁剪 prefix，仅保留 suffix。
 6. 构造裁剪后的 packed input 和 `cu_seqlens_q`。
@@ -948,7 +949,7 @@ with prefix_sharing_enabled(config):
 - config 参数校验和 Phase 1 约束。
 - detector 的 relation 输出、阈值、多长度 provider、transitive reuse。
 - planner 的 lengths、ranges、offsets、restore specs。
-- mapping 的 input / label / mask 裁剪。
+- batch trim 的 input / label / mask 裁剪。
 - cache 生命周期和 key 语义。
 - logprob restore 的张量语义。
 
@@ -1085,23 +1086,25 @@ with prefix_sharing_enabled(config):
 
 ## 11. 当前实现审计结论
 
-截至当前版本，Phase 1 不能被描述为“已经完成 verl + Megatron RL MVP”。准确状态如下：
+截至当前版本，Phase 1 代码主链路已经补齐；GPU / NPU / 真实 verl 框架 smoke test 是剩余闭环项。准确状态如下：
 
 已完成：
 
 - `core/config.py`：Phase 1 配置校验。
 - `core/prefix_detector.py`：per-sample reuse relation detector。
 - `core/planner.py`：metadata、裁剪范围、position offset、Prefix-Last Restore spec。
-- `core/mapping.py`：input / label / loss mask 裁剪与 Python list 级 logprob restore。
-- `core/logprob.py`：torch tensor 级 Prefix-Last Restore helper。
+- `core/batch_trim.py`：input / label / loss mask 裁剪与 packed 视图。
+- `core/logprob.py`：Python list 与 torch tensor 级 Prefix-Last Restore helper。
 - `core/cache.py`：forward/micro-batch/layer/provider/tp 维度的 K/V cache。
 - `backends/torch_ref.py`：reference attention backend，支持 q_len != kv_len 和 transitive reuse cache。
 - `integrations/patch_manager.py` 与 `integrations/context.py`：patch 生命周期与 runtime context。
-- `integrations/verl_mcore.py`：框架无关 batch adapter，已实际调用 mapping 完成 preprocess/postprocess。
+- `integrations/verl_mcore.py`：框架无关 batch adapter 和真实 verl actor helper，已实际调用 `batch_trim` 与 `logprob` 完成 preprocess/postprocess。
 
-未完成：
+剩余待真实环境验证：
 
-- Megatron `SelfAttention.forward()` 内真实 QKV projection 后的 rewiring。
+- Megatron 单层/小层数模型前向/反向对齐。
+- verl actor logprob/update smoke test。
+- CUDA / CANN / NPU backend 与设备侧 kernel 行为验证。
 - 非 fused RoPE 在真实 Megatron packed 参数下的实际接线。
 - verl actor 真实 preprocess/postprocess 函数 patch。
 - 从 provider prefix-last logits 到 reuser first suffix label 的真实 verl tensor 路径接线。

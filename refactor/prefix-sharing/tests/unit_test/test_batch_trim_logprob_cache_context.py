@@ -1,12 +1,14 @@
 import pytest
 
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVCacheKey
-from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.mapping import (
-    build_provider_prefix_last_values,
-    restore_prefix_last_logprobs,
+from prefix_sharing.core.batch_trim import (
     trim_inputs,
     trim_labels,
+)
+from prefix_sharing.core.cache import PrefixKVCache, PrefixKVCacheKey
+from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.core.logprob import (
+    build_provider_prefix_last_values,
+    restore_prefix_last_logprobs,
 )
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_context

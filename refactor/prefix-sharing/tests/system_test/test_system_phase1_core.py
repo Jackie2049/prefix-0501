@@ -1,5 +1,6 @@
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.mapping import restore_prefix_last_logprobs, trim_inputs
+from prefix_sharing.core.batch_trim import trim_inputs
+from prefix_sharing.core.logprob import restore_prefix_last_logprobs
 from prefix_sharing.core.planner import PrefixSharingPlanner
 
 

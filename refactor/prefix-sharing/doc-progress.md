@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-05-15 补充 15：拆分 `mapping.py` 为 `batch_trim.py` 和 `logprob.py`
+
+### 背景
+
+用户指出 `mapping` 命名无法一眼判断职责；`materialization` 又过于复杂。重新审视后确认原模块混合了两类职责：batch 裁剪/packed 视图，以及 Prefix-Last Restore logprob 组装。
+
+### 完成事项
+
+1. 重命名并收窄 batch 裁剪模块：
+   - `core/mapping.py` 改为 `core/batch_trim.py`
+   - 保留 `TrimmedBatch`、`trim_batch()`、`trim_inputs()`、`trim_labels()`、`trim_loss_masks()`
+   - 模块文档改为只描述 input / label / mask 裁剪和 packed 视图
+
+2. 移动 logprob 职责：
+   - `restore_prefix_last_logprobs()` 移入 `core/logprob.py`
+   - `build_provider_prefix_last_values()` 移入 `core/logprob.py`
+   - `logprob.py` 同时承载 Python list 版本和 torch tensor 版本 Prefix-Last Restore
+
+3. 更新引用和文档：
+   - `integrations/verl_mcore.py` 改为从 `batch_trim` 与 `logprob` 分别导入
+   - 单元测试、系统测试 import 更新
+   - `core/__init__.py` 导出新的 public helper
+   - `doc-designs-final.md` 更新模块边界
+
+### 当前结论
+
+模块边界变为：`planner` 负责计划，`batch_trim` 负责裁剪/packed 视图，`logprob` 负责 Prefix-Last Restore，命名比原 `mapping` 更直接。
+
+---
+
 ## 2026-05-14 补充 14：补齐 verl + Megatron Phase 1 真实代码入口
 
 ### 背景
@@ -34,7 +64,7 @@
 
 ### 当前结论
 
-代码层面 Phase 1 主链路缺口已补齐：core detector/planner/mapping、verl actor entry、runtime context、Megatron attention hook、RoPE 位置修正、KV injection、logprob restore 均已存在。当前唯一未闭环项是需要在真实 GPU / NPU / verl 环境中运行 small-scale actor logprob/update smoke test 与加速器测试。
+代码层面 Phase 1 主链路缺口已补齐：core detector/planner/batch trim/logprob、verl actor entry、runtime context、Megatron attention hook、RoPE 位置修正、KV injection、logprob restore 均已存在。当前唯一未闭环项是需要在真实 GPU / NPU / verl 环境中运行 small-scale actor logprob/update smoke test 与加速器测试。
 
 ---
 
@@ -266,7 +296,7 @@ python3 -m compileall prefix_sharing
 
 ### 完成事项
 
-1. 更新 `CLAUDE.md` 和 `agents-readme.md`：
+1. 更新 `AGENTS.md`（当时分别维护于 `CLAUDE.md` 与 `agents-readme.md`，已合并）：
    - 新增规则：每次 commit 完成后必须 push 到远程仓库。
    - 同步修正文档清单，明确 `doc-design-history.md` 和 `doc-designs-final.md` 的职责。
 
