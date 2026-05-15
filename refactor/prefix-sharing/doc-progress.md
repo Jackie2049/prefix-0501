@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-05-15 补充 16：将 Prefix Activation Reuse 纳入 Phase 2 探索特性
+
+### 背景
+
+用户指出：Phase 1 只复用 prefix K/V 是合理的最小闭环，因为 suffix token 会反复 attend prefix K/V；但如果进一步共享 prefix 的所有可复用激活，理论上可以继续减少 prefix 重复计算，并降低训练时重复保存 activation 带来的显存压力。
+
+### 文档更新
+
+1. 在 `doc-designs-final.md` 的 Phase 2 roadmap 中新增 “Prefix Activation Reuse” 探索特性。
+2. 明确 Phase 2 可从 KV sharing 扩展到 provider prefix layer hidden states、attention/MLP 中间激活、prefix-last logits 等更广义的 prefix activation reuse。
+3. 明确收益目标：
+   - 减少 reuser prefix 的整条 forward 重复计算。
+   - 降低 backward 需要保存的重复 prefix activation 显存。
+   - 保持多个 reuser loss / logprob 梯度正确累积回 provider prefix 计算图。
+4. 明确风险约束：
+   - 不允许 `detach` 切断梯度。
+   - 必须处理 activation checkpointing / recompute。
+   - 必须处理 TP / PP / SP / CP 下 activation 分片、跨 stage 传递和生命周期。
+   - 先以实验 feature flag 进入，不作为 Phase 2 默认路径。
+5. 记录参考关系：
+   - `PrefixTrain_dev` 是更接近 activation reuse 的重要参考，但不能直接照搬其侵入式 Megatron 修改。
+   - `flash-preference` 和 `dpo-prefix-sharing` 可作为 prompt/prefix 相同 preference 场景的边界建模参考。
+
+### 当前结论
+
+Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activation Reuse” 作为高收益探索方向；Phase 1 仍保持 KV injection + Prefix-Last Restore 的最小正确闭环。
+
+---
+
 ## 2026-05-15 补充 15：拆分 `mapping.py` 为 `batch_trim.py` 和 `logprob.py`
 
 ### 背景

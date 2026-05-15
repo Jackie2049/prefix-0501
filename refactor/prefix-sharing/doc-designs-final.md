@@ -1046,6 +1046,30 @@ with prefix_sharing_enabled(config):
 - backend capability 机制。
 - 性能策略：`min_prefix_len`、`min_group_size`、收益估计、自动 fallback。
 
+探索特性：Prefix Activation Reuse。
+
+Phase 1 采用 KV injection，因为 suffix token 在 attention 中会反复消费 prefix K/V，而 reuser prefix Q/output 本身不需要重新产出。这是最小正确闭环。Phase 2 应探索更充分的 prefix activation reuse：当 provider 与 reuser 共享相同 prefix 时，除 prefix K/V 外，进一步复用 provider prefix 的 layer hidden states、attention/MLP 中间激活、prefix-last logits 或其他可安全共享的 prefix 输出。
+
+该方向的目标：
+
+- 减少 reuser prefix 的整条 forward 重复计算，而不仅是 attention 中的 K/V 重复。
+- 在训练中减少重复保存的 prefix activations，降低 backward activation 显存压力。
+- 让多个 reuser 的 loss / logprob 梯度正确累积回 provider prefix 计算图。
+- 支持 per-sample reuse relation，即同一个 provider 可向不同 reuser 暴露不同长度的 prefix activation slice。
+
+设计约束：
+
+- 不允许通过 `detach` 切断 provider prefix activation 的梯度路径。
+- 必须兼容 activation checkpointing / recompute；共享 activation 在重算时不能产生语义漂移。
+- 必须明确 TP / PP / SP / CP 下 activation 分片、跨 stage 传递和生命周期边界。
+- 必须与 Prefix-Last Restore、full-prefix restore、logprob/loss mask 对齐。
+- 先以实验后端或显式 feature flag 形式进入，不作为 Phase 2 默认路径。
+
+参考关系：
+
+- `PrefixTrain_dev` 更接近 activation reuse 方向，证明了共享 prefix 激活是可探索路线，但其直接魔改 Megatron、跨 stage activation 传递和梯度处理方式不能直接照搬。
+- `flash-preference`、`dpo-prefix-sharing` 说明 prompt/prefix 相同的 preference/DPO 场景存在进一步复用 prefix 计算的需求；Phase 2 可借鉴其 prompt/response 边界和 pairwise 场景建模。
+
 ### 9.3 阶段三：训练范式扩展
 
 范围：
