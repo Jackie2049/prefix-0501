@@ -26,18 +26,26 @@ def test_planner_builds_phase_one_metadata_and_restore_specs():
     assert meta.input_keep_ranges == [(0, 7), (3, 6), (5, 7), (0, 3)]
     assert meta.kept_lengths_q == [7, 3, 2, 3]
     assert meta.expanded_lengths_kv == [7, 6, 7, 3]
+    # cu_seqlens_q: cumsum of kept_lengths_q (reuser Q packs suffix only) -> total 15.
+    # cu_seqlens_kv: cumsum of original_lengths (full logical KV: injected prefix + suffix) -> 23.
     assert meta.cu_seqlens_q == [0, 7, 10, 12, 15]
     assert meta.cu_seqlens_kv == [0, 7, 13, 20, 23]
+    # q_position_offsets: logical position of the first packed Q token (reuser == prefix_len).
+    # kv_position_offsets: KV always numbered from logical position 0.
     assert meta.q_position_offsets == [0, 3, 5, 0]
     assert meta.kv_position_offsets == [0, 0, 0, 0]
 
+    # prefix_last_restore: reuser Q skips prefix-last; first-suffix logprob is taken from
+    # provider output at prefix_len-1 and prepended to the reuser result.
     assert len(meta.prefix_last_restore) == 2
     first, second = meta.prefix_last_restore
+    # Sample 1: provider row 0 at pos 2 (token `3`) predicts first suffix `20` (original pos 3).
     assert first.reuse_idx_in_batch == 1
     assert first.provider_idx_in_batch == 0
-    assert first.provider_prefix_last_pos == 2
-    assert first.reuse_first_suffix_label_pos == 3
-    assert first.output_slot == 0
+    assert first.provider_prefix_last_pos == 2  # prefix_len - 1
+    assert first.reuse_first_suffix_label_pos == 3  # prefix_len, index of first suffix token
+    assert first.output_slot == 0  # prepend to suffix logprob sequence
+    # Sample 2: provider pos 4 (token `5`) predicts `30` (original pos 5).
     assert second.reuse_idx_in_batch == 2
     assert second.provider_idx_in_batch == 0
     assert second.provider_prefix_last_pos == 4
