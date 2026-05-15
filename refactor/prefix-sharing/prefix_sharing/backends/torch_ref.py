@@ -11,7 +11,7 @@ import math
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVCacheKey
+from prefix_sharing.core.cache import PrefixKVCache, PrefixKVSlotId
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.metadata import PrefixSharingBatchMeta
 
@@ -67,7 +67,7 @@ class TorchReferenceBackend:
         expanded_values = []
         for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
             if not meta.is_reuser(batch_index):
-                cache_key = PrefixKVCacheKey(
+                slot_id = PrefixKVSlotId(
                     meta.forward_id,
                     meta.micro_batch_id,
                     layer_id,
@@ -75,9 +75,9 @@ class TorchReferenceBackend:
                     tp_rank,
                 )
                 cache.store(
-                    cache_key,
-                    key=key_row,
-                    value=value_row,
+                    slot_id,
+                    key_tensor=key_row,
+                    value_tensor=value_row,
                     prefix_len=key_row.shape[0],
                     overwrite=True,
                 )
@@ -85,18 +85,18 @@ class TorchReferenceBackend:
                 expanded_values.append(value_row)
             else:
                 provider = meta.provider_index[batch_index]
-                provider_cache_key = PrefixKVCacheKey(
+                provider_slot_id = PrefixKVSlotId(
                     meta.forward_id,
                     meta.micro_batch_id,
                     layer_id,
                     provider,
                     tp_rank,
                 )
-                entry = cache.load(provider_cache_key)
+                entry = cache.load(provider_slot_id)
                 prefix_len = meta.prefix_lens[batch_index]
-                expanded_key = torch.cat([entry.key[:prefix_len], key_row], dim=0)
-                expanded_value = torch.cat([entry.value[:prefix_len], value_row], dim=0)
-                own_cache_key = PrefixKVCacheKey(
+                expanded_key = torch.cat([entry.key_tensor[:prefix_len], key_row], dim=0)
+                expanded_value = torch.cat([entry.value_tensor[:prefix_len], value_row], dim=0)
+                own_slot_id = PrefixKVSlotId(
                     meta.forward_id,
                     meta.micro_batch_id,
                     layer_id,
@@ -104,9 +104,9 @@ class TorchReferenceBackend:
                     tp_rank,
                 )
                 cache.store(
-                    own_cache_key,
-                    key=expanded_key,
-                    value=expanded_value,
+                    own_slot_id,
+                    key_tensor=expanded_key,
+                    value_tensor=expanded_value,
                     prefix_len=expanded_key.shape[0],
                     overwrite=True,
                 )

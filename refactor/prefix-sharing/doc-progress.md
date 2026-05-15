@@ -4,6 +4,33 @@
 
 ---
 
+## 2026-05-16 补充 17：重命名 Prefix K/V cache slot 与 entry
+
+### 背景
+
+用户指出 `PrefixKVCacheKey` 和 `PrefixKVEntry` 命名不直观，且 `Entry.key` 容易与 attention key tensor / cache key 混淆。重新审视后确认 cache 中存的槽位不一定只属于 provider，也可能是 expanded reuser 的完整 logical K/V。
+
+### 完成事项
+
+1. `PrefixKVCacheKey` 重命名为 `PrefixKVSlotId`。
+2. `PrefixKVEntry` 重命名为 `CachedPrefixKV`。
+3. `provider_idx_in_batch` 字段重命名为 `sample_idx_in_batch`。
+4. `key` / `value` 字段重命名为 `key_tensor` / `value_tensor`。
+5. 为两个 dataclass 增加一句话注释，说明 slot id 与 cached K/V 的职责。
+6. 更新 backend、测试、`core/__init__.py` 和详细设计文档引用。
+
+### 自测结果
+
+本地执行：
+
+```bash
+PYTHONPATH=refactor/prefix-sharing pytest -q refactor/prefix-sharing/tests/unit_test refactor/prefix-sharing/tests/integrated_test refactor/prefix-sharing/tests/system_test
+```
+
+结果：`29 passed, 4 skipped`。skip 仍来自本地缺少 `torch`、`torch_npu`、`verl`。
+
+---
+
 ## 2026-05-15 补充 16：将 Prefix Activation Reuse 纳入 Phase 2 探索特性
 
 ### 背景

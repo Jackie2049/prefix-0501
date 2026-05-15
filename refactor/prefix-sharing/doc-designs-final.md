@@ -213,14 +213,14 @@ class PrefixSharingConfig:
 @dataclass(frozen=True)
 class PrefixReuseSpec:
     reuse_idx_in_batch: int
-    provider_idx_in_batch: int
+    sample_idx_in_batch: int
     prefix_len: int
 ```
 
 含义：
 
 - `reuse_idx_in_batch`：当前裁剪 prefix、复用别人 KV 的样本。
-- `provider_idx_in_batch`：提供 prefix KV 的历史样本。
+- `sample_idx_in_batch`：提供 prefix KV 的历史样本。
 - `prefix_len`：reuser 从 provider 复用的 token 数量。
 
 关键规则：
@@ -304,7 +304,7 @@ class PrefixSharingBatchMeta:
 @dataclass(frozen=True)
 class PrefixLastRestoreSpec:
     reuse_idx_in_batch: int
-    provider_idx_in_batch: int
+    sample_idx_in_batch: int
     provider_prefix_last_pos: int
     reuse_first_suffix_label_pos: int
     output_slot: int
@@ -318,21 +318,21 @@ class PrefixLastRestoreSpec:
 - `output_slot` 是恢复结果在 reuser suffix 输出中的插入位置；Phase 1 为 `0`。
 - 该结构只描述语义，不绑定 logits 是 dense tensor、packed tensor，还是 backend 内部结构。
 
-### 4.6 PrefixKVCacheKey / PrefixKVEntry
+### 4.6 PrefixKVSlotId / CachedPrefixKV
 
 ```python
 @dataclass(frozen=True)
-class PrefixKVCacheKey:
+class PrefixKVSlotId:
     forward_id: int
     micro_batch_id: int
     layer_id: int
-    provider_idx_in_batch: int
+    sample_idx_in_batch: int
     tp_rank: int = 0
 
 @dataclass(frozen=True)
-class PrefixKVEntry:
-    key: Any
-    value: Any
+class CachedPrefixKV:
+    key_tensor: Any
+    value_tensor: Any
     prefix_len: int
 ```
 
@@ -545,22 +545,22 @@ loss_masks = trim_loss_masks(loss_masks, meta)
 
 核心类：
 
-- `PrefixKVCacheKey`
-- `PrefixKVEntry`
+- `PrefixKVSlotId`
+- `CachedPrefixKV`
 - `PrefixKVCache`
 
 主要接口：
 
 ```python
-cache.store(cache_key, key=key_tensor, value=value_tensor, prefix_len=n, overwrite=True)
-entry = cache.load(cache_key)
+cache.store(slot_id, key_tensor=key_tensor, value_tensor=value_tensor, prefix_len=n, overwrite=True)
+entry = cache.load(slot_id)
 cache.clear()
 cache.close()
 ```
 
 职责：
 
-- 按 `forward_id`、`micro_batch_id`、`layer_id`、`provider_idx_in_batch`、`tp_rank` 隔离 K/V。
+- 按 `forward_id`、`micro_batch_id`、`layer_id`、`sample_idx_in_batch`、`tp_rank` 隔离 K/V。
 - 保存 provider 或 reuser 的完整 logical K/V。
 - 为后续 reuser 提供可切片的 K/V。
 - 管理生命周期，防止 close 后继续读写。

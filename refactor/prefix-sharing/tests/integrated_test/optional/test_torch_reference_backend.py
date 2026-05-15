@@ -3,7 +3,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVCacheKey
+from prefix_sharing.core.cache import PrefixKVCache, PrefixKVSlotId
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.logprob import (
     compute_token_logprobs_from_logits,
@@ -69,7 +69,7 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
         forward_id=2,
         micro_batch_id=1,
     )
-    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in meta.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.sample_idx_in_batch, s.prefix_len) for s in meta.reuse_specs] == [
         (1, 0, 3),
         (2, 1, 4),
     ]
@@ -87,8 +87,8 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
         layer_id=0,
     )
 
-    reuser_cache_key = PrefixKVCacheKey(meta.forward_id, meta.micro_batch_id, 0, 1, 0)
-    assert cache.load(reuser_cache_key).key.shape[0] == 4
+    reuser_slot_id = PrefixKVSlotId(meta.forward_id, meta.micro_batch_id, 0, 1, 0)
+    assert cache.load(reuser_slot_id).key_tensor.shape[0] == 4
     assert expanded_key.shape[0] == sum(meta.expanded_lengths_kv)
     assert expanded_value.shape[0] == sum(meta.expanded_lengths_kv)
 

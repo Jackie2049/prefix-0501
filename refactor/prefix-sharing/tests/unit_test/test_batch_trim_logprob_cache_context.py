@@ -4,7 +4,7 @@ from prefix_sharing.core.batch_trim import (
     trim_inputs,
     trim_labels,
 )
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVCacheKey
+from prefix_sharing.core.cache import PrefixKVCache, PrefixKVSlotId
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.logprob import (
     build_provider_prefix_last_values,
@@ -68,17 +68,17 @@ def test_build_provider_prefix_last_values_uses_restore_specs():
 
 def test_prefix_kv_cache_lifecycle_and_isolation():
     cache = PrefixKVCache()
-    key = PrefixKVCacheKey(1, 2, 3, 4, 5)
-    cache.store(key, key="k", value="v", prefix_len=7)
+    key = PrefixKVSlotId(1, 2, 3, 4, 5)
+    cache.store(key, key_tensor="k", value_tensor="v", prefix_len=7)
     entry = cache.load(key)
-    assert entry.key == "k"
-    assert entry.value == "v"
+    assert entry.key_tensor == "k"
+    assert entry.value_tensor == "v"
     assert entry.prefix_len == 7
 
     with pytest.raises(KeyError):
-        cache.store(key, key="k2", value="v2", prefix_len=7)
+        cache.store(key, key_tensor="k2", value_tensor="v2", prefix_len=7)
 
-    other_micro_batch = PrefixKVCacheKey(1, 99, 3, 4, 5)
+    other_micro_batch = PrefixKVSlotId(1, 99, 3, 4, 5)
     assert not cache.contains(other_micro_batch)
     cache.close()
     assert cache.closed
