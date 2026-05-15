@@ -1,4 +1,56 @@
-"""Prefix-Last Restore helpers for logprob assembly."""
+"""Prefix-Last Restore helpers for logprob assembly.
+
+This module sits **after** model forward and consumes
+:class:`~prefix_sharing.core.metadata.PrefixSharingBatchMeta`, especially
+``prefix_last_restore`` entries produced by
+:mod:`prefix_sharing.core.planner`. When a reuser row trims the Q path to
+suffix-only queries, the forward pass never materializes ``output(P_last)``,
+yet the first response token ``S0`` still requires next-token semantics from
+that position. This module gathers provider prefix-last values and assembles
+complete per-row response logprobs without breaking the shared-prefix autograd
+path.
+
+Core Responsibilities:
+    1. **Gather provider prefix-last outputs**: read logits or other per-position
+       values at ``provider_prefix_last_pos`` on the provider row for each
+       :class:`~prefix_sharing.core.planner.PrefixLastRestoreSpec`.
+    2. **Compute first-suffix logprobs**: apply standard ``log_softmax`` +
+       label ``gather`` (or accept precomputed scalars) using the reuser's
+       first suffix label.
+    3. **Assemble restored response logprobs**: prepend or insert the restored
+       first-suffix logprob at ``output_slot`` so each row matches full-sequence
+       causal LM logprob semantics.
+
+Key Concepts:
+    - **Prefix-Last Restore**: reuser rows borrow ``logits[P_last]`` (or derived
+      logprob) from the provider to score ``S0``; subsequent suffix tokens use
+      reuser suffix-query outputs as usual.
+    - **Suffix logprobs without restore**: logprobs from kept query positions
+      only; for reusers, slot 0 already corresponds to the *second* suffix token.
+    - **Equivalence assumption**: restore is valid when provider and reuser share
+      identical prefix tokens, positions, masks, and RoPE conditions.
+
+Key Components:
+    - :func:`build_provider_prefix_last_values`: Tensor-agnostic gather from
+      provider rows by metadata indices (CPU tests and adapters).
+    - :func:`restore_prefix_last_logprobs`: Python list assembly with per-row
+      insert at ``output_slot``.
+    - :func:`gather_provider_prefix_last_logits`,
+      :func:`compute_token_logprobs_from_logits`,
+      :func:`restore_prefix_last_logprobs_tensor`: Torch path for padded tensors
+      and reference backends; lazy-imports PyTorch.
+
+Design Principles:
+    - **Meta-driven only**: which rows restore and where to read/write come
+      solely from ``meta.prefix_last_restore``; no detection or trimming here.
+    - **No detach**: restored values stay on the provider computation graph so
+      gradients from multiple reusers accumulate into the shared prefix.
+    - **Dual API surface**: list helpers for framework-agnostic tests;
+      tensor helpers mirror the same contract for Megatron / verl integration.
+    - **Backend-agnostic indexing**: gather/restore logic uses batch indices and
+      positions from metadata; integration stacks map the same spans on dense or
+      packed tensors without changing the contract.
+"""
 
 from __future__ import annotations
 
