@@ -52,7 +52,7 @@ def maybe_run_prefix_sharing_attention(
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
-        ctx.cache,
+        ctx.store,
         ctx.meta,
         layer_id=layer_id,
         tp_rank=tp_rank,

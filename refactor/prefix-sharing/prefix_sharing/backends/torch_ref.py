@@ -11,9 +11,9 @@ import math
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVSlotId
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
 
 
 def _torch() -> Any:
@@ -54,7 +54,7 @@ class TorchReferenceBackend:
         self,
         key: Any,
         value: Any,
-        cache: PrefixKVCache,
+        store: PrefixKVStore,
         meta: PrefixSharingBatchMeta,
         *,
         layer_id: int,
@@ -74,7 +74,7 @@ class TorchReferenceBackend:
                     batch_index,
                     tp_rank,
                 )
-                cache.store(
+                store.store(
                     slot_id,
                     key_tensor=key_row,
                     value_tensor=value_row,
@@ -92,7 +92,7 @@ class TorchReferenceBackend:
                     provider,
                     tp_rank,
                 )
-                entry = cache.load(provider_slot_id)
+                entry = store.load(provider_slot_id)
                 prefix_len = meta.prefix_lens[batch_index]
                 expanded_key = torch.cat([entry.key_tensor[:prefix_len], key_row], dim=0)
                 expanded_value = torch.cat([entry.value_tensor[:prefix_len], value_row], dim=0)
@@ -103,7 +103,7 @@ class TorchReferenceBackend:
                     batch_index,
                     tp_rank,
                 )
-                cache.store(
+                store.store(
                     own_slot_id,
                     key_tensor=expanded_key,
                     value_tensor=expanded_value,

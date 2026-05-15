@@ -3,7 +3,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVSlotId
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.logprob import (
     compute_token_logprobs_from_logits,
@@ -11,6 +10,7 @@ from prefix_sharing.core.logprob import (
     restore_prefix_last_logprobs_tensor,
 )
 from prefix_sharing.core.planner import PrefixSharingPlanner
+from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
 
 
 def test_torch_reference_backend_supports_q_len_different_from_kv_len():
@@ -20,7 +20,7 @@ def test_torch_reference_backend_supports_q_len_different_from_kv_len():
         micro_batch_id=1,
     )
     backend = TorchReferenceBackend()
-    cache = PrefixKVCache()
+    store = PrefixKVStore()
     query = torch.randn(sum(meta.kept_lengths_q), 4)
     key = torch.randn(sum(meta.kept_lengths_q), 4)
     value = torch.randn(sum(meta.kept_lengths_q), 4)
@@ -28,7 +28,7 @@ def test_torch_reference_backend_supports_q_len_different_from_kv_len():
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
-        cache,
+        store,
         meta,
         layer_id=0,
     )
@@ -45,7 +45,7 @@ def test_torch_reference_backend_supports_thd_grouped_query_attention():
         micro_batch_id=1,
     )
     backend = TorchReferenceBackend()
-    cache = PrefixKVCache()
+    store = PrefixKVStore()
     query = torch.randn(sum(meta.kept_lengths_q), 4, 8)
     key = torch.randn(sum(meta.kept_lengths_q), 2, 8)
     value = torch.randn(sum(meta.kept_lengths_q), 2, 8)
@@ -53,7 +53,7 @@ def test_torch_reference_backend_supports_thd_grouped_query_attention():
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
-        cache,
+        store,
         meta,
         layer_id=0,
     )
@@ -69,26 +69,26 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
         forward_id=2,
         micro_batch_id=1,
     )
-    assert [(s.reuse_idx_in_batch, s.sample_idx_in_batch, s.prefix_len) for s in meta.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in meta.reuse_specs] == [
         (1, 0, 3),
         (2, 1, 4),
     ]
 
     backend = TorchReferenceBackend()
-    cache = PrefixKVCache()
+    store = PrefixKVStore()
     key = torch.arange(sum(meta.kept_lengths_q) * 2, dtype=torch.float32).reshape(-1, 2)
     value = key + 100
 
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
-        cache,
+        store,
         meta,
         layer_id=0,
     )
 
     reuser_slot_id = PrefixKVSlotId(meta.forward_id, meta.micro_batch_id, 0, 1, 0)
-    assert cache.load(reuser_slot_id).key_tensor.shape[0] == 4
+    assert store.load(reuser_slot_id).key_tensor.shape[0] == 4
     assert expanded_key.shape[0] == sum(meta.expanded_lengths_kv)
     assert expanded_value.shape[0] == sum(meta.expanded_lengths_kv)
 
@@ -128,7 +128,7 @@ def test_torch_reference_backend_cuda_optional_smoke():
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
-        PrefixKVCache(),
+        PrefixKVStore(),
         meta,
         layer_id=0,
     )

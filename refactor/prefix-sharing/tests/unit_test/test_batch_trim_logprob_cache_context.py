@@ -4,13 +4,13 @@ from prefix_sharing.core.batch_trim import (
     trim_inputs,
     trim_labels,
 )
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVSlotId
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.logprob import (
     build_provider_prefix_last_values,
     restore_prefix_last_logprobs,
 )
 from prefix_sharing.core.planner import PrefixSharingPlanner
+from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_context
 
 
@@ -66,24 +66,24 @@ def test_build_provider_prefix_last_values_uses_restore_specs():
     assert values == [None, "p_last"]
 
 
-def test_prefix_kv_cache_lifecycle_and_isolation():
-    cache = PrefixKVCache()
+def test_prefix_kv_store_lifecycle_and_isolation():
+    store = PrefixKVStore()
     key = PrefixKVSlotId(1, 2, 3, 4, 5)
-    cache.store(key, key_tensor="k", value_tensor="v", prefix_len=7)
-    entry = cache.load(key)
+    store.store(key, key_tensor="k", value_tensor="v", prefix_len=7)
+    entry = store.load(key)
     assert entry.key_tensor == "k"
     assert entry.value_tensor == "v"
     assert entry.prefix_len == 7
 
     with pytest.raises(KeyError):
-        cache.store(key, key_tensor="k2", value_tensor="v2", prefix_len=7)
+        store.store(key, key_tensor="k2", value_tensor="v2", prefix_len=7)
 
     other_micro_batch = PrefixKVSlotId(1, 99, 3, 4, 5)
-    assert not cache.contains(other_micro_batch)
-    cache.close()
-    assert cache.closed
+    assert not store.contains(other_micro_batch)
+    store.close()
+    assert store.closed
     with pytest.raises(RuntimeError):
-        cache.load(key)
+        store.load(key)
 
 
 def test_prefix_sharing_context_sets_and_clears_current_context():
@@ -92,6 +92,6 @@ def test_prefix_sharing_context_sets_and_clears_current_context():
     with prefix_sharing_context(meta) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.meta is meta
-        assert not ctx.cache.closed
+        assert not ctx.store.closed
     assert current_prefix_sharing_context() is None
-    assert ctx.cache.closed
+    assert ctx.store.closed

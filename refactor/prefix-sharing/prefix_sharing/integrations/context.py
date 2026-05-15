@@ -7,8 +7,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
-from prefix_sharing.core.cache import PrefixKVCache
 from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.prefix_store import PrefixKVStore
 
 
 _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
@@ -20,7 +20,7 @@ _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
 @dataclass
 class PrefixSharingRuntimeContext:
     meta: PrefixSharingBatchMeta
-    cache: PrefixKVCache
+    store: PrefixKVStore
     backend: Any | None = None
     kept_position_ids: Any | None = None
     restore_positions: list[Any] = field(default_factory=list)
@@ -40,7 +40,7 @@ def prefix_sharing_context(
 ) -> Iterator[PrefixSharingRuntimeContext]:
     ctx = PrefixSharingRuntimeContext(
         meta=meta,
-        cache=PrefixKVCache(),
+        store=PrefixKVStore(),
         backend=backend,
         kept_position_ids=kept_position_ids,
         restore_positions=list(restore_positions or []),
@@ -50,7 +50,7 @@ def prefix_sharing_context(
         yield ctx
     finally:
         _current_context.reset(token)
-        ctx.cache.close()
+        ctx.store.close()
 
 
 def optional_prefix_sharing_context(

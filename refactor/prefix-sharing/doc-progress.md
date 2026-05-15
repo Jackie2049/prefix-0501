@@ -4,6 +4,28 @@
 
 ---
 
+## 2026-05-16 补充 18：重命名 prefix K/V 存储模块并更新提交前测试规范
+
+### 背景
+
+用户指出 `cache.py` 模块命名仍然过泛，容易和 inference KV cache 或可淘汰缓存混淆。当前模块实际职责是：在一个 runtime context 内保存 logical prefix K/V，并作为 reuser 构造 expanded K/V 的语义存储。
+
+### 完成事项
+
+1. `core/cache.py` 重命名为 `core/prefix_store.py`。
+2. `PrefixKVCache` 重命名为 `PrefixKVStore`。
+3. `CachedPrefixKV` 重命名为 `StoredPrefixKV`。
+4. 保留 `PrefixKVSlotId`，因为它已经准确表达 store slot 标识。
+5. runtime context 字段从 `cache` 改为 `store`，backend 参数同步改名。
+6. 更新测试、`core/__init__.py` 和详细设计文档。
+7. 更新 `AGENTS.md`：每次提交前必须运行与改动范围匹配的必要测试并确认通过；仅知识整理类文档修改可例外，且必须说明原因。
+
+### 自测要求
+
+本次为代码重命名和接口重构，提交前必须运行完整本地测试。
+
+---
+
 ## 2026-05-16 补充 17：重命名 Prefix K/V cache slot 与 entry
 
 ### 背景

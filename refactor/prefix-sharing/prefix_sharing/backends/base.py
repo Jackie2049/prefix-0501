@@ -35,7 +35,7 @@ class PrefixAttentionBackend(Protocol):
         self,
         key: Any,
         value: Any,
-        cache: Any,
+        store: Any,
         meta: PrefixSharingBatchMeta,
         *,
         layer_id: int,

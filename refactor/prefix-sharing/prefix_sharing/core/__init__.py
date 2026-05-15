@@ -1,9 +1,9 @@
 """Framework-independent prefix sharing semantics."""
 
-from prefix_sharing.core.cache import PrefixKVCache, PrefixKVSlotId
 from prefix_sharing.core.batch_trim import TrimmedBatch, trim_batch, trim_inputs, trim_labels, trim_loss_masks
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
+from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore, StoredPrefixKV
 from prefix_sharing.core.logprob import (
     build_provider_prefix_last_values,
     compute_token_logprobs_from_logits,
@@ -17,13 +17,14 @@ from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan
 __all__ = [
     "PrefixDetectionResult",
     "PrefixReuseSpec",
-    "PrefixKVCache",
     "PrefixKVSlotId",
+    "PrefixKVStore",
     "PrefixSharingBatchMeta",
     "PrefixSharingConfig",
     "PrefixSharingConfigError",
     "PrefixLastRestoreSpec",
     "PrefixSharingPlanner",
+    "StoredPrefixKV",
     "TrimmedBatch",
     "TriePrefixDetector",
     "build_provider_prefix_last_values",
