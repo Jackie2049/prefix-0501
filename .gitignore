@@ -28,7 +28,7 @@ Thumbs.db
 *.safetensors
 
 # Data
-data/
+# data/
 outputs/
 
 # Backup git directories
