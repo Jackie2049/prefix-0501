@@ -34,6 +34,7 @@ from prefix_sharing.integrations.context import (
     prefix_sharing_context,
 )
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
+from prefix_sharing.integrations.parallel_env import ParallelEnv, current_parallel_env
 from prefix_sharing.integrations.patch_manager import PatchHandle
 
 
@@ -54,6 +55,7 @@ class MegatronActorPreparedMicroBatch:
     backend: Any
     kept_position_ids: Any
     restore_positions: list[DensePrefixLastRestoreSpec]
+    parallel_env: ParallelEnv = field(default_factory=ParallelEnv)
 
 
 @dataclass(frozen=True)
@@ -114,10 +116,16 @@ class VerlMCoreBatchAdapter:
     def prepared_context(
         self,
         prepared: VerlMCorePreparedBatch,
+        *,
+        parallel_env: ParallelEnv | None = None,
     ) -> Iterator[PrefixSharingRuntimeContext]:
         """Open the runtime context consumed by patched attention."""
 
-        with prefix_sharing_context(prepared.meta, backend=TorchReferenceBackend()) as ctx:
+        with prefix_sharing_context(
+            prepared.meta,
+            backend=TorchReferenceBackend(),
+            parallel_env=parallel_env,
+        ) as ctx:
             yield ctx
 
     def restore_logprobs(
@@ -193,6 +201,7 @@ def prepare_megatron_actor_micro_batch(
     model_config: Any,
     *,
     backend: Any | None = None,
+    parallel_env: ParallelEnv | None = None,
 ) -> tuple[Any, MegatronActorPreparedMicroBatch | None]:
     """Trim one verl Megatron actor micro-batch in-place for prefix sharing.
 
@@ -259,6 +268,7 @@ def prepare_megatron_actor_micro_batch(
         backend=backend or TorchReferenceBackend(),
         kept_position_ids=kept_position_ids,
         restore_positions=restore_positions,
+        parallel_env=parallel_env or current_parallel_env(model_config=model_config),
     )
 
 
@@ -275,6 +285,7 @@ def megatron_actor_prefix_sharing_context(
         backend=prepared.backend,
         kept_position_ids=prepared.kept_position_ids,
         restore_positions=prepared.restore_positions,
+        parallel_env=prepared.parallel_env,
     ) as ctx:
         yield ctx
 

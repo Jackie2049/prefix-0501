@@ -3,6 +3,7 @@ import pytest
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.integrations.context import current_prefix_sharing_context
+from prefix_sharing.integrations.parallel_env import ParallelEnv
 from prefix_sharing.integrations.megatron_attention import (
     IntegrationUnavailable,
     MegatronAttentionIntegration,
@@ -91,9 +92,12 @@ def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
     assert prepared.loss_masks is not None
     assert prepared.loss_masks.rows == [[1, 1, 1, 1, 1], [1, 1, 1], [1, 1]]
 
-    with adapter.prepared_context(prepared) as ctx:
+    with adapter.prepared_context(prepared, parallel_env=ParallelEnv(dp_rank=1, dp_world_size=2)) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.meta is prepared.meta
+        assert ctx.parallel_env.dp_rank == 1
+        assert ctx.stats is not None
+        assert ctx.stats.trace_key == "dp1/tp0/pp0/cp0/fw7/mb8"
     assert current_prefix_sharing_context() is None
 
     restored = adapter.restore_logprobs(
@@ -106,6 +110,31 @@ def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
         [-2.0, -2.1, -2.2],
         [-9.0, -9.1],
     ]
+
+
+def test_rank_local_dp_batches_plan_and_restore_independently():
+    adapter = VerlMCoreBatchAdapter(PrefixSharingConfig(enabled=True, min_prefix_len=2))
+    rank0 = adapter.prepare_micro_batch(
+        [[1, 2, 10], [1, 2, 20]],
+        forward_id=100,
+        micro_batch_id=1,
+    )
+    rank1 = adapter.prepare_micro_batch(
+        [[9, 9, 30], [9, 9, 40]],
+        forward_id=100,
+        micro_batch_id=1,
+    )
+
+    assert rank0.meta.reuse_specs[0].provider_idx_in_batch == 0
+    assert rank1.meta.reuse_specs[0].provider_idx_in_batch == 0
+    assert rank0.input_ids.rows == [[1, 2, 10], [20]]
+    assert rank1.input_ids.rows == [[9, 9, 30], [40]]
+
+    restored0 = adapter.restore_logprobs([[-1.0, -1.1, -1.2], [-2.1]], [0.0, -2.0], rank0.meta)
+    restored1 = adapter.restore_logprobs([[-3.0, -3.1, -3.2], [-4.1]], [0.0, -4.0], rank1.meta)
+
+    assert restored0 == [[-1.0, -1.1, -1.2], [-2.0, -2.1]]
+    assert restored1 == [[-3.0, -3.1, -3.2], [-4.0, -4.1]]
 
 
 def test_prefix_sharing_config_from_verl_accepts_nested_actor_config():

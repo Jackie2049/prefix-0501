@@ -4,6 +4,45 @@
 
 ---
 
+## 2026-05-21 14:34 落地 DP runtime 信息和 rank-local 测试
+
+### 背景
+
+在 DP 设计讨论中确认：普通 DP 支持需要工程适配和测试验证，但不需要重新设计 prefix sharing 的核心计算逻辑。DP 第一版应增加 runtime rank 信息用于 debug / 日志，并补充 rank-local DP 模拟测试和 micro-batch 生命周期测试。
+
+### 完成事项
+
+1. 新增 `prefix_sharing/integrations/parallel_env.py`：
+   - `ParallelEnv`
+   - `current_parallel_env()`
+   - 支持无 Megatron 环境下的单进程默认值。
+   - 支持从 Megatron `parallel_state` 读取 DP / TP / PP / CP / EP rank 信息。
+2. 扩展 `PrefixSharingRuntimeContext`：
+   - 增加 `parallel_env`
+   - 增加 `PrefixSharingStats`
+   - 增加 `build_prefix_sharing_stats()`
+   - stats 中包含 `trace_key`、`dp_rank`、`dp_world_size`、reuse count、saved tokens 等调试信息。
+3. 扩展 verl Megatron prepared micro-batch：
+   - `MegatronActorPreparedMicroBatch` 携带 `parallel_env`。
+   - `megatron_actor_prefix_sharing_context()` 将 `parallel_env` 传入 runtime context。
+4. 增加测试：
+   - `test_parallel_env.py` 覆盖默认单进程、mock Megatron DP rank、parallel state 未初始化 fallback。
+   - `test_runtime_context.py` 覆盖 DP stats 和 micro-batch store 隔离。
+   - `test_patch_integrations.py` 覆盖 rank-local DP batch 独立 plan / restore。
+5. 更新 `docs/phase-2/design-history.md`，记录 DP 第一版已确认的工程范围。
+
+### 自测结果
+
+本地执行：
+
+```bash
+/Users/jackiemac/miniconda3/bin/python -m pytest -q refactor/prefix-sharing/tests/unit_test refactor/prefix-sharing/tests/integrated_test refactor/prefix-sharing/tests/system_test
+```
+
+结果：`34 passed, 5 skipped`。skip 原因仍为本地缺少 `torch`、`torch_npu`、`verl`。
+
+---
+
 ## 2026-05-21 14:10 补充 DP 并行策略详细设计初稿
 
 ### 背景

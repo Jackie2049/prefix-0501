@@ -272,6 +272,15 @@ class PrefixSharingStats:
 
 DP 第一版只做 rank-local 支持，不做跨 rank 优化。实现重点放在 `ParallelEnv`、context 生命周期、micro-batch id、stats 和测试上。这样可以用最小代码改动建立 Phase 2 并行能力的基础框架，为 TP / PP / CP 后续接入复用同一套 runtime abstraction。
 
+### 本轮确认
+
+已确认 DP 第一版需要做工程适配，但不需要改 prefix sharing 核心算法：
+
+- 增加 DP runtime 信息，用于 debug、日志和后续 validation。
+- 补充 DP rank-local 模拟测试。
+- 补充 micro-batch store 生命周期隔离测试。
+- 暂不做跨 DP rank prefix 发现、K/V 通信或 activation 共享。
+
 ---
 
 ## 2026-05-21 13:55 Phase 2 总体设计初稿
