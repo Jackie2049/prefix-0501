@@ -4,6 +4,389 @@
 
 ---
 
+## 2026-05-21 16:05 基于 uid 的 Prefix Group DP 负载均衡设计
+
+### 一、决策摘要
+
+Phase 2 的 DP 负载均衡采用 **prefix group locality first** 策略：
+
+```text
+先保证同一 prefix group 的样本被分配到同一个 DP rank；
+再在 group 粒度上平衡各 DP rank 的 workload。
+```
+
+默认使用 verl `DataProto.non_tensor_batch["uid"]` 作为 `prefix_group_id`。
+
+原因：
+
+- 当前 verl PPO / GRPO 已经为每个原始 prompt 生成 `uid`。
+- `DataProto.repeat(..., interleave=True)` 会把同一个 prompt 的 `uid` 复制到 n 条 rollout response 上。
+- GRPO advantage 本身也用 `uid` 做同 prompt 多 response 分组。
+- 对 prefix sharing 来说，同一个 prompt 的多条 response 正是最稳定的共享前缀来源。
+
+因此当前普通 RL 场景下：
+
+```text
+uid == prefix_group_id == prompt group id
+```
+
+未来接入 step / tree 模式时，`uid` 的语义可以扩展为公共祖先 id：
+
+```text
+step mode: uid = step_root_id / shared_state_id
+tree mode: uid = tree_root_id / common_ancestor_id
+```
+
+verl 和 prefix-sharing 不需要理解 tree 内部结构，只需要知道同一个 `uid` 的样本属于同一个前缀复用语义组。
+
+### 二、目标与非目标
+
+#### 目标
+
+1. 避免 verl 原有 sample-level token balance 把同一 prompt / tree / step group 拆散到不同 DP rank。
+2. 保持同 prefix group 样本的 DP rank locality，提高 rank-local micro-batch 内 prefix reuse ratio。
+3. 在 group locality 前提下，尽量平衡各 DP rank 的训练 workload。
+4. 只做样本重排，不改变 tensor 内容、label、loss mask、reward、advantage、old logprob。
+5. 控制 verl / Megatron 修改面：核心 partitioner 放在 `prefix_sharing` 包，verl 只保留薄调用点。
+
+#### 非目标
+
+1. 不做跨 DP rank K/V 或 activation 共享。
+2. 不做跨 micro-batch activation 共享。
+3. 不拆单条 sequence。
+4. 第一版不强依赖 PrefixTrain_dev 的跨 micro-batch memory manager。
+5. 第一版不要求 verl 原生支持 tree 数据结构，只要求 per-sample metadata 能携带 group id。
+
+### 三、为什么 verl 原 token balance 不够
+
+verl 当前 `_balance_batch()` 的逻辑是 sample-level：
+
+```text
+sample -> sequence length workload -> Karmarkar-Karp -> DP partitions -> batch.reorder()
+```
+
+它优化的是 dense forward 下每个 DP rank 的 token workload，但它不知道哪些样本共享前缀。
+
+在 prefix sharing 场景中，这会带来风险：
+
+```text
+同一个 prompt 的 n 条 response
+  -> 被 sample-level balance 分散到多个 DP rank
+  -> 每个 DP rank 内只剩少量同前缀样本
+  -> rank-local prefix sharing reuse ratio 下降
+```
+
+所以 prefix sharing 下 DP balance 的基本单位不应是 sample，而应是 prefix group。
+
+### 四、数据模型
+
+新增 prefix-sharing 内部抽象：
+
+```python
+@dataclass(frozen=True)
+class PrefixGroup:
+    group_id: str
+    sample_indices: tuple[int, ...]
+    original_tokens: int
+    estimated_compute_tokens: int
+    reusable_prefix_tokens: int
+```
+
+```python
+@dataclass(frozen=True)
+class PrefixGroupPartition:
+    dp_rank_to_indices: tuple[tuple[int, ...], ...]
+    dp_rank_to_group_ids: tuple[tuple[str, ...], ...]
+    group_workloads: dict[str, int]
+    fallback_reason: str | None = None
+```
+
+默认字段来源：
+
+```text
+group_key = "uid"
+group_ids = data.non_tensor_batch["uid"]
+```
+
+后续可配置：
+
+```yaml
+prefix_sharing:
+  dp_balance:
+    enabled: true
+    group_key: uid
+    workload: prefix_estimate
+    fallback_to_seqlen_balance: true
+```
+
+### 五、Workload 估算
+
+第一版分两档实现。
+
+#### Level 1：Group Locality + Dense Workload
+
+先按 `uid` 聚合样本，workload 使用 dense token workload 之和：
+
+```text
+group_workload = sum(calculate_workload(seq_len(sample)) for sample in group)
+```
+
+优点：
+
+- 实现简单。
+- 不需要额外跑 prefix detector。
+- 立刻避免同组样本被打散。
+- 和 verl 当前 `calculate_workload()` 兼容。
+
+缺点：
+
+- 只能平衡 dense workload，不能精确反映 prefix sharing 后的 compute tokens。
+
+#### Level 2：Prefix-Aware Workload
+
+对每个 group 内的 token 序列估算 prefix sharing 后真实 compute tokens：
+
+```text
+compute_tokens = process_in_order(group_token_ids)
+reusable_prefix_tokens = original_tokens - compute_tokens
+group_workload = f(compute_tokens)
+```
+
+这里可借鉴 PrefixTrain_dev 的 `process_in_order()`，但实现放入 `prefix_sharing` 包，避免依赖 PrefixTrain_dev / Aceso runtime。
+
+第一版建议先落 Level 1，再补 Level 2。原因是当前收益最大的风险不是 workload 估算误差，而是同前缀样本被 sample-level balance 拆散。
+
+### 六、DP 分配算法
+
+输入：
+
+```text
+DataProto batch
+dp_size
+group_key = "uid"
+```
+
+流程：
+
+1. 读取 `group_ids = batch.non_tensor_batch[group_key]`。
+2. 按 `group_id` 收集 sample indices。
+3. 为每个 group 计算 workload。
+4. 使用 Karmarkar-Karp / LDM 将 group 分配给 `dp_size` 个分区。
+5. 每个分区内按 workload 做稳定排序，减少 PP bubble。
+6. 展开为全局 sample index：
+
+```text
+global_idx = concat(dp0_sample_indices, dp1_sample_indices, ...)
+```
+
+7. 调用 `batch.reorder(global_idx)`。
+8. verl 原有 dispatch 继续按重排后的连续区间切给各 DP rank。
+
+关键不变量：
+
+```text
+同一个 group_id 的 sample indices 只出现在一个 DP partition 内。
+```
+
+如果某个 group 大到超过单个 DP rank 理想 workload，第一版仍保持不拆 group。后续再引入显式配置：
+
+```yaml
+allow_split_oversized_group: false
+```
+
+默认不拆，避免破坏 prefix reuse locality。
+
+### 七、verl 接入点
+
+最合适的接入点是 `RayPPOTrainer._balance_batch()` 附近。
+
+原因：
+
+- 这里仍能看到完整 global train batch。
+- 这里已经有 dp_size 查询和 `batch.reorder()`。
+- 重排后 verl worker group dispatch 会自动把连续区间分给 DP ranks。
+- 到 `MegatronPPOActor` 时每个 rank 只看到 local batch，已经无法做真正跨 DP rank placement。
+
+建议 verl 侧只加薄分支：
+
+```python
+if prefix_sharing_dp_balance_enabled(batch, config):
+    metrics.update(
+        reorder_dataproto_for_prefix_group_dp_balance(
+            batch=batch,
+            dp_size=dp_size,
+            group_key=config.prefix_sharing.dp_balance.group_key,
+        )
+    )
+else:
+    existing_seqlen_balance(batch, metrics)
+```
+
+核心实现放在：
+
+```text
+prefix_sharing/integrations/verl_dp_balance.py
+prefix_sharing/core/group_partition.py
+```
+
+Megatron 不需要修改。
+
+### 八、和 micro-batch 的关系
+
+当前设计只解决 DP rank 间 placement。
+
+rank-local micro-batch 切分仍按现有 verl 路径运行：
+
+```text
+MegatronPPOActor.forward_backward_batch()
+  -> rearrange_micro_batches()
+```
+
+短期风险：
+
+- 同一个 DP rank 内，`rearrange_micro_batches()` 仍可能把同一个 `uid` 拆到多个 micro-batch。
+
+当前决策：
+
+- 先不做跨 micro-batch activation 共享。
+- 先完成 DP group locality，确保同组样本至少在同一 DP rank。
+- 下一步再单独设计 rank-local prefix-group-aware micro-batch 切分。
+
+如果短期必须避免 micro-batch 内拆组，可以在后续加第二个薄 hook：
+
+```text
+rearrange_micro_batches()
+  -> prefix_group_aware_rearrange_micro_batches()
+```
+
+但这属于下一件事，不混入当前 DP 负载均衡设计。
+
+### 九、step / tree 模式接入
+
+verl 当前普通 PPO / GRPO 场景已天然支持：
+
+```text
+uid = 原始 prompt id
+```
+
+step / tree 模式接入要求数据生产方或 rollout manager 显式设置：
+
+```text
+data.non_tensor_batch["uid"] = common_ancestor_id
+```
+
+或使用独立字段：
+
+```text
+data.non_tensor_batch["prefix_group_id"] = common_ancestor_id
+```
+
+若使用独立字段，配置：
+
+```yaml
+prefix_sharing:
+  dp_balance:
+    group_key: prefix_group_id
+```
+
+建议语义：
+
+- `uid`: 默认 prefix group id，兼容当前 verl advantage grouping。
+- `prefix_group_id`: 可选覆盖字段，当业务希望将 advantage grouping 和 prefix grouping 解耦时使用。
+- `trajectory_id`: 可选，仅用于调试和日志。
+- `node_id` / `parent_id`: 可选，仅 tree-aware 分析需要，DP balance 第一版不读取。
+
+第一版不要求 verl 原生理解 step/tree；只要 `DataProto.non_tensor_batch` 里携带 per-sample group id 即可。
+
+### 十、正确性边界
+
+DP group balance 只做 sample reorder，理论上不改变每条样本的训练目标。
+
+必须保证：
+
+1. `batch.batch` 和 `batch.non_tensor_batch` 同步 reorder。
+2. `uid` 与 reward / advantage / old logprob / response / label 对齐。
+3. GRPO advantage 在 reorder 后仍按 `uid` 分组。
+4. rollout 输出与训练 batch union 后，`uid` 被正确 repeat。
+5. padding sample 若存在，不参与真实 workload 或用 fallback 处理。
+
+可能变化：
+
+- 浮点归约顺序。
+- dropout / RNG 消耗顺序。
+- optimizer 更新轨迹。
+
+这些属于样本调度变化带来的常规非 bitwise 差异，不是 prefix sharing 语义错误。
+
+### 十一、Fallback 策略
+
+触发 fallback 的情况：
+
+1. `group_key` 不在 `batch.non_tensor_batch`。
+2. `len(group_ids) != batch_size`。
+3. `dp_size <= 1`。
+4. group 数量少于 `dp_size` 且不允许空 rank。
+5. partition 后无法满足 verl dispatch 的 equal-size 要求。
+
+fallback 行为：
+
+```text
+如果 fallback_to_seqlen_balance=True:
+  使用 verl 原 seqlen balance
+否则:
+  不重排并记录 fallback_reason
+```
+
+日志 / metrics 至少记录：
+
+```text
+prefix_dp_balance/enabled
+prefix_dp_balance/fallback_reason
+prefix_dp_balance/group_count
+prefix_dp_balance/group_min_size
+prefix_dp_balance/group_max_size
+prefix_dp_balance/dp_min_workload
+prefix_dp_balance/dp_max_workload
+prefix_dp_balance/dp_imbalance_ratio
+```
+
+### 十二、测试计划
+
+#### prefix-sharing 单元测试
+
+1. 同一 `uid` 的样本分配到同一个 DP partition。
+2. 多个 `uid` 的 group workload 能被均衡分配。
+3. 缺失 `uid` 时返回 fallback reason。
+4. group 数小于 dp_size 时按配置 fallback。
+5. reorder 后 sample index 覆盖完整且无重复。
+
+#### verl 集成测试
+
+1. 构造 `DataProto`，`uid=[a,a,b,b,c,c]`，验证 `_balance_batch()` 后同 uid 不跨 DP partition。
+2. 验证 `batch.batch` 与 `non_tensor_batch` reorder 同步。
+3. GRPO advantage 使用 reorder 后 `uid` 仍正确分组。
+4. prefix-sharing disabled 时保持 verl 原逻辑。
+
+#### 性能观测
+
+1. 记录 sample-level seqlen balance 与 group-level balance 的 reuse ratio 对比。
+2. 记录各 DP rank original tokens / estimated compute tokens / group count。
+3. 对比 step wall time 和 prefix sharing saved token ratio。
+
+### 十三、开发拆分
+
+建议提交顺序：
+
+1. `[feat] 新增 prefix group partitioner`
+2. `[test] 覆盖 group-level DP partition`
+3. `[feat] verl _balance_batch 接入 prefix group balance 薄 hook`
+4. `[test] 覆盖 DataProto reorder 与 uid locality`
+5. `[doc] 收敛 DP group balance 设计`
+
+### 当前结论
+
+Phase 2 的 DP 负载均衡第一版应以 `uid` 为默认 `prefix_group_id`，在 verl controller 侧做 group-level reorder。它具备稳定性能收益预期，且不引入跨 rank / 跨 micro-batch activation 共享的精度风险。
+
 ## 2026-05-21 15:20 DP workload balance 与 rank-local DP 的关系澄清
 
 ### 一、问题背景
