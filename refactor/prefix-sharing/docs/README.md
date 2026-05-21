@@ -16,5 +16,6 @@
 
 ## Phase 2
 
-- `phase-2/design.md`：Phase 2 总体设计、工作主线和里程碑。
+- `phase-2/design-history.md`：Phase 2 方案历史、备选方案和阶段性设计。
+- `phase-2/design-final.md`：Phase 2 最终方案，当前为占位，待方案磋商收敛后更新。
 - `phase-2/parallel-plan.md`：Phase 2 第一阶段并行策略支持方案。

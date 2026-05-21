@@ -1,6 +1,6 @@
 # Prefix Sharing Roadmap
 
-> 本文档是项目全局 roadmap。Phase 1 详细规格见 `phase-1/design-final.md`，Phase 2 总体设计见 `phase-2/design.md`，并行策略方案见 `phase-2/parallel-plan.md`。
+> 本文档是项目全局 roadmap。Phase 1 详细规格见 `phase-1/design-final.md`，Phase 2 总体设计见 `phase-2/design-history.md`，并行策略方案见 `phase-2/parallel-plan.md`。
 
 ---
 
@@ -8,7 +8,7 @@
 
 当前代码处于 Phase 2 分支。Phase 1 的 core 语义和本地 CPU 开发者测试已经完成，真实 GPU / NPU / verl + Megatron 环境 smoke test 仍是业务落地前的必要闭环。
 
-阶段二的详细设计已经抽离到 `phase-2/design.md`。阶段二第一步先聚焦并行策略支持，不直接进入高性能 backend 或全量 activation reuse。
+阶段二的详细设计已经抽离到 `phase-2/design-history.md`。阶段二第一步先聚焦并行策略支持，不直接进入高性能 backend 或全量 activation reuse。
 
 ---
 
@@ -43,7 +43,7 @@
 
 目标：让 prefix sharing 从 Phase 1 的单机语义 MVP 进入真实训练配置可用状态。
 
-详细设计见 `phase-2/design.md`。
+详细设计见 `phase-2/design-history.md`。
 
 ### Phase 2.1 并行策略支持
 
@@ -68,15 +68,15 @@
 
 ### Phase 2.2 Backend 解耦
 
-摘要：扩展 `BackendCapabilities`，新增 runtime validation，明确 device、dtype、layout、parallel、fused path 和 fallback reason。详细设计见 `phase-2/design.md`。
+摘要：扩展 `BackendCapabilities`，新增 runtime validation，明确 device、dtype、layout、parallel、fused path 和 fallback reason。详细设计见 `phase-2/design-history.md`。
 
 ### Phase 2.3 高性能 Backend
 
-摘要：在 reference path 正确后接入 CUDA torch reference、flash-attn、Transformer Engine 和 CANN NPU backend。详细设计见 `phase-2/design.md`。
+摘要：在 reference path 正确后接入 CUDA torch reference、flash-attn、Transformer Engine 和 CANN NPU backend。详细设计见 `phase-2/design-history.md`。
 
 ### Phase 2.4 Prefix Activation Reuse
 
-摘要：探索 provider prefix hidden states、attention/MLP 中间激活、prefix-last logits 等 KV 以外的 activation reuse。详细设计见 `phase-2/design.md`。
+摘要：探索 provider prefix hidden states、attention/MLP 中间激活、prefix-last logits 等 KV 以外的 activation reuse。详细设计见 `phase-2/design-history.md`。
 
 ---
 

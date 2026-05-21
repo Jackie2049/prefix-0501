@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-05-21 14:10 补充 DP 并行策略详细设计初稿
+
+### 背景
+
+用户要求接下来先聚焦最简单的 DP 并行策略，并明确 Phase 2 应像 Phase 1 一样使用 `design-history` 记录方案磋商过程，待方案收敛后再写入 `design-final`。
+
+### 完成事项
+
+1. 将 `docs/phase-2/design.md` 重命名为 `docs/phase-2/design-history.md`。
+2. 将原 Phase 2 总体设计内容保留为 `2026-05-21 13:55 Phase 2 总体设计初稿` 历史条目。
+3. 在 `docs/phase-2/design-history.md` 顶部新增 `2026-05-21 14:10 DP 并行策略详细设计初稿`。
+4. DP 初稿明确：
+   - DP scope 是当前 DP rank 内当前 actor micro-batch。
+   - 不做跨 DP rank prefix 检测、K/V 交换或 activation 共享。
+   - DP 第一版重点是 `ParallelEnv`、runtime context、micro-batch id、store 生命周期、rank-local restore 和 stats。
+   - `PrefixKVSlotId` 暂不加入 `dp_rank`，因为每个 DP rank 是独立进程且 store 受 context 隔离。
+   - 后续最终方案收敛后再更新 `docs/phase-2/design-final.md`。
+5. 更新 `docs/roadmap.md`、`docs/README.md`、`docs/AGENTS.md` 中的 Phase 2 设计文档路径。
+6. 新增 `docs/phase-2/design-final.md` 占位文档，避免最终方案入口缺失。
+
+### 自测说明
+
+本次为文档设计更新，不涉及代码路径变更；提交前执行文档 diff 和路径引用检查即可。
+
+---
+
 ## 2026-05-21 13:55 抽离 Phase 2 总体设计文档
 
 ### 背景
@@ -12,8 +38,8 @@
 
 ### 完成事项
 
-1. 新增 `docs/phase-2/design.md`，承载 Phase 2 总体设计、工作主线和里程碑。
-2. 将 Phase 2 的 backend 解耦、高性能 backend、Prefix Activation Reuse 等设计内容从 `docs/roadmap.md` 中抽离到 `docs/phase-2/design.md`。
+1. 新增 `docs/phase-2/design-history.md`，承载 Phase 2 总体设计、工作主线和里程碑。
+2. 将 Phase 2 的 backend 解耦、高性能 backend、Prefix Activation Reuse 等设计内容从 `docs/roadmap.md` 中抽离到 `docs/phase-2/design-history.md`。
 3. 保留 `docs/phase-2/parallel-plan.md` 作为 Phase 2.1 并行策略支持的详细执行方案。
 4. 将 `docs/roadmap.md` 调整为全局摘要和导航，只保留 Phase 2 各主线摘要与链接。
 5. 更新 `docs/README.md` 和 `docs/AGENTS.md` 的文档清单。

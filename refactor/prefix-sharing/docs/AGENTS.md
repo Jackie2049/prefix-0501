@@ -22,7 +22,8 @@ prefix-0501/
 - `docs/roadmap.md` — 记录项目全局 roadmap
 - `docs/phase-1/design-history.md` — 记录历史方案设计、阶段性分析、被推翻方案和备选方案
 - `docs/phase-1/design-final.md` — 记录 Phase 1 最终规格和实现审计
-- `docs/phase-2/design.md` — 记录 Phase 2 总体设计和工作主线
+- `docs/phase-2/design-history.md` — 记录 Phase 2 方案设计历史和阶段性结论
+- `docs/phase-2/design-final.md` — 记录 Phase 2 最终方案，当前为占位，待方案收敛后更新
 - `docs/phase-2/parallel-plan.md` — 记录 Phase 2 并行策略支持方案
 
 ## 提交规范
