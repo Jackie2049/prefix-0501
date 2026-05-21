@@ -121,28 +121,7 @@ prefix_sharing:
 
 ### 五、Workload 估算
 
-第一版分两档实现。
-
-#### Level 1：Group Locality + Dense Workload
-
-先按 `uid` 聚合样本，workload 使用 dense token workload 之和：
-
-```text
-group_workload = sum(calculate_workload(seq_len(sample)) for sample in group)
-```
-
-优点：
-
-- 实现简单。
-- 不需要额外跑 prefix detector。
-- 立刻避免同组样本被打散。
-- 和 verl 当前 `calculate_workload()` 兼容。
-
-缺点：
-
-- 只能平衡 dense workload，不能精确反映 prefix sharing 后的 compute tokens。
-
-#### Level 2：Prefix-Aware Workload
+DP group balance 直接使用 prefix-aware workload，不再引入 dense workload 作为中间阶段。
 
 对每个 group 内的 token 序列估算 prefix sharing 后真实 compute tokens：
 
@@ -152,9 +131,36 @@ reusable_prefix_tokens = original_tokens - compute_tokens
 group_workload = f(compute_tokens)
 ```
 
-这里可借鉴 PrefixTrain_dev 的 `process_in_order()`，但实现放入 `prefix_sharing` 包，避免依赖 PrefixTrain_dev / Aceso runtime。
+`process_in_order()` 的语义：
 
-第一版建议先落 Level 1，再补 Level 2。原因是当前收益最大的风险不是 workload 估算误差，而是同前缀样本被 sample-level balance 拆散。
+```text
+按 group 内样本顺序逐条插入 Trie。
+每条样本找到和此前样本的最长已存在 prefix。
+该样本的 compute tokens = len(sample) - matched_prefix_len。
+group compute tokens = 所有样本 compute tokens 之和。
+```
+
+这里可借鉴 PrefixTrain_dev 的算法，但实现放入 `prefix_sharing` 包，避免依赖 PrefixTrain_dev / Aceso runtime。
+
+输入 token 序列优先来源：
+
+```text
+batch["input_ids"] + batch["attention_mask"]
+```
+
+估算时只使用 attention mask 标记的有效 token，避免 padding 影响 prefix match。
+
+对于同一个 `uid` 内的样本顺序，第一版使用 batch 当前顺序，保证实现简单且和实际训练 batch order 一致。后续如果要进一步提高 prefix reuse，可单独讨论 group 内重排策略；当前 DP balance 不改变 group 内样本相对顺序。
+
+dense sequence-length workload 只作为 fallback：
+
+```text
+prefix-aware estimate 不可用
+  -> 如果 fallback_to_seqlen_balance=True，使用 verl 原 seqlen balance
+  -> 否则不重排并记录 fallback_reason
+```
+
+它不再作为 prefix-sharing DP balance 的阶段性目标。
 
 ### 六、DP 分配算法
 
