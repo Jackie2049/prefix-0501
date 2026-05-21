@@ -17,9 +17,13 @@ prefix-0501/
 
 - 所有文档撰写均严格按**时间倒序**排列（最新在前）
 - 每次记录的抬头格式：`yyyy-mm-dd hh:mm <title>`
-- `doc-progress.md` — 记录所有工作进展
-- `doc-design-history.md` — 记录历史方案设计、阶段性分析、被推翻方案和备选方案
-- `doc-designs-final.md` — 记录当前最终方案，作为后续开发依据
+- `docs/progress.md` — 记录所有工作进展
+- `docs/glossary.md` — 记录全局术语
+- `docs/roadmap.md` — 记录项目全局 roadmap
+- `docs/phase-1/design-history.md` — 记录历史方案设计、阶段性分析、被推翻方案和备选方案
+- `docs/phase-1/design-final.md` — 记录 Phase 1 最终规格和实现审计
+- `docs/phase-2/design.md` — 记录 Phase 2 总体设计和工作主线
+- `docs/phase-2/parallel-plan.md` — 记录 Phase 2 并行策略支持方案
 
 ## 提交规范
 

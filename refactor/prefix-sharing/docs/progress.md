@@ -4,6 +4,84 @@
 
 ---
 
+## 2026-05-21 13:55 抽离 Phase 2 总体设计文档
+
+### 背景
+
+用户提醒：完成 docs 组织结构整改后，刚制定的 Phase 2 阶段设计和计划也应抽离到对应目录的对应文档中，不能继续主要散落在全局 roadmap 中。
+
+### 完成事项
+
+1. 新增 `docs/phase-2/design.md`，承载 Phase 2 总体设计、工作主线和里程碑。
+2. 将 Phase 2 的 backend 解耦、高性能 backend、Prefix Activation Reuse 等设计内容从 `docs/roadmap.md` 中抽离到 `docs/phase-2/design.md`。
+3. 保留 `docs/phase-2/parallel-plan.md` 作为 Phase 2.1 并行策略支持的详细执行方案。
+4. 将 `docs/roadmap.md` 调整为全局摘要和导航，只保留 Phase 2 各主线摘要与链接。
+5. 更新 `docs/README.md` 和 `docs/AGENTS.md` 的文档清单。
+
+### 自测说明
+
+本次为文档结构和内容归位，不涉及代码路径变更；提交前执行文档 diff 和路径引用检查即可。
+
+---
+
+## 2026-05-21 13:43 重组 docs 文档目录并独立 roadmap
+
+### 背景
+
+用户指出当前文档和知识管理较混乱，需要调整为 `docs/` 二级目录，并按阶段拆分三级目录：`docs/phase-1/`、`docs/phase-2/`。同时，`glossary`、`progress`、`AGENTS` 等全局文档应直接放在 `docs/` 下，roadmap 应从 Phase 1 final 文档中拆出为独立全局文档。
+
+### 完成事项
+
+1. 新建 `docs/README.md`，说明全局文档和分阶段文档的职责。
+2. 将 Phase 1 文档迁移到：
+   - `docs/phase-1/design-final.md`
+   - `docs/phase-1/design-history.md`
+3. 将 Phase 2 并行策略方案迁移到：
+   - `docs/phase-2/parallel-plan.md`
+4. 将全局文档迁移到：
+   - `docs/AGENTS.md`
+   - `docs/progress.md`
+   - `docs/glossary.md`
+5. 新增 `docs/roadmap.md`，以原 `design-final` 中的 roadmap 为基础，更新为全局 roadmap，并把 Phase 2 拆成并行策略、backend 解耦、高性能后端、activation reuse 四条主线。
+6. `docs/phase-1/design-final.md` 中只保留 roadmap 指针，避免 roadmap 在多个文档中重复维护。
+7. 更新文档路径引用和 `docs/AGENTS.md` 的文档清单。
+
+### 自测说明
+
+本次为文档结构重组，不涉及代码路径变更；提交前执行文档 diff 和路径引用检查即可。
+
+---
+
+## 2026-05-21 13:27 制定 Phase 2 并行策略支持方案
+
+### 背景
+
+用户明确阶段二核心任务包括：并行策略支持、backend 后端解耦、flash-attn 等高性能实现，以及 KV 以外的全量激活值复用。作为阶段二第一步，当前先聚焦各种并行策略支持。
+
+### 完成事项
+
+1. 创建并推送 `phase-2` 分支。
+2. 新增 `docs/phase-2/parallel-plan.md`，作为阶段二第一步的并行策略支持方案。
+3. 明确阶段二第一步不直接进入高性能 backend 或 activation reuse，而是先完成并行能力矩阵、runtime capability 校验、fallback / fail-fast 机制和测试矩阵。
+4. 将并行支持拆为：
+   - P0：DP / micro-batch / gradient accumulation、TP local K/V shard、vocab-parallel Prefix-Last Restore。
+   - P1：SP layout 验证、PP stage-local store、VPP context 隔离。
+   - P2：CP 设计实现、EP attention-only 兼容。
+   - P3：flash-attn / TE / CANN backend 与 activation reuse。
+5. 在 `docs/phase-1/design-final.md` 的 Phase 2 roadmap 中加入并行策略方案索引。
+
+### 自测说明
+
+本次为方案文档更新，不涉及代码路径变更；提交前可运行文档 diff 检查，不要求重新运行完整测试。上一轮代码整理后已执行：
+
+```bash
+/Users/jackiemac/miniconda3/bin/python -m pytest -q
+```
+
+结果：`28 passed, 5 skipped`。skip 原因仍为本地缺少 `torch`、`torch_npu`、`verl`。
+
+---
+
 ## 2026-05-16 补充 18：重命名 prefix K/V 存储模块并更新提交前测试规范
 
 ### 背景
@@ -18,7 +96,7 @@
 4. 保留 `PrefixKVSlotId`，因为它已经准确表达 store slot 标识。
 5. runtime context 字段从 `cache` 改为 `store`，backend 参数同步改名。
 6. 更新测试、`core/__init__.py` 和详细设计文档。
-7. 更新 `AGENTS.md`：每次提交前必须运行与改动范围匹配的必要测试并确认通过；仅知识整理类文档修改可例外，且必须说明原因。
+7. 更新 `docs/AGENTS.md`：每次提交前必须运行与改动范围匹配的必要测试并确认通过；仅知识整理类文档修改可例外，且必须说明原因。
 
 ### 自测要求
 
@@ -61,7 +139,7 @@ PYTHONPATH=refactor/prefix-sharing pytest -q refactor/prefix-sharing/tests/unit_
 
 ### 文档更新
 
-1. 在 `doc-designs-final.md` 的 Phase 2 roadmap 中新增 “Prefix Activation Reuse” 探索特性。
+1. 在 `docs/phase-1/design-final.md` 的 Phase 2 roadmap 中新增 “Prefix Activation Reuse” 探索特性。
 2. 明确 Phase 2 可从 KV sharing 扩展到 provider prefix layer hidden states、attention/MLP 中间激活、prefix-last logits 等更广义的 prefix activation reuse。
 3. 明确收益目标：
    - 减少 reuser prefix 的整条 forward 重复计算。
@@ -104,7 +182,7 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
    - `integrations/verl_mcore.py` 改为从 `batch_trim` 与 `logprob` 分别导入
    - 单元测试、系统测试 import 更新
    - `core/__init__.py` 导出新的 public helper
-   - `doc-designs-final.md` 更新模块边界
+   - `docs/phase-1/design-final.md` 更新模块边界
 
 ### 当前结论
 
@@ -212,8 +290,8 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
    - reuser 构造出的完整 logical KV 会再次写入 cache，因此 reuser 也可以作为后续样本的 provider
 
 4. 更新文档：
-   - `doc-designs-final.md` 明确 per-sample reuse relation 是 Phase 1 核心语义
-   - `doc-glossary.md` 新增 Reuse Relation，并将 Prefix Group 降级为调试/统计视图
+   - `docs/phase-1/design-final.md` 明确 per-sample reuse relation 是 Phase 1 核心语义
+   - `docs/glossary.md` 新增 Reuse Relation，并将 Prefix Group 降级为调试/统计视图
 
 5. 更新测试：
    - 增加同一 provider 多长度复用场景
@@ -250,7 +328,7 @@ python3 -m pytest
 1. 将 `PrefixSharingConfig.restore_mode` 改为更通用的 `boundary_strategy`。
 2. 当前阶段唯一允许值为 `prefix_last_restore`。
 3. 错误信息中明确后续可扩展策略包括 `boundary_token` 和 `strict_suffix`。
-4. 同步更新 `doc-designs-final.md` 和配置单元测试。
+4. 同步更新 `docs/phase-1/design-final.md` 和配置单元测试。
 5. 修正 `test_detector.py` 中嵌套列表场景的断言：当前 detector 以一层 token 序列为语义边界，不对嵌套列表做 flatten。
 
 ### 自测结果
@@ -313,7 +391,7 @@ python3 -m pytest tests/system_test
 
 ### 背景
 
-基于 `doc-designs-final.md` 和 Terminal Codex 主会话中的补充讨论，开始阶段一代码开发。阶段一目标是先完成 `verl + Megatron` RL MVP 所需的可迁移核心模块、reference backend、patch 框架和开发者自测。当前本地无 GPU / NPU，且未安装 PyTorch、verl、Megatron，因此加速器和真实框架测试先以 optional skip 形式落地。
+基于 `docs/phase-1/design-final.md` 和 Terminal Codex 主会话中的补充讨论，开始阶段一代码开发。阶段一目标是先完成 `verl + Megatron` RL MVP 所需的可迁移核心模块、reference backend、patch 框架和开发者自测。当前本地无 GPU / NPU，且未安装 PyTorch、verl、Megatron，因此加速器和真实框架测试先以 optional skip 形式落地。
 
 ### 完成事项
 
@@ -374,9 +452,9 @@ python3 -m compileall prefix_sharing
 
 ### 完成事项
 
-1. 更新 `AGENTS.md`（当时分别维护于 `CLAUDE.md` 与 `agents-readme.md`，已合并）：
+1. 更新 `docs/AGENTS.md`（当时分别维护于 `CLAUDE.md` 与 `agents-readme.md`，已合并）：
    - 新增规则：每次 commit 完成后必须 push 到远程仓库。
-   - 同步修正文档清单，明确 `doc-design-history.md` 和 `doc-designs-final.md` 的职责。
+   - 同步修正文档清单，明确 `docs/phase-1/design-history.md` 和 `docs/phase-1/design-final.md` 的职责。
 
 2. 本次规则变更完成后，将按新规则执行 commit 并 push。
 
@@ -397,9 +475,9 @@ python3 -m compileall prefix_sharing
 
 ### 完成事项
 
-1. 将 `doc-designs.md` 重命名为 `doc-design-history.md`。
+1. 当时将 `doc-designs.md` 重命名为 `doc-design-history.md`；当前文档结构中对应路径为 `docs/phase-1/design-history.md`。
 
-2. 新增 `doc-designs-final.md`，作为后续开发使用的最终设计文档，包含：
+2. 当时新增 `doc-designs-final.md`，作为后续开发使用的最终设计文档；当前文档结构中对应路径为 `docs/phase-1/design-final.md`，包含：
    - 项目目标与阶段一非目标
    - `One-Forward + KV Injection + Prefix-Last Restore` 核心方案
    - 三层架构：`core/`、`integrations/`、`backends/`
@@ -411,7 +489,7 @@ python3 -m compileall prefix_sharing
    - 阶段一实施计划
    - 四阶段 roadmap
 
-3. 更新 `doc-design-history.md` 顶部，记录最终方案收敛：
+3. 更新 `docs/phase-1/design-history.md` 顶部，记录最终方案收敛：
    - 阶段一：`verl + Megatron` RL MVP
    - 阶段二：并行策略、硬件解耦、加速后端，目标是业务可落地
    - 阶段三：扩展到 FSDP / Megatron 的 SFT 和 pretrain
@@ -419,7 +497,7 @@ python3 -m compileall prefix_sharing
 
 ### 当前结论
 
-当前已经完成需求、约束、总体架构、精度路径和 roadmap 的设计收敛。下一步可以基于 `doc-designs-final.md` 继续细化阶段一的接口签名、测试用例和开发任务拆分。
+当前已经完成需求、约束、总体架构、精度路径和 roadmap 的设计收敛。下一步可以基于 `docs/phase-1/design-final.md` 继续细化阶段一的接口签名、测试用例和开发任务拆分。
 
 ---
 
@@ -487,7 +565,7 @@ output(P_last)
 
 ### 文档更新
 
-更新 `doc-designs.md`：
+更新 `docs/phase-1/design-history.md`：
 - 新增 `2026-05-12 19:24 关键分析：Next-Token 边界问题与 Restore Mode 决策`
 - 记录 strict suffix、boundary token、prefix output restore 的差异
 - 明确 MVP 主线为 `One-Forward + KV Injection + Prefix-Last Restore`
@@ -498,7 +576,7 @@ output(P_last)
 
 ### 背景
 
-当前工作树回到 `origin/main` 的 `3d8a657` 后，此前本地写入的三层架构设计记录不在当前文档中。重新审视后，确认需要将三层架构方案作为最新设计记录恢复到 `doc-designs.md` 顶部。
+当前工作树回到 `origin/main` 的 `3d8a657` 后，此前本地写入的三层架构设计记录不在当前文档中。重新审视后，确认需要将三层架构方案作为最新设计记录恢复到 `docs/phase-1/design-history.md` 顶部。
 
 旧 One-Forward + KV Injection 方案核心方向可行，但存在工程边界不清的问题：
 - 过度依赖 `position_ids`，但 verl mcore THD 普通 RoPE 路径实际传入 `position_ids=None`
@@ -509,7 +587,7 @@ output(P_last)
 
 ### 完成事项
 
-1. 更新 `doc-designs.md`，新增最新设计章节：`2026-05-11 21:31 详细设计：三层架构 + Metadata + 后端适配方案`
+1. 更新 `docs/phase-1/design-history.md`，新增最新设计章节：`2026-05-11 21:31 详细设计：三层架构 + Metadata + 后端适配方案`
 
 2. 新设计将 prefix sharing 拆为三层：
    - **通用语义层**：`PrefixSharingBatchMeta`、detector、planner、mapping、cache，不绑定具体硬件后端
@@ -576,7 +654,7 @@ output(P_last)
 
 ### 文档更新
 
-1. 更新 `doc-designs.md`：
+1. 更新 `docs/phase-1/design-history.md`：
    - 修正 PP 兼容性描述（"简单"→"均不支持，MVP 阶段 PP=1"）
    - 添加 position_ids 处理说明（suffix-only 序列从 prefix_len 开始）
    - 添加 RoPE patch 模块（`patches/megatron_rope.py`）
@@ -584,7 +662,7 @@ output(P_last)
    - 更新技术风险表（添加 RoPE、PP、cache 污染）
    - 更新实现步骤（Step 2 添加 position_ids，Step 3 添加 RoPE 验证，Step 7 标注 PP 限制）
 
-2. 更新 `doc-progress.md` — 本记录
+2. 更新 `docs/progress.md` — 本记录
 
 ---
 
@@ -602,12 +680,12 @@ output(P_last)
 
 ### 完成事项
 
-1. **方案变更** — 将 doc-designs.md 中的 Two-Phase Forward 设计替换为 One-Forward + KV Injection 设计
+1. **方案变更** — 将 docs/phase-1/design-history.md 中的 Two-Phase Forward 设计替换为 One-Forward + KV Injection 设计
    - 一次 model forward，在每层 attention 中缓存/注入 prefix KV
    - 代码全部以 patch 形式在 prefix-sharing 项目中开发（不修改 verl/megatron）
    - 明确标注复用 PrefixTrain_dev 的已调测代码（迁移 + 修复 detach bug）
 
-2. **更新 doc-designs.md** — 替换主设计章节，保留 Megatron 分析和初始架构作为历史参考
+2. **更新 docs/phase-1/design-history.md** — 替换主设计章节，保留 Megatron 分析和初始架构作为历史参考
 
 ### 关键设计差异
 
@@ -644,7 +722,7 @@ output(P_last)
    - FlashAttention varlen 通过 `cu_seqlens` 管理变长序列
    - 确认 Megatron 没有内置的 prefix KV 共享机制
 
-4. **产出详细设计** — 完成 Two-Phase Forward 方案的详细设计，详见 `doc-designs.md`
+4. **产出详细设计** — 完成 Two-Phase Forward 方案的详细设计，详见 `docs/phase-1/design-history.md`
 
 ### 关键设计决策
 
@@ -673,7 +751,7 @@ output(P_last)
 1. **Megatron-LM v0.15.0 深入阅读** — 完整跟踪了 GPTModel forward 调用链和 attention 实现细节
    - 完整调用链: `GPTModel.forward()` → `_preprocess()` (embedding + RoPE) → `TransformerBlock.forward()` → `TransformerLayer.forward()` → `_forward_attention()` → `SelfAttention.forward()` → `DotProductAttention.forward()`
    - 张量形状: input `[b, s]` → embedding `[s, b, h]` → QKV `[s, b, np, hn]` → attention output `[s, b, h]`
-   - 找到了 prefix sharing 的 5 个精确注入位置（详见 `doc-designs.md`）
+   - 找到了 prefix sharing 的 5 个精确注入位置（详见 `docs/phase-1/design-history.md`）
 
 2. **mbridge 桥接层分析** — 理解了 verl ↔ mbridge ↔ Megatron 的数据流转
    - 两种桥接: VANILLA_MBRIDGE（`mbridge` 包）和 MEGATRON-BRIDGE（`megatron.bridge`）
@@ -718,16 +796,16 @@ output(P_last)
    ```
 
 2. **代码分析** — 深入阅读了 4 个关键仓库
-   - **PrefixTrain_dev**: Trie 树前缀检测 + activation 复用 + 魔改 Megatron 的分布式训练集成。PoC 级别，仅基于模拟数据跑通一个 iteration。详见 `doc-designs.md`
-   - **verl v0.7.0**: 高度模块化的 RL 框架，Actor/Critic/Rollout 均可插拔，有 Megatron 引擎层。详见 `doc-designs.md`
+   - **PrefixTrain_dev**: Trie 树前缀检测 + activation 复用 + 魔改 Megatron 的分布式训练集成。PoC 级别，仅基于模拟数据跑通一个 iteration。详见 `docs/phase-1/design-history.md`
+   - **verl v0.7.0**: 高度模块化的 RL 框架，Actor/Critic/Rollout 均可插拔，有 Megatron 引擎层。详见 `docs/phase-1/design-history.md`
    - **flash-preference**: 上下文管理器 API（一行代码启用），monkey patch 方式实现，2-3x 加速
    - **dpo-prefix-sharing**: FlexAttention + 自定义 mask，数值等价性保证，仅支持 DPO
 
-3. **初步方案设计** — 产出系统架构和 5 阶段施工计划，详见 `doc-designs.md`
+3. **初步方案设计** — 产出系统架构和 5 阶段施工计划，详见 `docs/phase-1/design-history.md`
 
 4. **工程管理规范** — 建立文档管理规定
-   - `doc-progress.md`: 所有工作进展记录
-   - `doc-designs.md`: 所有方案设计记录
+   - `docs/progress.md`: 所有工作进展记录
+   - `docs/phase-1/design-history.md`: 所有方案设计记录
    - 严格按时间倒序排列
 
 ### 关键发现

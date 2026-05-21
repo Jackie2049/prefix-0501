@@ -1,6 +1,6 @@
 # Prefix Sharing 详细设计规格书
 
-> 本文档是当前开发的主规格文档。目标读者包括后续接手开发的工程师，以及刚进入 prefix sharing / verl / Megatron 训练链路的开发者。历史讨论、被推翻方案、备选方案和阶段性分析记录见 `doc-design-history.md`。
+> 本文档是当前开发的主规格文档。目标读者包括后续接手开发的工程师，以及刚进入 prefix sharing / verl / Megatron 训练链路的开发者。历史讨论、被推翻方案、备选方案和阶段性分析记录见 `design-history.md`。
 
 ---
 
@@ -1020,78 +1020,7 @@ with prefix_sharing_enabled(config):
 
 ## 9. Roadmap
 
-### 9.1 阶段一：verl + Megatron RL MVP
-
-目标：打通当前最关键业务链路的最小正确闭环。
-
-成功标准：
-
-- 正确性测试通过。
-- small-scale RL actor 链路可运行。
-- 在合理精度假设下 logprob/loss/grad 对齐。
-- patch 可启停，不污染非 prefix sharing 路径。
-
-当前实现已补齐真实 Megatron SelfAttention hook 和真实 verl actor preprocess/postprocess 入口。剩余闭环缺口集中在真实 GPU / NPU / verl 环境下运行 small-scale actor logprob/update smoke test，并据实际 kernel 行为修正可能暴露的设备侧兼容问题。
-
-### 9.2 阶段二：业务落地能力
-
-重点：
-
-- TP 完整验证。
-- CP / PP 支持。
-- EP 兼容性分析和必要适配。
-- DP / micro-batch / gradient accumulation 稳定性。
-- CUDA TE / flash-attn 后端优化。
-- CANN NPU 专用后端和算子适配。
-- backend capability 机制。
-- 性能策略：`min_prefix_len`、`min_group_size`、收益估计、自动 fallback。
-
-探索特性：Prefix Activation Reuse。
-
-Phase 1 采用 KV injection，因为 suffix token 在 attention 中会反复消费 prefix K/V，而 reuser prefix Q/output 本身不需要重新产出。这是最小正确闭环。Phase 2 应探索更充分的 prefix activation reuse：当 provider 与 reuser 共享相同 prefix 时，除 prefix K/V 外，进一步复用 provider prefix 的 layer hidden states、attention/MLP 中间激活、prefix-last logits 或其他可安全共享的 prefix 输出。
-
-该方向的目标：
-
-- 减少 reuser prefix 的整条 forward 重复计算，而不仅是 attention 中的 K/V 重复。
-- 在训练中减少重复保存的 prefix activations，降低 backward activation 显存压力。
-- 让多个 reuser 的 loss / logprob 梯度正确累积回 provider prefix 计算图。
-- 支持 per-sample reuse relation，即同一个 provider 可向不同 reuser 暴露不同长度的 prefix activation slice。
-
-设计约束：
-
-- 不允许通过 `detach` 切断 provider prefix activation 的梯度路径。
-- 必须兼容 activation checkpointing / recompute；共享 activation 在重算时不能产生语义漂移。
-- 必须明确 TP / PP / SP / CP 下 activation 分片、跨 stage 传递和生命周期边界。
-- 必须与 Prefix-Last Restore、full-prefix restore、logprob/loss mask 对齐。
-- 先以实验后端或显式 feature flag 形式进入，不作为 Phase 2 默认路径。
-
-参考关系：
-
-- `PrefixTrain_dev` 更接近 activation reuse 方向，证明了共享 prefix 激活是可探索路线，但其直接魔改 Megatron、跨 stage activation 传递和梯度处理方式不能直接照搬。
-- `flash-preference`、`dpo-prefix-sharing` 说明 prompt/prefix 相同的 preference/DPO 场景存在进一步复用 prefix 计算的需求；Phase 2 可借鉴其 prompt/response 边界和 pairwise 场景建模。
-
-### 9.3 阶段三：训练范式扩展
-
-范围：
-
-- `verl + FSDP` RL 路径。
-- standalone Megatron SFT。
-- standalone Megatron pretrain。
-- standalone FSDP SFT / pretrain。
-- full-prefix restore。
-- PromptPrefixDetector。
-- 面向 next-token prediction 的通用 API。
-
-### 9.4 阶段四：上游 PR 与产品化
-
-方向：
-
-- verl PR：prefix sharing extension hook 或可选 config path。
-- Megatron PR：attention / packed sequence / RoPE / output restore 正式扩展点。
-- 独立插件或 pip package。
-- 稳定 API 文档。
-- 兼容矩阵。
-- benchmark。
+项目 roadmap 已迁移到全局文档 `../roadmap.md`，本文只保留 Phase 1 规格和实现审计。
 
 ---
 
