@@ -4,6 +4,144 @@
 
 ---
 
+## 2026-05-21 15:20 DP workload balance 与 rank-local DP 的关系澄清
+
+### 一、问题背景
+
+阅读 `dependency/PrefixTrain_dev` 后确认，它确实实现了 DP 之间的 mini-batch / workload balance：
+
+- 参数入口：`--dp-workload-balance`
+- 主要实现：`runtime/megatron/training.py::balance_initialize_data`
+- 估算函数：`runtime/megatron/prefix_match.py::process_in_order`
+- 分区函数：`runtime/megatron/prefix_match.py::kk_partition`
+- micro-batch 划分：`partition_micro_batch` / `partition_micro_batch_token_level`
+
+这部分逻辑容易和我们当前讨论的“DP 适配”混淆，需要拆成两个概念。
+
+### 二、两个不同问题
+
+#### 1. DP correctness / rank-local DP
+
+这是我们 Phase 2.1 已经确定并完成第一步实现的内容。
+
+定义：
+
+```text
+每个 DP rank 对自己拿到的 local micro-batch 独立执行 prefix detect / plan / store / restore。
+```
+
+它解决的是正确性和运行时隔离问题：
+
+- 不同 DP rank 的 runtime context 不串。
+- 同一 rank 的多个 micro-batch / gradient accumulation 不串。
+- restore 使用 local batch index。
+- store 生命周期限制在当前 micro-batch context。
+- 日志和 stats 能看到 `dp_rank / dp_world_size`。
+
+这部分不要求改变样本分发方式，也不要求跨 DP rank 通信。
+
+#### 2. DP workload balance
+
+这是 PrefixTrain_dev 额外做的性能优化，不是 DP correctness 的前提。
+
+它解决的是性能负载不均问题：
+
+```text
+普通 DP 通常按样本数切 batch。
+prefix sharing 后，不同样本真实 compute tokens = 原始 tokens - 可复用 prefix tokens。
+如果仍按样本数平均分，每个 DP rank 的实际计算量可能严重不均。
+step wall time 会被最慢的 DP rank 决定。
+```
+
+PrefixTrain_dev 的做法是：
+
+1. 对每个 uid / trajectory 内的 token 序列调用 `process_in_order()`。
+2. 用 Trie 模拟按顺序 prefix reuse 后还需要计算的 token 数。
+3. 将每个 uid 的 compute-token count 作为负载权重。
+4. 用 `kk_partition()` 把 uid 分到多个 DP / pipeline 分区，使每个分区 compute tokens 尽量接近。
+5. 再在每个分区内用 `partition_micro_batch*()` 切 micro-batch。
+6. 生成 `shared_prefix_len / store_for_sample_idx / shared_for_sample_idx / batch_idx_mapping_sample_idx`，供后续 activation memory manager 使用。
+
+所以它不是“DP rank 之间共享 K/V”，而是“prefix-aware 的数据分发和 micro-batch 切分”。
+
+### 三、和我们当前 DP 方案的关系
+
+当前 rank-local DP 已经能保证：
+
+- DP world size 大于 1 时，每个 rank 的 prefix sharing 语义正确。
+- 不跨 rank 复用，也不会破坏 DDP / Megatron DP 的梯度同步。
+- 不需要引入跨 rank activation 传输。
+
+但当前方案还不能保证：
+
+- 不同 DP rank 的 prefix-sharing 后 compute tokens 均衡。
+- micro-batch 内每次 forward 的真实 token workload 均衡。
+- 高 cache ratio 场景下 DP step time 最优。
+
+因此结论是：
+
+```text
+基础 DP 适配：不需要 DP workload balance。
+性能可用性 / 对齐 PrefixTrain_dev：后续需要 DP workload balance。
+```
+
+### 四、是否需要适配
+
+分阶段判断：
+
+1. Phase 2.1 DP correctness smoke：不适配，继续保持 rank-local DP。
+2. DP 性能评估：必须记录每个 rank 的 original tokens、saved tokens、compute tokens、cache ratio。
+3. 如果各 rank compute-token imbalance 明显，再引入 DP workload balance。
+4. 若目标是复现 PrefixTrain_dev 的大规模训练收益，DP workload balance 应进入 Phase 2.1 后半段或 Phase 2.2。
+
+不建议现在直接把 PrefixTrain_dev 的实现搬过来，原因：
+
+- 它绑定离线 `input_token_path` 和 Megatron 初始化流程。
+- 它按 uid / trajectory 粒度重排数据，和 verl / Ray actor 的 batch dispatch 需要重新设计边界。
+- 它的 memory manager 依赖全局 sample index 与跨 micro-batch activation store，而我们当前 Phase 2.1 明确先限制在 rank-local micro-batch context。
+- token-level balance 甚至会拆 sequence，需要额外验证 label、position、loss mask、restore mapping。
+
+### 五、建议适配路径
+
+先把 workload balance 作为独立能力，不和 DP correctness 混在一起。
+
+建议新增概念：
+
+```text
+PrefixSharingWorkloadEstimate:
+  original_tokens
+  reusable_prefix_tokens
+  compute_tokens
+  provider_count
+  reuse_count
+
+PrefixSharingBatchPartition:
+  rank_assignments
+  micro_batch_assignments
+  restore_order_mapping
+```
+
+实施顺序：
+
+1. **只观测，不重排**：在当前 rank-local DP stats 中增加 per-rank `compute_tokens = original_tokens - saved_tokens`。
+2. **离线模拟器**：给定一批 token ids 和 dp_world_size，复现 PrefixTrain_dev 的 `process_in_order + kk_partition`，输出 imbalance before / after。
+3. **rank-local micro-batch balance**：先只在单 rank 内按 estimated compute tokens 切 micro-batch，不改变跨 rank 数据分发。
+4. **verl dispatch 适配**：在 actor group dispatch 前做 prefix-aware rank assignment，并保留 restore order mapping。
+5. **可选 token-level balance**：最后再评估是否支持切 sequence；默认不做，因为风险最高。
+
+### 六、当前决策
+
+DP workload balance 是 Phase 2 并行策略里的重要性能子任务，但不是当前 DP correctness 的 blocker。
+
+当前阶段保持：
+
+- rank-local prefix sharing。
+- 不跨 DP rank 共享 activation。
+- 不改变 verl / Megatron 的数据分发。
+- 先通过 stats 暴露 rank 间 compute-token imbalance。
+
+后续当 DP=2/4 smoke 跑通后，再以 benchmark 数据决定是否进入 workload balance 实现。
+
 ## 2026-05-21 14:10 DP 并行策略详细设计初稿
 
 ### 一、定位
