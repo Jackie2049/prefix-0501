@@ -34,27 +34,11 @@ def reorder_dataproto_for_prefix_group_dp_balance(
     """Reorder a DataProto-like object by prefix group for DP dispatch."""
 
     if group_key not in getattr(batch, "non_tensor_batch", {}):
-        return _metrics(
-            PrefixGroupPartition(
-                dp_rank_to_indices=tuple(() for _ in range(max(dp_size, 0))),
-                dp_rank_to_group_ids=tuple(() for _ in range(max(dp_size, 0))),
-                group_workloads={},
-                fallback_reason="missing_group_key",
-            ),
-            metric_prefix,
-        )
+        return _fallback_metrics(dp_size, "missing_group_key", metric_prefix)
 
     tensor_batch = getattr(batch, "batch", {})
     if "input_ids" not in tensor_batch or "attention_mask" not in tensor_batch:
-        return _metrics(
-            PrefixGroupPartition(
-                dp_rank_to_indices=tuple(() for _ in range(max(dp_size, 0))),
-                dp_rank_to_group_ids=tuple(() for _ in range(max(dp_size, 0))),
-                group_workloads={},
-                fallback_reason="missing_token_fields",
-            ),
-            metric_prefix,
-        )
+        return _fallback_metrics(dp_size, "missing_token_fields", metric_prefix)
 
     partition = partition_prefix_groups(
         tensor_batch["input_ids"],
@@ -65,6 +49,20 @@ def reorder_dataproto_for_prefix_group_dp_balance(
     if not partition.is_fallback:
         batch.reorder(_reorder_arg([index for indices in partition.dp_rank_to_indices for index in indices]))
     return _metrics(partition, metric_prefix)
+
+
+def _empty_fallback_partition(dp_size: int, reason: str) -> PrefixGroupPartition:
+    empty = tuple(() for _ in range(max(dp_size, 0)))
+    return PrefixGroupPartition(
+        dp_rank_to_indices=empty,
+        dp_rank_to_group_ids=empty,
+        group_workloads={},
+        fallback_reason=reason,
+    )
+
+
+def _fallback_metrics(dp_size: int, reason: str, metric_prefix: str) -> dict[str, Any]:
+    return _metrics(_empty_fallback_partition(dp_size, reason), metric_prefix)
 
 
 def _metrics(partition: PrefixGroupPartition, prefix: str) -> dict[str, Any]:
