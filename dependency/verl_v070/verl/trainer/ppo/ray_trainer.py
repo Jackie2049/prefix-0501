@@ -1116,6 +1116,10 @@ class RayPPOTrainer:
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        attention_mask = batch.batch["attention_mask"]
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
+        workload_lst = calculate_workload(global_seqlen_lst)
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
@@ -1136,10 +1140,6 @@ class RayPPOTrainer:
             if prefix_balance_stats.get("prefix_dp_balance/enabled", 0):
                 return
 
-        attention_mask = batch.batch["attention_mask"]
-        batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
-        workload_lst = calculate_workload(global_seqlen_lst)
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
