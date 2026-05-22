@@ -43,15 +43,18 @@ def test_prepare_megatron_actor_micro_batch_trims_reuser_mask_and_context_positi
 
     with megatron_actor_prefix_sharing_context(prepared) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.restore_positions[0].provider_dense_pos == 2
-        assert ctx.restore_positions[0].reuse_dense_pos == 3
+        assert ctx.restore_positions[0].provider_1d_pos == 2
+        assert ctx.restore_positions[0].reuse_1d_pos == 5
     assert current_prefix_sharing_context() is None
 
 
 def test_restore_megatron_actor_log_probs_keeps_provider_autograd_path():
-    logits = torch.randn(2, 5, 8, requires_grad=True)
-    labels = torch.tensor([[0, 0, 0, 10, 11], [0, 0, 0, 3, 4]])
-    log_probs = torch.zeros(2, 5, requires_grad=True)
+    # THD compact format: [1, total_kept_tokens, V]
+    # row0 (provider) all 5 tokens, row1 (reuser) suffix 2 tokens (positions 3,4)
+    # total = 5 + 2 = 7, align_size=1 so no padding
+    logits = torch.randn(1, 7, 8, requires_grad=True)
+    labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
+    log_probs = torch.zeros(1, 7, requires_grad=True)
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
@@ -81,6 +84,6 @@ def test_restore_megatron_actor_log_probs_keeps_provider_autograd_path():
     with megatron_actor_prefix_sharing_context(prepared):
         restored = restore_megatron_actor_log_probs(logits, labels, log_probs, gather_fn)
 
-    restored[1, 3].backward()
+    restored[0, 5].backward()
     assert logits.grad is not None
     assert logits.grad[0, 2].abs().sum() > 0

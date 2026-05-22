@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 
@@ -25,8 +27,13 @@ def maybe_run_prefix_sharing_attention(
     owns RoPE, KV expansion, causal masking, and output projection.
     """
 
+    import logging
+    prefix_log = logging.getLogger(__file__)
+    prefix_log.warning("\n\n\nsuccess come into def maybe_run_prefix_sharing_attention\n\n\n")
+
     ctx = current_prefix_sharing_context()
     if ctx is None:
+        prefix_log.warning("\n\n\nctx is None\n\n\n")
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
@@ -49,6 +56,8 @@ def maybe_run_prefix_sharing_attention(
     backend = ctx.backend or TorchReferenceBackend()
     tp_rank = _tensor_parallel_rank()
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
+
+    prefix_log.warning("\n\n\ntry to build kv\n\n\n")
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
@@ -80,7 +89,40 @@ def _apply_positioned_rope(
 ) -> tuple[Any, Any]:
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
-    positions = kept_position_ids.to(device=query.device, dtype="long")
+    positions = kept_position_ids.to(device=query.device, dtype=torch.long)
+    max_needed = positions.max().item() + 1
+
+    # Extend q_pos_emb / k_pos_emb when they are shorter than the largest
+    # position_id needed by kept_position_ids.  THD-mode generated pos_emb
+    # only covers positions 0 .. max_seqlen_q-1, which is too small because
+    # prefix-sharing preserves the original position_ids (e.g. suffix starts
+    # at position 75).
+    #
+    # RoPE is linear: freqs[p] = p * inv_freq.  The step (inv_freq) can be
+    # recovered from the pos_emb itself as pos_emb[1] - pos_emb[0].
+    if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
+        dim_half = q_pos_emb.shape[-1] // 2
+        step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
+        n_extra = max_needed - q_pos_emb.shape[0]
+        extra_positions = torch.arange(
+            q_pos_emb.shape[0], max_needed,
+            device=q_pos_emb.device, dtype=q_pos_emb.dtype,
+        )
+        extra_angles = extra_positions[:, None, None, None] * step
+        extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
+        q_pos_emb = torch.cat([q_pos_emb, extra_emb], dim=0)
+    if k_pos_emb is not None and max_needed > k_pos_emb.shape[0]:
+        dim_half = k_pos_emb.shape[-1] // 2
+        step = k_pos_emb[1:2, :, :, :dim_half] - k_pos_emb[0:1, :, :, :dim_half]
+        n_extra = max_needed - k_pos_emb.shape[0]
+        extra_positions = torch.arange(
+            k_pos_emb.shape[0], max_needed,
+            device=k_pos_emb.device, dtype=k_pos_emb.dtype,
+        )
+        extra_angles = extra_positions[:, None, None, None] * step
+        extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
+        k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
+
     if q_pos_emb is not None:
         q_freqs = q_pos_emb.index_select(0, positions)
         query = apply_rotary_pos_emb(

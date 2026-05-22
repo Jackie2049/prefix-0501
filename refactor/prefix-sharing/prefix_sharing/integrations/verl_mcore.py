@@ -36,6 +36,9 @@ from prefix_sharing.integrations.context import (
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.patch_manager import PatchHandle
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 T = TypeVar("T")
 
@@ -44,8 +47,8 @@ T = TypeVar("T")
 class DensePrefixLastRestoreSpec:
     reuse_idx_in_batch: int
     provider_idx_in_batch: int
-    provider_dense_pos: int
-    reuse_dense_pos: int
+    provider_1d_pos: int
+    reuse_1d_pos: int
 
 
 @dataclass(frozen=True)
@@ -202,27 +205,74 @@ def prepare_megatron_actor_micro_batch(
     call. Unsupported or disabled cases return ``(batch, None)``.
     """
 
-    config = prefix_sharing_config_from_verl(actor_config)
-    if not config.enabled:
-        return batch, None
-    config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
-    if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
-        raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
-    if "multi_modal_inputs" in batch:
-        raise RuntimeError("prefix sharing phase 1 supports only text-only actor micro-batches")
+    batch_size = len(batch["input_ids"]) if "input_ids" in batch else None
+    logger.warning(f"[PS][prepare] ENTER: batch_size={batch_size}, batch_keys={list(batch.keys())}")
 
+    config = prefix_sharing_config_from_verl(actor_config)
+
+    # --- Path 1: prefix sharing disabled by config ---
+    if not config.enabled:
+        logger.warning(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enabled=False), returning (batch, None)")
+        return batch, None
+
+    logger.warning(f"[PS][prepare] config.enabled=True, validating config...")
+
+    config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
+    logger.warning(f"[PS][prepare] config.validate() returned OK")
+
+    # --- Path 2: missing use_remove_padding ---
+    logger.warning(f"[PS][prepare] checking megatron.use_remove_padding...")
+    if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
+        logger.warning(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
+        raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
+
+    # --- Path 3: multi_modal check ---
+    logger.warning(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
+    multi_modal_inputs = batch.get("multi_modal_inputs")
+    if multi_modal_inputs is not None:
+        # tensorclass 无法遍历（触发 CUDA 同步），改用底层 td 检查字段数
+        import inspect
+        is_tensorclass = hasattr(multi_modal_inputs, 'batch_size')
+        logger.warning(f"[PS][prepare] multi_modal_inputs type: tensorclass={is_tensorclass}, type={type(multi_modal_inputs).__name__}")
+        if is_tensorclass:
+            _td = getattr(multi_modal_inputs, 'td', None) or getattr(multi_modal_inputs, '_tensordict', None)
+            _keys = list(_td.keys()) if _td is not None else []
+            has_mm = len(_keys) > 0
+            logger.warning(f"[PS][prepare] tensorclass td keys={_keys}, has_mm={has_mm}")
+        else:
+            has_mm = any(mmi is not None and len(mmi.keys()) > 0 for mmi in multi_modal_inputs)
+        if has_mm:
+            logger.warning(f"[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
+            raise RuntimeError("prefix sharing phase 1 supports only text-only actor micro-batches")
+        logger.warning(f"[PS][prepare] multi_modal check PASSED (no real multi-modal content)")
+
+    # --- Read tensors ---
     attention_mask = batch["attention_mask"].to(bool)
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
+    logger.warning(f"[PS][prepare] tensor shapes: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}, position_ids={position_ids.shape}")
+
+    # --- Path 4: wrong tensor dims ---
     if attention_mask.dim() != 2 or input_ids.dim() != 2 or position_ids.dim() != 2:
+        logger.warning(f"[PS][prepare] PATH 4: non-2D tensors detected, raising RuntimeError")
         raise RuntimeError("prefix sharing phase 1 expects 2D input_ids/attention_mask/position_ids")
 
+    # --- Planning ---
     valid_indices = [attention_mask[row].nonzero(as_tuple=False).flatten() for row in range(input_ids.shape[0])]
     sequences = [input_ids[row, indices].detach().cpu().tolist() for row, indices in enumerate(valid_indices)]
+    seq_lens = [len(s) for s in sequences]
+    logger.warning(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
+
     meta = PrefixSharingPlanner(config).plan(sequences)
+    logger.warning(f"[PS][prepare] plan result: has_sharing={meta.has_sharing}, keep_ranges={meta.input_keep_ranges}, prefix_last_restore={meta.prefix_last_restore}")
+
+    # --- Path 5: no sharing found ---
     if not meta.has_sharing:
+        logger.warning(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
         return batch, None
 
+    # --- Path 6: sharing found, prepare batch ---
+    logger.warning(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
     prepared_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
     new_attention_mask[:] = False
@@ -240,26 +290,48 @@ def prepare_megatron_actor_micro_batch(
     prepared_batch["attention_mask"] = new_attention_mask
     prepared_batch["position_ids"] = new_position_ids
 
+    # Compute 1D positions in THD compact tensor
+    # Simulate preprocess_packed_seqs alignment to get cu_seqlens_padded
+    import torch
+    seqlens_in_batch = new_attention_mask.sum(dim=-1, dtype=torch.int32)
+    try:
+        from megatron.core import parallel_state as mpu
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        cp_size = mpu.get_context_parallel_world_size()
+    except (ImportError, RuntimeError, AssertionError):
+        tp_size = 1
+        cp_size = 1
+    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    pad_sizes = (align_size - seqlens_in_batch % align_size) % align_size
+    seqlens_padded = seqlens_in_batch + pad_sizes
+    cu_seqlens_padded = torch.zeros(len(seqlens_in_batch) + 1, dtype=torch.int32)
+    cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
+    cu_seqlens_cpu = cu_seqlens_padded.tolist()
+
     restore_positions = []
     for spec in meta.prefix_last_restore:
-        provider_indices = valid_indices[spec.provider_idx_in_batch]
-        reuse_indices = valid_indices[spec.reuse_idx_in_batch]
+        p_idx = spec.provider_idx_in_batch
+        r_idx = spec.reuse_idx_in_batch
+        provider_offset = spec.provider_prefix_last_pos - meta.input_keep_ranges[p_idx][0]
+        reuse_offset = spec.reuse_first_suffix_label_pos - meta.input_keep_ranges[r_idx][0]
         restore_positions.append(
             DensePrefixLastRestoreSpec(
                 reuse_idx_in_batch=spec.reuse_idx_in_batch,
                 provider_idx_in_batch=spec.provider_idx_in_batch,
-                provider_dense_pos=int(provider_indices[spec.provider_prefix_last_pos].item()),
-                reuse_dense_pos=int(reuse_indices[spec.reuse_first_suffix_label_pos].item()),
+                provider_1d_pos=int(cu_seqlens_cpu[p_idx] + provider_offset),
+                reuse_1d_pos=int(cu_seqlens_cpu[r_idx] + reuse_offset),
             )
         )
 
     kept_position_ids = _concat_tensors(kept_position_rows)
-    return prepared_batch, MegatronActorPreparedMicroBatch(
+    prepared = MegatronActorPreparedMicroBatch(
         meta=meta,
         backend=backend or TorchReferenceBackend(),
         kept_position_ids=kept_position_ids,
         restore_positions=restore_positions,
     )
+    logger.warning(f"[PS][prepare] PATH 6 DONE: returning (prepared_batch, prepared) with keep_ranges={meta.input_keep_ranges}")
+    return prepared_batch, prepared
 
 
 @contextmanager
@@ -293,21 +365,26 @@ def restore_megatron_actor_log_probs(
     restored = log_probs.clone()
     for spec in ctx.restore_positions:
         provider_logits = logits[
-            spec.provider_idx_in_batch : spec.provider_idx_in_batch + 1,
-            spec.provider_dense_pos : spec.provider_dense_pos + 1,
+            0:1,
+            spec.provider_1d_pos : spec.provider_1d_pos + 1,
             :,
-        ]
+        ].clone()
         reuse_label = labels[
-            spec.reuse_idx_in_batch : spec.reuse_idx_in_batch + 1,
-            spec.reuse_dense_pos : spec.reuse_dense_pos + 1,
+            0:1,
+            spec.reuse_1d_pos : spec.reuse_1d_pos + 1,
         ]
         restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-        restored[spec.reuse_idx_in_batch, spec.reuse_dense_pos] = restored_value.reshape(())
+        restored[0, spec.reuse_1d_pos] = restored_value.reshape(())
     return restored
 
 
 def prefix_sharing_config_from_verl(actor_config: Any) -> PrefixSharingConfig:
     raw = _read_actor_value(actor_config, "prefix_sharing", None)
+    raw = True
+    import logging
+    logger = logging.getLogger(__file__)
+    logger.info(f"prefix_sharing_config_from_verl: raw={raw}")
+
     if raw is None:
         raw = _read_actor_value(actor_config, "prefix_sharing_config", None)
     if raw is None or raw is False:

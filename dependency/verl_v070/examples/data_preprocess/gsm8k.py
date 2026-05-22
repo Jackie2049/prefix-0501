@@ -59,7 +59,17 @@ if __name__ == "__main__":
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            question_raw = example.pop("question")
+            import random
+
+            question_raw = example.pop("question")   # ← 移到最前面
+
+            # ====== 随机插入 6~12 个随机前缀 ======
+            n_prefix = random.randint(6, 12)
+            which_prefix = random.randint(0, 2)
+            prefix_words = ["歪比巴布", "南北绿豆", "哈基米"]
+            prefix = prefix_words[which_prefix] * n_prefix
+            question_raw = prefix + question_raw
+            # ====================================
 
             question = question_raw + " " + instruction_following
 
