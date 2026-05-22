@@ -4,6 +4,56 @@
 
 ---
 
+## 2026-05-22 继续落地 Prefix Group DP 负载均衡
+
+### 背景
+
+用户确认 DP 负载均衡应以 `uid` 作为默认 `prefix_group_id`，并要求将已收敛方案写入 `design-final`，随后按 TDD 原则开始开发与测试。同时要求将 TDD 原则记录到全局 `AGENTS.md`。
+
+### 完成事项
+
+1. 更新 `docs/AGENTS.md`：
+   - 新增“开发流程规范”。
+   - 明确代码开发必须遵循 TDD：先写失败测试，再实现，再重构。
+2. 更新 `docs/phase-2/design-final.md`：
+   - 写入 DP correctness 最终方案。
+   - 写入基于 `uid` / `prefix_group_id` 的 Prefix Group DP 负载均衡最终方案。
+   - 明确 workload 直接使用 prefix-aware `process_in_order()` compute tokens。
+3. 新增 `prefix_sharing/core/group_partition.py`：
+   - `process_in_order()`
+   - `estimate_group_workloads()`
+   - `partition_prefix_groups()`
+   - `PrefixGroup` / `PrefixGroupPartition`
+4. 新增 `prefix_sharing/integrations/verl_dp_balance.py`：
+   - `prefix_sharing_dp_balance_enabled()`
+   - `prefix_sharing_dp_balance_group_key()`
+   - `reorder_dataproto_for_prefix_group_dp_balance()`
+5. 在 verl `RayPPOTrainer._balance_batch()` 中增加薄 hook：
+   - prefix group DP balance 启用且成功时直接使用 prefix-sharing reorder。
+   - helper fallback 时回退 verl 原 seqlen balance。
+   - Megatron 无需修改。
+6. 新增测试：
+   - `test_group_partition.py` 覆盖 prefix-aware compute tokens、group locality、fallback。
+   - `test_verl_dp_balance.py` 覆盖 DataProto-like reorder、配置读取和 verl 薄 hook 存在性。
+
+### 自测结果
+
+本地执行：
+
+```bash
+/Users/jackiemac/miniconda3/bin/python -m pytest -q tests/unit_test/test_group_partition.py tests/integrated_test/test_verl_dp_balance.py
+/Users/jackiemac/miniconda3/bin/python -m pytest -q tests/unit_test tests/integrated_test tests/system_test
+```
+
+结果：
+
+- 新增定向测试：`10 passed`
+- 全量可运行测试：`44 passed, 5 skipped`
+
+skip 原因为本地缺少 optional 依赖 `torch`、`torch_npu`、`verl`。
+
+---
+
 ## 2026-05-21 14:34 落地 DP runtime 信息和 rank-local 测试
 
 ### 背景

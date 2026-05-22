@@ -65,6 +65,17 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+try:
+    from prefix_sharing.integrations.verl_dp_balance import (
+        prefix_sharing_dp_balance_enabled,
+        prefix_sharing_dp_balance_group_key,
+        reorder_dataproto_for_prefix_group_dp_balance,
+    )
+except ModuleNotFoundError:
+    prefix_sharing_dp_balance_enabled = None
+    prefix_sharing_dp_balance_group_key = None
+    reorder_dataproto_for_prefix_group_dp_balance = None
+
 
 @dataclass
 class ResourcePoolManager:
@@ -1105,13 +1116,30 @@ class RayPPOTrainer:
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        # Get dp_size from dispatch info to correctly balance across data parallel ranks
+        # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        if (
+            prefix_sharing_dp_balance_enabled is not None
+            and prefix_sharing_dp_balance_enabled(self.config)
+            and reorder_dataproto_for_prefix_group_dp_balance is not None
+        ):
+            group_key = "uid"
+            if prefix_sharing_dp_balance_group_key is not None:
+                group_key = prefix_sharing_dp_balance_group_key(self.config, default="uid")
+            prefix_balance_stats = reorder_dataproto_for_prefix_group_dp_balance(
+                batch=batch,
+                dp_size=dp_size,
+                group_key=group_key,
+            )
+            metrics.update(prefix_balance_stats)
+            if prefix_balance_stats.get("prefix_dp_balance/enabled", 0):
+                return
+
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
         workload_lst = calculate_workload(global_seqlen_lst)
-        # Get dp_size from dispatch info to correctly balance across data parallel ranks
-        # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
-        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
