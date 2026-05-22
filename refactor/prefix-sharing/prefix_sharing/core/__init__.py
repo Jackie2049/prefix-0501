@@ -5,9 +5,9 @@ from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigE
 from prefix_sharing.core.group_partition import (
     PrefixGroup,
     PrefixGroupPartition,
+    estimate_incremental_prefix_compute_tokens,
     estimate_group_workloads,
     partition_prefix_groups,
-    process_in_order,
 )
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
 from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore, StoredPrefixKV
@@ -38,10 +38,10 @@ __all__ = [
     "TriePrefixDetector",
     "build_provider_prefix_last_values",
     "compute_token_logprobs_from_logits",
+    "estimate_incremental_prefix_compute_tokens",
     "estimate_group_workloads",
     "gather_provider_prefix_last_logits",
     "partition_prefix_groups",
-    "process_in_order",
     "restore_prefix_last_logprobs",
     "restore_prefix_last_logprobs_tensor",
     "trim_batch",

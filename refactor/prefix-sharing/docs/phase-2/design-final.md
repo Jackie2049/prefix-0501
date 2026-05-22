@@ -138,17 +138,18 @@ DP group balance 直接使用前缀复用后的 workload 估算。
 对每个 group 内 token 序列执行：
 
 ```text
-compute_tokens = process_in_order(group_token_ids)
+compute_tokens = estimate_incremental_prefix_compute_tokens(group_token_ids)
 reusable_prefix_tokens = original_tokens - compute_tokens
 group_workload = compute_tokens
 ```
 
-`process_in_order()` 语义：
+`estimate_incremental_prefix_compute_tokens()` 语义：
 
-1. 按 group 内样本当前顺序逐条插入 Trie。
+1. 只建模当前 DP 调度组内、rank-local、按样本现有顺序发生的增量前缀复用。
 2. 每条样本找到和此前样本的最长已存在 prefix。
-3. 当前样本 compute tokens = `len(sample) - matched_prefix_len`。
-4. group compute tokens = 所有样本 compute tokens 之和。
+3. 当前样本新增计算量 = `len(sample) - matched_prefix_len`。
+4. group workload = 所有样本新增计算量之和。
+5. 该函数是 prefix-sharing 自己的 workload 估算器，不承诺兼容 PrefixTrain_dev 的函数签名或实现细节。
 
 输入 token 序列优先从：
 
@@ -271,7 +272,7 @@ prefix_dp_balance/compute_tokens
 
 单元测试：
 
-1. `process_in_order()` 正确计算 prefix reuse 后 compute tokens。
+1. `estimate_incremental_prefix_compute_tokens()` 正确计算 prefix reuse 后 compute tokens。
 2. 同一 `uid` 的样本分配到同一个 DP partition。
 3. partition workload 使用 prefix-aware compute tokens。
 4. 缺失 `uid` / token 字段时返回 fallback reason。

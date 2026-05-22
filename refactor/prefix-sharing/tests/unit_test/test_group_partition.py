@@ -1,12 +1,12 @@
 from prefix_sharing.core.group_partition import (
     PrefixGroupPartition,
+    estimate_incremental_prefix_compute_tokens,
     estimate_group_workloads,
     partition_prefix_groups,
-    process_in_order,
 )
 
 
-def test_process_in_order_counts_tokens_after_prefix_reuse():
+def test_estimate_incremental_prefix_compute_tokens_counts_rank_local_prefix_reuse():
     token_lists = [
         [1, 2, 3, 4],
         [1, 2, 3, 5],
@@ -14,7 +14,19 @@ def test_process_in_order_counts_tokens_after_prefix_reuse():
         [7, 8],
     ]
 
-    assert process_in_order(token_lists) == 8
+    assert estimate_incremental_prefix_compute_tokens(token_lists) == 8
+
+
+def test_estimate_incremental_prefix_compute_tokens_handles_duplicates_and_shorter_rows():
+    token_lists = [
+        [1, 2, 3, 4],
+        [1, 2],
+        [1, 2, 3, 4],
+        [1, 2, 3, 5],
+        [],
+    ]
+
+    assert estimate_incremental_prefix_compute_tokens(token_lists) == 5
 
 
 def test_estimate_group_workloads_uses_attention_mask_and_prefix_reuse():

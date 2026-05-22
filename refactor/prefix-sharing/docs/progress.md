@@ -18,9 +18,9 @@
 2. 更新 `docs/phase-2/design-final.md`：
    - 写入 DP correctness 最终方案。
    - 写入基于 `uid` / `prefix_group_id` 的 Prefix Group DP 负载均衡最终方案。
-   - 明确 workload 直接使用 prefix-aware `process_in_order()` compute tokens。
+   - 明确 workload 直接使用 prefix-aware `estimate_incremental_prefix_compute_tokens()` compute tokens。
 3. 新增 `prefix_sharing/core/group_partition.py`：
-   - `process_in_order()`
+   - `estimate_incremental_prefix_compute_tokens()`
    - `estimate_group_workloads()`
    - `partition_prefix_groups()`
    - `PrefixGroup` / `PrefixGroupPartition`

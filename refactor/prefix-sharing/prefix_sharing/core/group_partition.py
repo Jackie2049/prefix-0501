@@ -45,26 +45,44 @@ class _TrieNode:
         self.children: dict[int, _TrieNode] = {}
 
 
-def process_in_order(token_lists: Sequence[TokenSequence]) -> int:
-    """Return compute tokens after online prefix reuse within ``token_lists``."""
+class _IncrementalPrefixTrie:
+    """Tracks prefixes already materialized inside one scheduling group."""
 
-    root = _TrieNode()
-    compute_tokens = 0
-    for seq in token_lists:
-        node = root
-        matched = 0
-        tokens = [int(token) for token in seq]
+    def __init__(self) -> None:
+        self._root = _TrieNode()
+
+    def count_new_tokens_and_insert(self, tokens: Sequence[int]) -> int:
+        node = self._root
+        matched_prefix_len = 0
+
         for token in tokens:
             child = node.children.get(token)
             if child is None:
                 break
             node = child
-            matched += 1
-        compute_tokens += len(tokens) - matched
-        for token in tokens[matched:]:
+            matched_prefix_len += 1
+
+        for token in tokens[matched_prefix_len:]:
             child = _TrieNode()
             node.children[token] = child
             node = child
+
+        return len(tokens) - matched_prefix_len
+
+
+def estimate_incremental_prefix_compute_tokens(token_rows: Sequence[TokenSequence]) -> int:
+    """Estimate compute tokens with rank-local incremental prefix reuse.
+
+    The estimator models the policy used for DP scheduling only: samples in the
+    same prefix group are handled in their existing order, and each later sample
+    may reuse the longest prefix already seen in that group.
+    """
+
+    trie = _IncrementalPrefixTrie()
+    compute_tokens = 0
+    for row in token_rows:
+        tokens = [int(token) for token in row]
+        compute_tokens += trie.count_new_tokens_and_insert(tokens)
     return compute_tokens
 
 
@@ -87,7 +105,7 @@ def estimate_group_workloads(
     for group_id, indices in group_to_indices.items():
         group_tokens = [token_rows[index] for index in indices]
         original_tokens = sum(len(tokens) for tokens in group_tokens)
-        compute_tokens = process_in_order(group_tokens)
+        compute_tokens = estimate_incremental_prefix_compute_tokens(group_tokens)
         groups[group_id] = PrefixGroup(
             group_id=group_id,
             sample_indices=tuple(indices),
