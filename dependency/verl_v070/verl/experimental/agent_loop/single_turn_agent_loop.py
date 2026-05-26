@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import logging
 import os
+import random
 from typing import Any
 from uuid import uuid4
 
@@ -32,6 +34,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
         self.response_length = self.config.actor_rollout_ref.rollout.response_length
 
+        # 前缀配置：同一 prompt 的 n=8 条 response 共享相同前缀
+        self.prefix_len: int = 64             # 前缀 token 数，按需调整
+        self.vocab_range: int = 32000         # 模型 vocab size，确保 token id 有效
+
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
 
@@ -47,7 +53,16 @@ class SingleTurnAgentLoop(AgentLoopBase):
             videos=videos,
         )
 
-        # 3. generate sequences
+        logger.warning("\n\n\nBegin to generate prefix sequences")
+        # 3. 根据 prompt 生成确定性前缀（同 prompt 同前缀，不同 prompt 不同前缀）
+        prompt_hash = hashlib.md5(repr(messages).encode()).hexdigest()
+        seed = int(prompt_hash[:8], 16)
+        rng = random.Random(seed)
+        prefix_token_ids: list[int] = [
+            rng.randint(1, self.vocab_range - 1) for _ in range(self.prefix_len)
+        ]
+
+        # 4. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
@@ -59,9 +74,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
         response_mask = [1] * len(output.token_ids)
 
+        logger.warning("Begin to extract response")
+        # 5. 取 response，替换前 prefix_len 个 token 为固定前缀
+        ids = output.token_ids[: self.response_length]
+        ids[: self.prefix_len] = prefix_token_ids[: len(ids)]
+        logger.warning("get new response\n\n\n")
+
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=output.token_ids[: self.response_length],
+            response_ids=ids,
             response_mask=response_mask[: self.response_length],
             response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
             routed_experts=(

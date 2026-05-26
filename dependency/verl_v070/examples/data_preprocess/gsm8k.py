@@ -54,6 +54,11 @@ if __name__ == "__main__":
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 
+    # 取前 N 条
+    N = 512
+    train_dataset = train_dataset.select(range(N))
+    test_dataset = test_dataset.select(range(N))
+
     instruction_following = 'Let\'s think step by step and output the final answer after "####".'
 
     # add a row to each data item that represents a unique id
@@ -63,13 +68,13 @@ if __name__ == "__main__":
 
             question_raw = example.pop("question")   # ← 移到最前面
 
-            # ====== 随机插入 6~12 个随机前缀 ======
-            n_prefix = random.randint(6, 12)
-            which_prefix = random.randint(0, 2)
-            prefix_words = ["歪比巴布", "南北绿豆", "哈基米"]
-            prefix = prefix_words[which_prefix] * n_prefix
-            question_raw = prefix + question_raw
-            # ====================================
+            # # ====== 随机插入 6~12 个随机前缀 ======
+            # n_prefix = random.randint(6, 12)
+            # which_prefix = random.randint(0, 2)
+            # prefix_words = ["歪比巴布", "南北绿豆", "哈基米"]
+            # prefix = prefix_words[which_prefix] * n_prefix
+            # question_raw = prefix + question_raw
+            # # ====================================
 
             question = question_raw + " " + instruction_following
 
