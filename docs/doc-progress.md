@@ -46,7 +46,7 @@
 本地执行：
 
 ```bash
-PYTHONPATH=refactor/prefix-sharing pytest -q refactor/prefix-sharing/tests/unit_test refactor/prefix-sharing/tests/integrated_test refactor/prefix-sharing/tests/system_test
+PYTHONPATH=prefix-sharing pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
 ```
 
 结果：`29 passed, 4 skipped`。skip 仍来自本地缺少 `torch`、`torch_npu`、`verl`。
@@ -708,13 +708,12 @@ output(P_last)
    prefix-0501/
    ├── survey/                  # 调研参考项目
    │   ├── dpo-prefix-sharing/  # DPO 前缀共享（TRL + FlexAttention）
-   │   └── flash-preference/    # 通用前缀共享（HF + monkey patch）
+   │   ├── flash-preference/    # 通用前缀共享（HF + monkey patch）
+   │   └── PrefixTrain_dev/     # 团队 PoC 代码
    ├── dependency/              # 当前 RL pipeline 依赖
    │   ├── verl_v070/           # verl v0.7.0（shallow clone）
-   │   ├── megatron_v0150/      # Megatron-LM core_v0.15.0（shallow clone）
-   │   └── PrefixTrain_dev/     # 团队 PoC 代码
-   └── refactor/
-       └── prefix-sharing/      # 正式开发仓库（Jackie2049/prefix-sharing）
+   │   └── megatron_v0150/      # Megatron-LM core_v0.15.0（shallow clone）
+   └── prefix-sharing/      # 正式开发仓库（Jackie2049/prefix-sharing）
    ```
 
 2. **代码分析** — 深入阅读了 4 个关键仓库
