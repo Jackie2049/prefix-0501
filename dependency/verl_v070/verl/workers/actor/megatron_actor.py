@@ -678,7 +678,7 @@ class MegatronPPOActor(BasePPOActor):
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ######### prefix-sharing #########
-                    # 侵入原因：prefix-sharing 的 One-Forward 方案会跳过前缀 token 的 logits 计算，
+                    # prefix-sharing 的 One-Forward 方案会跳过前缀 token 的 logits 计算，
                     # 需要在 logits_processor 中恢复这些位置的 log_probs 以保证训练语义正确性
                     if restore_suffix_first_log_probs_from_prefix is not None:
                         log_probs = restore_suffix_first_log_probs_from_prefix(
@@ -693,8 +693,8 @@ class MegatronPPOActor(BasePPOActor):
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
                 ######### prefix-sharing #########
-                # 侵入原因：需要通过 context manager 在 Megatron attention 层注入运行时状态，
-                # 使 attention 层能识别 prefix-sharing 模式并执行 KV 缓存注入和恢复
+                # 通过 context manager 在 Megatron attention 注入运行时状态，
+                # 使 attention 层能识别 prefix-sharing 模式并执行 KV 激活值复用
                 prefix_context = prefix_sharing_runtime_context or nullcontext
                 with prefix_context(prefix_sharing_runtime_state):
                     output = forward_fn(

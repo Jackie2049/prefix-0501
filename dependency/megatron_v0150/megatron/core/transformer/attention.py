@@ -800,6 +800,9 @@ class Attention(MegatronModule, ABC):
             value = value.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
+        ######### prefix-sharing #########
+        # Megatron attention 是计算图的核心，必须在 attention 计算前拦截，
+        # 在 prefix token 位置注入预计算的 KV 缓存，跳过重复计算，从而实现前缀复用
         import logging
         prefix_log = logging.getLogger(__file__)
 
@@ -831,6 +834,7 @@ class Attention(MegatronModule, ABC):
             return prefix_sharing_output
         
         prefix_log.warning("\n\n\nprefix hook failed\n\n\n")
+        ######### prefix-sharing #########
 
         # ================================================
         # relative positional embedding (rotary embedding)
