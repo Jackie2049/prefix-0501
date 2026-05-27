@@ -1,7 +1,7 @@
 """Prefix-Last Restore helpers for logprob assembly.
 
 This module sits **after** model forward and consumes
-:class:`~prefix_sharing.core.metadata.PrefixSharingPlan`, especially
+:class:`~prefix_sharing.core.planner.PrefixSharingPlan`, especially
 ``prefix_last_restore`` entries produced by
 :mod:`prefix_sharing.core.planner`. When a reuser row trims the Q path to
 suffix-only queries, the forward pass never materializes ``output(P_last)``,
@@ -56,7 +56,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence, TypeVar
 
-from prefix_sharing.core.metadata import PrefixSharingPlan
+from prefix_sharing.core.planner import PrefixSharingPlan
 
 
 T = TypeVar("T")

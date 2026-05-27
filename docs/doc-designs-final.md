@@ -146,9 +146,8 @@ Prefix-Last Restore 的理论前提是：复用关系中 provider 与 reuser 的
 prefix_sharing/
 ├── core/                         # 通用语义层
 │   ├── config.py                 # PrefixSharingConfig + 约束校验
-│   ├── metadata.py               # PrefixSharingPlan / PrefixLastRestoreSpec
 │   ├── prefix_detector.py        # PrefixDetector / TriePrefixDetector / PrefixReuseSpec
-│   ├── planner.py                # 裁剪、offset、restore 计划
+│   ├── planner.py                # PrefixSharingPlan / PrefixLastRestoreSpec / 裁剪、offset、restore 计划
 │   ├── batch_trim.py             # input / label / mask 裁剪与 packed 视图
 │   ├── prefix_store.py           # PrefixKVStore 生命周期管理
 │   └── logprob.py                # Prefix-Last Restore logprob 工具
@@ -200,6 +199,8 @@ class PrefixSharingConfig:
 
 `validate()` 的职责：
 
+- `from_raw()` 统一把 bool / mapping / OmegaConf-like / object 配置归一化为 `PrefixSharingConfig`。
+- verl actor 配置中只读取 `prefix_sharing_config` 字段，不再兼容多个外层字段名。
 - `enable_prefix_sharing=True` 或环境变量 `ENABLE_PREFIX_SHARING=1/true/yes/on` 时启用 prefix sharing；环境变量只作为额外开启入口，不替代其他配置字段。
 - 校验配置字段合法性，例如 `min_prefix_len >= 1`、`min_group_size >= 2`。
 - 校验 `boundary_strategy` 当前只能是 `prefix_last_restore`。

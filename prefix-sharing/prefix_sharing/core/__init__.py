@@ -11,8 +11,7 @@ from prefix_sharing.core.logprob import (
     restore_prefix_last_logprobs,
     restore_prefix_last_logprobs_tensor,
 )
-from prefix_sharing.core.metadata import PrefixSharingPlan
-from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlanner
+from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
 
 __all__ = [
     "PrefixDetectionResult",

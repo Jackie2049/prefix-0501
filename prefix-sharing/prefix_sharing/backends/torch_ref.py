@@ -12,7 +12,7 @@ from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.metadata import PrefixSharingPlan
+from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
 
 

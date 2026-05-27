@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.metadata import PrefixSharingPlan
+from prefix_sharing.core.planner import PrefixSharingPlan
 
 
 @dataclass(frozen=True)

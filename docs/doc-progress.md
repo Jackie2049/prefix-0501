@@ -4,6 +4,46 @@
 
 ---
 
+## 2026-05-27 16:57 将 PrefixSharingPlan 整合进 planner
+
+### 背景
+
+用户指出 `PrefixSharingPlan` 单独放在 `metadata.py` 中会让 planner 产物结构和生成逻辑分散，阅读时需要在两个 core 文件之间跳转。
+
+### 完成事项
+
+1. 将 `PrefixSharingPlan` 从 `core/metadata.py` 移入 `core/planner.py`。
+2. 删除 `core/metadata.py`。
+3. 将源码中的 `prefix_sharing.core.metadata` import 全部改为 `prefix_sharing.core.planner`。
+4. 更新包导出、当前设计文档和架构 overview / PUML。
+
+### 自测结果
+
+结果：`50 passed, 3 skipped`。skip 来自本地缺少 `torch_npu`、`verl`，以及 CUDA 不可用的 optional 测试。
+
+---
+
+## 2026-05-27 16:40 收敛 prefix sharing 配置解析入口
+
+### 背景
+
+用户指出 `prefix_sharing_config_from_verl()` 和 `_env_enables_prefix_sharing()` 分散在 integration / config 两处，阅读时难以判断最终启用逻辑在哪里生效。
+
+### 完成事项
+
+1. 新增 `PrefixSharingConfig.from_raw()`，统一解析 bool、mapping、OmegaConf-like 和 object 配置。
+2. 只认 `prefix_sharing_config` 作为 verl actor_config 中的配置字段，不再兼容 `prefix_sharing`。
+3. `PrefixSharingConfig.from_raw()` 只认 `enable_prefix_sharing`，不再兼容旧字段 `enabled`。
+4. 保持 `ENABLE_PREFIX_SHARING` 只在 `PrefixSharingConfig.__post_init__()` 中生效，作为唯一环境变量覆盖入口。
+5. 删除公开的 `prefix_sharing_config_from_verl()` 和无意义的 `_read_prefix_sharing_raw_config()` 包装。
+6. 更新测试和设计 / overview 文档。
+
+### 自测结果
+
+结果：`50 passed, 3 skipped`。skip 来自本地缺少 `torch_npu`、`verl`，以及 CUDA 不可用的 optional 测试。
+
+---
+
 ## 2026-05-27 16:13 重命名 suffix-first logprob restore 入口
 
 ### 背景
@@ -208,8 +248,8 @@ PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache p
 
 1. 将 `PrefixSharingConfig.enabled` 重命名为 `enable_prefix_sharing`。
 2. 将代码和测试中的 `config.enabled` / `PrefixSharingConfig(enabled=...)` 同步改为新字段名。
-3. `prefix_sharing_config_from_verl()` 支持新的 `enable_prefix_sharing` 配置键，并兼容旧的 `enabled` 键作为迁移入口。
-4. 移除 `prefix_sharing_config_from_verl()` 中强制 `raw = True` 的调试遗留逻辑，确保嵌套配置值会被真实解析。
+3. `PrefixSharingConfig.from_raw()` 支持新的 `enable_prefix_sharing` 配置键。
+4. 移除旧配置解析路径中强制 `raw = True` 的调试遗留逻辑，确保嵌套配置值会被真实解析。
 5. 更新 `docs/doc-designs-final.md` 中的配置字段引用。
 
 ### 自测结果

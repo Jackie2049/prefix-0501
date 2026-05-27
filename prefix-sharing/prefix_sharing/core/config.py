@@ -33,6 +33,25 @@ def _env_enables_prefix_sharing() -> bool:
     )
 
 
+def _to_plain_mapping(raw: Any) -> dict[str, Any]:
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(raw):
+            return dict(OmegaConf.to_container(raw, resolve=True))
+    except ModuleNotFoundError:
+        pass
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if hasattr(raw, "__dict__"):
+        return {
+            key: value
+            for key, value in vars(raw).items()
+            if not key.startswith("_")
+        }
+    raise TypeError("prefix_sharing config must be a bool, mapping, or OmegaConf object")
+
+
 @dataclass(frozen=True)
 class PrefixSharingConfig:
     """User-facing phase-1 configuration.
@@ -61,6 +80,17 @@ class PrefixSharingConfig:
     def __post_init__(self) -> None:
         if _env_enables_prefix_sharing() and not self.enable_prefix_sharing:
             object.__setattr__(self, "enable_prefix_sharing", True)
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "PrefixSharingConfig":
+        """Build config from bool/mapping/object input and environment overrides."""
+
+        if raw is None or raw is False:
+            return cls(enable_prefix_sharing=False)
+        if raw is True:
+            return cls(enable_prefix_sharing=True)
+        values = _to_plain_mapping(raw)
+        return cls(**values)
 
     def validate(self, model_config: Any | None = None, integrate_mode: str | None = None) -> None:
         """Validate phase-1 constraints against a model/config object.

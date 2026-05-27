@@ -1,7 +1,7 @@
 """Trim per-row batches after prefix-sharing planning.
 
 This module sits **after** :mod:`prefix_sharing.core.planner` and consumes
-:class:`~prefix_sharing.core.metadata.PrefixSharingPlan`. The planner encodes
+:class:`~prefix_sharing.core.planner.PrefixSharingPlan`. The planner encodes
 *which* token spans each row keeps on the Q path and how packed lengths line up;
 this module applies those decisions to concrete per-row data: it slices
 ``input_ids``, ``labels``, and ``loss_masks`` into trimmed rows, and builds a
@@ -41,7 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Generic, Sequence, TypeVar
 
-from prefix_sharing.core.metadata import PrefixSharingPlan
+from prefix_sharing.core.planner import PrefixSharingPlan
 
 
 T = TypeVar("T")

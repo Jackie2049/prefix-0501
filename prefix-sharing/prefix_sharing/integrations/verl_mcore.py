@@ -13,7 +13,7 @@ This module has two layers:
 from __future__ import annotations
 
 import importlib
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, Sequence, TypeVar
 
@@ -26,7 +26,7 @@ from prefix_sharing.core.batch_trim import (
     trim_loss_masks,
 )
 from prefix_sharing.core.logprob import restore_prefix_last_logprobs
-from prefix_sharing.core.metadata import PrefixSharingPlan
+from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
@@ -209,7 +209,9 @@ def build_prefix_sharing_micro_batch(
     batch_size = len(batch["input_ids"]) if "input_ids" in batch else None
     logger.warning(f"[PS][prepare] ENTER: batch_size={batch_size}, batch_keys={list(batch.keys())}")
 
-    config = prefix_sharing_config_from_verl(actor_config)
+    config = PrefixSharingConfig.from_raw(
+        _read_actor_value(actor_config, "prefix_sharing_config", None)
+    )
 
     # --- Path 1: prefix sharing disabled by config ---
     if not config.enable_prefix_sharing:
@@ -276,7 +278,7 @@ def build_prefix_sharing_micro_batch(
         logger.warning(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
         return batch, None
 
-    # --- Path 6: sharing found, prepare batch ---
+    # --- Path 6: sharing found, trim the original micro-batch ---
     logger.warning(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
     trimmed_micro_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
@@ -315,16 +317,16 @@ def build_prefix_sharing_micro_batch(
 
     prefix_last_restore_slots = []
     for spec in prefix_sharing_plan.prefix_last_restore:
-        p_idx = spec.provider_idx_in_batch
-        r_idx = spec.reuse_idx_in_batch
-        provider_offset = spec.provider_prefix_last_pos - prefix_sharing_plan.input_keep_ranges[p_idx][0]
-        reuse_offset = spec.reuse_first_suffix_label_pos - prefix_sharing_plan.input_keep_ranges[r_idx][0]
+        provider_idx = spec.provider_idx_in_batch
+        reuse_idx = spec.reuse_idx_in_batch
+        provider_offset = spec.provider_prefix_last_pos - prefix_sharing_plan.input_keep_ranges[provider_idx][0]
+        reuse_offset = spec.reuse_first_suffix_label_pos - prefix_sharing_plan.input_keep_ranges[reuse_idx][0]
         prefix_last_restore_slots.append(
             PackedPackedPrefixLastRestoreSlot(
                 reuse_idx_in_batch=spec.reuse_idx_in_batch,
                 provider_idx_in_batch=spec.provider_idx_in_batch,
-                provider_1d_pos=int(cu_seqlens_cpu[p_idx] + provider_offset),
-                reuse_1d_pos=int(cu_seqlens_cpu[r_idx] + reuse_offset),
+                provider_1d_pos=int(cu_seqlens_cpu[provider_idx] + provider_offset),
+                reuse_1d_pos=int(cu_seqlens_cpu[reuse_idx] + reuse_offset),
             )
         )
 
@@ -369,20 +371,6 @@ def restore_suffix_first_log_probs_from_prefix(
     return restored
 
 
-def prefix_sharing_config_from_verl(actor_config: Any) -> PrefixSharingConfig:
-    raw = _read_actor_value(actor_config, "prefix_sharing", None)
-    if raw is None:
-        raw = _read_actor_value(actor_config, "prefix_sharing_config", None)
-    if raw is None or raw is False:
-        return PrefixSharingConfig(enable_prefix_sharing=False)
-    if raw is True:
-        return PrefixSharingConfig(enable_prefix_sharing=True)
-    values = _to_plain_mapping(raw)
-    if "enabled" in values and "enable_prefix_sharing" not in values:
-        values["enable_prefix_sharing"] = values.pop("enabled")
-    return PrefixSharingConfig(**values)
-
-
 def _clone_batch(batch: Any) -> Any:
     if hasattr(batch, "clone"):
         return batch.clone()
@@ -418,22 +406,3 @@ def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
             else:
                 current = getattr(current, part, default)
     return current
-
-
-def _to_plain_mapping(raw: Any) -> dict[str, Any]:
-    try:
-        from omegaconf import OmegaConf
-
-        if OmegaConf.is_config(raw):
-            return dict(OmegaConf.to_container(raw, resolve=True))
-    except ModuleNotFoundError:
-        pass
-    if isinstance(raw, Mapping):
-        return dict(raw)
-    if hasattr(raw, "__dict__"):
-        return {
-            key: value
-            for key, value in vars(raw).items()
-            if not key.startswith("_")
-        }
-    raise TypeError("prefix_sharing config must be a bool, mapping, or OmegaConf object")

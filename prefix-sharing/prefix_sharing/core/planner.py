@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.prefix_detector import PrefixDetectionResult, TriePrefixDetector
+from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,90 @@ class PrefixLastRestoreSpec:
     group_id: int
 
 
-from prefix_sharing.core.metadata import PrefixSharingPlan  # noqa: E402
+Range = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class PrefixSharingPlan:
+    """Complete framework-independent plan for a single micro-batch."""
+
+    # 基础标识信息
+    forward_id: int                              # 前向传播唯一标识
+    micro_batch_id: int                          # micro-batch序号
+    batch_size: int                              # 批次内序列数量
+    original_lengths: list[int]                   # 各序列原始长度
+
+    # 前缀复用关系
+    reuse_specs: list[PrefixReuseSpec]           # 序列间复用关系规范
+    group_ids: list[int]                        # 各序列所属前缀组ID
+    is_provider: list[bool]                      # 各序列是否为provider（被复用方）
+    provider_index: list[int]                    # 各序列的provider在batch中的索引
+    prefix_lens: list[int]                      # 各序列前缀长度（可共享部分）
+    suffix_lens: list[int]                      # 各序列后缀长度（需独立计算部分）
+
+    # THD格式下的序列长度管理
+    kept_lengths_q: list[int]                   # 裁剪后各序列的Q长度
+    expanded_lengths_kv: list[int]             # 扩展后各序列的KV长度（包含共享前缀）
+    cu_seqlens_q: list[int]                     # Q的累积序列长度（用于THD索引）
+    cu_seqlens_kv: list[int]                   # KV的累积序列长度（用于THD索引）
+    max_seqlen_q: int                          # Q的最大序列长度
+    max_seqlen_kv: int                         # KV的最大序列长度
+
+    # 位置偏移（用于恢复原始位置信息）
+    q_position_offsets: list[int]               # Q相对于原始序列的位置偏移
+    kv_position_offsets: list[int]             # KV相对于原始序列的位置偏移
+
+    # 裁剪保留范围（start, end）
+    input_keep_ranges: list[Range]              # input_ids保留范围
+    label_keep_ranges: list[Range]             # labels保留范围
+    loss_mask_keep_ranges: list[Range]         # loss_mask保留范围
+
+    # 恢复点信息（用于logprob恢复）
+    prefix_last_restore: list[PrefixLastRestoreSpec] = field(default_factory=list)  # reuser的suffix-first位置恢复规范
+
+    def __post_init__(self) -> None:
+        expected = self.batch_size
+        fields: Sequence[tuple[str, list[object]]] = (
+            ("original_lengths", self.original_lengths),
+            ("group_ids", self.group_ids),
+            ("is_provider", self.is_provider),
+            ("provider_index", self.provider_index),
+            ("prefix_lens", self.prefix_lens),
+            ("suffix_lens", self.suffix_lens),
+            ("kept_lengths_q", self.kept_lengths_q),
+            ("expanded_lengths_kv", self.expanded_lengths_kv),
+            ("q_position_offsets", self.q_position_offsets),
+            ("kv_position_offsets", self.kv_position_offsets),
+            ("input_keep_ranges", self.input_keep_ranges),
+            ("label_keep_ranges", self.label_keep_ranges),
+            ("loss_mask_keep_ranges", self.loss_mask_keep_ranges),
+        )
+        for name, value in fields:
+            if len(value) != expected:
+                raise ValueError(f"{name} length must equal batch_size={expected}")
+        if len(self.cu_seqlens_q) != expected + 1:
+            raise ValueError("cu_seqlens_q length must equal batch_size + 1")
+        if len(self.cu_seqlens_kv) != expected + 1:
+            raise ValueError("cu_seqlens_kv length must equal batch_size + 1")
+
+    @property
+    def has_sharing(self) -> bool:
+        return bool(self.reuse_specs)
+
+    def is_reuser(self, idx_in_batch: int) -> bool:
+        return self.provider_index[idx_in_batch] != idx_in_batch and self.prefix_lens[idx_in_batch] > 0
+
+    def q_range_for_batch(self, idx_in_batch: int) -> Range:
+        return self.cu_seqlens_q[idx_in_batch], self.cu_seqlens_q[idx_in_batch + 1]
+
+    def kv_range_for_batch(self, idx_in_batch: int) -> Range:
+        return self.cu_seqlens_kv[idx_in_batch], self.cu_seqlens_kv[idx_in_batch + 1]
+
+    def restore_for_reuse(self, idx_in_batch: int) -> PrefixLastRestoreSpec | None:
+        for spec in self.prefix_last_restore:
+            if spec.reuse_idx_in_batch == idx_in_batch:
+                return spec
+        return None
 
 
 _forward_ids = itertools.count(1)

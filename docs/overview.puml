@@ -11,16 +11,16 @@ package "dependency/ (外部框架 - 侵入式修改)" as DependencyLayer #E3F2F
             +forward_step()
             .. 负责单次 micro-batch 前向传播，调用 prefix sharing 准备和恢复 ..
             __关键修改 (所在函数)__
-            +__init__()
-            .. try/except 导入 prefix-sharing 模块，模块缺失时自动回退原始行为 ..
-            +forward_step()
-            .. 插入 build_prefix_sharing_micro_batch()，做前缀匹配、裁剪 batch、生成 RuntimeState ..
-            +forward_step()
-            .. fused kernels 检查，Phase 1 不兼容需报错 ..
-            +forward_step()
-            .. 插入 prefix_sharing_runtime_context()，负责传递执行计划、共享 KV ..
-            +forward_step()/logits_processor()
-            .. 插入 restore_suffix_first_log_probs_from_prefix()，恢复 reuser 的 logprob ..
+            +__init__(): Line 61-70 加入try/except
+            .. 为了导入 prefix-sharing 模块，模块缺失时自动回退原始行为，不阻塞正常使用 ..
+            +forward_step(): Line 585-593 插入 build_prefix_sharing_micro_batch()
+            .. 在micro-batch内部，做前缀匹配、batch裁剪、生成 PrefixRuntimeState ..
+            +forward_step(): Line 631-632 判断是否启用fused kernels
+            ..当前不兼容融合算子，需要跑异常 ..
+            +forward_step(): Line 680-681 插入 prefix_sharing_runtime_context()
+            .. 为核心的forward_fn建立PrefixSharingRuntimeContext，传递PrefixSharingPlan、PrefixKVStore、LastRestoreSlots等 ..
+            +forward_step()/logits_processor(): Line 669-675 插入 restore_suffix_first_log_probs_from_prefix()
+            .. 用于logits_processor中 恢复 suffix第一个token的 logprob ..
         }
     }
     
@@ -49,11 +49,11 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
         +VerlMCoreIntegration
         .. 安装 Megatron attention patch 的集成入口 ..
         +build_prefix_sharing_micro_batch()
-        .. 前缀检测入口：配置验证 → plan → batch 裁剪 → 构建 PrefixSharingRuntimeState ..
+        .. 前缀检测入口：配置验证 → 执行前缀复用计划（plan） → batch 裁剪 → 构建 PrefixSharingRuntimeState ..
         +restore_suffix_first_log_probs_from_prefix()
         .. 恢复 reuser 的 suffix-first logprob，从 context 读取 restore_slots 并重新计算 ..
-        +prefix_sharing_config_from_verl()
-        .. 从 verl actor 配置解析 PrefixSharingConfig ..
+        +PrefixSharingConfig.from_raw(actor_config.prefix_sharing_config)
+        .. 从 verl actor 配置读取 prefix_sharing_config，语义解析和环境变量覆盖统一交给 PrefixSharingConfig ..
         +enable_prefix_sharing()
         .. 启用 prefix sharing 集成入口 ..
         +prefix_sharing_enabled()
@@ -182,7 +182,7 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         +group_id: int
     }
     
-    class "metadata.py\nPrefixSharingPlan" as Metadata #CE93D8 {
+    class "planner.py\nPrefixSharingPlan" as Plan #CE93D8 {
         +forward_id: int
         +micro_batch_id: int
         +batch_size: int
@@ -218,8 +218,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         +prefix_len: int
     }
     
-    Metadata ..> ReuseSpec : reuse_specs 引用
-    Metadata ..> RestoreSpec : prefix_last_restore 引用
+    Plan ..> ReuseSpec : reuse_specs 引用
+    Plan ..> RestoreSpec : prefix_last_restore 引用
     
     class "batch_trim.py\nTrimmedBatch" as TrimmedBatch #CE93D8 {
         +rows: list[list[T]]
@@ -340,8 +340,8 @@ VerlMcore ..> PatchManager : 安装 attention patch
 ' ==================== Integration -> Core 调用 ====================
 VerlMcore ..> Config : 读取/解析配置
 VerlMcore ..> Planner : 生成执行计划
-VerlMcore ..> Metadata : 创建 PrefixSharingPlan
-RuntimeState ..> Metadata : 持有 plan
+VerlMcore ..> Plan : 创建 PrefixSharingPlan
+RuntimeState ..> Plan : 持有 plan
 VerlMcore ..> BatchTrim : 裁剪 batch
 VerlMcore ..> Logprob : 恢复 logprob
 MegatronRuntime ..> Context : 获取 KV Store 和 Plan
@@ -352,16 +352,16 @@ Planner ..> TrieDetector : 调用 detect
 Planner ..> DetectionResult : plan_from_detection 输入
 TrieDetector ..> DetectionResult : detect() 输出
 TrieDetector ..> ReuseSpec : 输出 reuse_specs
-Planner ..> Metadata : 生成 PrefixSharingPlan
+Planner ..> Plan : 生成 PrefixSharingPlan
 Planner ..> RestoreSpec : prefix_last_restore 字段
-Metadata ..> ReuseSpec : reuse_specs 字段引用
-Metadata ..> RestoreSpec : prefix_last_restore 字段引用
-BatchTrim ..> Metadata : 使用裁剪范围
-Logprob ..> Metadata : 使用恢复位置
+Plan ..> ReuseSpec : reuse_specs 字段引用
+Plan ..> RestoreSpec : prefix_last_restore 字段引用
+BatchTrim ..> Plan : 使用裁剪范围
+Logprob ..> Plan : 使用恢复位置
 Context ..> PrefixStore : 持有 store
 
 ' ==================== Backend 依赖 ====================
-TorchRef ..> Metadata : 读取执行计划
+TorchRef ..> Plan : 读取执行计划
 TorchRef ..> PrefixStore : 读写 KV
 
 ' ==================== 关键调用流程注释 ====================

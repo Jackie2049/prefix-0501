@@ -19,7 +19,7 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
         "responses": torch.tensor([[10, 11], [20, 21]]),
     }
     actor_config = {
-        "prefix_sharing": {"enabled": True, "min_prefix_len": 3},
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
         "megatron": {"use_remove_padding": True},
     }
     model_config = SimpleNamespace(
@@ -61,7 +61,7 @@ def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path
         "responses": torch.tensor([[10, 11], [20, 21]]),
     }
     actor_config = {
-        "prefix_sharing": {"enabled": True, "min_prefix_len": 3},
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
         "megatron": {"use_remove_padding": True},
     }
     model_config = SimpleNamespace(

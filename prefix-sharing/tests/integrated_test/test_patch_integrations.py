@@ -11,7 +11,6 @@ from prefix_sharing.integrations.patch_manager import PatchManager
 from prefix_sharing.integrations.verl_mcore import (
     VerlMCoreBatchAdapter,
     VerlMCoreIntegration,
-    prefix_sharing_config_from_verl,
     prefix_sharing_enabled,
 )
 
@@ -108,15 +107,13 @@ def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
     ]
 
 
-def test_prefix_sharing_config_from_verl_accepts_nested_actor_config():
-    config = prefix_sharing_config_from_verl(
+def test_prefix_sharing_config_from_raw_accepts_nested_config():
+    config = PrefixSharingConfig.from_raw(
         {
-            "prefix_sharing": {
-                "enable_prefix_sharing": True,
-                "min_prefix_len": 4,
-                "min_group_size": 3,
-                "boundary_strategy": "prefix_last_restore",
-            }
+            "enable_prefix_sharing": True,
+            "min_prefix_len": 4,
+            "min_group_size": 3,
+            "boundary_strategy": "prefix_last_restore",
         }
     )
 
@@ -125,16 +122,15 @@ def test_prefix_sharing_config_from_verl_accepts_nested_actor_config():
     assert config.min_group_size == 3
 
 
-def test_prefix_sharing_config_from_verl_accepts_legacy_enabled_key():
-    config = prefix_sharing_config_from_verl({"prefix_sharing": {"enabled": True}})
+def test_prefix_sharing_config_from_raw_rejects_legacy_enabled_key():
+    with pytest.raises(TypeError, match="enabled"):
+        PrefixSharingConfig.from_raw({"enabled": True})
 
-    assert config.enable_prefix_sharing is True
 
-
-def test_prefix_sharing_config_from_verl_accepts_env_enable(monkeypatch):
+def test_prefix_sharing_config_from_raw_accepts_env_enable(monkeypatch):
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", "1")
 
-    config = prefix_sharing_config_from_verl({})
+    config = PrefixSharingConfig.from_raw(None)
 
     assert config.enable_prefix_sharing is True
 

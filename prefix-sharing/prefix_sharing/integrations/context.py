@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
-from prefix_sharing.core.metadata import PrefixSharingPlan
+from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import PrefixKVStore
 
 
