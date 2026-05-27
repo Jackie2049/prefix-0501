@@ -4,6 +4,24 @@
 
 ---
 
+## 2026-05-27 15:59 重命名 prefix sharing micro-batch 构建入口
+
+### 背景
+
+用户指定将 Megatron actor micro-batch 构建入口重命名为 `build_prefix_sharing_micro_batch()`，去掉过泛的 `prepare` 和冗余的 actor / Megatron 语境。
+
+### 完成事项
+
+1. 将 integration 入口重命名为 `build_prefix_sharing_micro_batch()`。
+2. 同步更新 verl actor 依赖入口、公开导出和 optional 集成测试。
+3. 更新当前设计文档、架构 overview / PUML 与历史进展记录中的函数名。
+
+### 自测结果
+
+结果：`50 passed, 3 skipped`。skip 来自本地缺少 `torch_npu`、`verl`，以及 CUDA 不可用的 optional 测试。
+
+---
+
 ## 2026-05-27 11:37 删除 Megatron actor 专属 context 兼容包装
 
 ### 背景
@@ -120,7 +138,7 @@ PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache p
 
 1. 将 `PrefixSharingBatchMeta` 重命名为 `PrefixSharingPlan`。
 2. 将 runtime context 字段从 `meta` 改为 `prefix_sharing_plan`。
-3. 将 `prepare_megatron_actor_micro_batch()` 中 planner 输出变量改为 `prefix_sharing_plan`。
+3. 将 `build_prefix_sharing_micro_batch()` 中 planner 输出变量改为 `prefix_sharing_plan`。
 4. 更新 core、backend、integration、测试和当前设计文档中的类型与字段引用。
 
 ### 自测结果
@@ -305,7 +323,7 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
 
 1. 补齐 verl actor 主路径入口：
    - 在 `megatron_actor.py` 中新增极薄 import / helper 调用 / context manager。
-   - `prepare_megatron_actor_micro_batch()` 在 micro-batch 内生成 prefix_sharing_plan，按 attention mask 裁掉 reuser prefix。
+   - `build_prefix_sharing_micro_batch()` 在 micro-batch 内生成 prefix_sharing_plan，按 attention mask 裁掉 reuser prefix。
    - `megatron_actor_prefix_sharing_context()` 把 prefix_sharing_plan、cache、backend、原始 position_ids、restore slot 传给 Megatron attention。
    - `restore_megatron_actor_log_probs()` 从 provider prefix-last logits 恢复 reuser 第一个 suffix token logprob，保持 autograd 路径。
 

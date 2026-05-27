@@ -6,12 +6,12 @@ torch = pytest.importorskip("torch")
 
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_mcore import (
-    prepare_megatron_actor_micro_batch,
+    build_prefix_sharing_micro_batch,
     restore_megatron_actor_log_probs,
 )
 
 
-def test_prepare_megatron_actor_micro_batch_trims_reuser_mask_and_context_positions():
+def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_positions():
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
@@ -30,7 +30,7 @@ def test_prepare_megatron_actor_micro_batch_trims_reuser_mask_and_context_positi
         model_type="text_only_causal_lm",
     )
 
-    trimmed_micro_batch, prefix_sharing_runtime_state = prepare_megatron_actor_micro_batch(batch, actor_config, model_config)
+    trimmed_micro_batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
 
     assert prefix_sharing_runtime_state is not None
     assert prefix_sharing_runtime_state.prefix_sharing_plan.has_sharing
@@ -71,7 +71,7 @@ def test_restore_megatron_actor_log_probs_keeps_provider_autograd_path():
         fused_single_qkv_rope=False,
         model_type="text_only_causal_lm",
     )
-    _, prefix_sharing_runtime_state = prepare_megatron_actor_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
 
     def gather_fn(provider_logits, reuse_label):
         return torch.gather(

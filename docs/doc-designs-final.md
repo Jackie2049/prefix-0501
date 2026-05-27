@@ -828,7 +828,7 @@ hidden_states
 - `VerlMCorePrefixSharingBatch`
 - `PrefixSharingRuntimeState`
 - `PackedPackedPrefixLastRestoreSlot`
-- `prepare_megatron_actor_micro_batch()`
+- `build_prefix_sharing_micro_batch()`
 - `restore_megatron_actor_log_probs()`
 - `VerlMCoreIntegration`
 - `enable_prefix_sharing()`

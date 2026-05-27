@@ -191,7 +191,7 @@ def prefix_sharing_enabled(
         handle.disable()
 
 
-def prepare_megatron_actor_micro_batch(
+def build_prefix_sharing_micro_batch(
     batch: Any,
     actor_config: Any,
     model_config: Any,

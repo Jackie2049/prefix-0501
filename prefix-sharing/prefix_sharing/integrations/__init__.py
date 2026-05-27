@@ -14,7 +14,7 @@ from prefix_sharing.integrations.verl_mcore import (
     VerlMCorePrefixSharingBatch,
     enable_prefix_sharing,
     prefix_sharing_enabled,
-    prepare_megatron_actor_micro_batch,
+    build_prefix_sharing_micro_batch,
     restore_megatron_actor_log_probs,
 )
 
@@ -31,6 +31,6 @@ __all__ = [
     "enable_prefix_sharing",
     "prefix_sharing_runtime_context",
     "prefix_sharing_enabled",
-    "prepare_megatron_actor_micro_batch",
+    "build_prefix_sharing_micro_batch",
     "restore_megatron_actor_log_probs",
 ]

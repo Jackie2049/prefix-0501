@@ -61,12 +61,12 @@ from verl.workers.actor import BasePPOActor
 try:
     from prefix_sharing.integrations.context import prefix_sharing_runtime_context
     from prefix_sharing.integrations.verl_mcore import (
-        prepare_megatron_actor_micro_batch,
+        build_prefix_sharing_micro_batch,
         restore_megatron_actor_log_probs,
     )
 except ModuleNotFoundError:
     prefix_sharing_runtime_context = None
-    prepare_megatron_actor_micro_batch = None
+    build_prefix_sharing_micro_batch = None
     restore_megatron_actor_log_probs = None
 
 __all__ = ["MegatronPPOActor"]
@@ -583,14 +583,14 @@ class MegatronPPOActor(BasePPOActor):
             batch = batch.to(get_device_id())
             batch = batch.contiguous()
             prefix_sharing_runtime_state = None
-            if prepare_megatron_actor_micro_batch is not None:
-                batch, prefix_sharing_runtime_state = prepare_megatron_actor_micro_batch(
+            if build_prefix_sharing_micro_batch is not None:
+                batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(
                     batch,
                     self.config,
                     self.tf_config,
                 )
-                logger.warning(f"\n\n\nprepare_megatron_actor_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
-            else: logger.warning("\n\n\nprepare_megatron_actor_micro_batch is None\n\n\n")
+                logger.warning(f"\n\n\nbuild_prefix_sharing_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
+            else: logger.warning("\n\n\nbuild_prefix_sharing_micro_batch is None\n\n\n")
 
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
