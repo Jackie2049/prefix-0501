@@ -24,6 +24,31 @@ def test_enabled_config_accepts_phase_one_constraints():
     config.validate(ModelConfig())
 
 
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", "y"])
+def test_env_var_can_enable_prefix_sharing(monkeypatch, value):
+    monkeypatch.setenv("ENABLE_PREFIX_SHARING", value)
+
+    config = PrefixSharingConfig()
+
+    assert config.enable_prefix_sharing is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "n", ""])
+def test_env_var_false_values_do_not_enable_prefix_sharing(monkeypatch, value):
+    monkeypatch.setenv("ENABLE_PREFIX_SHARING", value)
+
+    config = PrefixSharingConfig()
+
+    assert config.enable_prefix_sharing is False
+
+
+def test_env_var_rejects_invalid_prefix_sharing_value(monkeypatch):
+    monkeypatch.setenv("ENABLE_PREFIX_SHARING", "maybe")
+
+    with pytest.raises(PrefixSharingConfigError, match="ENABLE_PREFIX_SHARING"):
+        PrefixSharingConfig()
+
+
 @pytest.mark.parametrize(
     "field,value,message",
     [

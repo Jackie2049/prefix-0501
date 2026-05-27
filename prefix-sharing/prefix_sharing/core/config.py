@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -16,6 +17,20 @@ def _read_config_value(config: Any, name: str, default: Any = None) -> Any:
     if isinstance(config, Mapping):
         return config.get(name, default)
     return getattr(config, name, default)
+
+
+def _env_enables_prefix_sharing() -> bool:
+    value = os.getenv("ENABLE_PREFIX_SHARING")
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n", ""}:
+        return False
+    raise PrefixSharingConfigError(
+        "ENABLE_PREFIX_SHARING must be one of: 1/0, true/false, yes/no, on/off"
+    )
 
 
 @dataclass(frozen=True)
@@ -42,6 +57,10 @@ class PrefixSharingConfig:
     validate_precision: bool = False
     integrate_mode: str = "verl_megatron_actor"
     model_type: str = "text_only_causal_lm"  # Model type identifier; phase 1 only supports text-only causal LM
+
+    def __post_init__(self) -> None:
+        if _env_enables_prefix_sharing() and not self.enable_prefix_sharing:
+            object.__setattr__(self, "enable_prefix_sharing", True)
 
     def validate(self, model_config: Any | None = None, integrate_mode: str | None = None) -> None:
         """Validate phase-1 constraints against a model/config object.

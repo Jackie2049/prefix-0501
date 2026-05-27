@@ -200,6 +200,7 @@ class PrefixSharingConfig:
 
 `validate()` 的职责：
 
+- `enable_prefix_sharing=True` 或环境变量 `ENABLE_PREFIX_SHARING=1/true/yes/on` 时启用 prefix sharing；环境变量只作为额外开启入口，不替代其他配置字段。
 - 校验配置字段合法性，例如 `min_prefix_len >= 1`、`min_group_size >= 2`。
 - 校验 `boundary_strategy` 当前只能是 `prefix_last_restore`。
 - 校验模型/并行/融合路径满足 Phase 1 边界。

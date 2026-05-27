@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-05-27 10:14 支持通过环境变量启用 prefix sharing
+
+### 背景
+
+用户要求除配置字段外，也能通过 `ENABLE_PREFIX_SHARING` 环境变量开启 prefix sharing。
+
+### 完成事项
+
+1. `PrefixSharingConfig` 构造时读取 `ENABLE_PREFIX_SHARING`。
+2. 支持 `1`、`true`、`yes`、`on`、`y` 作为开启值；支持 `0`、`false`、`no`、`off`、`n` 和空字符串作为未开启值。
+3. 非法环境变量值会抛出 `PrefixSharingConfigError`，避免拼写错误导致静默行为。
+4. 增加 unit / integration 测试，覆盖直接构造 config 和 verl 配置解析入口。
+5. 更新 `docs/doc-designs-final.md` 中的配置说明。
+
+### 自测结果
+
+本地执行：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache python3 -m pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
+```
+
+结果：`43 passed, 5 skipped`。skip 来自本地缺少 `torch`、`torch_npu`、`verl` 的 optional 测试。
+
+---
+
 ## 2026-05-27 10:08 重命名 PrefixSharingConfig 启用开关
 
 ### 背景

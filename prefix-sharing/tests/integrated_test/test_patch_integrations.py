@@ -131,6 +131,14 @@ def test_prefix_sharing_config_from_verl_accepts_legacy_enabled_key():
     assert config.enable_prefix_sharing is True
 
 
+def test_prefix_sharing_config_from_verl_accepts_env_enable(monkeypatch):
+    monkeypatch.setenv("ENABLE_PREFIX_SHARING", "1")
+
+    config = prefix_sharing_config_from_verl({})
+
+    assert config.enable_prefix_sharing is True
+
+
 def test_prefix_sharing_enabled_propagates_install_failure(monkeypatch):
     class FakeIntegration:
         def __init__(self, config, backend=None):
