@@ -25,7 +25,7 @@ Key Components:
       ``flattened``, and ``cu_seqlens``.
     - :func:`trim_batch`, :func:`trim_inputs`, :func:`trim_labels`,
       :func:`trim_loss_masks`: Row slicing helpers; the ``trim_*`` entry points
-      wire the correct plan field into :func:`trim_batch`.
+      wire the correct prefix_sharing_plan field into :func:`trim_batch`.
 
 Design Principles:
     - **Meta-driven only**: no layout heuristics here; all spans come from
@@ -79,13 +79,13 @@ def trim_batch(rows: Sequence[Sequence[T]], ranges: Sequence[tuple[int, int]]) -
     return TrimmedBatch(rows=trimmed_rows, flattened=flattened, cu_seqlens=cu_seqlens)
 
 
-def trim_inputs(input_ids: Sequence[Sequence[T]], plan: PrefixSharingPlan) -> TrimmedBatch[T]:
-    return trim_batch(input_ids, plan.input_keep_ranges)
+def trim_inputs(input_ids: Sequence[Sequence[T]], prefix_sharing_plan: PrefixSharingPlan) -> TrimmedBatch[T]:
+    return trim_batch(input_ids, prefix_sharing_plan.input_keep_ranges)
 
 
-def trim_labels(labels: Sequence[Sequence[T]], plan: PrefixSharingPlan) -> TrimmedBatch[T]:
-    return trim_batch(labels, plan.label_keep_ranges)
+def trim_labels(labels: Sequence[Sequence[T]], prefix_sharing_plan: PrefixSharingPlan) -> TrimmedBatch[T]:
+    return trim_batch(labels, prefix_sharing_plan.label_keep_ranges)
 
 
-def trim_loss_masks(loss_masks: Sequence[Sequence[T]], plan: PrefixSharingPlan) -> TrimmedBatch[T]:
-    return trim_batch(loss_masks, plan.loss_mask_keep_ranges)
+def trim_loss_masks(loss_masks: Sequence[Sequence[T]], prefix_sharing_plan: PrefixSharingPlan) -> TrimmedBatch[T]:
+    return trim_batch(loss_masks, prefix_sharing_plan.loss_mask_keep_ranges)

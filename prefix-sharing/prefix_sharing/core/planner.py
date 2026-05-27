@@ -44,8 +44,8 @@ Design Principles:
 Example:
     >>> from prefix_sharing.core.config import PrefixSharingConfig
     >>> planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
-    >>> plan = planner.plan([[1, 2, 3, 4], [1, 2, 3, 5]], forward_id=1, micro_batch_id=1)
-    >>> plan.has_sharing
+    >>> prefix_sharing_plan = planner.plan([[1, 2, 3, 4], [1, 2, 3, 5]], forward_id=1, micro_batch_id=1)
+    >>> prefix_sharing_plan.has_sharing
     True
 """
 

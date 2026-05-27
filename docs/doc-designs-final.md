@@ -448,7 +448,7 @@ result = detector.detect(input_ids)
 
 ```python
 planner = PrefixSharingPlanner(config)
-plan = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
+prefix_sharing_plan = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 ```
 
 输入：
@@ -507,9 +507,9 @@ plan = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 主要接口：
 
 ```python
-trimmed = trim_inputs(input_ids, plan)
-labels = trim_labels(labels, plan)
-loss_masks = trim_loss_masks(loss_masks, plan)
+trimmed = trim_inputs(input_ids, prefix_sharing_plan)
+labels = trim_labels(labels, prefix_sharing_plan)
+loss_masks = trim_loss_masks(loss_masks, prefix_sharing_plan)
 ```
 
 职责：
@@ -537,7 +537,7 @@ loss_masks = trim_loss_masks(loss_masks, plan)
 测试重点：
 
 - input / label / loss mask 裁剪区间一致。
-- packed 后长度等于 `sum(plan.kept_lengths_q)`。
+- packed 后长度等于 `sum(prefix_sharing_plan.kept_lengths_q)`。
 - 空 suffix、无 sharing、全 sharing 场景。
 
 ### 5.5 `core/prefix_store.py`
@@ -602,9 +602,9 @@ store.close()
 主要接口：
 
 ```python
-provider_logits = gather_provider_prefix_last_logits(logits_by_batch, plan)
+provider_logits = gather_provider_prefix_last_logits(logits_by_batch, prefix_sharing_plan)
 token_logprobs = compute_token_logprobs_from_logits(logits, labels)
-restored = restore_prefix_last_logprobs_tensor(suffix_logprobs, first_suffix_logprobs, plan)
+restored = restore_prefix_last_logprobs_tensor(suffix_logprobs, first_suffix_logprobs, prefix_sharing_plan)
 ```
 
 职责：
@@ -649,9 +649,9 @@ class PrefixAttentionBackend:
     capabilities: BackendCapabilities
 
     def validate(self, config, model_config=None) -> None: ...
-    def apply_rope(self, query, key, plan, **kwargs): ...
-    def build_kv(self, key, value, cache, plan, *, layer_id, tp_rank=0): ...
-    def attention(self, query, key, value, plan, **kwargs): ...
+    def apply_rope(self, query, key, prefix_sharing_plan, **kwargs): ...
+    def build_kv(self, key, value, cache, prefix_sharing_plan, *, layer_id, tp_rank=0): ...
+    def attention(self, query, key, value, prefix_sharing_plan, **kwargs): ...
 ```
 
 职责：
@@ -677,8 +677,8 @@ class PrefixAttentionBackend:
 主要接口：
 
 ```python
-expanded_key, expanded_value = backend.build_kv(key, value, cache, plan, layer_id=0)
-output = backend.attention(query, expanded_key, expanded_value, plan)
+expanded_key, expanded_value = backend.build_kv(key, value, cache, prefix_sharing_plan, layer_id=0)
+output = backend.attention(query, expanded_key, expanded_value, prefix_sharing_plan)
 ```
 
 职责：
@@ -732,7 +732,7 @@ output = backend.attention(query, expanded_key, expanded_value, plan)
 
 - 绑定当前 `PrefixSharingPlan`。
 - 绑定当前 `PrefixKVStore`。
-- 让 attention patch 在不改变大量函数签名的情况下读取当前 plan/store。
+- 让 attention patch 在不改变大量函数签名的情况下读取当前 prefix_sharing_plan/store。
 - 保证上下文退出后恢复旧状态。
 
 设计要求：
@@ -780,7 +780,7 @@ manager.disable_all()
 职责：
 
 - 在 QKV projection 后、Megatron 标准 RoPE 前接入 prefix sharing backend。
-- 从当前 runtime context 读取 `plan` 和 `cache`。
+- 从当前 runtime context 读取 `prefix_sharing_plan` 和 `cache`。
 - 按 verl micro-batch 传入的原始 `position_ids` 为压缩后的 packed THD query/key 重新选择 RoPE 频率，避免 reuser suffix 被错误当作 position 0 开始。
 - 调用 backend 的 `build_kv()`、`attention()` 和 Megatron 原始 output projection。
 - 在未启用 prefix sharing 或无共享关系时保持原路径行为。
@@ -791,8 +791,8 @@ manager.disable_all()
 hidden_states
   -> QKV projection
   -> positioned RoPE for kept tokens
-  -> backend.build_kv(key, value, cache, plan)
-  -> backend.attention(query, expanded_key, expanded_value, plan)
+  -> backend.build_kv(key, value, cache, prefix_sharing_plan)
+  -> backend.attention(query, expanded_key, expanded_value, prefix_sharing_plan)
   -> output projection
 ```
 
@@ -809,7 +809,7 @@ hidden_states
 
 职责：
 
-- 根据 `plan.q_position_offsets` 调整 query 的 position。
+- 根据 `prefix_sharing_plan.q_position_offsets` 调整 query 的 position。
 - 保持 key/value 的 logical position 从 0 开始。
 - 在 fused RoPE 启用时拒绝 Phase 1 路径。
 
@@ -837,7 +837,7 @@ hidden_states
 
 - 在 micro-batch preprocess 阶段生成 `PrefixSharingPlan`。
 - 调用 `batch_trim` 裁剪 input、labels、loss mask、response mask。
-- 进入 `prefix_sharing_context()`，让 Megatron attention patch 可读取 plan/cache。
+- 进入 `prefix_sharing_context()`，让 Megatron attention patch 可读取 prefix_sharing_plan/cache。
 - postprocess 阶段组装 logprob，执行 Prefix-Last Restore。
 - 保持 verl actor 原始 batch 顺序和返回格式。
 - 在 `dependency/verl_v070/verl/workers/actor/megatron_actor.py` 中仅保留最小使能入口：micro-batch 准备、forward context 和 logprob restore 调用。
@@ -848,7 +848,7 @@ hidden_states
 - 无可复用 relation 时输出应等价于 baseline。
 - 多 micro-batch 之间 cache 不得污染。
 - 报错信息应能定位是 preprocess、attention、restore 还是 patch 约束失败。
-- 当前实现状态：框架无关 adapter 与真实 verl actor helper 均已落地。启用 `config.prefix_sharing.enable_prefix_sharing=True` 且 `config.megatron.use_remove_padding=True` 时，micro-batch 会按 attention mask 生成 plan，reuser prefix 位会从 attention mask 中移除，packed THD 位置表和 Prefix-Last Restore dense slot 会进入 runtime context。fused actor kernel、multi-modal batch、非 THD 路径仍按 Phase 1 约束显式拒绝。
+- 当前实现状态：框架无关 adapter 与真实 verl actor helper 均已落地。启用 `config.prefix_sharing.enable_prefix_sharing=True` 且 `config.megatron.use_remove_padding=True` 时，micro-batch 会按 attention mask 生成 `prefix_sharing_plan`，reuser prefix 位会从 attention mask 中移除，packed THD 位置表和 Prefix-Last Restore dense slot 会进入 runtime context。fused actor kernel、multi-modal batch、非 THD 路径仍按 Phase 1 约束显式拒绝。
 
 ---
 
@@ -867,7 +867,7 @@ hidden_states
 5. reuser 样本裁剪 prefix，仅保留 suffix。
 6. 构造裁剪后的 packed input 和 `cu_seqlens_q`。
 7. 记录 logical expanded KV 长度和 `cu_seqlens_kv`。
-8. 把 plan/cache 写入当前 `prefix_sharing_context`。
+8. 把 prefix_sharing_plan/cache 写入当前 `prefix_sharing_context`。
 
 ### 6.2 Attention
 
@@ -983,7 +983,7 @@ with prefix_sharing_enabled(config):
 
 覆盖：
 
-- Phase 1 core pipeline：detect -> plan -> trim -> build metadata -> restore。
+- Phase 1 core pipeline：detect -> build prefix_sharing_plan -> trim -> restore。
 - 无 sharing 和有 sharing 的端到端语义。
 - 多 micro-batch cache 隔离。
 

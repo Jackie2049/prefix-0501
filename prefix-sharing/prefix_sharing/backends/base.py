@@ -28,7 +28,7 @@ class PrefixAttentionBackend(Protocol):
     def validate(self, config: PrefixSharingConfig, model_config: Any | None = None) -> None:
         ...
 
-    def apply_rope(self, query: Any, key: Any, plan: PrefixSharingPlan, **kwargs: Any) -> tuple[Any, Any]:
+    def apply_rope(self, query: Any, key: Any, prefix_sharing_plan: PrefixSharingPlan, **kwargs: Any) -> tuple[Any, Any]:
         ...
 
     def build_kv(
@@ -36,12 +36,12 @@ class PrefixAttentionBackend(Protocol):
         key: Any,
         value: Any,
         store: Any,
-        plan: PrefixSharingPlan,
+        prefix_sharing_plan: PrefixSharingPlan,
         *,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
         ...
 
-    def attention(self, query: Any, key: Any, value: Any, plan: PrefixSharingPlan, **kwargs: Any) -> Any:
+    def attention(self, query: Any, key: Any, value: Any, prefix_sharing_plan: PrefixSharingPlan, **kwargs: Any) -> Any:
         ...

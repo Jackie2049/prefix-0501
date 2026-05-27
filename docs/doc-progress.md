@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-05-27 10:32 统一 PrefixSharingPlan 产物变量命名
+
+### 背景
+
+用户指出 `PrefixSharingPlan` 对应产物继续命名为 `plan` 仍然过泛，影响阅读调用链时判断变量语义。
+
+### 完成事项
+
+1. 将 runtime context 字段统一为 `prefix_sharing_plan`。
+2. 将 prepared micro-batch / prepared batch 中的产物字段统一为 `prefix_sharing_plan`。
+3. 将 core、backend、integration 和测试中的函数参数、局部变量统一为 `prefix_sharing_plan`。
+4. 保留 `PrefixSharingPlanner.plan()` 方法名，作为生成计划的动作接口。
+5. 更新当前设计文档中的示例和 runtime 描述。
+
+### 自测结果
+
+本地执行：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache python3 -m pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
+```
+
+结果：`43 passed, 5 skipped`。skip 来自本地缺少 `torch`、`torch_npu`、`verl` 的 optional 测试。
+
+---
+
 ## 2026-05-27 10:27 重命名 PrefixSharingBatchMeta 为 PrefixSharingPlan
 
 ### 背景
@@ -13,7 +39,7 @@
 ### 完成事项
 
 1. 将 `PrefixSharingBatchMeta` 重命名为 `PrefixSharingPlan`。
-2. 将 runtime context 字段从 `meta` 改为 `plan`。
+2. 将 runtime context 字段从 `meta` 改为 `prefix_sharing_plan`。
 3. 将 `prepare_megatron_actor_micro_batch()` 中 planner 输出变量改为 `prefix_sharing_plan`。
 4. 更新 core、backend、integration、测试和当前设计文档中的类型与字段引用。
 
@@ -199,8 +225,8 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
 
 1. 补齐 verl actor 主路径入口：
    - 在 `megatron_actor.py` 中新增极薄 import / helper 调用 / context manager。
-   - `prepare_megatron_actor_micro_batch()` 在 micro-batch 内生成 prefix-sharing plan，按 attention mask 裁掉 reuser prefix。
-   - `megatron_actor_prefix_sharing_context()` 把 plan、cache、backend、原始 position_ids、restore slot 传给 Megatron attention。
+   - `prepare_megatron_actor_micro_batch()` 在 micro-batch 内生成 prefix_sharing_plan，按 attention mask 裁掉 reuser prefix。
+   - `megatron_actor_prefix_sharing_context()` 把 prefix_sharing_plan、cache、backend、原始 position_ids、restore slot 传给 Megatron attention。
    - `restore_megatron_actor_log_probs()` 从 provider prefix-last logits 恢复 reuser 第一个 suffix token logprob，保持 autograd 路径。
 
 2. 补齐 Megatron attention 真实 hook：

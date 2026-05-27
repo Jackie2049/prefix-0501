@@ -19,7 +19,7 @@ _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
 
 @dataclass
 class PrefixSharingRuntimeContext:
-    plan: PrefixSharingPlan
+    prefix_sharing_plan: PrefixSharingPlan
     store: PrefixKVStore
     backend: Any | None = None
     kept_position_ids: Any | None = None
@@ -32,14 +32,14 @@ def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
 
 @contextmanager
 def prefix_sharing_context(
-    plan: PrefixSharingPlan,
+    prefix_sharing_plan: PrefixSharingPlan,
     *,
     backend: Any | None = None,
     kept_position_ids: Any | None = None,
     restore_positions: list[Any] | None = None,
 ) -> Iterator[PrefixSharingRuntimeContext]:
     ctx = PrefixSharingRuntimeContext(
-        plan=plan,
+        prefix_sharing_plan=prefix_sharing_plan,
         store=PrefixKVStore(),
         backend=backend,
         kept_position_ids=kept_position_ids,
@@ -59,7 +59,7 @@ def optional_prefix_sharing_context(
     if prepared is None:
         return nullcontext(None)
     return prefix_sharing_context(
-        prepared.plan,
+        prepared.prefix_sharing_plan,
         backend=getattr(prepared, "backend", None),
         kept_position_ids=getattr(prepared, "kept_position_ids", None),
         restore_positions=getattr(prepared, "restore_positions", None),

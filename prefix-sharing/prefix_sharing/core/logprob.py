@@ -42,7 +42,7 @@ Key Components:
 
 Design Principles:
     - **Meta-driven only**: which rows restore and where to read/write come
-      solely from ``plan.prefix_last_restore``; no detection or trimming here.
+      solely from ``prefix_sharing_plan.prefix_last_restore``; no detection or trimming here.
     - **No detach**: restored values stay on the provider computation graph so
       gradients from multiple reusers accumulate into the shared prefix.
     - **Dual API surface**: list helpers for framework-agnostic tests;
@@ -65,7 +65,7 @@ T = TypeVar("T")
 def restore_prefix_last_logprobs(
     suffix_logprobs: Sequence[Sequence[float]],
     provider_prefix_last_logprobs: Sequence[float],
-    plan: PrefixSharingPlan,
+    prefix_sharing_plan: PrefixSharingPlan,
 ) -> list[list[float]]:
     """Assemble response logprobs with Prefix-Last Restore semantics.
 
@@ -75,13 +75,13 @@ def restore_prefix_last_logprobs(
     logprob that predicts the first suffix token.
     """
 
-    if len(suffix_logprobs) != plan.batch_size:
+    if len(suffix_logprobs) != prefix_sharing_plan.batch_size:
         raise ValueError("suffix_logprobs length must equal batch size")
-    if len(provider_prefix_last_logprobs) != plan.batch_size:
+    if len(provider_prefix_last_logprobs) != prefix_sharing_plan.batch_size:
         raise ValueError("provider_prefix_last_logprobs length must equal batch size")
 
     restored = [list(row) for row in suffix_logprobs]
-    for spec in plan.prefix_last_restore:
+    for spec in prefix_sharing_plan.prefix_last_restore:
         restored_value = provider_prefix_last_logprobs[spec.reuse_idx_in_batch]
         row = restored[spec.reuse_idx_in_batch]
         if spec.output_slot < 0 or spec.output_slot > len(row):
@@ -92,7 +92,7 @@ def restore_prefix_last_logprobs(
 
 def build_provider_prefix_last_values(
     provider_values_by_batch: Sequence[Sequence[T]],
-    plan: PrefixSharingPlan,
+    prefix_sharing_plan: PrefixSharingPlan,
 ) -> list[T | None]:
     """Gather provider prefix-last values for every reuse batch index.
 
@@ -100,8 +100,8 @@ def build_provider_prefix_last_values(
     perform the same indexing on tensors without changing the metadata contract.
     """
 
-    values: list[T | None] = [None] * plan.batch_size
-    for spec in plan.prefix_last_restore:
+    values: list[T | None] = [None] * prefix_sharing_plan.batch_size
+    for spec in prefix_sharing_plan.prefix_last_restore:
         provider_row = provider_values_by_batch[spec.provider_idx_in_batch]
         values[spec.reuse_idx_in_batch] = provider_row[spec.provider_prefix_last_pos]
     return values
@@ -126,7 +126,7 @@ def compute_token_logprobs_from_logits(logits: Any, labels: Any) -> Any:
 def restore_prefix_last_logprobs_tensor(
     suffix_logprobs: Any,
     first_suffix_logprobs: Any,
-    plan: PrefixSharingPlan,
+    prefix_sharing_plan: PrefixSharingPlan,
 ) -> Any:
     """Insert Prefix-Last Restore logprobs into a padded response tensor.
 
@@ -136,7 +136,7 @@ def restore_prefix_last_logprobs_tensor(
         first_suffix_logprobs: Tensor shaped ``[batch]``. For each reuse sample,
             this is computed from provider prefix-last logits and that reuse
             sample's first suffix label.
-        plan: Prefix-sharing metadata.
+        prefix_sharing_plan: Prefix sharing execution plan.
 
     Returns:
         Tensor shaped ``[batch, max_restored_response]``. Rows are padded with
@@ -148,16 +148,16 @@ def restore_prefix_last_logprobs_tensor(
         import torch
     except ModuleNotFoundError as exc:
         raise RuntimeError("restore_prefix_last_logprobs_tensor requires PyTorch") from exc
-    if suffix_logprobs.shape[0] != plan.batch_size:
+    if suffix_logprobs.shape[0] != prefix_sharing_plan.batch_size:
         raise ValueError("suffix_logprobs batch dimension must match metadata")
-    if first_suffix_logprobs.shape[0] != plan.batch_size:
+    if first_suffix_logprobs.shape[0] != prefix_sharing_plan.batch_size:
         raise ValueError("first_suffix_logprobs batch dimension must match metadata")
 
     restored_lengths = []
     rows = []
-    restore_by_batch = {spec.reuse_idx_in_batch: spec for spec in plan.prefix_last_restore}
-    for batch_index in range(plan.batch_size):
-        logical_len = plan.kept_lengths_q[batch_index]
+    restore_by_batch = {spec.reuse_idx_in_batch: spec for spec in prefix_sharing_plan.prefix_last_restore}
+    for batch_index in range(prefix_sharing_plan.batch_size):
+        logical_len = prefix_sharing_plan.kept_lengths_q[batch_index]
         row = suffix_logprobs[batch_index, :logical_len]
         if batch_index in restore_by_batch:
             row = torch.cat([first_suffix_logprobs[batch_index : batch_index + 1], row], dim=0)
@@ -165,13 +165,13 @@ def restore_prefix_last_logprobs_tensor(
         restored_lengths.append(row.shape[0])
 
     max_len = max(restored_lengths, default=0)
-    out = suffix_logprobs.new_zeros((plan.batch_size, max_len))
+    out = suffix_logprobs.new_zeros((prefix_sharing_plan.batch_size, max_len))
     for batch_index, row in enumerate(rows):
         out[batch_index, : row.shape[0]] = row
     return out
 
 
-def gather_provider_prefix_last_logits(logits_by_batch: Any, plan: PrefixSharingPlan) -> Any:
+def gather_provider_prefix_last_logits(logits_by_batch: Any, prefix_sharing_plan: PrefixSharingPlan) -> Any:
     """Gather provider prefix-last logits for each reuse sample.
 
     ``logits_by_batch`` is expected to be a padded tensor shaped
@@ -184,8 +184,8 @@ def gather_provider_prefix_last_logits(logits_by_batch: Any, plan: PrefixSharing
         import torch
     except ModuleNotFoundError as exc:
         raise RuntimeError("gather_provider_prefix_last_logits requires PyTorch") from exc
-    out = logits_by_batch.new_zeros((plan.batch_size, logits_by_batch.shape[-1]))
-    for spec in plan.prefix_last_restore:
+    out = logits_by_batch.new_zeros((prefix_sharing_plan.batch_size, logits_by_batch.shape[-1]))
+    for spec in prefix_sharing_plan.prefix_last_restore:
         out[spec.reuse_idx_in_batch] = logits_by_batch[
             spec.provider_idx_in_batch,
             spec.provider_prefix_last_pos,

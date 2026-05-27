@@ -62,7 +62,7 @@ def maybe_run_prefix_sharing_attention(
         key,
         value,
         ctx.store,
-        ctx.plan,
+        ctx.prefix_sharing_plan,
         layer_id=layer_id,
         tp_rank=tp_rank,
     )
@@ -70,7 +70,7 @@ def maybe_run_prefix_sharing_attention(
         query,
         expanded_key,
         expanded_value,
-        ctx.plan,
+        ctx.prefix_sharing_plan,
         attention_mask=attention_mask,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
