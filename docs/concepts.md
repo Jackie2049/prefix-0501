@@ -121,6 +121,37 @@
 
 ---
 
+### PrefixSharingRuntimeState（前缀共享运行时状态）
+
+**定义**：连接框架层（verl）与算子层（Megatron attention）的运行时状态载体，封装 prefix-sharing 执行所需的全部元数据。
+
+**说明**：
+- 由 `build_prefix_sharing_micro_batch()` 在 forward 前构建，携带 micro-batch 的前缀分析结果
+- 包含四个核心字段：
+  - `prefix_sharing_plan`: 前缀共享计划（哪些序列共享、保留范围、恢复点映射）
+  - `backend`: 后端执行引擎（如 `TorchReferenceBackend`），负责 KV 缓存的存储与检索
+  - `kept_position_ids`: 裁剪后保留的 position ids，用于 THD 格式下的位置对齐
+  - `prefix_last_restore_slots`: 需要从 provider 复制到 reuser 的 KV 位置映射（1D 展开后）
+- 通过 `prefix_sharing_runtime_context` context manager 注入执行上下文，使 attention 层无需修改函数签名即可获取状态
+- 采用 `contextvars` 机制实现跨层隐式传递，避免在 verl actor 和 Megatron attention 之间显式传递参数
+
+**生命周期**：
+1. **构建阶段**（verl actor）：分析 micro-batch 内序列的共同前缀，裁剪 batch，生成 runtime state
+2. **传递阶段**（context manager）：通过 `with prefix_sharing_runtime_context(state)` 将状态绑定到当前执行上下文
+3. **消费阶段**（Megatron attention）：`maybe_run_prefix_sharing_attention()` 从 context 读取 plan，执行 KV 缓存注入和恢复
+
+**设计目的**：
+- 解决框架层与算子层之间缺乏直接参数传递通道的问题
+- 确保 KV 缓存的读写位置与原始序列位置在 THD（packed）格式下精确对齐
+- 保持计算图完整性（`kept_position_ids` 和 `prefix_last_restore_slots` 中的位置信息）
+
+**相关代码**：
+- `PrefixSharingRuntimeState` 数据类定义：`prefix_sharing/integrations/verl_mcore.py:52-56`
+- 构建逻辑：`build_prefix_sharing_micro_batch()` in `prefix_sharing/integrations/verl_mcore.py:194-340`
+- 上下文管理器：`prefix_sharing_runtime_context()` in `prefix_sharing/integrations/context.py:34-53`
+
+---
+
 ## 实现相关术语
 
 ### Trie（前缀树）
@@ -145,6 +176,7 @@
 | 复用关系 | `PrefixReuseSpec` | `reuse_specs` | - |
 | 前缀组 | `PrefixGroup` | `groups`, `member_indices` | - |
 | 前缀长度 | `prefix_len` | `prefix_lens` | - |
+| 前缀共享运行时状态 | `PrefixSharingRuntimeState` | `prefix_sharing_plan`, `backend`, `kept_position_ids`, `prefix_last_restore_slots` | - |
 
 ### 文档命名
 
@@ -166,6 +198,7 @@
 | KV Cache Reuse | KV 缓存复用 | 复用已计算的 KV |
 | Token Sequence | Token 序列 | 整数序列 |
 | Batch | 批次 | 一次处理的多个序列 |
+| PrefixSharingRuntimeState | 前缀共享运行时状态 | 连接框架层与算子层的状态载体 |
 
 ---
 

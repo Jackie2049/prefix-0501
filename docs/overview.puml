@@ -8,6 +8,8 @@ package "dependency/ (外部框架 - 侵入式修改)" as DependencyLayer #E3F2F
     ' ---- verl_v070 ----
     package "verl_v070/" as VerlPkg #BBDEFB {
         class "MegatronPPOActor" as MegatronPPOActor #90CAF9 {
+            verl Megatron Actor
+            PPO训练Actor，集成prefix sharing的micro-batch处理逻辑
             +forward_step()
             .. 负责单次 micro-batch 前向传播，调用 prefix sharing 准备和恢复 ..
             __关键修改 (所在函数)__
@@ -27,6 +29,8 @@ package "dependency/ (外部框架 - 侵入式修改)" as DependencyLayer #E3F2F
     ' ---- megatron_v0150 ----
     package "megatron_v0150/" as MegatronPkg #C8E6C9 {
         class "SelfAttention" as SelfAttention #A5D6A7 {
+            Megatron SelfAttention
+            自注意力层，被patch以支持prefix sharing hook拦截
             +forward()
             .. 自注意力前向传播，QKV 计算后插入 prefix sharing hook ..
             __关键修改 (所在函数)__
@@ -44,23 +48,21 @@ package "dependency/ (外部框架 - 侵入式修改)" as DependencyLayer #E3F2F
 package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FFF3E0 {
     
     class "verl_mcore.py" as VerlMcore #FFCC80 {
-        +VerlMCoreBatchAdapter
-        .. 框架轻量适配器，将 verl micro-batch 转为 prefix-sharing metadata 和裁剪后的 inputs/labels/masks ..
-        +VerlMCoreIntegration
-        .. 安装 Megatron attention patch 的集成入口 ..
+        verl+mcore集成入口
+        提供batch准备、logprob恢复、patch安装等集成函数
         +build_prefix_sharing_micro_batch()
-        .. 前缀检测入口：配置验证 → 执行前缀复用计划（plan） → batch 裁剪 → 构建 PrefixSharingRuntimeState ..
+        .. 前缀检测入口：配置验证 → 执行前缀复用计划 → batch 裁剪 → 构建 PrefixSharingRuntimeState ..
         +restore_suffix_first_log_probs_from_prefix()
         .. 恢复 reuser 的 suffix-first logprob，从 context 读取 restore_slots 并重新计算 ..
-        +PrefixSharingConfig.from_raw(actor_config.prefix_sharing_config)
-        .. 从 verl actor 配置读取 prefix_sharing_config，语义解析和环境变量覆盖统一交给 PrefixSharingConfig ..
         +enable_prefix_sharing()
-        .. 启用 prefix sharing 集成入口 ..
+        .. 启用 prefix sharing：安装 Megatron attention patch ..
         +prefix_sharing_enabled()
         .. 上下文管理器包装 enable_prefix_sharing ..
     }
     
     class "verl_mcore.py\nPrefixSharingRuntimeState" as RuntimeState #FFCC80 {
+        运行时状态容器
+        封装执行计划、backend实例、位置编码等运行时数据
         +prefix_sharing_plan: PrefixSharingPlan
         .. 执行计划，包含 reuse_specs、裁剪范围、restore slots 等 ..
         +backend: Any
@@ -72,20 +74,17 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
     }
     
     class "context.py\nPackedPrefixLastRestoreIndex" as PackedRestoreIndex #FFCC80 {
+        Packed恢复索引
+        在packed THD格式中定位prefix-last恢复位置
         +reuse_idx_in_batch: int
         +provider_idx_in_batch: int
         +provider_1d_pos: int
         +reuse_1d_pos: int
     }
     
-    class "verl_mcore.py\nVerlMCorePrefixSharingBatch" as VerlBatch #FFCC80 {
-        +prefix_sharing_plan: PrefixSharingPlan
-        +input_ids: TrimmedBatch[int]
-        +labels: TrimmedBatch[Any] | None
-        +loss_masks: TrimmedBatch[Any] | None
-    }
-    
     class "megatron_runtime.py" as MegatronRuntime #FFCC80 {
+        Megatron运行时Hook
+        拦截SelfAttention执行，完成RoPE、KV注入、Attention计算
         +maybe_run_prefix_sharing_attention()
         .. Attention 拦截执行核心：检查 context → 应用 RoPE → build_kv → attention → 返回结果 ..
         +_apply_positioned_rope()
@@ -93,6 +92,8 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
     }
     
     class "context.py" as Context #FFCC80 {
+        运行时上下文管理器
+        提供上下文管理器管理RuntimeContext生命周期
         +PrefixSharingRuntimeContext()
         .. 运行时上下文数据类，存储执行计划、KV Store、backend、位置编码和 restore slots ..
         +prefix_sharing_runtime_context()
@@ -100,26 +101,14 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
         +current_prefix_sharing_context()
         .. 获取当前线程的 prefix sharing 上下文，供 Megatron attention hook 使用 ..
     }
-    
-    class "megatron_attention.py" as MegatronAttentionInt #FFCC80 {
-        +MegatronAttentionIntegration()
-        .. Megatron attention 集成入口，封装 patch 安装 ..
-        +install()
-        .. 校验配置并返回 PatchHandle，用于安装 attention hook ..
-    }
-    
-    class "patch_manager.py" as PatchManager #FFCC80 {
-        +PatchHandle
-        .. 可回滚的 patch 句柄，支持 disable() 恢复原始属性 ..
-        +PatchManager
-        .. 安装属性 patch，若任一步骤失败则回滚 ..
-    }
 }
 
 ' ==================== Core 层 ====================
 package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     
     class "config.py\nPrefixSharingConfig" as Config #CE93D8 {
+        配置管理器
+        管理所有prefix sharing相关配置参数及验证
         +enable_prefix_sharing: bool
         +detector: str = "trie"
         +backend: str = "torch_ref"
@@ -138,6 +127,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "prefix_detector.py\nPrefixDetector (ABC)" as Detector #CE93D8 {
+        前缀检测器抽象基类
+        定义检测可共享前缀的标准接口
         +{abstract} detect()
         .. 前缀检测抽象接口，输入 batch token IDs，输出 PrefixDetectionResult ..
     }
@@ -148,6 +139,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "prefix_detector.py\nPrefixDetectionResult" as DetectionResult #CE93D8 {
+        前缀检测结果
+        包含batch中所有样本的复用关系和分组信息
         +batch_size: int
         +reuse_specs: tuple[PrefixReuseSpec, ...]
         +groups: tuple[PrefixGroup, ...]
@@ -158,6 +151,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "prefix_detector.py\nPrefixGroup" as PrefixGroup #CE93D8 {
+        前缀共享组
+        共享相同前缀的一组样本及其元信息
         +group_id: int
         +member_indices: tuple[int, ...]
         +prefix_len: int
@@ -165,6 +160,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "planner.py\nPrefixSharingPlanner" as Planner #CE93D8 {
+        规划器
+        调用检测器检测可共享前缀，然后制定复用计划
         +config: PrefixSharingConfig
         +detector: TriePrefixDetector | None
         +plan()
@@ -174,6 +171,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "planner.py\nPrefixLastRestoreSpec" as RestoreSpec #CE93D8 {
+        Prefix-Last恢复规范
+        描述如何从provider恢复reuser的prefix-last位置logprob
         +reuse_idx_in_batch: int
         +provider_idx_in_batch: int
         +provider_prefix_last_pos: int
@@ -183,6 +182,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "planner.py\nPrefixSharingPlan" as Plan #CE93D8 {
+        前缀共享执行计划
+        描述如何裁剪batch、复用KV、恢复logprob的完整方案
         +forward_id: int
         +micro_batch_id: int
         +batch_size: int
@@ -213,21 +214,24 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "prefix_detector.py\nPrefixReuseSpec" as ReuseSpec #CE93D8 {
+        前缀复用规范
+        描述reuser样本与provider的复用关系及prefix长度
         +reuse_idx_in_batch: int
         +provider_idx_in_batch: int
         +prefix_len: int
     }
     
-    Plan ..> ReuseSpec : reuse_specs 引用
-    Plan ..> RestoreSpec : prefix_last_restore 引用
-    
     class "batch_trim.py\nTrimmedBatch" as TrimmedBatch #CE93D8 {
+        裁剪后的batch
+        保留suffix后的压缩batch结构
         +rows: list[list[T]]
         +flattened: list[T]
         +cu_seqlens: list[int]
     }
     
     class "batch_trim.py" as BatchTrim #CE93D8 {
+        Batch裁剪模块
+        根据执行计划裁剪batch，仅保留suffix部分
         +trim_batch()
         .. 通用裁剪函数，返回 TrimmedBatch ..
         +trim_inputs()
@@ -239,6 +243,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "logprob.py" as Logprob #CE93D8 {
+        Logprob恢复模块
+        从provider恢复reuser的prefix-last位置logprob值
         +restore_prefix_last_logprobs()
         .. 组装包含 prefix-last 恢复语义的 response logprobs ..
         +build_provider_prefix_last_values()
@@ -252,6 +258,8 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "prefix_store.py\nPrefixKVSlotId" as KVSlotId #CE93D8 {
+        KV存储槽位标识
+        唯一定位某层某样本的prefix KV缓存位置
         +forward_id: int
         +micro_batch_id: int
         +layer_id: int
@@ -260,12 +268,16 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
     }
     
     class "prefix_store.py\nStoredPrefixKV" as StoredKV #CE93D8 {
+        存储的Prefix KV
+        包含key/value张量及prefix长度的存储单元
         +key_tensor: Any
         +value_tensor: Any
         +prefix_len: int
     }
     
     class "prefix_store.py\nPrefixKVStore" as PrefixStore #CE93D8 {
+        KV存储管理器
+        管理provider的prefix KV写入和reuser的读取
         +store()
         .. 写入 provider 的 prefix KV，按复合 key 索引 ..
         +load()
@@ -280,19 +292,9 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
 ' ==================== Backends 层 ====================
 package "prefix-sharing/backends/ (硬件执行层)" as BackendsLayer #E8F5E9 {
     
-    class "base.py\nBackendCapabilities" as Capabilities #A5D6A7 {
-        +name: str
-        +supports_cpu: bool
-        +supports_cuda: bool
-        +supports_cann: bool
-        +supports_different_q_kv_lengths: bool
-        +supports_prefix_last_restore: bool
-        +supports_fused_rope: bool
-        +supports_context_parallel: bool
-        +supports_pipeline_parallel: bool
-    }
-    
     class "base.py\nPrefixAttentionBackend (Protocol)" as BackendProtocol #A5D6A7 {
+        Attention Backend协议
+        定义backend必须实现的RoPE、KV构建、Attention接口
         +capabilities: BackendCapabilities
         +validate()
         +apply_rope()
@@ -301,6 +303,8 @@ package "prefix-sharing/backends/ (硬件执行层)" as BackendsLayer #E8F5E9 {
     }
     
     class "torch_ref.py\nTorchReferenceBackend" as TorchRef #A5D6A7 {
+        PyTorch参考Backend
+        用原生PyTorch实现attention计算，保留autograd
         +capabilities: BackendCapabilities
         +validate()
         .. 校验 backend 与 PrefixSharingConfig 兼容性 ..
@@ -313,10 +317,14 @@ package "prefix-sharing/backends/ (硬件执行层)" as BackendsLayer #E8F5E9 {
     }
     
     class "cuda_ref.py\nCudaReferenceBackend" as CudaRef #A5D6A7 {
+        CUDA参考Backend
+        继承TorchReferenceBackend，Phase 1占位符
         .. 继承 TorchReferenceBackend，Phase 1 占位 ..
     }
-    
+
     class "cann_ref.py\nCannReferenceBackend" as CannRef #A5D6A7 {
+        CANN参考Backend
+        继承TorchReferenceBackend，Phase 1占位符
         .. 继承 TorchReferenceBackend，Phase 1 占位 ..
     }
 }
@@ -335,30 +343,32 @@ SelfAttention ..> MegatronRuntime : 调用 maybe_run_prefix_sharing_attention()
 ' ==================== Integration 内部依赖 ====================
 VerlMcore ..> RuntimeState : 创建运行时状态
 Context ..> RuntimeState : 使用构造 PrefixSharingRuntimeContext
-VerlMcore ..> PatchManager : 安装 attention patch
+RuntimeState *-- Plan : 持有执行计划
 
 ' ==================== Integration -> Core 调用 ====================
 VerlMcore ..> Config : 读取/解析配置
 VerlMcore ..> Planner : 生成执行计划
 VerlMcore ..> Plan : 创建 PrefixSharingPlan
-RuntimeState ..> Plan : 持有 plan
 VerlMcore ..> BatchTrim : 裁剪 batch
 VerlMcore ..> Logprob : 恢复 logprob
 MegatronRuntime ..> Context : 获取 KV Store 和 Plan
 MegatronRuntime ..> TorchRef : 执行 build_kv 和 attention
 
 ' ==================== Core 内部依赖 ====================
-Planner ..> TrieDetector : 调用 detect
+Planner *-- TrieDetector : 持有 detector
 Planner ..> DetectionResult : plan_from_detection 输入
 TrieDetector ..> DetectionResult : detect() 输出
+DetectionResult *-- PrefixGroup : groups 字段
 TrieDetector ..> ReuseSpec : 输出 reuse_specs
 Planner ..> Plan : 生成 PrefixSharingPlan
-Planner ..> RestoreSpec : prefix_last_restore 字段
-Plan ..> ReuseSpec : reuse_specs 字段引用
-Plan ..> RestoreSpec : prefix_last_restore 字段引用
+Plan *-- ReuseSpec : reuse_specs
+Plan *-- RestoreSpec : prefix_last_restore
 BatchTrim ..> Plan : 使用裁剪范围
+BatchTrim ..> TrimmedBatch : 返回裁剪结果
 Logprob ..> Plan : 使用恢复位置
-Context ..> PrefixStore : 持有 store
+Context *-- PrefixStore : 持有 store
+PrefixStore *-- StoredKV : entries 存储
+PrefixStore ..> KVSlotId : 作为 key 使用
 
 ' ==================== Backend 依赖 ====================
 TorchRef ..> Plan : 读取执行计划

@@ -11,7 +11,7 @@
 
 ```
 prefix-0501/
-├── docs/             # 项目文档（概念、设计、进展等）
+├── docs/             # 项目文档（概念、架构、历史归档等）
 ├── survey/           # 调研与 PoC（只读参考）
 ├── dependency/       # verl / Megatron 依赖快照（必要时少量改动，优先插件化接入）
 └── prefix-sharing/   # 正式开发目录
@@ -24,51 +24,53 @@ prefix-0501/
 | 目录 | 默认行为 | 说明与约束 |
 |------|----------|------------|
 | `prefix-sharing/` | **可改** | 所有功能开发、测试必须落在 `prefix-sharing/prefix_sharing/`（`core/` → `backends/` → `integrations/` 分层，不要把 core 逻辑写进 integration 层） |
-| `docs/` | **可改** | 仓库级项目文档（设计、进展、术语等）；撰写与管理规范见下文「文档管理规定」 |
+| `docs/` | **可改** | 仓库级项目文档（概念、架构、历史归档等）；撰写与管理规范见下文「文档入口」 |
 | `dependency/` | **谨慎改动** | `verl_v070`、`megatron_v0150` 快照；允许少量必要改动，但**优先**通过 `prefix-sharing` 插件化接入（patch / helper / context）；verl / Megatron 内只保留特性使能入口（import、helper 调用、context manager），**不在其中沉淀核心逻辑** |
 | `survey/` | **只读** | `PrefixTrain_dev`、`flash-preference`、`dpo-prefix-sharing` 等重要参考；默认只读，除非用户明确要求；**不可**把 PoC 的侵入式 Megatron 魔改直接照搬 |
 | 仓库根目录 | **按需** | 维护顶层说明（如本文件）、`.gitignore` 等基础设施 |
 
 ---
 
-## 3. 文档管理规定
+## 3. 文档入口
 
 项目文档统一放在仓库根目录 `docs/`，由 **`prefix-0501` 仓库**维护，不属于 `prefix-sharing/` 模块职责。
 
 | 文件 | 用途 |
 |------|------|
-| `docs/doc-progress.md` | 记录所有工作进展 |
-| `docs/doc-design-history.md` | 记录历史方案设计、阶段性分析、被推翻方案和备选方案 |
-| `docs/doc-designs-final.md` | 记录当前最终方案，作为后续开发依据 |
-| `docs/doc-glossary.md` | 全局术语表 |
+| `docs/concepts.md` | 当前概念、术语、核心语义和设计约定；用于语义争议或命名分歧时对齐 |
+| `docs/overview.md` | 当前项目架构、模块关系和主要数据流 |
+| `docs/overview.puml` | 当前架构图（PlantUML） |
+| `docs/legacy/` | 历史 `doc-*` 文档归档；只作背景参考，不作为当前实现规范 |
 
-撰写规范：
+文档维护原则：
 
-- 所有文档均严格按**时间倒序**排列（最新在前）
-- 每次记录的抬头格式：`yyyy-mm-dd hh:mm <title>`
-- 关键设计决策若来自参考代码分析，需回源码验证是否在主流程中被调用
+- 后续开发**不要求**每次记录工作进展日志。
+- 概念、术语、语义约定变化时，按需更新 `docs/concepts.md`。
+- 架构、模块边界、数据流变化时，按需更新 `docs/overview.md` 和 `docs/overview.puml`。
+- `docs/legacy/` 默认只读，除非用户明确要求整理历史材料。
+- 关键设计决策若来自参考代码分析，需回源码验证是否在主流程中被调用。
 
 遇到不同任务，先读对应文档：
 
-| 任务 | 阅读顺序 |
+| 任务 | 阅读建议 |
 |------|----------|
-| 写代码 / 修 bug | `docs/doc-designs-final.md` → `prefix-sharing/AGENTS.md` |
-| 理解历史方案 | `docs/doc-design-history.md` |
-| 记录工作进展 | `docs/doc-progress.md` |
-| 查术语 | `docs/doc-glossary.md` |
-| 了解模块分层 | `prefix-sharing/prefix_sharing/` 下 `core/`、`backends/`、`integrations/` |
+| 写代码 / 修 bug | 先读 `prefix-sharing/AGENTS.md` 和相关代码；涉及语义、术语、分层争议时再查 `docs/concepts.md` |
+| 理解架构 / 模块关系 | `docs/overview.md` / `docs/overview.puml` |
+| 查概念 / 术语 | `docs/concepts.md` |
+| 理解历史方案 | `docs/legacy/` |
+| 了解模块分层 | `prefix-sharing/prefix_sharing/` 下 `core/`、`backends/`、`integrations/`，并参考 `docs/overview.md` |
 
 ---
 
 ## 4. 不可违反的技术原则
 
-以下原则在整个仓库内全局有效，细节见 `prefix-sharing/AGENTS.md` 和 `docs/doc-designs-final.md`：
+以下原则在整个仓库内全局有效，细节见 `prefix-sharing/AGENTS.md` 和 `docs/concepts.md`：
 
-1. **正确性优先于性能**
-2. 精度方案：**One-Forward + KV Injection + Prefix-Last Restore**
-3. 缓存 prefix KV 时**绝不 detach**，必须保留 autograd 计算图
-4. 分层：`core/`（框架无关语义）→ `backends/`（硬件执行）→ `integrations/`（verl/Megatron 薄适配）
-5. **TDD**：先写表达目标行为的失败测试，再实现；修 bug 先写复现测试
+1. **TDD 优先** —— 代码开发前优先设计测试用例，并先写能表达目标行为的测试代码，再实现功能或修复问题。该原则不是机械绝对：纯重构、小幅命名调整、文档整理等低风险改动不强制额外补测试，但必须维护较高测试覆盖率，不能让关键语义缺少保护。
+2. **精度一致性大于性能** —— prefix sharing 的红线是 logprob / loss / 梯度语义与 baseline 一致。所有设计必须先回答是否影响精度、如何保证精度一致，再考虑性能收益；last token restore、prefix KV 不 detach 等问题都属于精度红线。
+3. 精度方案：**One-Forward + KV Injection + Prefix-Last Restore**。
+4. **KV 缓存绝不 `detach()`** —— 缓存 prefix KV 时必须保留完整 autograd 计算图，禁止切断梯度。
+5. **分层清晰** —— `core/`（框架无关语义）→ `backends/`（硬件执行）→ `integrations/`（verl/Megatron 薄适配）。优先通过 `prefix-sharing` 插件化接入，严格控制对 `dependency/verl_v070`、`dependency/megatron_v0150` 的侵入式修改；verl / Megatron 内只保留必要入口，不沉淀 core 逻辑。
 
 ---
 
@@ -76,17 +78,18 @@ prefix-0501/
 
 ### 新增 core 能力
 
-1. 读 `docs/doc-designs-final.md` 确认是否在 Phase 范围内
-2. 在 `prefix-sharing/tests/` 写失败测试
-3. 改 `prefix-sharing/prefix_sharing/core/`
-4. 跑测试（见下文命令）
+1. 先读 `prefix-sharing/AGENTS.md` 和相关 core 代码。
+2. 涉及概念、术语、语义边界时，查 `docs/concepts.md`。
+3. 优先在 `prefix-sharing/tests/` 写失败测试，用测试表达目标行为和精度边界。
+4. 改 `prefix-sharing/prefix_sharing/core/`。
+5. 跑测试（见下文命令）。
 
 ### 接入 verl / Megatron
 
 1. **首选**：在 `prefix-sharing/prefix_sharing/integrations/` 实现 patch / helper / context，插件化接入
 2. 到 `dependency/` 查调用点，确认最小必要的使能入口
 3. 若必须在 verl / Megatron 内改动，只做**最小、可追踪**的修改，不在其中沉淀 prefix-sharing 核心逻辑
-4. 集成测试放 `prefix-sharing/tests/integrated_test/`
+4. 先设计集成行为和精度风险，再在 `prefix-sharing/tests/integrated_test/` 补充必要测试
 
 ### 分析 survey / dependency 代码
 
@@ -97,9 +100,10 @@ prefix-0501/
 
 ### 改文档
 
-1. 设计变更：更新 `docs/doc-designs-final.md` 或 `docs/doc-design-history.md`
-2. 每次完成的工作：在 `docs/doc-progress.md` 顶部追加记录
-3. 路径 / 结构变更：同步更新本文件和 `prefix-sharing/AGENTS.md`
+1. 概念 / 术语 / 语义约定变更：更新 `docs/concepts.md`。
+2. 架构 / 模块关系 / 数据流变更：更新 `docs/overview.md` 和 `docs/overview.puml`。
+3. 路径 / 结构变更：同步更新本文件和 `prefix-sharing/AGENTS.md`。
+4. 历史归档 `docs/legacy/` 默认不改，除非用户明确要求。
 
 ---
 
@@ -122,12 +126,12 @@ PYTHONPATH=prefix-sharing pytest -q \
 
 ## 7. Git 提交规范
 
-- 每一次修改（文档或代码），在修改完结后必须 commit 提交
-- 每次 commit 完成后必须 push 到远程仓库
+- 修改完成后，默认等待用户明确要求提交；用户要求“提交”时再执行 commit。
+- 用户要求提交时，必须先运行与改动范围匹配的必要测试并确认通过；仅知识整理类文档修改可例外，但必须在回复中明确说明未运行测试的原因。
+- commit 完成后按用户要求或仓库协作约定尝试 push；若网络或权限策略阻止 push，需报告本地分支 ahead 状态。
 - 如果修改未完成或只做了一半，**不要 commit**
 - commit message 格式：`[type] <中文简要说明>`
 - type 取值：`feat`(特性)、`fix`(修复)、`chore`(琐事)、`test`(测试)、`doc`(文档)
-- 每次提交前必须运行与改动范围匹配的必要测试并确认通过；仅知识整理类文档修改可例外，但必须在提交说明或回复中明确说明未运行测试的原因
 
 ### Cursor Agent 特殊规则
 
@@ -155,5 +159,7 @@ PYTHONPATH=prefix-sharing pytest -q \
 ## 9. 进一步阅读
 
 - 专项开发规范：[`prefix-sharing/AGENTS.md`](prefix-sharing/AGENTS.md)
-- 当前主规格：[`docs/doc-designs-final.md`](docs/doc-designs-final.md)
-- 工作进展：[`docs/doc-progress.md`](docs/doc-progress.md)
+- 概念与语义约定：[`docs/concepts.md`](docs/concepts.md)
+- 架构说明：[`docs/overview.md`](docs/overview.md)
+- 架构图：[`docs/overview.puml`](docs/overview.puml)
+- 历史归档：[`docs/legacy/`](docs/legacy/)

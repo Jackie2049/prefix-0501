@@ -53,7 +53,7 @@
 | **Prefix Detection** | 检测 batch 内样本间最长公共前缀的算法过程 |
 | **Prefix Group** | 一组序列，他们从同一个 provider 共享长度为prefix_len的前缀 |
 
-> 更多术语见 [`doc-glossary.md`](doc-glossary.md)
+> 更多概念和术语见 [`concepts.md`](concepts.md)
 
 ### 2.2 数据结构
 
@@ -710,7 +710,7 @@ def _apply_positioned_rope(..., kept_position_ids, ...):
 |------|------|----------|
 | [`AGENTS.md`](AGENTS.md) | 仓库级开发规范 | 所有开发工作 |
 | [`prefix-sharing/AGENTS.md`](prefix-sharing/AGENTS.md) | 模块级详细规范 | core/integration 开发 |
-| [`docs/doc-designs-final.md`](docs/doc-designs-final.md) | 当前最终设计方案 | 理解当前实现依据 |
-| [`docs/doc-progress.md`](docs/doc-progress.md) | 工作进展记录 | 了解最新状态 |
-| [`docs/doc-glossary.md`](docs/doc-glossary.md) | 完整术语表 | 查术语定义 |
+| [`docs/concepts.md`](docs/concepts.md) | 当前概念、术语和核心语义约定 | 语义对齐、命名分歧、术语查询 |
+| [`docs/overview.md`](docs/overview.md) | 当前架构说明 | 理解模块关系和数据流 |
 | [`docs/overview.puml`](docs/overview.puml) | 架构类图（PlantUML）| 详细架构设计 |
+| [`docs/legacy/`](docs/legacy/) | 历史 `doc-*` 文档归档 | 理解历史方案和被推翻方案 |
