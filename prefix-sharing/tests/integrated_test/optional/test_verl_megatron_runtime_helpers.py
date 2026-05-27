@@ -7,7 +7,7 @@ torch = pytest.importorskip("torch")
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_mcore import (
     build_prefix_sharing_micro_batch,
-    restore_megatron_actor_log_probs,
+    restore_suffix_first_log_probs_from_prefix,
 )
 
 
@@ -47,7 +47,7 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
     assert current_prefix_sharing_context() is None
 
 
-def test_restore_megatron_actor_log_probs_keeps_provider_autograd_path():
+def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path():
     # THD compact format: [1, total_kept_tokens, V]
     # row0 (provider) all 5 tokens, row1 (reuser) suffix 2 tokens (positions 3,4)
     # total = 5 + 2 = 7, align_size=1 so no padding
@@ -81,7 +81,7 @@ def test_restore_megatron_actor_log_probs_keeps_provider_autograd_path():
         ).squeeze(-1)
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
-        restored = restore_megatron_actor_log_probs(logits, labels, log_probs, gather_fn)
+        restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
 
     restored[0, 5].backward()
     assert logits.grad is not None

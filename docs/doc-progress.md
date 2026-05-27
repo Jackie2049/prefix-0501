@@ -4,6 +4,25 @@
 
 ---
 
+## 2026-05-27 16:13 重命名 suffix-first logprob restore 入口
+
+### 背景
+
+用户指出 `restore_megatron_actor_log_probs()` 没必要强调 Megatron / actor，最终确认命名为 `restore_suffix_first_log_probs_from_prefix()`，直接表达用 prefix-last logits 修复 reuser suffix-first logprob 的语义。
+
+### 完成事项
+
+1. 将 integration restore 入口重命名为 `restore_suffix_first_log_probs_from_prefix()`。
+2. 同步更新 verl actor 依赖入口、公开导出和 optional 集成测试。
+3. 更新当前设计文档、架构 overview / PUML 与历史进展记录中的函数名。
+4. 顺手修正 overview 中过期的 `PrefixSharingBatchMeta` 和已删除 context 包装引用。
+
+### 自测结果
+
+结果：`50 passed, 3 skipped`。skip 来自本地缺少 `torch_npu`、`verl`，以及 CUDA 不可用的 optional 测试。
+
+---
+
 ## 2026-05-27 15:59 重命名 prefix sharing micro-batch 构建入口
 
 ### 背景
@@ -325,7 +344,7 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
    - 在 `megatron_actor.py` 中新增极薄 import / helper 调用 / context manager。
    - `build_prefix_sharing_micro_batch()` 在 micro-batch 内生成 prefix_sharing_plan，按 attention mask 裁掉 reuser prefix。
    - `megatron_actor_prefix_sharing_context()` 把 prefix_sharing_plan、cache、backend、原始 position_ids、restore slot 传给 Megatron attention。
-   - `restore_megatron_actor_log_probs()` 从 provider prefix-last logits 恢复 reuser 第一个 suffix token logprob，保持 autograd 路径。
+   - `restore_suffix_first_log_probs_from_prefix()` 从 provider prefix-last logits 恢复 reuser 第一个 suffix token logprob，保持 autograd 路径。
 
 2. 补齐 Megatron attention 真实 hook：
    - 在 `Attention.forward()` packed THD squeeze 后、标准 RoPE 前新增 `maybe_run_prefix_sharing_attention()` 调用。

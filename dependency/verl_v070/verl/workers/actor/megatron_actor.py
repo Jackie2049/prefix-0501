@@ -22,7 +22,6 @@ Note that our model doesn't have to be `MegatronModule` because we don't share e
 import itertools
 import logging
 import os
-from contextlib import nullcontext
 from functools import partial
 from typing import Iterable
 
@@ -58,16 +57,21 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 
+######### prefix-sharing #########
+# verl 主流程中需要集成 prefix-sharing 能力，通过可选导入实现插件化接入，
+# 当 prefix-sharing 模块存在时启用功能，不存在时保持原行为（设为 None 作为 guard）
+from contextlib import nullcontext
 try:
     from prefix_sharing.integrations.context import prefix_sharing_runtime_context
     from prefix_sharing.integrations.verl_mcore import (
         build_prefix_sharing_micro_batch,
-        restore_megatron_actor_log_probs,
+        restore_suffix_first_log_probs_from_prefix,
     )
 except ModuleNotFoundError:
     prefix_sharing_runtime_context = None
     build_prefix_sharing_micro_batch = None
-    restore_megatron_actor_log_probs = None
+    restore_suffix_first_log_probs_from_prefix = None
+######### prefix-sharing #########
 
 __all__ = ["MegatronPPOActor"]
 
@@ -582,6 +586,9 @@ class MegatronPPOActor(BasePPOActor):
             batch = next(batch_iter)
             batch = batch.to(get_device_id())
             batch = batch.contiguous()
+            ######### prefix-sharing #########
+            # 在 forward 前读取和修改 micro-batch，识别micro-batch内的共同前缀，并构建运行时状态，
+            # 这是 prefix-sharing 的入口点，需要在数据进入模型前完成 micro-batch 重组
             prefix_sharing_runtime_state = None
             if build_prefix_sharing_micro_batch is not None:
                 batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(
@@ -591,6 +598,7 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 logger.warning(f"\n\n\nbuild_prefix_sharing_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
             else: logger.warning("\n\n\nbuild_prefix_sharing_micro_batch is None\n\n\n")
+            ######### prefix-sharing #########
 
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
@@ -628,8 +636,11 @@ class MegatronPPOActor(BasePPOActor):
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
             if self.use_fused_kernels:
+                ######### prefix-sharing #########
+                # 当前版本暂不支持 fused kernels，必须在进入 fused kernel 分支前检查并阻断
                 if prefix_sharing_runtime_state is not None:
                     raise RuntimeError("prefix sharing phase 1 requires actor fused kernels to be disabled")
+                ######### prefix-sharing #########
                 forward_fn = get_mcore_forward_fused_fn(self.hf_config)
                 if return_schedule_plan:
                     forward_fn = gptmodel_forward_1f1b_overlap
@@ -666,17 +677,24 @@ class MegatronPPOActor(BasePPOActor):
                         logits_bak = logits
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
-                    if restore_megatron_actor_log_probs is not None:
-                        log_probs = restore_megatron_actor_log_probs(
+                    ######### prefix-sharing #########
+                    # 侵入原因：prefix-sharing 的 One-Forward 方案会跳过前缀 token 的 logits 计算，
+                    # 需要在 logits_processor 中恢复这些位置的 log_probs 以保证训练语义正确性
+                    if restore_suffix_first_log_probs_from_prefix is not None:
+                        log_probs = restore_suffix_first_log_probs_from_prefix(
                             logits_bak,
                             label,
                             log_probs,
                             vocab_parallel_log_probs_from_logits,
                         )
+                    ######### prefix-sharing #########
                     ret["log_probs"] = log_probs
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
+                ######### prefix-sharing #########
+                # 侵入原因：需要通过 context manager 在 Megatron attention 层注入运行时状态，
+                # 使 attention 层能识别 prefix-sharing 模式并执行 KV 缓存注入和恢复
                 prefix_context = prefix_sharing_runtime_context or nullcontext
                 with prefix_context(prefix_sharing_runtime_state):
                     output = forward_fn(
@@ -689,6 +707,7 @@ class MegatronPPOActor(BasePPOActor):
                         logits_processor_args=logits_processor_args,
                         data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                     )
+                ######### prefix-sharing #########
 
             if forward_only:
                 meta_info = None

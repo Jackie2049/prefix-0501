@@ -829,7 +829,7 @@ hidden_states
 - `PrefixSharingRuntimeState`
 - `PackedPackedPrefixLastRestoreSlot`
 - `build_prefix_sharing_micro_batch()`
-- `restore_megatron_actor_log_probs()`
+- `restore_suffix_first_log_probs_from_prefix()`
 - `VerlMCoreIntegration`
 - `enable_prefix_sharing()`
 - `prefix_sharing_enabled()`

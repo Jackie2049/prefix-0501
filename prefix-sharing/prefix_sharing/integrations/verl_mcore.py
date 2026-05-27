@@ -342,13 +342,13 @@ def build_prefix_sharing_micro_batch(
     return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
-def restore_megatron_actor_log_probs(
+def restore_suffix_first_log_probs_from_prefix(
     logits: Any,
     labels: Any,
     log_probs: Any,
     vocab_parallel_log_probs_fn: Any,
 ) -> Any:
-    """Restore reuser first-suffix logprob from provider prefix-last logits."""
+    """Restore reuser suffix-first logprob from provider prefix-last logits."""
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_slots:
