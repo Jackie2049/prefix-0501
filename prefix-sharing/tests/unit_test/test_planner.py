@@ -9,7 +9,7 @@ def test_planner_builds_phase_one_metadata_and_restore_specs():
         [1, 2, 3, 4, 5, 30, 31],
         [9, 9, 9],
     ]
-    planner = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=3))
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
     meta = planner.plan(input_ids, forward_id=7, micro_batch_id=3)
 
     assert meta.forward_id == 7
@@ -54,7 +54,7 @@ def test_planner_builds_phase_one_metadata_and_restore_specs():
 
 
 def test_planner_no_shared_prefix_keeps_original_shapes():
-    planner = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2))
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2))
     meta = planner.plan([[1, 2], [1, 3], [4, 5]], forward_id=1, micro_batch_id=1)
 
     assert not meta.has_sharing

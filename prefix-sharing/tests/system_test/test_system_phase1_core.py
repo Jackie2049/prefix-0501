@@ -11,7 +11,7 @@ def test_phase_one_core_system_flow_without_framework_dependencies():
         [901, 902],
     ]
     planner = PrefixSharingPlanner(
-        PrefixSharingConfig(enabled=True, min_prefix_len=3, min_group_size=2)
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3, min_group_size=2)
     )
     meta = planner.plan(input_ids, forward_id=123, micro_batch_id=456)
     trimmed = trim_inputs(input_ids, meta)

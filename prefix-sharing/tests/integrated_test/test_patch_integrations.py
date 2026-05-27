@@ -49,14 +49,14 @@ def test_patch_manager_context_manager_restores_original():
 
 
 def test_megatron_integration_reports_missing_dependency_cleanly():
-    config = PrefixSharingConfig(enabled=True)
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
     with pytest.raises(IntegrationUnavailable, match="Megatron"):
         integration.install(model_config={})
 
 
 def test_verl_integration_reports_missing_dependency_cleanly():
-    config = PrefixSharingConfig(enabled=True)
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = VerlMCoreIntegration(config=config)
     with pytest.raises(IntegrationUnavailable, match="verl"):
         integration.install(model_config={})
@@ -64,7 +64,7 @@ def test_verl_integration_reports_missing_dependency_cleanly():
 
 def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
     adapter = VerlMCoreBatchAdapter(
-        PrefixSharingConfig(enabled=True, min_prefix_len=3, min_group_size=2)
+        PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3, min_group_size=2)
     )
     prepared = adapter.prepare_micro_batch(
         [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21, 22], [9, 9]],
@@ -112,7 +112,7 @@ def test_prefix_sharing_config_from_verl_accepts_nested_actor_config():
     config = prefix_sharing_config_from_verl(
         {
             "prefix_sharing": {
-                "enabled": True,
+                "enable_prefix_sharing": True,
                 "min_prefix_len": 4,
                 "min_group_size": 3,
                 "boundary_strategy": "prefix_last_restore",
@@ -120,9 +120,15 @@ def test_prefix_sharing_config_from_verl_accepts_nested_actor_config():
         }
     )
 
-    assert config.enabled is True
+    assert config.enable_prefix_sharing is True
     assert config.min_prefix_len == 4
     assert config.min_group_size == 3
+
+
+def test_prefix_sharing_config_from_verl_accepts_legacy_enabled_key():
+    config = prefix_sharing_config_from_verl({"prefix_sharing": {"enabled": True}})
+
+    assert config.enable_prefix_sharing is True
 
 
 def test_prefix_sharing_enabled_propagates_install_failure(monkeypatch):
@@ -135,5 +141,5 @@ def test_prefix_sharing_enabled_propagates_install_failure(monkeypatch):
 
     monkeypatch.setattr("prefix_sharing.integrations.verl_mcore.VerlMCoreIntegration", FakeIntegration)
     with pytest.raises(RuntimeError, match="install failed"):
-        with prefix_sharing_enabled(PrefixSharingConfig(enabled=True)):
+        with prefix_sharing_enabled(PrefixSharingConfig(enable_prefix_sharing=True)):
             pass

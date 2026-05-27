@@ -7,7 +7,7 @@ from prefix_sharing.core.planner import PrefixSharingPlanner
 
 
 def _meta():
-    planner = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=3))
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
     return planner.plan(
         [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21, 22]],
         forward_id=10,

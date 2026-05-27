@@ -211,11 +211,11 @@ def prepare_megatron_actor_micro_batch(
     config = prefix_sharing_config_from_verl(actor_config)
 
     # --- Path 1: prefix sharing disabled by config ---
-    if not config.enabled:
-        logger.warning(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enabled=False), returning (batch, None)")
+    if not config.enable_prefix_sharing:
+        logger.warning(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enable_prefix_sharing=False), returning (batch, None)")
         return batch, None
 
-    logger.warning(f"[PS][prepare] config.enabled=True, validating config...")
+    logger.warning(f"[PS][prepare] config.enable_prefix_sharing=True, validating config...")
 
     config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
     logger.warning(f"[PS][prepare] config.validate() returned OK")
@@ -380,18 +380,15 @@ def restore_megatron_actor_log_probs(
 
 def prefix_sharing_config_from_verl(actor_config: Any) -> PrefixSharingConfig:
     raw = _read_actor_value(actor_config, "prefix_sharing", None)
-    raw = True
-    import logging
-    logger = logging.getLogger(__file__)
-    logger.info(f"prefix_sharing_config_from_verl: raw={raw}")
-
     if raw is None:
         raw = _read_actor_value(actor_config, "prefix_sharing_config", None)
     if raw is None or raw is False:
-        return PrefixSharingConfig(enabled=False)
+        return PrefixSharingConfig(enable_prefix_sharing=False)
     if raw is True:
-        return PrefixSharingConfig(enabled=True)
+        return PrefixSharingConfig(enable_prefix_sharing=True)
     values = _to_plain_mapping(raw)
+    if "enabled" in values and "enable_prefix_sharing" not in values:
+        values["enable_prefix_sharing"] = values.pop("enabled")
     return PrefixSharingConfig(**values)
 
 

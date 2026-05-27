@@ -15,12 +15,12 @@ class ModelConfig:
 
 
 def test_disabled_config_does_not_validate_model_constraints():
-    config = PrefixSharingConfig(enabled=False)
+    config = PrefixSharingConfig(enable_prefix_sharing=False)
     config.validate(ModelConfig(pipeline_model_parallel_size=8))
 
 
 def test_enabled_config_accepts_phase_one_constraints():
-    config = PrefixSharingConfig(enabled=True)
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
     config.validate(ModelConfig())
 
 
@@ -37,15 +37,15 @@ def test_enabled_config_accepts_phase_one_constraints():
 def test_enabled_config_rejects_unsupported_phase_one_constraints(field, value, message):
     model_config = ModelConfig()
     setattr(model_config, field, value)
-    config = PrefixSharingConfig(enabled=True)
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
     with pytest.raises(PrefixSharingConfigError, match=message):
         config.validate(model_config)
 
 
 def test_enabled_config_rejects_non_phase_one_modes():
     with pytest.raises(PrefixSharingConfigError, match="detector"):
-        PrefixSharingConfig(enabled=True, detector="prompt").validate(ModelConfig())
+        PrefixSharingConfig(enable_prefix_sharing=True, detector="prompt").validate(ModelConfig())
     with pytest.raises(PrefixSharingConfigError, match="boundary_strategy"):
-        PrefixSharingConfig(enabled=True, boundary_strategy="restore_last_prefix_token").validate(ModelConfig())
+        PrefixSharingConfig(enable_prefix_sharing=True, boundary_strategy="restore_last_prefix_token").validate(ModelConfig())
     with pytest.raises(PrefixSharingConfigError, match="integrate_mode"):
-        PrefixSharingConfig(enabled=True).validate(ModelConfig(), integrate_mode="verl_fsdp")
+        PrefixSharingConfig(enable_prefix_sharing=True).validate(ModelConfig(), integrate_mode="verl_fsdp")

@@ -27,7 +27,7 @@ class PrefixSharingConfig:
     should fail loudly instead of silently changing training semantics.
     """
 
-    enabled: bool = False
+    enable_prefix_sharing: bool = False
     detector: str = "trie"
     backend: str = "torch_ref"
     min_prefix_len: int = 1  # Prefixes shorter than this won't be cached (too short = not worth it)
@@ -51,7 +51,7 @@ class PrefixSharingConfig:
             integrate_mode: Optional integration mode name.
         """
 
-        if not self.enabled:
+        if not self.enable_prefix_sharing:
             return
         if self.detector != "trie":
             raise PrefixSharingConfigError("phase 1 supports only detector='trie'")

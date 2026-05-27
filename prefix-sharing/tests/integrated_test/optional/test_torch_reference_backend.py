@@ -14,7 +14,7 @@ from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
 
 
 def test_torch_reference_backend_supports_q_len_different_from_kv_len():
-    meta = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2)).plan(
+    meta = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)).plan(
         [[1, 2, 10], [1, 2, 20, 21]],
         forward_id=1,
         micro_batch_id=1,
@@ -39,7 +39,7 @@ def test_torch_reference_backend_supports_q_len_different_from_kv_len():
 
 
 def test_torch_reference_backend_supports_thd_grouped_query_attention():
-    meta = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2)).plan(
+    meta = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)).plan(
         [[1, 2, 10], [1, 2, 20, 21]],
         forward_id=1,
         micro_batch_id=1,
@@ -64,7 +64,7 @@ def test_torch_reference_backend_supports_thd_grouped_query_attention():
 
 
 def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
-    meta = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2)).plan(
+    meta = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)).plan(
         [[1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5]],
         forward_id=2,
         micro_batch_id=1,
@@ -94,7 +94,7 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
 
 
 def test_prefix_last_restore_tensor_keeps_autograd_path():
-    meta = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2)).plan(
+    meta = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)).plan(
         [[1, 2, 10], [1, 2, 20, 21]],
         forward_id=1,
         micro_batch_id=1,
@@ -116,7 +116,7 @@ def test_prefix_last_restore_tensor_keeps_autograd_path():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available locally")
 def test_torch_reference_backend_cuda_optional_smoke():
-    meta = PrefixSharingPlanner(PrefixSharingConfig(enabled=True, min_prefix_len=2)).plan(
+    meta = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)).plan(
         [[1, 2, 10], [1, 2, 20]],
         forward_id=1,
         micro_batch_id=1,

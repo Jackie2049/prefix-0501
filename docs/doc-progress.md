@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-05-27 10:08 重命名 PrefixSharingConfig 启用开关
+
+### 背景
+
+用户指出 `PrefixSharingConfig.enabled` 读起来过泛，在调用点写成 `config.enabled` 时无法直接表达启用的是 prefix sharing 能力。
+
+### 完成事项
+
+1. 将 `PrefixSharingConfig.enabled` 重命名为 `enable_prefix_sharing`。
+2. 将代码和测试中的 `config.enabled` / `PrefixSharingConfig(enabled=...)` 同步改为新字段名。
+3. `prefix_sharing_config_from_verl()` 支持新的 `enable_prefix_sharing` 配置键，并兼容旧的 `enabled` 键作为迁移入口。
+4. 移除 `prefix_sharing_config_from_verl()` 中强制 `raw = True` 的调试遗留逻辑，确保嵌套配置值会被真实解析。
+5. 更新 `docs/doc-designs-final.md` 中的配置字段引用。
+
+### 自测结果
+
+本地先安装 `pytest` 后执行：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache python3 -m pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
+```
+
+结果：`29 passed, 5 skipped`。skip 来自本地缺少 `torch`、`torch_npu`、`verl` 的 optional 测试。
+
+---
+
 ## 2026-05-16 补充 18：重命名 prefix K/V 存储模块并更新提交前测试规范
 
 ### 背景
