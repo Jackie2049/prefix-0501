@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-05-27 11:22 清理 prefix sharing runtime state 命名
+
+### 背景
+
+用户指出 `prepared`、`prefix_sharing_prepared`、`MegatronActorPreparedMicroBatch` 和 `DensePrefixLastRestoreSpec` 等命名无法准确表达对象职责。
+
+### 完成事项
+
+1. 将 `MegatronActorPreparedMicroBatch` 重命名为 `PrefixSharingRuntimeState`。
+2. 将 `DensePrefixLastRestoreSpec` 重命名为 `PackedPackedPrefixLastRestoreSlot`。
+3. 将 adapter 返回的 `VerlMCorePreparedBatch` 重命名为 `VerlMCorePrefixSharingBatch`。
+4. 将 forward 前返回的 batch 变量改为 `trimmed_micro_batch`。
+5. 将 runtime state 变量统一为 `prefix_sharing_runtime_state`。
+6. 将 `restore_positions` 字段和变量统一为 `prefix_last_restore_slots`。
+7. 将 adapter 的 `prepared_context()` 重命名为 `prefix_sharing_runtime_context()`。
+8. 同步更新 verl 使能入口、测试、公开导出和当前设计文档。
+
+### 自测结果
+
+本地执行：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache python3 -m pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
+```
+
+结果：`43 passed, 5 skipped`。skip 来自本地缺少 `torch`、`torch_npu`、`verl` 的 optional 测试。
+
+---
+
 ## 2026-05-27 10:32 统一 PrefixSharingPlan 产物变量命名
 
 ### 背景
@@ -259,9 +288,9 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
 
 1. 补齐 `integrations/verl_mcore.py` 的框架无关 batch adapter：
    - 新增 `VerlMCoreBatchAdapter`
-   - 新增 `VerlMCorePreparedBatch`
+   - 新增 `VerlMCorePrefixSharingBatch`
    - `prepare_micro_batch()` 调用 planner + mapping，实际裁剪 input / labels / loss masks
-   - `prepared_context()` 建立 runtime context，供 patched attention 消费
+   - `prefix_sharing_runtime_context()` 建立 runtime context，供 patched attention 消费
    - `restore_logprobs()` 调用 mapping 的 Prefix-Last Restore
 
 2. 补齐公开入口：

@@ -582,14 +582,14 @@ class MegatronPPOActor(BasePPOActor):
             batch = next(batch_iter)
             batch = batch.to(get_device_id())
             batch = batch.contiguous()
-            prefix_sharing_prepared = None
+            prefix_sharing_runtime_state = None
             if prepare_megatron_actor_micro_batch is not None:
-                batch, prefix_sharing_prepared = prepare_megatron_actor_micro_batch(
+                batch, prefix_sharing_runtime_state = prepare_megatron_actor_micro_batch(
                     batch,
                     self.config,
                     self.tf_config,
                 )
-                logger.warning(f"\n\n\nprepare_megatron_actor_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_prepared: {prefix_sharing_prepared is not None}\n\n\n")
+                logger.warning(f"\n\n\nprepare_megatron_actor_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
             else: logger.warning("\n\n\nprepare_megatron_actor_micro_batch is None\n\n\n")
 
             input_ids = batch["input_ids"]
@@ -628,7 +628,7 @@ class MegatronPPOActor(BasePPOActor):
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
             if self.use_fused_kernels:
-                if prefix_sharing_prepared is not None:
+                if prefix_sharing_runtime_state is not None:
                     raise RuntimeError("prefix sharing phase 1 requires actor fused kernels to be disabled")
                 forward_fn = get_mcore_forward_fused_fn(self.hf_config)
                 if return_schedule_plan:
@@ -678,7 +678,7 @@ class MegatronPPOActor(BasePPOActor):
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
                 prefix_context = megatron_actor_prefix_sharing_context or nullcontext
-                with prefix_context(prefix_sharing_prepared):
+                with prefix_context(prefix_sharing_runtime_state):
                     output = forward_fn(
                         model=model,
                         input_ids=input_ids,

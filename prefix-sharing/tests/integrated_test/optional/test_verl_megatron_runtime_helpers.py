@@ -31,20 +31,20 @@ def test_prepare_megatron_actor_micro_batch_trims_reuser_mask_and_context_positi
         model_type="text_only_causal_lm",
     )
 
-    prepared_batch, prepared = prepare_megatron_actor_micro_batch(batch, actor_config, model_config)
+    trimmed_micro_batch, prefix_sharing_runtime_state = prepare_megatron_actor_micro_batch(batch, actor_config, model_config)
 
-    assert prepared is not None
-    assert prepared.prefix_sharing_plan.has_sharing
-    assert prepared_batch["attention_mask"].tolist() == [
+    assert prefix_sharing_runtime_state is not None
+    assert prefix_sharing_runtime_state.prefix_sharing_plan.has_sharing
+    assert trimmed_micro_batch["attention_mask"].tolist() == [
         [True, True, True, True, True],
         [False, False, False, True, True],
     ]
-    assert prepared.kept_position_ids.tolist() == [0, 1, 2, 3, 4, 3, 4]
+    assert prefix_sharing_runtime_state.kept_position_ids.tolist() == [0, 1, 2, 3, 4, 3, 4]
 
-    with megatron_actor_prefix_sharing_context(prepared) as ctx:
+    with megatron_actor_prefix_sharing_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.restore_positions[0].provider_1d_pos == 2
-        assert ctx.restore_positions[0].reuse_1d_pos == 5
+        assert ctx.prefix_last_restore_slots[0].provider_1d_pos == 2
+        assert ctx.prefix_last_restore_slots[0].reuse_1d_pos == 5
     assert current_prefix_sharing_context() is None
 
 
@@ -72,7 +72,7 @@ def test_restore_megatron_actor_log_probs_keeps_provider_autograd_path():
         fused_single_qkv_rope=False,
         model_type="text_only_causal_lm",
     )
-    _, prepared = prepare_megatron_actor_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = prepare_megatron_actor_micro_batch(batch, actor_config, model_config)
 
     def gather_fn(provider_logits, reuse_label):
         return torch.gather(
@@ -81,7 +81,7 @@ def test_restore_megatron_actor_log_probs_keeps_provider_autograd_path():
             index=reuse_label.unsqueeze(-1),
         ).squeeze(-1)
 
-    with megatron_actor_prefix_sharing_context(prepared):
+    with megatron_actor_prefix_sharing_context(prefix_sharing_runtime_state):
         restored = restore_megatron_actor_log_probs(logits, labels, log_probs, gather_fn)
 
     restored[0, 5].backward()

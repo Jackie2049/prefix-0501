@@ -825,7 +825,9 @@ hidden_states
 核心类/函数：
 
 - `VerlMCoreBatchAdapter`
-- `VerlMCorePreparedBatch`
+- `VerlMCorePrefixSharingBatch`
+- `PrefixSharingRuntimeState`
+- `PackedPackedPrefixLastRestoreSlot`
 - `prepare_megatron_actor_micro_batch()`
 - `megatron_actor_prefix_sharing_context()`
 - `restore_megatron_actor_log_probs()`

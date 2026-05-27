@@ -44,7 +44,7 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
-class DensePrefixLastRestoreSpec:
+class PackedPackedPrefixLastRestoreSlot:
     reuse_idx_in_batch: int
     provider_idx_in_batch: int
     provider_1d_pos: int
@@ -52,15 +52,15 @@ class DensePrefixLastRestoreSpec:
 
 
 @dataclass(frozen=True)
-class MegatronActorPreparedMicroBatch:
+class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
     kept_position_ids: Any
-    restore_positions: list[DensePrefixLastRestoreSpec]
+    prefix_last_restore_slots: list[PackedPackedPrefixLastRestoreSlot]
 
 
 @dataclass(frozen=True)
-class VerlMCorePreparedBatch:
+class VerlMCorePrefixSharingBatch:
     """Framework-independent materialization of one verl actor micro-batch."""
 
     prefix_sharing_plan: PrefixSharingPlan
@@ -94,7 +94,7 @@ class VerlMCoreBatchAdapter:
         loss_masks: Sequence[Sequence[T]] | None = None,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
-    ) -> VerlMCorePreparedBatch:
+    ) -> VerlMCorePrefixSharingBatch:
         """Plan prefix sharing and trim a micro-batch."""
 
         assert self.planner is not None
@@ -106,7 +106,7 @@ class VerlMCoreBatchAdapter:
         trimmed_inputs = trim_inputs(input_ids, prefix_sharing_plan)
         trimmed_labels = trim_labels(labels, prefix_sharing_plan) if labels is not None else None
         trimmed_loss_masks = trim_loss_masks(loss_masks, prefix_sharing_plan) if loss_masks is not None else None
-        return VerlMCorePreparedBatch(
+        return VerlMCorePrefixSharingBatch(
             prefix_sharing_plan=prefix_sharing_plan,
             input_ids=trimmed_inputs,
             labels=trimmed_labels,
@@ -114,13 +114,13 @@ class VerlMCoreBatchAdapter:
         )
 
     @contextmanager
-    def prepared_context(
+    def prefix_sharing_runtime_context(
         self,
-        prepared: VerlMCorePreparedBatch,
+        prefix_sharing_batch: VerlMCorePrefixSharingBatch,
     ) -> Iterator[PrefixSharingRuntimeContext]:
         """Open the runtime context consumed by patched attention."""
 
-        with prefix_sharing_context(prepared.prefix_sharing_plan, backend=TorchReferenceBackend()) as ctx:
+        with prefix_sharing_context(prefix_sharing_batch.prefix_sharing_plan, backend=TorchReferenceBackend()) as ctx:
             yield ctx
 
     def restore_logprobs(
@@ -196,7 +196,7 @@ def prepare_megatron_actor_micro_batch(
     model_config: Any,
     *,
     backend: Any | None = None,
-) -> tuple[Any, MegatronActorPreparedMicroBatch | None]:
+) -> tuple[Any, PrefixSharingRuntimeState | None]:
     """Trim one verl Megatron actor micro-batch in-place for prefix sharing.
 
     The framework-facing contract is intentionally small: dependency/verl calls
@@ -277,7 +277,7 @@ def prepare_megatron_actor_micro_batch(
 
     # --- Path 6: sharing found, prepare batch ---
     logger.warning(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
-    prepared_batch = _clone_batch(batch)
+    trimmed_micro_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
     new_attention_mask[:] = False
     new_input_ids = input_ids.clone()
@@ -290,9 +290,9 @@ def prepare_megatron_actor_micro_batch(
         new_attention_mask[row, kept_indices] = True
         kept_position_rows.append(position_ids[row, kept_indices])
 
-    prepared_batch["input_ids"] = new_input_ids
-    prepared_batch["attention_mask"] = new_attention_mask
-    prepared_batch["position_ids"] = new_position_ids
+    trimmed_micro_batch["input_ids"] = new_input_ids
+    trimmed_micro_batch["attention_mask"] = new_attention_mask
+    trimmed_micro_batch["position_ids"] = new_position_ids
 
     # Compute 1D positions in THD compact tensor
     # Simulate preprocess_packed_seqs alignment to get cu_seqlens_padded
@@ -312,14 +312,14 @@ def prepare_megatron_actor_micro_batch(
     cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
     cu_seqlens_cpu = cu_seqlens_padded.tolist()
 
-    restore_positions = []
+    prefix_last_restore_slots = []
     for spec in prefix_sharing_plan.prefix_last_restore:
         p_idx = spec.provider_idx_in_batch
         r_idx = spec.reuse_idx_in_batch
         provider_offset = spec.provider_prefix_last_pos - prefix_sharing_plan.input_keep_ranges[p_idx][0]
         reuse_offset = spec.reuse_first_suffix_label_pos - prefix_sharing_plan.input_keep_ranges[r_idx][0]
-        restore_positions.append(
-            DensePrefixLastRestoreSpec(
+        prefix_last_restore_slots.append(
+            PackedPackedPrefixLastRestoreSlot(
                 reuse_idx_in_batch=spec.reuse_idx_in_batch,
                 provider_idx_in_batch=spec.provider_idx_in_batch,
                 provider_1d_pos=int(cu_seqlens_cpu[p_idx] + provider_offset),
@@ -328,29 +328,32 @@ def prepare_megatron_actor_micro_batch(
         )
 
     kept_position_ids = _concat_tensors(kept_position_rows)
-    prepared = MegatronActorPreparedMicroBatch(
+    prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         backend=backend or TorchReferenceBackend(),
         kept_position_ids=kept_position_ids,
-        restore_positions=restore_positions,
+        prefix_last_restore_slots=prefix_last_restore_slots,
     )
-    logger.warning(f"[PS][prepare] PATH 6 DONE: returning (prepared_batch, prepared) with keep_ranges={prefix_sharing_plan.input_keep_ranges}")
-    return prepared_batch, prepared
+    logger.warning(
+        "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
+        f"prefix_sharing_runtime_state) with keep_ranges={prefix_sharing_plan.input_keep_ranges}"
+    )
+    return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
 @contextmanager
 def megatron_actor_prefix_sharing_context(
-    prepared: MegatronActorPreparedMicroBatch | None,
+    prefix_sharing_runtime_state: PrefixSharingRuntimeState | None,
 ) -> Iterator[PrefixSharingRuntimeContext | None]:
-    if prepared is None:
+    if prefix_sharing_runtime_state is None:
         with nullcontext(None) as ctx:
             yield ctx
         return
     with prefix_sharing_context(
-        prepared.prefix_sharing_plan,
-        backend=prepared.backend,
-        kept_position_ids=prepared.kept_position_ids,
-        restore_positions=prepared.restore_positions,
+        prefix_sharing_runtime_state.prefix_sharing_plan,
+        backend=prefix_sharing_runtime_state.backend,
+        kept_position_ids=prefix_sharing_runtime_state.kept_position_ids,
+        prefix_last_restore_slots=prefix_sharing_runtime_state.prefix_last_restore_slots,
     ) as ctx:
         yield ctx
 
@@ -364,10 +367,10 @@ def restore_megatron_actor_log_probs(
     """Restore reuser first-suffix logprob from provider prefix-last logits."""
 
     ctx = current_prefix_sharing_context()
-    if ctx is None or not ctx.restore_positions:
+    if ctx is None or not ctx.prefix_last_restore_slots:
         return log_probs
     restored = log_probs.clone()
-    for spec in ctx.restore_positions:
+    for spec in ctx.prefix_last_restore_slots:
         provider_logits = logits[
             0:1,
             spec.provider_1d_pos : spec.provider_1d_pos + 1,

@@ -23,7 +23,7 @@ class PrefixSharingRuntimeContext:
     store: PrefixKVStore
     backend: Any | None = None
     kept_position_ids: Any | None = None
-    restore_positions: list[Any] = field(default_factory=list)
+    prefix_last_restore_slots: list[Any] = field(default_factory=list)
 
 
 def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
@@ -36,14 +36,14 @@ def prefix_sharing_context(
     *,
     backend: Any | None = None,
     kept_position_ids: Any | None = None,
-    restore_positions: list[Any] | None = None,
+    prefix_last_restore_slots: list[Any] | None = None,
 ) -> Iterator[PrefixSharingRuntimeContext]:
     ctx = PrefixSharingRuntimeContext(
         prefix_sharing_plan=prefix_sharing_plan,
         store=PrefixKVStore(),
         backend=backend,
         kept_position_ids=kept_position_ids,
-        restore_positions=list(restore_positions or []),
+        prefix_last_restore_slots=list(prefix_last_restore_slots or []),
     )
     token = _current_context.set(ctx)
     try:
@@ -54,13 +54,13 @@ def prefix_sharing_context(
 
 
 def optional_prefix_sharing_context(
-    prepared: Any | None,
+    prefix_sharing_runtime_state: Any | None,
 ) -> Iterator[PrefixSharingRuntimeContext | None]:
-    if prepared is None:
+    if prefix_sharing_runtime_state is None:
         return nullcontext(None)
     return prefix_sharing_context(
-        prepared.prefix_sharing_plan,
-        backend=getattr(prepared, "backend", None),
-        kept_position_ids=getattr(prepared, "kept_position_ids", None),
-        restore_positions=getattr(prepared, "restore_positions", None),
+        prefix_sharing_runtime_state.prefix_sharing_plan,
+        backend=getattr(prefix_sharing_runtime_state, "backend", None),
+        kept_position_ids=getattr(prefix_sharing_runtime_state, "kept_position_ids", None),
+        prefix_last_restore_slots=getattr(prefix_sharing_runtime_state, "prefix_last_restore_slots", None),
     )
