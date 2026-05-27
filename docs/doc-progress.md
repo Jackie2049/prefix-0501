@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-05-27 17:21 分离 prefix-last restore 逻辑计划与 packed 索引
+
+### 背景
+
+用户指出 `PrefixSharingRuntimeState` 同时包含 `prefix_sharing_plan.prefix_last_restore` 和 `prefix_last_restore_slots`，看起来像重复保存两份 prefix-last restore 信息。
+
+### 完成事项
+
+1. 保留 `PrefixSharingPlan.prefix_last_restore` 作为唯一逻辑 restore spec。
+2. 将 `PrefixSharingRuntimeState.prefix_last_restore_slots` 替换为 `packed_cu_seqlens`，只保存当前 forward 的 packed layout 原料。
+3. 新增 `PackedPrefixLastRestoreIndex`，由 `prefix_sharing_runtime_context()` 根据 plan + packed layout 派生。
+4. 将 `PrefixSharingRuntimeContext.prefix_last_restore_slots` 重命名为 `prefix_last_restore_indices`。
+5. 删除 `PackedPackedPrefixLastRestoreSlot`，同步更新 restore 函数、测试和设计 / overview 文档。
+
+### 自测结果
+
+结果：`50 passed, 3 skipped`。skip 来自本地缺少 `torch_npu`、`verl`，以及 CUDA 不可用的 optional 测试。
+
+---
+
 ## 2026-05-27 16:57 将 PrefixSharingPlan 整合进 planner
 
 ### 背景

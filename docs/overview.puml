@@ -67,11 +67,11 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
         .. attention backend 实例，如 TorchReferenceBackend ..
         +kept_position_ids: Any
         .. 保留的原始位置编码，用于 RoPE 计算 ..
-        +prefix_last_restore_slots: list[PackedPackedPrefixLastRestoreSlot]
-        .. 1D 紧凑张量中的 prefix-last 恢复位置 ..
+        +packed_cu_seqlens: list[int]
+        .. 当前 forward 的 packed THD row offset，用于 context 派生恢复索引 ..
     }
     
-    class "verl_mcore.py\nPackedPackedPrefixLastRestoreSlot" as PackedRestoreSlot #FFCC80 {
+    class "context.py\nPackedPrefixLastRestoreIndex" as PackedRestoreIndex #FFCC80 {
         +reuse_idx_in_batch: int
         +provider_idx_in_batch: int
         +provider_1d_pos: int
@@ -390,7 +390,7 @@ note bottom of Context
   - store: PrefixKVStore
   - backend: Any
   - kept_position_ids: 原始位置编码
-  - prefix_last_restore_slots: 恢复位置
+  - prefix_last_restore_indices: packed 读写索引
   
   主入口是 prefix_sharing_runtime_context()
 endnote

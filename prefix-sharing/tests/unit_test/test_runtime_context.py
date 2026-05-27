@@ -15,7 +15,7 @@ def _prefix_sharing_runtime_state():
         prefix_sharing_plan=prefix_sharing_plan,
         backend=None,
         kept_position_ids=None,
-        prefix_last_restore_slots=[],
+        packed_cu_seqlens=list(prefix_sharing_plan.cu_seqlens_q),
     )
 
 
@@ -25,6 +25,8 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.prefix_sharing_plan is prefix_sharing_runtime_state.prefix_sharing_plan
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
         assert not ctx.store.closed
     assert current_prefix_sharing_context() is None
     assert ctx.store.closed

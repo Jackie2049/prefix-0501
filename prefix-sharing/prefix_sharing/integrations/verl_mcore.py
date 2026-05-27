@@ -41,19 +41,11 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
-class PackedPackedPrefixLastRestoreSlot:
-    reuse_idx_in_batch: int
-    provider_idx_in_batch: int
-    provider_1d_pos: int
-    reuse_1d_pos: int
-
-
-@dataclass(frozen=True)
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
     kept_position_ids: Any
-    prefix_last_restore_slots: list[PackedPackedPrefixLastRestoreSlot]
+    packed_cu_seqlens: list[int]
 
 
 @dataclass(frozen=True)
@@ -120,7 +112,7 @@ class VerlMCoreBatchAdapter:
             prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
             backend=TorchReferenceBackend(),
             kept_position_ids=None,
-            prefix_last_restore_slots=[],
+            packed_cu_seqlens=list(prefix_sharing_batch.prefix_sharing_plan.cu_seqlens_q),
         )
         return _prefix_sharing_runtime_context(runtime_state)
 
@@ -315,27 +307,12 @@ def build_prefix_sharing_micro_batch(
     cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
     cu_seqlens_cpu = cu_seqlens_padded.tolist()
 
-    prefix_last_restore_slots = []
-    for spec in prefix_sharing_plan.prefix_last_restore:
-        provider_idx = spec.provider_idx_in_batch
-        reuse_idx = spec.reuse_idx_in_batch
-        provider_offset = spec.provider_prefix_last_pos - prefix_sharing_plan.input_keep_ranges[provider_idx][0]
-        reuse_offset = spec.reuse_first_suffix_label_pos - prefix_sharing_plan.input_keep_ranges[reuse_idx][0]
-        prefix_last_restore_slots.append(
-            PackedPackedPrefixLastRestoreSlot(
-                reuse_idx_in_batch=spec.reuse_idx_in_batch,
-                provider_idx_in_batch=spec.provider_idx_in_batch,
-                provider_1d_pos=int(cu_seqlens_cpu[provider_idx] + provider_offset),
-                reuse_1d_pos=int(cu_seqlens_cpu[reuse_idx] + reuse_offset),
-            )
-        )
-
     kept_position_ids = _concat_tensors(kept_position_rows)
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         backend=backend or TorchReferenceBackend(),
         kept_position_ids=kept_position_ids,
-        prefix_last_restore_slots=prefix_last_restore_slots,
+        packed_cu_seqlens=[int(value) for value in cu_seqlens_cpu],
     )
     logger.warning(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
@@ -353,21 +330,21 @@ def restore_suffix_first_log_probs_from_prefix(
     """Restore reuser suffix-first logprob from provider prefix-last logits."""
 
     ctx = current_prefix_sharing_context()
-    if ctx is None or not ctx.prefix_last_restore_slots:
+    if ctx is None or not ctx.prefix_last_restore_indices:
         return log_probs
     restored = log_probs.clone()
-    for spec in ctx.prefix_last_restore_slots:
+    for index in ctx.prefix_last_restore_indices:
         provider_logits = logits[
             0:1,
-            spec.provider_1d_pos : spec.provider_1d_pos + 1,
+            index.provider_1d_pos : index.provider_1d_pos + 1,
             :,
         ].clone()
         reuse_label = labels[
             0:1,
-            spec.reuse_1d_pos : spec.reuse_1d_pos + 1,
+            index.reuse_1d_pos : index.reuse_1d_pos + 1,
         ]
         restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-        restored[0, spec.reuse_1d_pos] = restored_value.reshape(())
+        restored[0, index.reuse_1d_pos] = restored_value.reshape(())
     return restored
 
 

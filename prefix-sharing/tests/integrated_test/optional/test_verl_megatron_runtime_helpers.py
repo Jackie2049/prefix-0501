@@ -42,8 +42,8 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.prefix_last_restore_slots[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_slots[0].reuse_1d_pos == 5
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
     assert current_prefix_sharing_context() is None
 
 

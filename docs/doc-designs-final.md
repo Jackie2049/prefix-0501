@@ -828,7 +828,7 @@ hidden_states
 - `VerlMCoreBatchAdapter`
 - `VerlMCorePrefixSharingBatch`
 - `PrefixSharingRuntimeState`
-- `PackedPackedPrefixLastRestoreSlot`
+- `PackedPrefixLastRestoreIndex`
 - `build_prefix_sharing_micro_batch()`
 - `restore_suffix_first_log_probs_from_prefix()`
 - `VerlMCoreIntegration`
