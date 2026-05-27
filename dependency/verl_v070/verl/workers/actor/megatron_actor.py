@@ -59,13 +59,13 @@ from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 
 try:
+    from prefix_sharing.integrations.context import prefix_sharing_runtime_context
     from prefix_sharing.integrations.verl_mcore import (
-        megatron_actor_prefix_sharing_context,
         prepare_megatron_actor_micro_batch,
         restore_megatron_actor_log_probs,
     )
 except ModuleNotFoundError:
-    megatron_actor_prefix_sharing_context = None
+    prefix_sharing_runtime_context = None
     prepare_megatron_actor_micro_batch = None
     restore_megatron_actor_log_probs = None
 
@@ -677,7 +677,7 @@ class MegatronPPOActor(BasePPOActor):
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
-                prefix_context = megatron_actor_prefix_sharing_context or nullcontext
+                prefix_context = prefix_sharing_runtime_context or nullcontext
                 with prefix_context(prefix_sharing_runtime_state):
                     output = forward_fn(
                         model=model,

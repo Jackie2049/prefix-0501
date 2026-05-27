@@ -28,11 +28,8 @@ from prefix_sharing.core.batch_trim import (
 from prefix_sharing.core.logprob import restore_prefix_last_logprobs
 from prefix_sharing.core.metadata import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
-from prefix_sharing.integrations.context import (
-    PrefixSharingRuntimeContext,
-    current_prefix_sharing_context,
-    prefix_sharing_context,
-)
+from prefix_sharing.integrations.context import current_prefix_sharing_context
+from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.patch_manager import PatchHandle
 
@@ -113,15 +110,19 @@ class VerlMCoreBatchAdapter:
             loss_masks=trimmed_loss_masks,
         )
 
-    @contextmanager
     def prefix_sharing_runtime_context(
         self,
         prefix_sharing_batch: VerlMCorePrefixSharingBatch,
-    ) -> Iterator[PrefixSharingRuntimeContext]:
+    ) -> Iterator[Any]:
         """Open the runtime context consumed by patched attention."""
 
-        with prefix_sharing_context(prefix_sharing_batch.prefix_sharing_plan, backend=TorchReferenceBackend()) as ctx:
-            yield ctx
+        runtime_state = PrefixSharingRuntimeState(
+            prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
+            backend=TorchReferenceBackend(),
+            kept_position_ids=None,
+            prefix_last_restore_slots=[],
+        )
+        return _prefix_sharing_runtime_context(runtime_state)
 
     def restore_logprobs(
         self,
@@ -201,7 +202,7 @@ def prepare_megatron_actor_micro_batch(
 
     The framework-facing contract is intentionally small: dependency/verl calls
     this once after obtaining the micro-batch and then opens
-    :func:`megatron_actor_prefix_sharing_context` around its existing forward
+    :func:`prefix_sharing_runtime_context` around its existing forward
     call. Unsupported or disabled cases return ``(batch, None)``.
     """
 
@@ -341,21 +342,12 @@ def prepare_megatron_actor_micro_batch(
     return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
-@contextmanager
 def megatron_actor_prefix_sharing_context(
     prefix_sharing_runtime_state: PrefixSharingRuntimeState | None,
-) -> Iterator[PrefixSharingRuntimeContext | None]:
-    if prefix_sharing_runtime_state is None:
-        with nullcontext(None) as ctx:
-            yield ctx
-        return
-    with prefix_sharing_context(
-        prefix_sharing_runtime_state.prefix_sharing_plan,
-        backend=prefix_sharing_runtime_state.backend,
-        kept_position_ids=prefix_sharing_runtime_state.kept_position_ids,
-        prefix_last_restore_slots=prefix_sharing_runtime_state.prefix_last_restore_slots,
-    ) as ctx:
-        yield ctx
+) -> Iterator[Any]:
+    """Compatibility wrapper for older verl actor patch call sites."""
+
+    return _prefix_sharing_runtime_context(prefix_sharing_runtime_state)
 
 
 def restore_megatron_actor_log_probs(

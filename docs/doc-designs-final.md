@@ -725,13 +725,13 @@ output = backend.attention(query, expanded_key, expanded_value, prefix_sharing_p
 核心对象：
 
 - `PrefixSharingRuntimeContext`
-- `prefix_sharing_context()`
-- `get_current_prefix_sharing_context()`
+- `prefix_sharing_runtime_context()`
+- `current_prefix_sharing_context()`
 
 职责：
 
-- 绑定当前 `PrefixSharingPlan`。
-- 绑定当前 `PrefixKVStore`。
+- 从 `PrefixSharingRuntimeState` 创建并绑定当前 `PrefixSharingRuntimeContext`。
+- 绑定当前 `PrefixSharingPlan` 和 `PrefixKVStore`。
 - 让 attention patch 在不改变大量函数签名的情况下读取当前 prefix_sharing_plan/store。
 - 保证上下文退出后恢复旧状态。
 
@@ -829,7 +829,6 @@ hidden_states
 - `PrefixSharingRuntimeState`
 - `PackedPackedPrefixLastRestoreSlot`
 - `prepare_megatron_actor_micro_batch()`
-- `megatron_actor_prefix_sharing_context()`
 - `restore_megatron_actor_log_probs()`
 - `VerlMCoreIntegration`
 - `enable_prefix_sharing()`
@@ -839,7 +838,7 @@ hidden_states
 
 - 在 micro-batch preprocess 阶段生成 `PrefixSharingPlan`。
 - 调用 `batch_trim` 裁剪 input、labels、loss mask、response mask。
-- 进入 `prefix_sharing_context()`，让 Megatron attention patch 可读取 prefix_sharing_plan/cache。
+- 进入 `prefix_sharing_runtime_context()`，让 Megatron attention patch 可读取 prefix_sharing_plan/cache。
 - postprocess 阶段组装 logprob，执行 Prefix-Last Restore。
 - 保持 verl actor 原始 batch 顺序和返回格式。
 - 在 `dependency/verl_v070/verl/workers/actor/megatron_actor.py` 中仅保留最小使能入口：micro-batch 准备、forward context 和 logprob restore 调用。

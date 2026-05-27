@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -31,20 +31,9 @@ def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
 
 
 @contextmanager
-def prefix_sharing_context(
-    prefix_sharing_plan: PrefixSharingPlan,
-    *,
-    backend: Any | None = None,
-    kept_position_ids: Any | None = None,
-    prefix_last_restore_slots: list[Any] | None = None,
+def _bind_prefix_sharing_runtime_context(
+    ctx: PrefixSharingRuntimeContext,
 ) -> Iterator[PrefixSharingRuntimeContext]:
-    ctx = PrefixSharingRuntimeContext(
-        prefix_sharing_plan=prefix_sharing_plan,
-        store=PrefixKVStore(),
-        backend=backend,
-        kept_position_ids=kept_position_ids,
-        prefix_last_restore_slots=list(prefix_last_restore_slots or []),
-    )
     token = _current_context.set(ctx)
     try:
         yield ctx
@@ -53,14 +42,20 @@ def prefix_sharing_context(
         ctx.store.close()
 
 
-def optional_prefix_sharing_context(
+@contextmanager
+def prefix_sharing_runtime_context(
     prefix_sharing_runtime_state: Any | None,
 ) -> Iterator[PrefixSharingRuntimeContext | None]:
     if prefix_sharing_runtime_state is None:
-        return nullcontext(None)
-    return prefix_sharing_context(
-        prefix_sharing_runtime_state.prefix_sharing_plan,
-        backend=getattr(prefix_sharing_runtime_state, "backend", None),
-        kept_position_ids=getattr(prefix_sharing_runtime_state, "kept_position_ids", None),
-        prefix_last_restore_slots=getattr(prefix_sharing_runtime_state, "prefix_last_restore_slots", None),
+        yield None
+        return
+
+    ctx = PrefixSharingRuntimeContext(
+        prefix_sharing_plan=prefix_sharing_runtime_state.prefix_sharing_plan,
+        store=PrefixKVStore(),
+        backend=prefix_sharing_runtime_state.backend,
+        kept_position_ids=prefix_sharing_runtime_state.kept_position_ids,
+        prefix_last_restore_slots=list(prefix_sharing_runtime_state.prefix_last_restore_slots),
     )
+    with _bind_prefix_sharing_runtime_context(ctx) as bound_ctx:
+        yield bound_ctx

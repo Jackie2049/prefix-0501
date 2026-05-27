@@ -4,6 +4,33 @@
 
 ---
 
+## 2026-05-27 11:32 简化 prefix sharing runtime context 入口
+
+### 背景
+
+用户指出 `megatron_actor_prefix_sharing_context`、`prefix_sharing_context` 和 `PrefixSharingRuntimeContext` 三层上下文设计过于绕，实际真正的上下文对象是 `PrefixSharingRuntimeContext`。
+
+### 完成事项
+
+1. 将公开运行时入口收敛为 `prefix_sharing_runtime_context(prefix_sharing_runtime_state)`。
+2. 由 `prefix_sharing_runtime_context()` 直接创建并绑定 `PrefixSharingRuntimeContext`，退出时关闭 `PrefixKVStore` 并恢复 `ContextVar`。
+3. 移除旧的 `prefix_sharing_context()` / `optional_prefix_sharing_context()` 主路径接口。
+4. `dependency/verl_v070/verl/workers/actor/megatron_actor.py` 改为直接使用 `prefix_sharing_runtime_context`。
+5. 保留 `megatron_actor_prefix_sharing_context()` 作为旧调用点兼容包装，不再作为主设计入口。
+6. 同步更新 unit / integration 测试和当前设计文档。
+
+### 自测结果
+
+本地执行：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache python3 -m pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
+```
+
+结果：`43 passed, 5 skipped`。skip 来自本地缺少 `torch`、`torch_npu`、`verl` 的 optional 测试。
+
+---
+
 ## 2026-05-27 11:22 清理 prefix sharing runtime state 命名
 
 ### 背景
