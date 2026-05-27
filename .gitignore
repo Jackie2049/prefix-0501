@@ -21,6 +21,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Test coverage
+.coverage
+cov.json
+
 # Model checkpoints (large files)
 *.pt
 *.pth
