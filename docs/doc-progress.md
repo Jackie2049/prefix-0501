@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-05-27 11:37 删除 Megatron actor 专属 context 兼容包装
+
+### 背景
+
+用户确认 `megatron_actor_prefix_sharing_context()` 只剩一层无语义委托，会干扰对 runtime context 主入口的理解。
+
+### 完成事项
+
+1. 删除 `megatron_actor_prefix_sharing_context()`。
+2. 从 `prefix_sharing.integrations` 公开导出中移除该符号。
+3. 保持 Megatron actor 主路径直接使用 `prefix_sharing_runtime_context(prefix_sharing_runtime_state)`。
+
+### 自测结果
+
+本地执行：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache python3 -m pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
+```
+
+结果：`43 passed, 5 skipped`。skip 来自本地缺少 `torch`、`torch_npu`、`verl` 的 optional 测试。
+
+---
+
 ## 2026-05-27 11:32 简化 prefix sharing runtime context 入口
 
 ### 背景

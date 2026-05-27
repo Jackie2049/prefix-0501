@@ -31,18 +31,6 @@ def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
 
 
 @contextmanager
-def _bind_prefix_sharing_runtime_context(
-    ctx: PrefixSharingRuntimeContext,
-) -> Iterator[PrefixSharingRuntimeContext]:
-    token = _current_context.set(ctx)
-    try:
-        yield ctx
-    finally:
-        _current_context.reset(token)
-        ctx.store.close()
-
-
-@contextmanager
 def prefix_sharing_runtime_context(
     prefix_sharing_runtime_state: Any | None,
 ) -> Iterator[PrefixSharingRuntimeContext | None]:
@@ -57,5 +45,9 @@ def prefix_sharing_runtime_context(
         kept_position_ids=prefix_sharing_runtime_state.kept_position_ids,
         prefix_last_restore_slots=list(prefix_sharing_runtime_state.prefix_last_restore_slots),
     )
-    with _bind_prefix_sharing_runtime_context(ctx) as bound_ctx:
-        yield bound_ctx
+    token = _current_context.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _current_context.reset(token)
+        ctx.store.close()

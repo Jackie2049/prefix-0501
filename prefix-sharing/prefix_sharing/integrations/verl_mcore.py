@@ -342,14 +342,6 @@ def prepare_megatron_actor_micro_batch(
     return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
-def megatron_actor_prefix_sharing_context(
-    prefix_sharing_runtime_state: PrefixSharingRuntimeState | None,
-) -> Iterator[Any]:
-    """Compatibility wrapper for older verl actor patch call sites."""
-
-    return _prefix_sharing_runtime_context(prefix_sharing_runtime_state)
-
-
 def restore_megatron_actor_log_probs(
     logits: Any,
     labels: Any,
