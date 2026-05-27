@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-05-27 10:27 重命名 PrefixSharingBatchMeta 为 PrefixSharingPlan
+
+### 背景
+
+用户指出 `PrefixSharingBatchMeta` 和局部变量 `meta` 语义过弱，planner 输出实际是一次 micro-batch 的 prefix sharing 执行计划。
+
+### 完成事项
+
+1. 将 `PrefixSharingBatchMeta` 重命名为 `PrefixSharingPlan`。
+2. 将 runtime context 字段从 `meta` 改为 `plan`。
+3. 将 `prepare_megatron_actor_micro_batch()` 中 planner 输出变量改为 `prefix_sharing_plan`。
+4. 更新 core、backend、integration、测试和当前设计文档中的类型与字段引用。
+
+### 自测结果
+
+本地执行：
+
+```bash
+PYTHONPATH=prefix-sharing PYTHONPYCACHEPREFIX=/private/tmp/prefix-0501-pycache python3 -m pytest -q prefix-sharing/tests/unit_test prefix-sharing/tests/integrated_test prefix-sharing/tests/system_test
+```
+
+结果：`43 passed, 5 skipped`。skip 来自本地缺少 `torch`、`torch_npu`、`verl` 的 optional 测试。
+
+---
+
 ## 2026-05-27 10:14 支持通过环境变量启用 prefix sharing
 
 ### 背景
@@ -175,7 +200,7 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
 1. 补齐 verl actor 主路径入口：
    - 在 `megatron_actor.py` 中新增极薄 import / helper 调用 / context manager。
    - `prepare_megatron_actor_micro_batch()` 在 micro-batch 内生成 prefix-sharing plan，按 attention mask 裁掉 reuser prefix。
-   - `megatron_actor_prefix_sharing_context()` 把 meta、cache、backend、原始 position_ids、restore slot 传给 Megatron attention。
+   - `megatron_actor_prefix_sharing_context()` 把 plan、cache、backend、原始 position_ids、restore slot 传给 Megatron attention。
    - `restore_megatron_actor_log_probs()` 从 provider prefix-last logits 恢复 reuser 第一个 suffix token logprob，保持 autograd 路径。
 
 2. 补齐 Megatron attention 真实 hook：
@@ -253,7 +278,7 @@ Phase 2 除并行、硬件后端、性能策略外，应包含 “Prefix Activat
    - `min_group_size` 在 relation 语义下仍生效：历史命中样本数加当前样本需达到阈值
 
 2. 改造 metadata / planner：
-   - `PrefixSharingBatchMeta` 新增 `reuse_specs`
+   - `PrefixSharingPlan` 新增 `reuse_specs`
    - planner 基于 `provider_index[i] != i and prefix_lens[i] > 0` 判断 reuser
    - `prefix_last_restore` 从 per-sample reuse relation 派生
 
@@ -371,7 +396,7 @@ python3 -m pytest tests/system_test
 
 1. 新增 `prefix_sharing/` 包结构：
    - `core/config.py`：`PrefixSharingConfig` 和阶段一硬约束校验
-   - `core/metadata.py`：`PrefixSharingBatchMeta`、`PrefixLastRestoreSpec`
+   - `core/metadata.py`：`PrefixSharingPlan`、`PrefixLastRestoreSpec`
    - `core/detector.py`：`TriePrefixDetector`
    - `core/planner.py`：prefix group 到可执行 metadata 的计划生成
    - `core/mapping.py`：input / label / loss / Prefix-Last Restore 坐标映射
@@ -455,7 +480,7 @@ python3 -m compileall prefix_sharing
    - 项目目标与阶段一非目标
    - `One-Forward + KV Injection + Prefix-Last Restore` 核心方案
    - 三层架构：`core/`、`integrations/`、`backends/`
-   - `PrefixSharingConfig`、`PrefixSharingBatchMeta`、`PrefixLastRestoreSpec`
+   - `PrefixSharingConfig`、`PrefixSharingPlan`、`PrefixLastRestoreSpec`
    - detector、planner、mapping、cache、backend 职责
    - 阶段一 preprocess / attention / postprocess 数据流
    - 非侵入式 patch 集成策略
@@ -564,7 +589,7 @@ output(P_last)
 1. 更新 `doc-designs.md`，新增最新设计章节：`2026-05-11 21:31 详细设计：三层架构 + Metadata + 后端适配方案`
 
 2. 新设计将 prefix sharing 拆为三层：
-   - **通用语义层**：`PrefixSharingBatchMeta`、detector、planner、mapping、cache，不绑定具体硬件后端
+   - **通用语义层**：`PrefixSharingPlan`、detector、planner、mapping、cache，不绑定具体硬件后端
    - **模型集成层**：MVP 完全通过 patch 接入 verl mcore preprocess/postprocess、Megatron attention hook、RoPE offset、logprob/loss 对齐
    - **后端适配层**：`TorchReferenceBackend`、CUDA backend、CANN NPU backend 等，通过统一接口消费 metadata
 
@@ -592,7 +617,7 @@ output(P_last)
 
 ### 下一步
 
-- 按新设计先实现 `PrefixSharingConfig.validate()`、`PrefixSharingBatchMeta`、planner、mapping 和 `TorchReferenceBackend`
+- 按新设计先实现 `PrefixSharingConfig.validate()`、`PrefixSharingPlan`、planner、mapping 和 `TorchReferenceBackend`
 - 用 reference backend 验证裁剪、RoPE offset、KV 注入、label/logprob/output mapping
 - 再进入 Megatron 单层 hook 和 verl logprob patch 集成
 

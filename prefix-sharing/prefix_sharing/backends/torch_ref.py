@@ -12,7 +12,7 @@ from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.metadata import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
 
 
@@ -41,35 +41,35 @@ class TorchReferenceBackend:
         self,
         query: Any,
         key: Any,
-        meta: PrefixSharingBatchMeta,
+        plan: PrefixSharingPlan,
         *,
         rope_fn: Any | None = None,
         **_: Any,
     ) -> tuple[Any, Any]:
         if rope_fn is None:
             return query, key
-        return rope_fn(query, key, meta.q_position_offsets, meta.kv_position_offsets)
+        return rope_fn(query, key, plan.q_position_offsets, plan.kv_position_offsets)
 
     def build_kv(
         self,
         key: Any,
         value: Any,
         store: PrefixKVStore,
-        meta: PrefixSharingBatchMeta,
+        plan: PrefixSharingPlan,
         *,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
         torch = _torch()
-        key_rows = _split_packed(key, meta.kept_lengths_q)
-        value_rows = _split_packed(value, meta.kept_lengths_q)
+        key_rows = _split_packed(key, plan.kept_lengths_q)
+        value_rows = _split_packed(value, plan.kept_lengths_q)
         expanded_keys = []
         expanded_values = []
         for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
-            if not meta.is_reuser(batch_index):
+            if not plan.is_reuser(batch_index):
                 slot_id = PrefixKVSlotId(
-                    meta.forward_id,
-                    meta.micro_batch_id,
+                    plan.forward_id,
+                    plan.micro_batch_id,
                     layer_id,
                     batch_index,
                     tp_rank,
@@ -84,21 +84,21 @@ class TorchReferenceBackend:
                 expanded_keys.append(key_row)
                 expanded_values.append(value_row)
             else:
-                provider = meta.provider_index[batch_index]
+                provider = plan.provider_index[batch_index]
                 provider_slot_id = PrefixKVSlotId(
-                    meta.forward_id,
-                    meta.micro_batch_id,
+                    plan.forward_id,
+                    plan.micro_batch_id,
                     layer_id,
                     provider,
                     tp_rank,
                 )
                 entry = store.load(provider_slot_id)
-                prefix_len = meta.prefix_lens[batch_index]
+                prefix_len = plan.prefix_lens[batch_index]
                 expanded_key = torch.cat([entry.key_tensor[:prefix_len], key_row], dim=0)
                 expanded_value = torch.cat([entry.value_tensor[:prefix_len], value_row], dim=0)
                 own_slot_id = PrefixKVSlotId(
-                    meta.forward_id,
-                    meta.micro_batch_id,
+                    plan.forward_id,
+                    plan.micro_batch_id,
                     layer_id,
                     batch_index,
                     tp_rank,
@@ -114,14 +114,14 @@ class TorchReferenceBackend:
                 expanded_values.append(expanded_value)
         return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
 
-    def attention(self, query: Any, key: Any, value: Any, meta: PrefixSharingBatchMeta, **_: Any) -> Any:
+    def attention(self, query: Any, key: Any, value: Any, plan: PrefixSharingPlan, **_: Any) -> Any:
         torch = _torch()
-        query_rows = _split_packed(query, meta.kept_lengths_q)
-        key_rows = _split_packed(key, meta.expanded_lengths_kv)
-        value_rows = _split_packed(value, meta.expanded_lengths_kv)
+        query_rows = _split_packed(query, plan.kept_lengths_q)
+        key_rows = _split_packed(key, plan.expanded_lengths_kv)
+        value_rows = _split_packed(value, plan.expanded_lengths_kv)
         outputs = []
         for batch_index, (q_row, k_row, v_row) in enumerate(zip(query_rows, key_rows, value_rows)):
-            prefix_len = meta.q_position_offsets[batch_index]
+            prefix_len = plan.q_position_offsets[batch_index]
             mask = _causal_q_kv_mask(
                 q_len=q_row.shape[0],
                 kv_len=k_row.shape[0],

@@ -26,7 +26,7 @@ from prefix_sharing.core.batch_trim import (
     trim_loss_masks,
 )
 from prefix_sharing.core.logprob import restore_prefix_last_logprobs
-from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.metadata import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import (
     PrefixSharingRuntimeContext,
@@ -53,7 +53,7 @@ class DensePrefixLastRestoreSpec:
 
 @dataclass(frozen=True)
 class MegatronActorPreparedMicroBatch:
-    meta: PrefixSharingBatchMeta
+    plan: PrefixSharingPlan
     backend: Any
     kept_position_ids: Any
     restore_positions: list[DensePrefixLastRestoreSpec]
@@ -63,7 +63,7 @@ class MegatronActorPreparedMicroBatch:
 class VerlMCorePreparedBatch:
     """Framework-independent materialization of one verl actor micro-batch."""
 
-    meta: PrefixSharingBatchMeta
+    plan: PrefixSharingPlan
     input_ids: TrimmedBatch[int]
     labels: TrimmedBatch[Any] | None = None
     loss_masks: TrimmedBatch[Any] | None = None
@@ -75,7 +75,7 @@ class VerlMCoreBatchAdapter:
 
     The adapter is intentionally tensor-agnostic for Phase 1 local tests. A real
     verl integration can map the returned ``TrimmedBatch.flattened`` and
-    ``meta.cu_seqlens_q`` fields to torch tensors without changing core
+    ``plan.cu_seqlens_q`` fields to torch tensors without changing core
     semantics.
     """
 
@@ -98,16 +98,16 @@ class VerlMCoreBatchAdapter:
         """Plan prefix sharing and trim a micro-batch."""
 
         assert self.planner is not None
-        meta = self.planner.plan(
+        prefix_sharing_plan = self.planner.plan(
             input_ids,
             forward_id=forward_id,
             micro_batch_id=micro_batch_id,
         )
-        trimmed_inputs = trim_inputs(input_ids, meta)
-        trimmed_labels = trim_labels(labels, meta) if labels is not None else None
-        trimmed_loss_masks = trim_loss_masks(loss_masks, meta) if loss_masks is not None else None
+        trimmed_inputs = trim_inputs(input_ids, prefix_sharing_plan)
+        trimmed_labels = trim_labels(labels, prefix_sharing_plan) if labels is not None else None
+        trimmed_loss_masks = trim_loss_masks(loss_masks, prefix_sharing_plan) if loss_masks is not None else None
         return VerlMCorePreparedBatch(
-            meta=meta,
+            plan=prefix_sharing_plan,
             input_ids=trimmed_inputs,
             labels=trimmed_labels,
             loss_masks=trimmed_loss_masks,
@@ -120,21 +120,21 @@ class VerlMCoreBatchAdapter:
     ) -> Iterator[PrefixSharingRuntimeContext]:
         """Open the runtime context consumed by patched attention."""
 
-        with prefix_sharing_context(prepared.meta, backend=TorchReferenceBackend()) as ctx:
+        with prefix_sharing_context(prepared.plan, backend=TorchReferenceBackend()) as ctx:
             yield ctx
 
     def restore_logprobs(
         self,
         suffix_logprobs: Sequence[Sequence[float]],
         provider_prefix_last_logprobs: Sequence[float],
-        meta: PrefixSharingBatchMeta,
+        plan: PrefixSharingPlan,
     ) -> list[list[float]]:
         """Assemble per-row logprobs with Prefix-Last Restore."""
 
         return restore_prefix_last_logprobs(
             suffix_logprobs,
             provider_prefix_last_logprobs,
-            meta,
+            plan,
         )
 
 
@@ -263,11 +263,15 @@ def prepare_megatron_actor_micro_batch(
     seq_lens = [len(s) for s in sequences]
     logger.warning(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
 
-    meta = PrefixSharingPlanner(config).plan(sequences)
-    logger.warning(f"[PS][prepare] plan result: has_sharing={meta.has_sharing}, keep_ranges={meta.input_keep_ranges}, prefix_last_restore={meta.prefix_last_restore}")
+    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
+    logger.warning(
+        f"[PS][prepare] plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
+        f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
+        f"prefix_last_restore={prefix_sharing_plan.prefix_last_restore}"
+    )
 
     # --- Path 5: no sharing found ---
-    if not meta.has_sharing:
+    if not prefix_sharing_plan.has_sharing:
         logger.warning(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
         return batch, None
 
@@ -281,7 +285,7 @@ def prepare_megatron_actor_micro_batch(
     kept_position_rows = []
 
     for row, indices in enumerate(valid_indices):
-        keep_start, keep_end = meta.input_keep_ranges[row]
+        keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
         kept_indices = indices[keep_start:keep_end]
         new_attention_mask[row, kept_indices] = True
         kept_position_rows.append(position_ids[row, kept_indices])
@@ -309,11 +313,11 @@ def prepare_megatron_actor_micro_batch(
     cu_seqlens_cpu = cu_seqlens_padded.tolist()
 
     restore_positions = []
-    for spec in meta.prefix_last_restore:
+    for spec in prefix_sharing_plan.prefix_last_restore:
         p_idx = spec.provider_idx_in_batch
         r_idx = spec.reuse_idx_in_batch
-        provider_offset = spec.provider_prefix_last_pos - meta.input_keep_ranges[p_idx][0]
-        reuse_offset = spec.reuse_first_suffix_label_pos - meta.input_keep_ranges[r_idx][0]
+        provider_offset = spec.provider_prefix_last_pos - prefix_sharing_plan.input_keep_ranges[p_idx][0]
+        reuse_offset = spec.reuse_first_suffix_label_pos - prefix_sharing_plan.input_keep_ranges[r_idx][0]
         restore_positions.append(
             DensePrefixLastRestoreSpec(
                 reuse_idx_in_batch=spec.reuse_idx_in_batch,
@@ -325,12 +329,12 @@ def prepare_megatron_actor_micro_batch(
 
     kept_position_ids = _concat_tensors(kept_position_rows)
     prepared = MegatronActorPreparedMicroBatch(
-        meta=meta,
+        plan=prefix_sharing_plan,
         backend=backend or TorchReferenceBackend(),
         kept_position_ids=kept_position_ids,
         restore_positions=restore_positions,
     )
-    logger.warning(f"[PS][prepare] PATH 6 DONE: returning (prepared_batch, prepared) with keep_ranges={meta.input_keep_ranges}")
+    logger.warning(f"[PS][prepare] PATH 6 DONE: returning (prepared_batch, prepared) with keep_ranges={prefix_sharing_plan.input_keep_ranges}")
     return prepared_batch, prepared
 
 
@@ -343,7 +347,7 @@ def megatron_actor_prefix_sharing_context(
             yield ctx
         return
     with prefix_sharing_context(
-        prepared.meta,
+        prepared.plan,
         backend=prepared.backend,
         kept_position_ids=prepared.kept_position_ids,
         restore_positions=prepared.restore_positions,

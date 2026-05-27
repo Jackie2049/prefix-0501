@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.metadata import PrefixSharingPlan
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class PrefixAttentionBackend(Protocol):
     def validate(self, config: PrefixSharingConfig, model_config: Any | None = None) -> None:
         ...
 
-    def apply_rope(self, query: Any, key: Any, meta: PrefixSharingBatchMeta, **kwargs: Any) -> tuple[Any, Any]:
+    def apply_rope(self, query: Any, key: Any, plan: PrefixSharingPlan, **kwargs: Any) -> tuple[Any, Any]:
         ...
 
     def build_kv(
@@ -36,12 +36,12 @@ class PrefixAttentionBackend(Protocol):
         key: Any,
         value: Any,
         store: Any,
-        meta: PrefixSharingBatchMeta,
+        plan: PrefixSharingPlan,
         *,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
         ...
 
-    def attention(self, query: Any, key: Any, value: Any, meta: PrefixSharingBatchMeta, **kwargs: Any) -> Any:
+    def attention(self, query: Any, key: Any, value: Any, plan: PrefixSharingPlan, **kwargs: Any) -> Any:
         ...

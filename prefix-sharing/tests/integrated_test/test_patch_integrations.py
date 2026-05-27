@@ -82,7 +82,7 @@ def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
         micro_batch_id=8,
     )
 
-    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in prepared.meta.reuse_specs] == [
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in prepared.plan.reuse_specs] == [
         (1, 0, 3),
     ]
     assert prepared.input_ids.rows == [[1, 2, 3, 10, 11], [20, 21, 22], [9, 9]]
@@ -93,13 +93,13 @@ def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
 
     with adapter.prepared_context(prepared) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.meta is prepared.meta
+        assert ctx.plan is prepared.plan
     assert current_prefix_sharing_context() is None
 
     restored = adapter.restore_logprobs(
         [[-1.0, -1.1, -1.2, -1.3, -1.4], [-2.1, -2.2], [-9.0, -9.1]],
         [0.0, -2.0, 0.0],
-        prepared.meta,
+        prepared.plan,
     )
     assert restored == [
         [-1.0, -1.1, -1.2, -1.3, -1.4],

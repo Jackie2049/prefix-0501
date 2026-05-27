@@ -16,14 +16,14 @@ def _meta():
 
 
 def test_trim_inputs_and_labels_follow_metadata_ranges():
-    meta = _meta()
+    plan = _meta()
     inputs = [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21, 22]]
     labels = [["p1", "p2", "s0", "s1", "eos"], ["p1", "p2", "s0", "s1", "s2", "eos"]]
 
-    trimmed_inputs = trim_inputs(inputs, meta)
-    trimmed_labels = trim_labels(labels, meta)
+    trimmed_inputs = trim_inputs(inputs, plan)
+    trimmed_labels = trim_labels(labels, plan)
 
     assert trimmed_inputs.rows == [[1, 2, 3, 10, 11], [20, 21, 22]]
     assert trimmed_inputs.flattened == [1, 2, 3, 10, 11, 20, 21, 22]
-    assert trimmed_inputs.cu_seqlens == meta.cu_seqlens_q
+    assert trimmed_inputs.cu_seqlens == plan.cu_seqlens_q
     assert trimmed_labels.rows == [["p1", "p2", "s0", "s1", "eos"], ["s1", "s2", "eos"]]

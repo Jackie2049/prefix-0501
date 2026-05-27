@@ -13,11 +13,11 @@ def _meta():
 
 
 def test_prefix_sharing_context_sets_and_clears_current_context():
-    meta = _meta()
+    plan = _meta()
     assert current_prefix_sharing_context() is None
-    with prefix_sharing_context(meta) as ctx:
+    with prefix_sharing_context(plan) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.meta is meta
+        assert ctx.plan is plan
         assert not ctx.store.closed
     assert current_prefix_sharing_context() is None
     assert ctx.store.closed

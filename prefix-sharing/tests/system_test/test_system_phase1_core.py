@@ -13,10 +13,10 @@ def test_phase_one_core_system_flow_without_framework_dependencies():
     planner = PrefixSharingPlanner(
         PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3, min_group_size=2)
     )
-    meta = planner.plan(input_ids, forward_id=123, micro_batch_id=456)
-    trimmed = trim_inputs(input_ids, meta)
+    plan = planner.plan(input_ids, forward_id=123, micro_batch_id=456)
+    trimmed = trim_inputs(input_ids, plan)
 
-    assert meta.has_sharing
+    assert plan.has_sharing
     assert trimmed.rows == [
         [101, 102, 103, 201, 202],
         [301, 302, 303],
@@ -37,7 +37,7 @@ def test_phase_one_core_system_flow_without_framework_dependencies():
     restored = restore_prefix_last_logprobs(
         suffix_logprobs,
         first_suffix_logprobs_by_batch,
-        meta,
+        plan,
     )
 
     assert restored[0] == [-1.0, -1.1, -1.2, -1.3, -1.4]

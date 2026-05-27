@@ -11,7 +11,7 @@ from prefix_sharing.core.logprob import (
     restore_prefix_last_logprobs,
     restore_prefix_last_logprobs_tensor,
 )
-from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.metadata import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlanner
 
 __all__ = [
@@ -19,7 +19,7 @@ __all__ = [
     "PrefixReuseSpec",
     "PrefixKVSlotId",
     "PrefixKVStore",
-    "PrefixSharingBatchMeta",
+    "PrefixSharingPlan",
     "PrefixSharingConfig",
     "PrefixSharingConfigError",
     "PrefixLastRestoreSpec",

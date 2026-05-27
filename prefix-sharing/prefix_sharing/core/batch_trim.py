@@ -1,7 +1,7 @@
 """Trim per-row batches after prefix-sharing planning.
 
 This module sits **after** :mod:`prefix_sharing.core.planner` and consumes
-:class:`~prefix_sharing.core.metadata.PrefixSharingBatchMeta`. The planner encodes
+:class:`~prefix_sharing.core.metadata.PrefixSharingPlan`. The planner encodes
 *which* token spans each row keeps on the Q path and how packed lengths line up;
 this module applies those decisions to concrete per-row data: it slices
 ``input_ids``, ``labels``, and ``loss_masks`` into trimmed rows, and builds a
@@ -25,11 +25,11 @@ Key Components:
       ``flattened``, and ``cu_seqlens``.
     - :func:`trim_batch`, :func:`trim_inputs`, :func:`trim_labels`,
       :func:`trim_loss_masks`: Row slicing helpers; the ``trim_*`` entry points
-      wire the correct meta field into :func:`trim_batch`.
+      wire the correct plan field into :func:`trim_batch`.
 
 Design Principles:
     - **Meta-driven only**: no layout heuristics here; all spans come from
-      ``PrefixSharingBatchMeta`` produced by the planner.
+      ``PrefixSharingPlan`` produced by the planner.
     - **Sequence-generic**: type parameter ``T`` supports token ids, mask weights,
       or other per-position scalars.
     - **Backend-agnostic**: returns Python lists; integration stacks map the same
@@ -41,7 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Generic, Sequence, TypeVar
 
-from prefix_sharing.core.metadata import PrefixSharingBatchMeta
+from prefix_sharing.core.metadata import PrefixSharingPlan
 
 
 T = TypeVar("T")
@@ -79,13 +79,13 @@ def trim_batch(rows: Sequence[Sequence[T]], ranges: Sequence[tuple[int, int]]) -
     return TrimmedBatch(rows=trimmed_rows, flattened=flattened, cu_seqlens=cu_seqlens)
 
 
-def trim_inputs(input_ids: Sequence[Sequence[T]], meta: PrefixSharingBatchMeta) -> TrimmedBatch[T]:
-    return trim_batch(input_ids, meta.input_keep_ranges)
+def trim_inputs(input_ids: Sequence[Sequence[T]], plan: PrefixSharingPlan) -> TrimmedBatch[T]:
+    return trim_batch(input_ids, plan.input_keep_ranges)
 
 
-def trim_labels(labels: Sequence[Sequence[T]], meta: PrefixSharingBatchMeta) -> TrimmedBatch[T]:
-    return trim_batch(labels, meta.label_keep_ranges)
+def trim_labels(labels: Sequence[Sequence[T]], plan: PrefixSharingPlan) -> TrimmedBatch[T]:
+    return trim_batch(labels, plan.label_keep_ranges)
 
 
-def trim_loss_masks(loss_masks: Sequence[Sequence[T]], meta: PrefixSharingBatchMeta) -> TrimmedBatch[T]:
-    return trim_batch(loss_masks, meta.loss_mask_keep_ranges)
+def trim_loss_masks(loss_masks: Sequence[Sequence[T]], plan: PrefixSharingPlan) -> TrimmedBatch[T]:
+    return trim_batch(loss_masks, plan.loss_mask_keep_ranges)

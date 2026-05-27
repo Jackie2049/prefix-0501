@@ -15,7 +15,7 @@ Range = tuple[int, int]
 
 
 @dataclass(frozen=True)
-class PrefixSharingBatchMeta:
+class PrefixSharingPlan:
     """Complete framework-independent plan for a single micro-batch."""
 
     forward_id: int

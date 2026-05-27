@@ -34,7 +34,7 @@ def test_prepare_megatron_actor_micro_batch_trims_reuser_mask_and_context_positi
     prepared_batch, prepared = prepare_megatron_actor_micro_batch(batch, actor_config, model_config)
 
     assert prepared is not None
-    assert prepared.meta.has_sharing
+    assert prepared.plan.has_sharing
     assert prepared_batch["attention_mask"].tolist() == [
         [True, True, True, True, True],
         [False, False, False, True, True],

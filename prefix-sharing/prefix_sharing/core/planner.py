@@ -14,7 +14,7 @@ Core Responsibilities:
        the KV path, and which contiguous token spans to keep for inputs, labels,
        and loss masks. Inputs are only ``provider_index``, ``prefix_lens``, and
        per-row original length; the result is encoded as lengths, cumulative
-       seqlens, and keep ranges inside ``PrefixSharingBatchMeta``.
+       seqlens, and keep ranges inside ``PrefixSharingPlan``.
     2. Set ``q_position_offsets`` so reuser rows preserve correct absolute positions
        when the Q path only packs the suffix after a shared prefix.
     3. Emit :class:`PrefixLastRestoreSpec` entries when a reuser has both a
@@ -44,8 +44,8 @@ Design Principles:
 Example:
     >>> from prefix_sharing.core.config import PrefixSharingConfig
     >>> planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
-    >>> meta = planner.plan([[1, 2, 3, 4], [1, 2, 3, 5]], forward_id=1, micro_batch_id=1)
-    >>> meta.has_sharing
+    >>> plan = planner.plan([[1, 2, 3, 4], [1, 2, 3, 5]], forward_id=1, micro_batch_id=1)
+    >>> plan.has_sharing
     True
 """
 
@@ -81,7 +81,7 @@ class PrefixLastRestoreSpec:
     group_id: int
 
 
-from prefix_sharing.core.metadata import PrefixSharingBatchMeta  # noqa: E402
+from prefix_sharing.core.metadata import PrefixSharingPlan  # noqa: E402
 
 
 _forward_ids = itertools.count(1)
@@ -115,7 +115,7 @@ class PrefixSharingPlanner:
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
-    ) -> PrefixSharingBatchMeta:
+    ) -> PrefixSharingPlan:
         detection = self.detector.detect(input_ids)
         return self.plan_from_detection(
             input_ids,
@@ -131,7 +131,7 @@ class PrefixSharingPlanner:
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
-    ) -> PrefixSharingBatchMeta:
+    ) -> PrefixSharingPlan:
         if len(input_ids) != detection.batch_size:
             raise ValueError("input_ids batch size does not match detection result")
         if forward_id is None:
@@ -200,7 +200,7 @@ class PrefixSharingPlanner:
         cu_seqlens_q = _cumsum(kept_lengths_q)
         cu_seqlens_kv = _cumsum(expanded_lengths_kv)
 
-        return PrefixSharingBatchMeta(
+        return PrefixSharingPlan(
             forward_id=forward_id,
             micro_batch_id=micro_batch_id,
             batch_size=batch_size,
