@@ -1,0 +1,178 @@
+# Configuration file for feature precision guarding cases
+
+spec:
+  data_path: /home/llama_dataset/llama_text_document  #/home/local_data/data/llama_data/llama_text_document
+  tokenizer_model: /home/llama2-7b-tokenizer/tokenizer.model   #/home/local_data/data/llama2-tokenizer/tokenizer.model
+  mbs: 2
+  gbs: 16
+  train_iters: 1000
+
+run_baseline: True
+
+baseline:
+  pre_process:
+    - { script_file: llama_param_cvt.sh,
+        param: {
+          py_script_path: MindSpeed/tests_extend/system_tests/feature_precision_guarding/llama_param_cvt.py,
+          input_model_dir: ./ckpt_llama,
+          output_model_dir: ./ckpt_llama_baseline,
+          tp_size: 1,
+          pp_size: 1,
+          num_layers: 12,
+          swiglu: True,
+        }
+    }
+  run:
+    - { script_file: pretrain_fpg_llama.sh,
+        param: { npu_per_node: 1,
+                 tp_size: 1,
+                 pp_size: 1,
+                 load_ckpt_dir: ./ckpt_llama_baseline
+        }
+    }
+
+features:
+  - tp_parallel: # TP test:  TP8PP1 + SP
+      pre_process:
+        - { script_file: llama_param_cvt.sh,
+            param: {
+              py_script_path: MindSpeed/tests_extend/system_tests/feature_precision_guarding/llama_param_cvt.py,
+              input_model_dir: ./ckpt_llama,
+              output_model_dir: ./ckpt_llama_tp8pp1,
+              tp_size: 8,
+              pp_size: 1,
+              num_layers: 12,
+              swiglu: True,
+            }
+        }
+      run:
+        - { script_file: pretrain_fpg_llama.sh, # 仅TP并行
+            param: { npu_per_node: 8,
+                     tp_size: 8,
+                     pp_size: 1,
+                     load_ckpt_dir: ./ckpt_llama_tp8pp1,
+            }
+        }
+        - { script_file: pretrain_fpg_llama.sh,  # 计算通信并行 (通过python脚本使能）
+            param: { npu_per_node: 8,
+                     tp_size: 8,
+                     pp_size: 1,
+                     load_ckpt_dir: ./ckpt_llama_tp8pp1,
+                     coc_parallel_num: 8,
+                     use_coc_fused_kernel: 0
+            }
+        }
+        - { script_file: pretrain_fpg_llama.sh,  # 计算通信并行 （通过融合算子使能）
+            param: { npu_per_node: 8,
+                     tp_size: 8,
+                     pp_size: 1,
+                     load_ckpt_dir: ./ckpt_llama_tp8pp1,
+                     use_coc_fused_kernel: 1
+            }
+        }
+  - 3d_parallel_fused_feature:
+      pre_process:
+        - { script_file: llama_param_cvt.sh,
+            param: {
+              py_script_path: MindSpeed/tests_extend/system_tests/feature_precision_guarding/llama_param_cvt.py,
+              input_model_dir: ./ckpt_llama,
+              output_model_dir: ./ckpt_llama_tp2pp2,
+              tp_size: 2,
+              pp_size: 2,
+              num_layers: 12,
+              swiglu: True,
+            }
+        }
+      run:
+        - { script_file: pretrain_fpg_llama.sh, # 3D parallel and others features: TP2PP2DP2 + SP + DistributedOptimizer + OverlapGradReduce + MemoryFragmentationOptim + MC2
+            param: { npu_per_node: 8,
+                     tp_size: 2,
+                     pp_size: 2,
+                     load_ckpt_dir: ./ckpt_llama_tp2pp2,
+                     extra_args: '"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"',
+                     ascend_mc2: 1
+            }
+        }
+        - { script_file: pretrain_fpg_llama.sh, # reuse-fp32-param + ulysses长序列并行
+            param: { npu_per_node: 8,
+                     tp_size: 2,
+                     pp_size: 2,
+                     load_ckpt_dir: ./ckpt_llama_tp2pp2,
+                     extra_args: '"--reuse-fp32-param"',
+            }
+        }
+
+  - vpp:
+      pre_process:
+        - { script_file: llama_param_cvt.sh,
+            param: {
+              py_script_path: MindSpeed/tests_extend/system_tests/feature_precision_guarding/llama_param_cvt.py,
+              input_model_dir: ./ckpt_llama,
+              output_model_dir: ./ckpt_llama_tp1pp4vp1,
+              tp_size: 1,
+              pp_size: 4,
+              vp_size: 1,
+              num_layers: 12,
+              swiglu: True,
+            }
+        }
+      run:
+        - { script_file: pretrain_fpg_llama.sh,
+            param: { npu_per_node: 8,
+                     tp_size: 1,
+                     pp_size: 4,
+                     load_ckpt_dir: ./ckpt_llama_tp1pp4vp1,
+                     extra_args: '"--num-layers-per-virtual-pipeline-stage 1"',
+            }
+        }
+  - recompute-comm-optim:
+      pre_process:
+        - { script_file: llama_param_cvt.sh,
+            param: {
+              py_script_path: MindSpeed/tests_extend/system_tests/feature_precision_guarding/llama_param_cvt.py,
+              input_model_dir: ./ckpt_llama,
+              output_model_dir: ./ckpt_llama_tp2pp2,
+              tp_size: 2,
+              pp_size: 2,
+              num_layers: 12,
+              swiglu: True,
+            }
+        }
+      run:
+        - { script_file: pretrain_fpg_llama.sh, # 选择性重计算
+            param: { npu_per_node: 8,
+                     tp_size: 2,
+                     pp_size: 2,
+                     load_ckpt_dir: ./ckpt_llama_tp2pp2,
+                     extra_args: '"--recompute-activations"',
+            }
+        }
+        - { script_file: pretrain_fpg_llama.sh, # 完全重计算 uniform
+            param: { npu_per_node: 8,
+                     tp_size: 2,
+                     pp_size: 2,
+                     load_ckpt_dir: ./ckpt_llama_tp2pp2,
+                     extra_args: '"--recompute-granularity full --recompute-method uniform --recompute-num-layers 2 --optimize-recomp-communication-level 2"',
+            }
+        }
+        - { script_file: pretrain_fpg_llama.sh, # 完全重计算 block
+            param: { npu_per_node: 8,
+                     tp_size: 2,
+                     pp_size: 2,
+                     load_ckpt_dir: ./ckpt_llama_tp2pp2,
+                     extra_args: '"--recompute-granularity full --recompute-method block --recompute-num-layers 2"',
+            }
+        }
+        - { script_file: pretrain_fpg_llama.sh, # 自适应选择冲计算
+            param: { npu_per_node: 8,
+                     tp_size: 2,
+                     pp_size: 2,
+                     load_ckpt_dir: ./ckpt_llama_tp2pp2,
+                     extra_args: '"--adaptive-recompute-device-swap"',
+                     adaptive_recomputing: 1
+            }
+        }
+
+
+
+
