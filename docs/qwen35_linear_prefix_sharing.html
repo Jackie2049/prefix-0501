@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen 3.5 Prefix Sharing — 差异代码 + Linear Attention 详解</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+SC:wght@300;400;500;700;900&family=Space+Grotesk:wght@400;600;700&display=swap');
+:root{
+--bg:#06090f;--bg2:#0c1018;--bg3:#111724;
+--bdr:#1c2538;
+--t1:#e8ecf4;--t2:#a0aec0;--t3:#607090;
+--blue:#4f8ff7;--bluebg:rgba(79,143,247,.08);--bluebd:rgba(79,143,247,.18);
+--green:#34d399;--greenbg:rgba(52,211,153,.08);--greenbd:rgba(52,211,153,.18);
+--orange:#fb923c;--orangebg:rgba(251,146,60,.08);--orangebd:rgba(251,146,60,.18);
+--red:#f87171;--redbg:rgba(248,113,113,.06);
+--cyan:#22d3ee;--cyanbg:rgba(34,211,238,.08);--cyanbd:rgba(34,211,238,.18);
+--teal:#2dd4bf;--tealbg:rgba(45,212,191,.08);--tealbd:rgba(45,212,191,.18);
+--purple:#a78bfa;--purplebg:rgba(167,139,250,.08);
+--yellow:#fbbf24;--yellowbg:rgba(251,191,36,.08);
+}
+*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}
+body{font-family:'Noto Sans SC',sans-serif;background:var(--bg);color:var(--t1);line-height:1.65;font-size:14px}
+nav.top{position:fixed;top:0;left:0;right:0;z-index:999;background:rgba(6,9,15,.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:4px;padding:0 20px;height:48px}
+nav.top .brand{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:14px;color:var(--cyan);margin-right:16px;letter-spacing:-.3px}
+nav.top a{color:var(--t3);text-decoration:none;font-size:11.5px;padding:5px 12px;border-radius:5px;transition:all .15s;white-space:nowrap}
+nav.top a:hover{color:var(--t2);background:rgba(255,255,255,.04)}
+nav.top a.active{color:var(--cyan);background:var(--cyanbg)}
+.sp{height:48px}
+.w{max-width:1160px;margin:0 auto;padding:0 28px 80px}
+
+.sec{margin-bottom:64px;scroll-margin-top:60px}
+.sec h2{font-family:'Space Grotesk',sans-serif;font-size:24px;font-weight:700;letter-spacing:-.5px;margin-bottom:6px;display:flex;align-items:center;gap:10px}
+.sec h2 .n{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;padding:2px 10px;border-radius:4px;display:inline-block}
+.sec .d{color:var(--t2);font-size:13px;margin-bottom:24px;max-width:700px}
+
+/* panel */
+.p{background:var(--bg2);border:1px solid var(--bdr);border-radius:12px;margin-bottom:16px;overflow:hidden}
+.ph{padding:12px 20px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:8px}
+.ph .dot{width:7px;height:7px;border-radius:50%}
+.ph h3{font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600}
+.pb{padding:20px 24px}
+
+/* diff view */
+.diff{border-radius:10px;overflow:hidden;border:1px solid var(--bdr);margin:12px 0;font-family:'JetBrains Mono',monospace;font-size:11.5px;line-height:1.75;background:var(--bg)}
+.diff-h{padding:8px 14px;background:var(--bg2);border-bottom:1px solid var(--bdr);display:flex;align-items:center;justify-content:space-between}
+.diff-h .fp{font-size:11px;color:var(--t2)}
+.diff-h .tag{font-size:9px;font-weight:600;padding:2px 8px;border-radius:3px;letter-spacing:.3px}
+.tag-add{background:var(--greenbg);color:var(--green)}.tag-mod{background:var(--orangebg);color:var(--orange)}.tag-info{background:var(--cyanbg);color:var(--cyan)}
+.diff-b{padding:10px 0;overflow-x:auto}
+.diff-b .ln{display:flex;align-items:stretch;min-height:20px}
+.diff-b .ln .num{width:40px;text-align:right;padding-right:12px;color:var(--t3);user-select:none;flex-shrink:0;font-size:10px;line-height:1.75}
+.diff-b .ln .code{flex:1;padding-right:14px;white-space:pre;color:var(--t2)}
+.diff-b .ln .code .cm{color:var(--t3)}.diff-b .ln .code .kw{color:var(--purple)}.diff-b .ln .code .fn{color:var(--blue)}.diff-b .ln .code .st{color:var(--green)}
+.diff-b .ln.ctx{background:var(--bg)}.diff-b .ln.ctx .code{color:var(--t3)}
+.diff-b .ln.add{background:rgba(52,211,153,.06)}.diff-b .ln.add .code{color:var(--green)}
+.diff-b .ln.add .num{color:var(--green);opacity:.5}
+.diff-b .ln.del{background:var(--redbg)}.diff-b .ln.del .code{color:var(--red);text-decoration:line-through;opacity:.6}
+.diff-b .ln.hdr{background:rgba(34,211,238,.05)}.diff-b .ln.hdr .code{color:var(--cyan);font-weight:600}
+
+/* info */
+.info{border-radius:8px;padding:14px 18px;display:flex;gap:10px;align-items:flex-start;font-size:12px;margin:14px 0}
+.info .ic{font-size:16px;flex-shrink:0;margin-top:1px}.info .tx{color:var(--t2)}.info .tx strong{font-weight:600}
+.info-i{background:var(--cyanbg);border:1px solid var(--cyanbd)}.info-i .tx strong{color:var(--cyan)}
+.info-g{background:var(--greenbg);border:1px solid var(--greenbd)}.info-g .tx strong{color:var(--green)}
+.info-o{background:var(--orangebg);border:1px solid var(--orangebd)}.info-o .tx strong{color:var(--orange)}
+
+/* visual */
+.vrow{display:flex;align-items:center;gap:0;margin:16px 0;flex-wrap:wrap;justify-content:center}
+.vbox{border-radius:8px;padding:12px 16px;text-align:center;min-width:100px}
+.vbox .vt{font-family:'Space Grotesk',sans-serif;font-size:11.5px;font-weight:600;margin-bottom:3px}
+.vbox .vs{font-family:'JetBrains Mono',monospace;font-size:10px;opacity:.7}
+.vbox .vn{font-size:9.5px;opacity:.45;margin-top:3px}
+.vb-blue{background:var(--bluebg);border:1px solid var(--bluebd);color:var(--blue)}
+.vb-green{background:var(--greenbg);border:1px solid var(--greenbd);color:var(--green)}
+.vb-orange{background:var(--orangebg);border:1px solid var(--orangebd);color:var(--orange)}
+.vb-cyan{background:var(--cyanbg);border:1px solid var(--cyanbd);color:var(--cyan)}
+.vb-teal{background:var(--tealbg);border:1px solid var(--tealbd);color:var(--teal)}
+.vb-dim{background:rgba(255,255,255,.02);border:1px solid var(--bdr);color:var(--t3)}
+.vb-red{background:var(--redbg);border:1px solid rgba(248,113,113,.15);color:var(--red)}
+.arr{color:var(--t3);font-size:16px;padding:0 4px;flex-shrink:0;opacity:.35}
+.arrdn{display:flex;justify-content:center;color:var(--t3);font-size:16px;padding:4px 0;opacity:.35}
+
+.tens{display:inline-block;border-radius:5px;padding:6px 12px;font-family:'JetBrains Mono',monospace;font-size:10.5px;border:1px solid;text-align:center;margin:3px}
+.tens .tl{font-size:9px;opacity:.6;margin-bottom:1px}.tens .ts{font-weight:600}
+.t-blue{background:var(--bluebg);border-color:var(--bluebd);color:var(--blue)}
+.t-green{background:var(--greenbg);border-color:var(--greenbd);color:var(--green)}
+.t-orange{background:var(--orangebg);border-color:var(--orangebd);color:var(--orange)}
+.t-cyan{background:var(--cyanbg);border-color:var(--cyanbd);color:var(--cyan)}
+.t-red{background:var(--redbg);border-color:rgba(248,113,113,.18);color:var(--red)}
+
+/* state anim */
+.state-flow{display:flex;align-items:center;gap:12px;padding:16px;background:var(--bg);border-radius:10px;margin:12px 0;flex-wrap:wrap;justify-content:center}
+.state-grid{display:inline-grid;gap:2px}
+.state-grid .sc{width:10px;height:10px;border-radius:2px}
+
+/* step */
+.steps{list-style:none;padding:0;counter-reset:st}
+.steps li{counter-increment:st;padding:14px 16px 14px 52px;position:relative;border-left:2px solid var(--bdr);margin-left:14px}
+.steps li::before{content:counter(st);position:absolute;left:-13px;top:12px;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700}
+.steps li:first-child{border-left-color:transparent}
+.steps li h4{font-size:13px;font-weight:600;margin-bottom:3px}
+.steps li p{color:var(--t2);font-size:12px}
+.st-o::before{background:var(--orange);color:#000}.st-c::before{background:var(--cyan);color:#000}
+.st-g::before{background:var(--green);color:#000}.st-b::before{background:var(--blue);color:#fff}
+
+/* table */
+.tbl{width:100%;border-collapse:collapse;font-size:12px;margin:12px 0}
+.tbl th{text-align:left;padding:7px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--t3);border-bottom:1px solid var(--bdr);background:var(--bg)}
+.tbl td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.02);font-family:'JetBrains Mono',monospace;font-size:11px}
+.tbl td:first-child{font-family:'Noto Sans SC',sans-serif;color:var(--t2)}
+
+.bdg{font-size:9px;padding:2px 7px;border-radius:3px;font-weight:600;letter-spacing:.2px;display:inline-block;font-family:'JetBrains Mono',monospace}
+
+/* matrix computation steps + code panel side-by-side */
+.step-pair{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0;align-items:start}
+.mat-step{background:var(--bg);border-radius:8px;padding:12px 16px;border:1px solid var(--bdr)}
+.ms-label{font-size:11px;font-weight:600;color:var(--t3);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid rgba(255,255,255,.04)}
+.ms-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:3px 0;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6}
+.ms-t{font-weight:700;padding:2px 8px;border-radius:4px;font-size:12px}
+.ms-w{font-weight:600;padding:2px 8px;border-radius:4px;font-size:11px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);color:var(--purple)}
+.ms-blue{color:var(--blue)}.ms-orange{color:var(--orange)}.ms-cyan{color:var(--cyan)}.ms-red{color:var(--red)}.ms-green{color:var(--green)}
+.ms-shape{color:var(--t2);font-size:11px}.ms-op{color:var(--t3);font-size:12px}
+.ms-note{font-size:10px;color:var(--t3);font-family:'Noto Sans SC',sans-serif;margin-left:4px}
+
+/* code panel */
+.mat-code{background:var(--bg);border:1px solid var(--bdr);border-radius:8px;overflow:hidden;font-family:'JetBrains Mono',monospace;font-size:10.5px;line-height:1.7}
+.mc-file{padding:6px 12px;background:rgba(34,211,238,.04);border-bottom:1px solid var(--bdr);font-size:9.5px;color:var(--cyan);font-weight:600;letter-spacing:.2px}
+.mc-body{padding:10px 12px;overflow-x:auto;white-space:pre;color:var(--t2)}
+.mc-body .cm{color:var(--t3);font-style:italic}
+.mc-body .kw{color:var(--purple)}
+.mc-body .fn{color:var(--blue)}
+.mc-body .st{color:var(--green)}
+.mc-body .dim{color:var(--yellow);font-weight:500}
+.mc-body .var{color:var(--t1);font-weight:600}
+.mc-body .op{color:var(--t3)}
+
+@media(max-width:900px){
+  .step-pair{grid-template-columns:1fr}
+  .w{padding:0 12px}
+  nav.top{overflow-x:auto}
+}
+</style>
+</head>
+<body>
+<nav class="top">
+<span class="brand">Qwen 3.5 Prefix Sharing</span>
+<a href="#s-gqa" class="active">GQA &amp; 注意力基础</a>
+<a href="#s-linear">矩阵计算过程</a>
+<a href="#s-sharing">共享方案详解</a>
+<a href="#s-diff">差异代码</a>
+</nav>
+<div class="sp"></div>
+<div class="w">
+
+<!-- ===================== 三种注意力矩阵计算 ===================== -->
+<div class="sec" id="s-linear">
+<h2><span class="n" style="background:var(--orangebg);color:var(--orange)">01</span>三种注意力的矩阵计算过程</h2>
+<p class="d">左侧为矩阵形状推导，右侧为 transformers 实际代码（含维度注释）。B=批次, S=序列长度, H=hidden_size=4096。</p>
+
+<!-- ===== 标准注意力 ===== -->
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--blue)"></span><h3>标准注意力 (Qwen2 / Llama) — 逐层展开每一步矩阵乘法</h3></div>
+<div class="pb">
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 1: 输入</div>
+<div class="ms-row"><div class="ms-t ms-blue">x</div><div class="ms-shape">[B, S, 4096]</div><div class="ms-note">隐藏层维度 = 4096</div></div></div>
+<div class="mat-code"><div class="mc-file">参考：transformers/models/llama/modeling_llama.py</div>
+<div class="mc-body"><span class="cm"># LlamaAttention.forward()</span>
+<span class="var">hidden_states</span> = ...            <span class="cm"># <span class="dim">[B, S, 4096]</span></span>
+<span class="var">bsz, q_len, _</span> = hidden_states.size()</div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 2: QKV 三路线性投影（每组参数独立）</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>q</sub></div><div class="ms-shape">[4096, 4096]</div><div class="ms-op">=</div>
+<div class="ms-t ms-blue">Q</div><div class="ms-shape">[B, S, 4096]</div>
+<div class="ms-op">→ reshape</div>
+<div class="ms-t ms-blue">Q</div><div class="ms-shape">[B, S, 32, 128]</div>
+<div class="ms-note">32 个注意力头，每头 128 维</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>k</sub></div><div class="ms-shape">[4096, 512]</div><div class="ms-op">=</div>
+<div class="ms-t ms-blue">K</div><div class="ms-shape">[B, S, 512]</div>
+<div class="ms-op">→ reshape</div>
+<div class="ms-t ms-blue">K</div><div class="ms-shape">[B, S, 4, 128]</div>
+<div class="ms-note">4 个 KV 头（GQA），每组 32/4=8 个 Q 头共享</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>v</sub></div><div class="ms-shape">[4096, 512]</div><div class="ms-op">=</div>
+<div class="ms-t ms-blue">V</div><div class="ms-shape">[B, S, 512]</div>
+<div class="ms-op">→ reshape</div>
+<div class="ms-t ms-blue">V</div><div class="ms-shape">[B, S, 4, 128]</div>
+<div class="ms-note">与 K 相同</div>
+</div>
+</div>
+<div class="mat-code"><div class="mc-file">参考 LlamaAttention: q_proj/k_proj/v_proj</div>
+<div class="mc-body"><span class="cm"># nn.Linear(4096, 32*128) = nn.Linear(4096, 4096)</span>
+<span class="var">query_states</span> = self.q_proj(hidden_states)
+    .view(bsz, q_len, 32, 128)  <span class="cm"># <span class="dim">[B, S, 4096]</span> → <span class="dim">[B, S, 32, 128]</span></span>
+
+<span class="cm"># nn.Linear(4096, 4*128) = nn.Linear(4096, 512)</span>
+<span class="var">key_states</span> = self.k_proj(hidden_states)
+    .view(bsz, q_len, 4, 128)   <span class="cm"># <span class="dim">[B, S, 512]</span> → <span class="dim">[B, S, 4, 128]</span></span>
+
+<span class="cm"># nn.Linear(4096, 4*128) = nn.Linear(4096, 512)</span>
+<span class="var">value_states</span> = self.v_proj(hidden_states)
+    .view(bsz, q_len, 4, 128)   <span class="cm"># <span class="dim">[B, S, 512]</span> → <span class="dim">[B, S, 4, 128]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 3: RoPE 旋转位置编码（Q 和 K 都做）</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">Q, K</div>
+<div class="ms-op">+ 位置角度 →</div>
+<div class="ms-t ms-blue">Q', K'</div>
+<div class="ms-shape">[B, S, 32, 128] / [B, S, 4, 128]</div>
+<div class="ms-note">全部 128 维都施加旋转（factor=1.0）</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">transformers/modeling_utils.py: apply_rotary_pos_emb</div>
+<div class="mc-body"><span class="cm"># 全部 head_dim 参与旋转 (partial_rotary_factor=1.0)</span>
+<span class="var">query_states</span>, <span class="var">key_states</span> = apply_rotary_pos_emb(
+    query_states,   <span class="cm"># <span class="dim">[B, 32, S, 128]</span></span>
+    key_states,     <span class="cm"># <span class="dim">[B,  4, S, 128]</span></span>
+    cos, sin, position_ids
+)
+<span class="cm"># → Q' <span class="dim">[B, 32, S, 128]</span>, K' <span class="dim">[B, 4, S, 128]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 4: GQA — 把 4 个 KV 头复制到 32 个</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">K</div><div class="ms-shape">[B, S, 4, 128]</div>
+<div class="ms-op">×8 repeat →</div>
+<div class="ms-t ms-blue">K'</div><div class="ms-shape">[B, S, 32, 128]</div>
+<div class="ms-note">每个 KV 头被复制 32÷4=8 次</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">V</div><div class="ms-shape">[B, S, 4, 128]</div>
+<div class="ms-op">×8 repeat →</div>
+<div class="ms-t ms-blue">V'</div><div class="ms-shape">[B, S, 32, 128]</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">transformers/modeling_utils.py: repeat_kv</div>
+<div class="mc-body"><span class="cm"># num_key_value_groups = 32 // 4 = 8</span>
+<span class="kw">def</span> <span class="fn">repeat_kv</span>(hidden_states, n_rep):
+    <span class="cm"># hidden_states: <span class="dim">[B, 4, S, 128]</span></span>
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    <span class="kw">if</span> n_rep == 1:
+        <span class="kw">return</span> hidden_states
+    hidden_states = hidden_states[:, :, None, :, :]
+        .expand(batch, num_kv_heads, n_rep, slen, head_dim)
+        <span class="cm"># <span class="dim">[B, 4, 8, S, 128]</span></span>
+    <span class="kw">return</span> hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+        <span class="cm"># → <span class="dim">[B, 32, S, 128]</span></span>
+
+<span class="var">key_states</span> = repeat_kv(key_states, self.num_key_value_groups)
+<span class="var">value_states</span> = repeat_kv(value_states, self.num_key_value_groups)</div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 5: 注意力计算 — 这一步产生 KV Cache</div>
+<div class="ms-row">
+<div class="ms-t ms-cyan">scores</div><div class="ms-op">=</div>
+<div class="ms-t ms-blue">Q'</div><div class="ms-shape">[B, 32, S, 128]</div>
+<div class="ms-op">×</div>
+<div class="ms-t ms-blue">K'<sup>T</sup></div><div class="ms-shape">[B, 32, 128, S]</div>
+<div class="ms-op">/ √128 →</div>
+<div class="ms-t ms-cyan">scores</div><div class="ms-shape">[B, 32, S, S]</div>
+<div class="ms-note">S×S 的注意力矩阵</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-cyan">probs</div><div class="ms-op">= softmax(scores) →</div>
+<div class="ms-t ms-cyan">probs</div><div class="ms-shape">[B, 32, S, S]</div>
+<div class="ms-note">每行是一个 token 对所有历史 token 的注意力权重</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-cyan">attn_out</div><div class="ms-op">=</div>
+<div class="ms-t ms-cyan">probs</div><div class="ms-shape">[B, 32, S, S]</div>
+<div class="ms-op">×</div>
+<div class="ms-t ms-blue">V'</div><div class="ms-shape">[B, 32, S, 128]</div>
+<div class="ms-op">→</div>
+<div class="ms-t ms-cyan">attn_out</div><div class="ms-shape">[B, 32, S, 128]</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">sdpa_attention / eager_attention_forward</div>
+<div class="mc-body"><span class="cm"># scaling = head_dim ** -0.5 = 128 ** -0.5</span>
+<span class="var">attn_weights</span> = torch.matmul(
+    query_states,              <span class="cm"># <span class="dim">[B, 32, S, 128]</span></span>
+    key_states.transpose(-2, -1)  <span class="cm"># <span class="dim">[B, 32, 128, S]</span></span>
+) / math.sqrt(self.head_dim)  <span class="cm"># → <span class="dim">[B, 32, S, S]</span></span>
+
+<span class="var">attn_weights</span> = nn.functional.softmax(
+    attn_weights, dim=-1, dtype=torch.float32
+).to(query_states.dtype)      <span class="cm"># <span class="dim">[B, 32, S, S]</span></span>
+
+<span class="var">attn_output</span> = torch.matmul(
+    attn_weights,              <span class="cm"># <span class="dim">[B, 32, S, S]</span></span>
+    value_states               <span class="cm"># <span class="dim">[B, 32, S, 128]</span></span>
+)                             <span class="cm"># → <span class="dim">[B, 32, S, 128]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 6: 输出投影</div>
+<div class="ms-row">
+<div class="ms-t ms-cyan">attn_out</div><div class="ms-shape">[B, S, 4096]</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>o</sub></div><div class="ms-shape">[4096, 4096]</div><div class="ms-op">→</div>
+<div class="ms-t ms-blue">output</div><div class="ms-shape">[B, S, 4096]</div></div></div>
+<div class="mat-code"><div class="mc-file">LlamaAttention.forward() — 输出投影</div>
+<div class="mc-body"><span class="var">attn_output</span> = attn_output.transpose(1, 2)
+    .contiguous()              <span class="cm"># <span class="dim">[B, S, 32, 128]</span> → <span class="dim">[B, S, 4096]</span></span>
+<span class="var">attn_output</span> = self.o_proj(attn_output)
+    <span class="cm"># nn.Linear(4096, 4096)</span>
+    <span class="cm"># <span class="dim">[B, S, 4096]</span> @ <span class="dim">[4096, 4096]</span> → <span class="dim">[B, S, 4096]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">缓存（KV Cache）</div>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<div class="tens t-blue"><div class="tl">Key Cache</div><div class="ts">[B, 4, S, 128]</div></div>
+<div class="tens t-blue"><div class="tl">Value Cache</div><div class="ts">[B, 4, S, 128]</div></div>
+<div style="font-size:11px;color:var(--green)">S 维度随序列增长，4 个 KV 头，每头 128 维</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">transformers/cache_utils.py: DynamicCache.update()</div>
+<div class="mc-body"><span class="cm"># past_key_values.update() 追加新的 K、V</span>
+<span class="var">key_states</span>, <span class="var">value_states</span> = past_key_values.update(
+    key_states,     <span class="cm"># <span class="dim">[B, 4, S_new, 128]</span></span>
+    value_states,   <span class="cm"># <span class="dim">[B, 4, S_new, 128]</span></span>
+    layer_idx
+)
+<span class="cm"># 返回完整缓存：Key Cache <span class="dim">[B, 4, S_total, 128]</span></span>
+<span class="cm">#             Value Cache <span class="dim">[B, 4, S_total, 128]</span></span>
+<span class="cm"># S_total = 已缓存 + 新增，随序列线性增长</span></div></div>
+</div>
+
+</div>
+</div>
+
+<!-- ===== Qwen 3.5 Full Attention ===== -->
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--blue)"></span><h3>Qwen 3.5 Full Attention — <span style="color:var(--orange)">橙色</span> 为与标准注意力的差异</h3></div>
+<div class="pb">
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 1: 输入</div>
+<div class="ms-row"><div class="ms-t ms-blue">x</div><div class="ms-shape">[B, S, 4096]</div></div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:647-655 Qwen3_5Attention.forward()</div>
+<div class="mc-body"><span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states, position_embeddings, ...):
+    <span class="var">input_shape</span> = hidden_states.shape[:-1]   <span class="cm"># (B, S)</span>
+    <span class="var">hidden_shape</span> = (*input_shape, -1, self.head_dim) <span class="cm"># (B, S, -1, 256)</span>
+    <span class="cm"># hidden_states: <span class="dim">[B, S, 4096]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 2: 投影 — Q 和 gate 融合在一起，K/V 独立</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>q</sub></div><div class="ms-shape">[4096, 4096]</div><div class="ms-op">→ split →</div>
+<div class="ms-t ms-blue">Q</div><div class="ms-shape">[B, S, 16, 256]</div>
+<div class="ms-op">+</div>
+<div class="ms-t ms-orange">gate</div><div class="ms-shape" style="color:var(--orange)">[B, S, 4096]</div>
+<div class="ms-note" style="color:var(--orange)">↑ 一个投影同时输出 Q 和 gate</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>k</sub></div><div class="ms-shape">[4096, <span style="color:var(--orange)">1024</span>]</div><div class="ms-op">=</div>
+<div class="ms-t ms-blue">K</div><div class="ms-shape">[B, S, 4, <span style="color:var(--orange)">256</span>]</div>
+<div class="ms-note" style="color:var(--orange)">head_dim 128→256，4 个 KV 头</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>v</sub></div><div class="ms-shape">[4096, <span style="color:var(--orange)">1024</span>]</div><div class="ms-op">=</div>
+<div class="ms-t ms-blue">V</div><div class="ms-shape">[B, S, 4, <span style="color:var(--orange)">256</span>]</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:632-665</div>
+<div class="mc-body"><span class="cm"># __init__: q_proj 输出维度 = 16*256*2 = 8192 (Q+gate 融合)</span>
+self.q_proj = nn.Linear(4096, <span class="dim">16 * 256 * 2</span>)  <span class="cm"># → <span class="dim">[B, S, 8192]</span></span>
+self.k_proj = nn.Linear(4096, <span class="dim">4 * 256</span>)       <span class="cm"># → <span class="dim">[B, S, 1024]</span></span>
+self.v_proj = nn.Linear(4096, <span class="dim">4 * 256</span>)       <span class="cm"># → <span class="dim">[B, S, 1024]</span></span>
+
+<span class="cm"># forward:</span>
+<span class="var">query_states</span>, <span class="var">gate</span> = torch.chunk(
+    self.q_proj(hidden_states)           <span class="cm"># <span class="dim">[B, S, 8192]</span></span>
+    .view(*input_shape, -1, self.head_dim * 2),  <span class="cm"># <span class="dim">[B, S, 16, 512]</span></span>
+    2, dim=-1                            <span class="cm"># split at dim=-1</span>
+)
+<span class="cm"># query_states: <span class="dim">[B, S, 16, 256]</span></span>
+<span class="cm"># gate:         <span class="dim">[B, S, 16, 256]</span></span>
+
+<span class="var">gate</span> = gate.reshape(*input_shape, -1)  <span class="cm"># <span class="dim">[B, S, 4096]</span></span>
+<span class="var">key_states</span> = self.k_proj(hidden_states)
+    .view(hidden_shape)                  <span class="cm"># <span class="dim">[B, S, 4, 256]</span></span>
+<span class="var">value_states</span> = self.v_proj(hidden_states)
+    .view(hidden_shape)                  <span class="cm"># <span class="dim">[B, S, 4, 256]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 3: <span style="color:var(--orange)">RMSNorm(Q)</span> + <span style="color:var(--orange)">RMSNorm(K)</span> + RoPE(仅 <span style="color:var(--orange)">25%</span>)</div>
+<div class="ms-row">
+<div class="ms-t ms-orange">RMSNorm(Q)</div><div class="ms-shape">[B, S, 16, 256]</div>
+<div class="ms-op">→</div>
+<div class="ms-t ms-orange">RoPE on 64/256 dims</div>
+<div class="ms-op">→</div>
+<div class="ms-t ms-blue">Q'</div><div class="ms-shape">[B, S, 16, 256]</div>
+<div class="ms-note" style="color:var(--orange)">只有前 64 维（25%）施加旋转</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:644-645, 663-668</div>
+<div class="mc-body"><span class="cm"># __init__: head_dim 上的 RMSNorm (非 hidden_size 上)</span>
+self.q_norm = Qwen3_5RMSNorm(<span class="dim">256</span>)  <span class="cm"># head_dim=256</span>
+self.k_norm = Qwen3_5RMSNorm(<span class="dim">256</span>)
+
+<span class="cm"># forward: 先 RMSNorm 再转置</span>
+<span class="var">query_states</span> = self.q_norm(
+    query_states.view(hidden_shape)  <span class="cm"># <span class="dim">[B, S, 16, 256]</span></span>
+).transpose(1, 2)                     <span class="cm"># → <span class="dim">[B, 16, S, 256]</span></span>
+
+<span class="var">key_states</span> = self.k_norm(
+    self.k_proj(hidden_states).view(hidden_shape)  <span class="cm"># <span class="dim">[B, S, 4, 256]</span></span>
+).transpose(1, 2)                     <span class="cm"># → <span class="dim">[B, 4, S, 256]</span></span>
+
+<span class="cm"># RoPE: partial_rotary_factor=0.25 → 仅旋转前 64 维</span>
+<span class="cm"># dim = int(256 * 0.25) = 64</span>
+cos, sin = position_embeddings
+<span class="var">query_states</span>, <span class="var">key_states</span> = apply_rotary_pos_emb(
+    query_states, key_states, cos, sin
+)  <span class="cm"># Q' <span class="dim">[B, 16, S, 256]</span>, K' <span class="dim">[B, 4, S, 256]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 4: GQA — 把 4 个 KV 头复制到 16 个</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">K</div><div class="ms-shape">[B, S, 4, 256]</div>
+<div class="ms-op">×4 repeat →</div>
+<div class="ms-t ms-blue">K'</div><div class="ms-shape">[B, S, 16, 256]</div>
+<div class="ms-note">16/4=4 次复制（比 Qwen2 的 8 次少）</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:628, 671</div>
+<div class="mc-body"><span class="cm"># num_key_value_groups = 16 // 4 = 4</span>
+self.num_key_value_groups = (
+    config.num_attention_heads   <span class="cm"># 16</span>
+    // config.num_key_value_heads <span class="cm"># 4</span>
+)                                 <span class="cm"># = 4</span>
+
+<span class="cm"># past_key_values.update() 内部处理 GQA repeat</span>
+<span class="var">key_states</span>, <span class="var">value_states</span> = past_key_values.update(
+    key_states,    <span class="cm"># <span class="dim">[B, 4, S, 256]</span></span>
+    value_states,  <span class="cm"># <span class="dim">[B, 4, S, 256]</span></span>
+    self.layer_idx
+)
+<span class="cm"># repeat_kv 在 attention_interface 内部完成</span>
+<span class="cm"># K' <span class="dim">[B, 16, S, 256]</span>, V' <span class="dim">[B, 16, S, 256]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 5: 注意力计算</div>
+<div class="ms-row">
+<div class="ms-t ms-cyan">scores</div><div class="ms-op">= Q' × K'<sup>T</sup> / √<span style="color:var(--orange)">256</span></div>
+<div class="ms-op">→ softmax → × V' →</div>
+<div class="ms-t ms-cyan">attn_out</div><div class="ms-shape">[B, S, 16, 256]</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:673-686</div>
+<div class="mc-body"><span class="cm"># scaling = head_dim ** -0.5 = 256 ** -0.5</span>
+<span class="var">attn_output</span>, <span class="var">attn_weights</span> = attention_interface(
+    self,
+    query_states,   <span class="cm"># <span class="dim">[B, 16, S, 256]</span></span>
+    key_states,     <span class="cm"># <span class="dim">[B, 16, S, 256]</span> (after GQA repeat)</span>
+    value_states,   <span class="cm"># <span class="dim">[B, 16, S, 256]</span></span>
+    attention_mask,
+    scaling=self.scaling,  <span class="cm"># 1/√256</span>
+)
+<span class="cm"># attn_output: <span class="dim">[B, 16, S, 256]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 6: <span style="color:var(--orange)">输出门控</span> — 标准注意力没有这步</div>
+<div class="ms-row">
+<div class="ms-t ms-cyan">attn_out</div><div class="ms-shape">[B, S, 4096]</div>
+<div class="ms-op">×</div>
+<div class="ms-t ms-orange">sigmoid(gate)</div><div class="ms-shape" style="color:var(--orange)">[B, S, 4096]</div>
+<div class="ms-op">→</div>
+<div class="ms-t ms-orange">gated_out</div><div class="ms-shape" style="color:var(--orange)">[B, S, 4096]</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:688-689</div>
+<div class="mc-body"><span class="var">attn_output</span> = attn_output.reshape(*input_shape, -1)
+    .contiguous()               <span class="cm"># <span class="dim">[B, 16, S, 256]</span> → <span class="dim">[B, S, 4096]</span></span>
+
+<span class="cm"># ★ 输出门控：标准注意力没有这步</span>
+<span class="var">attn_output</span> = attn_output * torch.sigmoid(gate)
+    <span class="cm"># <span class="dim">[B, S, 4096]</span> × sigmoid(<span class="dim">[B, S, 4096]</span>) → <span class="dim">[B, S, 4096]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 7: 输出投影</div>
+<div class="ms-row">
+<div class="ms-t ms-orange">gated_out</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>o</sub></div><div class="ms-shape">[4096, 4096]</div><div class="ms-op">→</div>
+<div class="ms-t ms-blue">output</div><div class="ms-shape">[B, S, 4096]</div></div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:641-642, 691</div>
+<div class="mc-body"><span class="cm"># __init__:</span>
+self.o_proj = nn.Linear(<span class="dim">4096</span>, <span class="dim">4096</span>, bias=config.attention_bias)
+
+<span class="cm"># forward:</span>
+<span class="var">attn_output</span> = self.o_proj(attn_output)
+    <span class="cm"># <span class="dim">[B, S, 4096]</span> @ <span class="dim">[4096, 4096]</span> → <span class="dim">[B, S, 4096]</span></span>
+<span class="kw">return</span> attn_output, attn_weights</div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">缓存</div>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<div class="tens t-orange"><div class="tl">Key Cache</div><div class="ts">[B, 4, S, <span style="color:var(--orange)">256</span>]</div></div>
+<div class="tens t-orange"><div class="tl">Value Cache</div><div class="ts">[B, 4, S, <span style="color:var(--orange)">256</span>]</div></div>
+<div style="font-size:11px;color:var(--green)">head_dim 翻倍，但结构兼容 → GQA repeat 和 einsum 自动适配 ✓</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">cache_utils.py — 与标准 KV Cache 相同结构</div>
+<div class="mc-body"><span class="cm"># KV Cache 结构与 Llama 相同，仅 head_dim 不同</span>
+<span class="cm"># Key Cache:   <span class="dim">[B, 4, S_total, 256]</span>  (256 vs 标准 128)</span>
+<span class="cm"># Value Cache: <span class="dim">[B, 4, S_total, 256]</span></span>
+<span class="cm"># 仍然随 S 线性增长，但每 token 缓存量翻倍</span>
+<span class="cm"># S_total = 1024 时: 2 × B × 4 × 1024 × 256 × 2B ≈ 8 MB/层</span></div></div>
+</div>
+
+</div>
+</div>
+
+<!-- ===== Linear Attention ===== -->
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--orange)"></span><h3>Linear Attention (GatedDeltaNet) — 完全不同的计算，没有 softmax</h3></div>
+<div class="pb">
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 1: 输入</div>
+<div class="ms-row"><div class="ms-t ms-blue">x</div><div class="ms-shape">[B, S, 4096]</div></div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:422-431 Qwen3_5GatedDeltaNet.forward()</div>
+<div class="mc-body"><span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states, cache_params, attention_mask):
+    <span class="var">hidden_states</span> = apply_mask_to_padding_states(...)
+    <span class="var">batch_size, seq_len, _</span> = hidden_states.shape  <span class="cm"># B, S, <span class="dim">4096</span></span>
+    <span class="cm"># hidden_states: <span class="dim">[B, S, 4096]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 2: <span style="color:var(--orange)">四路投影</span>（标准注意力只有三路）</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>qkv</sub></div><div class="ms-shape">[4096, <span style="color:var(--orange)">8192</span>]</div><div class="ms-op">→ split →</div>
+<div class="ms-t ms-orange">Q<sub>raw</sub></div><div class="ms-shape">[B, S, 16, 128]</div>
+<div class="ms-op">+</div>
+<div class="ms-t ms-orange">K<sub>raw</sub></div><div class="ms-shape">[B, S, 16, 128]</div>
+<div class="ms-op">+</div>
+<div class="ms-t ms-orange">V<sub>raw</sub></div><div class="ms-shape">[B, S, 32, 128]</div>
+<div class="ms-note" style="color:var(--orange)">16 个 K 头，32 个 V 头，融合投影</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>z</sub></div><div class="ms-shape">[4096, 4096]</div><div class="ms-op">→</div>
+<div class="ms-t ms-orange">z</div><div class="ms-shape">[B, S, 32, 128]</div>
+<div class="ms-note" style="color:var(--orange)">输出门控信号（后面用 silu(z) 乘输出）</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>b</sub></div><div class="ms-shape">[4096, 32]</div><div class="ms-op">→</div>
+<div class="ms-t ms-orange">b</div><div class="ms-shape">[B, S, 32]</div>
+<div class="ms-note" style="color:var(--orange)">→ sigmoid(b) = β 写入门</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-blue">x</div><div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>a</sub></div><div class="ms-shape">[4096, 32]</div><div class="ms-op">→</div>
+<div class="ms-t ms-orange">a</div><div class="ms-shape">[B, S, 32]</div>
+<div class="ms-note" style="color:var(--orange)">→ 衰减因子 G = exp(-exp(A)·softplus(a+dt_bias))</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:357-365, 417-420, 442-449</div>
+<div class="mc-body"><span class="cm"># __init__: 维度计算</span>
+self.num_k_heads = 16;  self.head_k_dim = 128
+self.num_v_heads = 32;  self.head_v_dim = 128
+self.key_dim   = <span class="dim">16 * 128</span> = 2048   <span class="cm"># K 维度</span>
+self.value_dim = <span class="dim">32 * 128</span> = 4096   <span class="cm"># V 维度</span>
+self.conv_dim  = <span class="dim">2048*2 + 4096</span> = 8192 <span class="cm"># Q+K+V 融合</span>
+
+<span class="cm"># __init__: 四个投影</span>
+self.in_proj_qkv = nn.Linear(<span class="dim">4096</span>, <span class="dim">8192</span>)  <span class="cm"># Q+K+V</span>
+self.in_proj_z   = nn.Linear(<span class="dim">4096</span>, <span class="dim">4096</span>)  <span class="cm"># z gate</span>
+self.in_proj_b   = nn.Linear(<span class="dim">4096</span>, <span class="dim">32</span>)    <span class="cm"># β (写入门)</span>
+self.in_proj_a   = nn.Linear(<span class="dim">4096</span>, <span class="dim">32</span>)    <span class="cm"># A (衰减门)</span>
+
+<span class="cm"># forward:</span>
+<span class="var">mixed_qkv</span> = self.in_proj_qkv(hidden_states)
+    <span class="cm"># <span class="dim">[B, S, 4096]</span> @ <span class="dim">[4096, 8192]</span> → <span class="dim">[B, S, 8192]</span></span>
+<span class="var">z</span> = self.in_proj_z(hidden_states)
+    .reshape(batch_size, seq_len, -1, self.head_v_dim)
+    <span class="cm"># <span class="dim">[B, S, 4096]</span> → <span class="dim">[B, S, 32, 128]</span></span>
+<span class="var">b</span> = self.in_proj_b(hidden_states)  <span class="cm"># <span class="dim">[B, S, 32]</span></span>
+<span class="var">a</span> = self.in_proj_a(hidden_states)  <span class="cm"># <span class="dim">[B, S, 32]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 3: <span style="color:var(--orange)">Causal Conv1D</span>（标准注意力没有这步）</div>
+<div class="ms-row">
+<div class="ms-t ms-orange">Q<sub>raw</sub>, K<sub>raw</sub>, V<sub>raw</sub></div>
+<div class="ms-op">→ Conv1D(kernel=4) + SiLU →</div>
+<div class="ms-t ms-orange">Q, K, V</div>
+<div class="ms-shape">同上形状</div>
+<div class="ms-note" style="color:var(--orange)">卷积让每个 token 能"看到"前 3 个 token 的局部上下文</div>
+</div>
+<div class="ms-row">
+<div class="ms-op" style="font-size:11px">保存副作用：</div>
+<div class="tens t-cyan"><div class="tl">C (conv_state)</div><div class="ts">[B, 8192, 3]</div></div>
+<div style="font-size:11px;color:var(--t3)">最后 3 个 token 的卷积特征，固定大小</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:375-382, 462-477</div>
+<div class="mc-body"><span class="cm"># __init__: 因果卷积 (groups=conv_dim 即 depthwise)</span>
+self.conv1d = nn.Conv1d(
+    in_channels=<span class="dim">8192</span>, out_channels=<span class="dim">8192</span>,
+    kernel_size=<span class="dim">4</span>, groups=<span class="dim">8192</span>,  <span class="cm"># depthwise conv</span>
+    padding=3   <span class="cm"># kernel_size - 1</span>
+)
+
+<span class="cm"># forward: prefill (S > 1) 路径</span>
+<span class="var">mixed_qkv</span> = mixed_qkv.transpose(1, 2)  <span class="cm"># <span class="dim">[B, 8192, S]</span></span>
+<span class="cm"># 保存 conv_state 供后续 decode</span>
+conv_state = F.pad(mixed_qkv, (4 - S, 0))
+cache_params.update_conv_state(conv_state, layer_idx) <span class="cm"># <span class="dim">[B, 8192, 3]</span></span>
+<span class="var">mixed_qkv</span> = causal_conv1d_fn(
+    x=mixed_qkv, weight=self.conv1d.weight.squeeze(1),
+    activation=<span class="st">"silu"</span>
+)                              <span class="cm"># → <span class="dim">[B, 8192, S]</span></span>
+
+<span class="cm"># split 出 Q, K, V</span>
+<span class="var">mixed_qkv</span> = mixed_qkv.transpose(1, 2)  <span class="cm"># <span class="dim">[B, S, 8192]</span></span>
+<span class="var">query</span>, <span class="var">key</span>, <span class="var">value</span> = torch.split(
+    mixed_qkv, [<span class="dim">2048</span>, <span class="dim">2048</span>, <span class="dim">4096</span>], dim=-1
+)
+<span class="var">query</span> = query.reshape(B, S, -1, <span class="dim">128</span>)  <span class="cm"># <span class="dim">[B, S, 16, 128]</span></span>
+<span class="var">key</span>   = key.reshape(B, S, -1, <span class="dim">128</span>)    <span class="cm"># <span class="dim">[B, S, 16, 128]</span></span>
+<span class="var">value</span> = value.reshape(B, S, -1, <span class="dim">128</span>)  <span class="cm"># <span class="dim">[B, S, 32, 128]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 3b: 门控参数计算</div>
+<div class="ms-row">
+<div class="ms-t ms-orange">β = sigmoid(b)</div><div class="ms-shape">[B, S, 32]</div>
+<div class="ms-note">写入门：新信息写入多少</div>
+</div>
+<div class="ms-row">
+<div class="ms-t ms-orange">G = -exp(A)·softplus(a + dt_bias)</div><div class="ms-shape">[B, S, 32]</div>
+<div class="ms-note">衰减门：旧信息遗忘多少</div>
+</div>
+<div class="ms-row">
+<span style="color:var(--t3);font-size:11px">K/V 头数不等时 repeat_interleave：</span>
+<div class="ms-t ms-orange">Q</div><div class="ms-shape">[B, S, 32, 128]</div>
+<div class="ms-t ms-orange">K</div><div class="ms-shape">[B, S, 32, 128]</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:386-389, 491-496</div>
+<div class="mc-body"><span class="cm"># __init__: 可学习参数</span>
+self.dt_bias = nn.Parameter(torch.ones(<span class="dim">32</span>))  <span class="cm"># num_v_heads</span>
+A = torch.empty(<span class="dim">32</span>).uniform_(0, 16)
+self.A_log = nn.Parameter(torch.log(A))
+
+<span class="cm"># forward: 计算门控</span>
+<span class="var">beta</span> = b.sigmoid()  <span class="cm"># <span class="dim">[B, S, 32]</span></span>
+<span class="var">g</span> = -self.A_log.float().exp() * F.softplus(
+    a.float() + self.dt_bias
+)                         <span class="cm"># <span class="dim">[B, S, 32]</span></span>
+
+<span class="cm"># K/V 头数不等时对齐 (32 // 16 = 2)</span>
+<span class="kw">if</span> self.num_v_heads // self.num_k_heads > 1:
+    <span class="var">query</span> = query.repeat_interleave(
+        <span class="dim">2</span>, dim=2)  <span class="cm"># <span class="dim">[B, S, 16, 128]</span> → <span class="dim">[B, S, 32, 128]</span></span>
+    <span class="var">key</span> = key.repeat_interleave(
+        <span class="dim">2</span>, dim=2)    <span class="cm"># <span class="dim">[B, S, 16, 128]</span> → <span class="dim">[B, S, 32, 128]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 4: <span style="color:var(--orange)">Gated Delta Rule 递推</span> — 核心计算（替代 softmax 注意力）</div>
+<div class="ms-row" style="background:var(--orangebg);border-radius:8px;padding:10px;margin-bottom:8px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--orange);width:100%">
+<strong>初始化：</strong> S<sub>0</sub> = zeros([B, 32, 128, 128]) &nbsp; <span style="color:var(--t3)">← 状态矩阵，固定大小</span><br>
+<strong>对每个 token t = 1..S：</strong><br>
+&nbsp;&nbsp; β<sub>t</sub> = sigmoid(b<sub>t</sub>) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--t3)">← 写入门 <span style="color:var(--dim)">[B, 32, 1]</span></span><br>
+&nbsp;&nbsp; G<sub>t</sub> = exp(g<sub>t</sub>) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--t3)">← 衰减门 <span style="color:var(--dim)">[B, 32, 1, 1]</span></span><br>
+&nbsp;&nbsp; ΔV<sub>t</sub> = V<sub>t</sub> - S<sub>t-1</sub> @ K<sub>t</sub> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--t3)">← Delta 修正项 <span style="color:var(--dim)">[B, 32, 128]</span></span><br>
+&nbsp;&nbsp; <strong style="color:var(--cyan)">S<sub>t</sub> = G<sub>t</sub> ⊙ S<sub>t-1</sub> + β<sub>t</sub> × K<sub>t</sub><sup>T</sup> ⊗ ΔV<sub>t</sub></strong> &nbsp;&nbsp;<span style="color:var(--t3)">← 状态更新 <span style="color:var(--dim)">[B, 32, 128, 128]</span></span><br>
+&nbsp;&nbsp; O<sub>t</sub> = Q<sub>t</sub> @ S<sub>t</sub> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--t3)">← 输出 <span style="color:var(--dim)">[B, 32, 128]</span></span>
+</div>
+</div>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<div class="tens t-cyan"><div class="tl">S (recurrent_state)</div><div class="ts">[B, 32, 128, 128]</div></div>
+<div class="tens t-cyan"><div class="tl">C (conv_state)</div><div class="ts">[B, 8192, 3]</div></div>
+<div style="font-size:11px;color:var(--green)">固定大小！不随 S 增长！</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:314-348 torch_recurrent_gated_delta_rule()</div>
+<div class="mc-body"><span class="cm"># 逐 token 递推（decode 阶段 S=1 时走此路径）</span>
+<span class="var">last_recurrent_state</span> = (
+    torch.zeros(B, <span class="dim">32</span>, <span class="dim">128</span>, <span class="dim">128</span>)
+    <span class="kw">if</span> initial_state <span class="kw">is None</span>
+    <span class="kw">else</span> initial_state     <span class="cm"># <span class="dim">[B, 32, 128, 128]</span></span>
+)
+
+<span class="kw">for</span> i <span class="kw">in</span> range(sequence_length):
+    <span class="var">q_t</span> = query[:, :, i]    <span class="cm"># <span class="dim">[B, 32, 128]</span></span>
+    <span class="var">k_t</span> = key[:, :, i]      <span class="cm"># <span class="dim">[B, 32, 128]</span></span>
+    <span class="var">v_t</span> = value[:, :, i]    <span class="cm"># <span class="dim">[B, 32, 128]</span></span>
+    <span class="var">g_t</span> = g[:, :, i].exp()
+        .unsqueeze(-1).unsqueeze(-1)  <span class="cm"># <span class="dim">[B, 32, 1, 1]</span></span>
+    <span class="var">beta_t</span> = beta[:, :, i]
+        .unsqueeze(-1)                 <span class="cm"># <span class="dim">[B, 32, 1]</span></span>
+
+    <span class="cm"># ① 衰减旧状态</span>
+    <span class="var">last_recurrent_state</span> *= g_t
+        <span class="cm"># <span class="dim">[B, 32, 128, 128]</span></span>
+    <span class="cm"># ② 读取当前 K 对应的 V 预测</span>
+    <span class="var">kv_mem</span> = (last_recurrent_state * k_t.unsqueeze(-1)).sum(-2)
+        <span class="cm"># <span class="dim">[B, 32, 128, 128]</span> × <span class="dim">[B, 32, 128, 1]</span> → sum → <span class="dim">[B, 32, 128]</span></span>
+    <span class="cm"># ③ 计算 Delta（预测误差）</span>
+    <span class="var">delta</span> = (v_t - kv_mem) * beta_t  <span class="cm"># <span class="dim">[B, 32, 128]</span></span>
+    <span class="cm"># ④ 写入新信息</span>
+    <span class="var">last_recurrent_state</span> += k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        <span class="cm"># <span class="dim">[B, 32, 128, 1]</span> × <span class="dim">[B, 32, 1, 128]</span> → <span class="dim">[B, 32, 128, 128]</span></span>
+    <span class="cm"># ⑤ 查询输出</span>
+    out[:,:,i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(-2)
+        <span class="cm"># <span class="dim">[B, 32, 128, 128]</span> × <span class="dim">[B, 32, 128, 1]</span> → <span class="dim">[B, 32, 128]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 4b: Chunk 模式递推（prefill 阶段）</div>
+<div style="font-size:12px;color:var(--t2);margin:4px 0">将 S 个 token 分成 chunk_size=64 的块，块内并行计算 + 块间状态传递。</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:234-311 torch_chunk_gated_delta_rule()</div>
+<div class="mc-body"><span class="cm"># Prefill 路径：分块并行处理</span>
+<span class="var">query</span>, <span class="var">key</span>, <span class="var">value</span>, <span class="var">beta</span>, <span class="var">g</span> = [
+    x.transpose(1, 2) <span class="kw">for</span> x <span class="kw">in</span> (query, key, value, beta, g)
+]  <span class="cm"># Q,K,V: <span class="dim">[B, 32, S, 128]</span>, beta,g: <span class="dim">[B, 32, S]</span></span>
+
+<span class="cm"># L2 归一化 Q 和 K</span>
+<span class="var">query</span> = l2norm(query, dim=-1)  <span class="cm"># <span class="dim">[B, 32, S, 128]</span></span>
+<span class="var">key</span>   = l2norm(key, dim=-1)    <span class="cm"># <span class="dim">[B, 32, S, 128]</span></span>
+<span class="var">query</span> *= 1 / sqrt(128)
+
+<span class="cm"># 分块: <span class="dim">[B, 32, S, 128]</span> → <span class="dim">[B, 32, num_chunks, 64, 128]</span></span>
+query = query.reshape(B, H, -1, <span class="dim">64</span>, 128)
+
+<span class="cm"># 块间递推：对每个 chunk</span>
+<span class="kw">for</span> i <span class="kw">in</span> range(num_chunks):
+    <span class="var">q_i</span>, <span class="var">k_i</span>, <span class="var">v_i</span> = query[:,:,i], key[:,:,i], value[:,:,i]
+    <span class="cm"># 块内 W 型注意力 + 块间状态查询</span>
+    <span class="var">v_prime</span> = k_cumdecay[:,:,i] @ last_recurrent_state
+    <span class="var">v_new</span> = v_i - v_prime
+    <span class="var">out[:,:,i]</span> = (q_i * g_exp) @ S + attn @ v_new
+    <span class="cm"># 更新状态矩阵 S</span>
+    S = S * g_exp[:,:,i,-1] + k_i.T @ v_new
+<span class="cm"># 返回: out <span class="dim">[B, S, 32, 128]</span>, S <span class="dim">[B, 32, 128, 128]</span></span></div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">Step 5: 输出门控 + 投影</div>
+<div class="ms-row">
+<div class="ms-t ms-cyan">O</div><div class="ms-shape">[B, S, 32, 128]</div>
+<div class="ms-op">reshape →</div>
+<div class="ms-t ms-cyan">O</div><div class="ms-shape">[B, S, 4096]</div>
+<div class="ms-op">×</div>
+<div class="ms-t ms-orange">silu(z)</div><div class="ms-shape" style="color:var(--orange)">[B, S, 4096]</div>
+<div class="ms-op">×</div>
+<div class="ms-t ms-w">W<sub>out</sub></div><div class="ms-shape">[4096, 4096]</div><div class="ms-op">→</div>
+<div class="ms-t ms-blue">output</div><div class="ms-shape">[B, S, 4096]</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:391-403, 526-533</div>
+<div class="mc-body"><span class="cm"># __init__: RMSNormGated = RMSNorm × silu(z)</span>
+self.norm = Qwen3_5RMSNormGated(
+    <span class="dim">128</span>,  <span class="cm"># head_v_dim</span>
+    eps=config.rms_norm_eps
+)
+self.out_proj = nn.Linear(<span class="dim">4096</span>, <span class="dim">4096</span>)
+
+<span class="cm"># forward: 输出后处理</span>
+<span class="cm"># cache_params.update_recurrent_state(S, layer_idx)</span>
+<span class="var">core_attn_out</span> = core_attn_out.reshape(-1, self.head_v_dim)
+    <span class="cm"># <span class="dim">[B, S, 32, 128]</span> → <span class="dim">[B*S*32, 128]</span></span>
+<span class="var">z</span> = z.reshape(-1, self.head_v_dim)   <span class="cm"># <span class="dim">[B*S*32, 128]</span></span>
+
+<span class="cm"># ★ RMSNormGated: output = RMSNorm(x) * silu(z)</span>
+<span class="var">core_attn_out</span> = self.norm(core_attn_out, z)
+    <span class="cm"># <span class="dim">[B*S*32, 128]</span></span>
+<span class="var">core_attn_out</span> = core_attn_out.reshape(batch_size, seq_len, -1)
+    <span class="cm"># → <span class="dim">[B, S, 4096]</span></span>
+
+<span class="var">output</span> = self.out_proj(core_attn_out)
+    <span class="cm"># <span class="dim">[B, S, 4096]</span> @ <span class="dim">[4096, 4096]</span> → <span class="dim">[B, S, 4096]</span></span>
+<span class="kw">return</span> output</div></div>
+</div>
+
+<div class="step-pair">
+<div class="mat-step"><div class="ms-label">缓存 — <span style="color:var(--red)">没有 KV Cache！用固定状态矩阵代替</span></div>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<div class="tens t-orange"><div class="tl">S (recurrent)</div><div class="ts">[B, 32, 128, 128]</div></div>
+<div class="tens t-orange"><div class="tl">C (conv)</div><div class="ts">[B, 8192, 3]</div></div>
+<div style="font-size:11px;color:var(--orange)">固定大小 ~80KB/层，无论 prefix 多长</div>
+</div></div>
+<div class="mat-code"><div class="mc-file">modeling_qwen3_5.py:438-440, 523-524</div>
+<div class="mc-body"><span class="cm"># 从 cache_params 中读取/写入状态</span>
+<span class="var">conv_state</span> = cache_params.layers[layer_idx].conv_states
+    <span class="cm"># <span class="dim">[B, 8192, 3]</span> — 固定大小！不随 S 增长！</span>
+<span class="var">recurrent_state</span> = cache_params.layers[layer_idx].recurrent_states
+    <span class="cm"># <span class="dim">[B, 32, 128, 128]</span> — 固定大小！</span>
+
+<span class="cm"># 处理完后写回</span>
+cache_params.update_recurrent_state(
+    last_recurrent_state, layer_idx
+)  <span class="cm"># <span class="dim">[B, 32, 128, 128]</span></span>
+cache_params.update_conv_state(
+    conv_state, layer_idx
+)  <span class="cm"># <span class="dim">[B, 8192, 3]</span></span>
+
+<span class="cm"># 缓存大小估算 (fp16):</span>
+<span class="cm"># S: 32×128×128×2B = 1MB/层</span>
+<span class="cm"># C: 8192×3×2B = 48KB/层</span>
+<span class="cm"># 合计 ≈ 1MB/层 (P=1024 时 Full Attn 是 8MB/层)</span></div></div>
+</div>
+
+</div>
+</div>
+
+<!-- ===== 三种缓存对比 ===== -->
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--cyan)"></span><h3>三种缓存直观对比</h3></div>
+<div class="pb">
+<table class="tbl">
+<tr><th></th><th style="color:var(--blue)">标准 (Qwen2)</th><th style="color:var(--blue)">Full (Qwen3.5)</th><th style="color:var(--orange)">Linear (Qwen3.5)</th></tr>
+<tr><td>缓存内容</td><td>K + V 两个张量</td><td>K + V 两个张量</td><td style="color:var(--orange)">S 矩阵 + C 向量</td></tr>
+<tr><td>K/Key 形状</td><td>[B, 4, S, 128]</td><td>[B, 4, S, <span style="color:var(--orange)">256</span>]</td><td style="color:var(--orange)">无</td></tr>
+<tr><td>V/Val 形状</td><td>[B, 4, S, 128]</td><td>[B, 4, S, <span style="color:var(--orange)">256</span>]</td><td style="color:var(--orange)">无</td></tr>
+<tr><td>状态矩阵 S</td><td style="color:var(--t3)">无</td><td style="color:var(--t3)">无</td><td style="color:var(--orange)">[B, 32, 128, 128]</td></tr>
+<tr><td>卷积缓存 C</td><td style="color:var(--t3)">无</td><td style="color:var(--t3)">无</td><td style="color:var(--orange)">[B, 8192, 3]</td></tr>
+<tr><td>是否随 S 增长</td><td style="color:var(--red)">是</td><td style="color:var(--red)">是</td><td style="color:var(--green)">否（固定大小）</td></tr>
+<tr><td>P=1024 时缓存大小</td><td>4 MB/层</td><td style="color:var(--orange)">8 MB/层</td><td style="color:var(--green)">~1 MB/层</td></tr>
+<tr><td>共享方式</td><td>切片 K[:P], V[:P]</td><td>切片 K[:P], V[:P]</td><td style="color:var(--orange)">拷贝整个 S 和 C</td></tr>
+</table>
+</div>
+</div>
+
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--orange)"></span><h3>Linear Attention：递推式</h3></div>
+<div class="pb">
+<p style="font-size:12px;color:var(--t2);margin-bottom:12px">每个新 token 把自己的 K、V <strong>"融合"进一个固定大小的状态矩阵 S</strong>。不看历史表，只看当前摘要。</p>
+<div class="vrow">
+<div class="vbox vb-orange"><div class="vt">新 token 的 K, V</div><div class="vs">K:[32,128] V:[32,128]</div></div>
+<div class="arr">→ 融入 →</div>
+<div class="vbox vb-orange" style="border-width:2px"><div class="vt" style="font-size:13px">状态矩阵 S</div><div class="vs">[32, 128, 128]</div><div class="vn" style="color:var(--orange)">固定大小！永远不变！</div></div>
+<div class="arr">→</div>
+<div class="vbox vb-orange"><div class="vt">新 token 的 Q</div><div class="vs">[32, 128]</div></div>
+<div class="arr">→ Q×S →</div>
+<div class="vbox vb-orange"><div class="vt">输出</div><div class="vs">[32, 128]</div></div>
+</div>
+</div>
+</div>
+
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--orange)"></span><h3>递推公式——状态 S 是怎么一步步更新的</h3></div>
+<div class="pb">
+<p style="font-size:12px;color:var(--t2);margin-bottom:16px">处理第 t 个 token 时，有三个"门"控制状态更新：</p>
+
+<div style="background:var(--bg);border-radius:10px;padding:20px;margin-bottom:16px">
+<div style="text-align:center;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--orange);margin-bottom:16px;letter-spacing:.5px">
+S<sub>t</sub> = G<sub>t</sub> ⊙ S<sub>t-1</sub> + β<sub>t</sub> × K<sub>t</sub><sup>T</sup> ⊗ (V<sub>t</sub> - S<sub>t-1</sub> @ K<sub>t</sub>)
+</div>
+<div style="display:flex;gap:16px;flex-wrap:wrap;justify-content:center;font-size:12px">
+<div style="text-align:center;padding:10px 16px;background:var(--cyanbg);border-radius:8px;border:1px solid var(--cyanbd)">
+<div style="color:var(--cyan);font-weight:600;font-size:13px;margin-bottom:2px">G<sub>t</sub> = 衰减门</div>
+<div style="color:var(--t2)">exp(-exp(A) × dt)<br><strong style="color:var(--cyan)">越久远的信息衰减越多</strong></div>
+</div>
+<div style="text-align:center;padding:10px 16px;background:var(--greenbg);border-radius:8px;border:1px solid var(--greenbd)">
+<div style="color:var(--green);font-weight:600;font-size:13px;margin-bottom:2px">β<sub>t</sub> = 写入门</div>
+<div style="color:var(--t2)">sigmoid(b)<br><strong style="color:var(--green)">控制当前 token 写入多少新信息</strong></div>
+</div>
+<div style="text-align:center;padding:10px 16px;background:var(--orangebg);border-radius:8px;border:1px solid var(--orangebd)">
+<div style="color:var(--orange);font-weight:600;font-size:13px;margin-bottom:2px">(V - S@K) = 修正项</div>
+<div style="color:var(--t2)">Delta Rule<br><strong style="color:var(--orange)">只写入"预测误差"，而非原始 V</strong></div>
+</div>
+</div>
+</div>
+
+<p style="font-size:12px;color:var(--t2)">展开递推看，处理完 N 个 prefix token 后的状态 S<sub>N</sub>：</p>
+<div style="background:var(--bg);border-radius:8px;padding:14px;text-align:center;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan)">
+S<sub>N</sub> = &Sigma;<sub>t=1..N</sub> (&Pi;<sub>j=t+1..N</sub> G<sub>j</sub>) × β<sub>t</sub> × K<sub>t</sub><sup>T</sup> × ΔV<sub>t</sub>
+</div>
+<p style="text-align:center;font-size:12px;color:var(--cyan);font-weight:600;margin-top:8px">
+S<sub>N</sub> 是 N 个 prefix token 信息的加权和，压缩在一个 [B, 32, 128, 128] 的固定矩阵里。
+</p>
+</div>
+</div>
+
+<div class="info info-g">
+<span class="ic">★</span>
+<div class="tx"><strong>关键性质：S<sub>N</sub> 是 prefix 的"充分统计量"。</strong><br>
+从 S<sub>N</sub> 开始继续处理 suffix token，数学上<strong>等价于</strong>从 S<sub>0</sub>=0 开始处理完整序列 [prefix + suffix]。<br>这就是 prefix sharing 可以工作的数学基础。</div>
+</div>
+</div>
+
+<!-- ===================== 共享方案详解 ===================== -->
+<div class="sec" id="s-sharing">
+<h2><span class="n" style="background:var(--cyanbg);color:var(--cyan)">02</span>Linear Attention 层的前缀共享流程</h2>
+<p class="d">分 Phase 0 和 Phase 1。核心：把 prefix 处理完的状态 S<sub>prefix</sub> 拷贝给每条 reuser 序列。</p>
+
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--orange)"></span><h3>Phase 0 — 处理 prefix tokens，得到 S<sub>prefix</sub> 和 C<sub>prefix</sub></h3></div>
+<div class="pb">
+
+<p style="font-size:12px;color:var(--t2);margin-bottom:16px">只取 1 份公共 prefix tokens，送入每层的 GatedDeltaNet，保存处理后的状态。</p>
+
+<ol class="steps">
+<li class="st-o">
+<h4>取出 prefix tokens，做 QKV + z + b + a 投影</h4>
+<p>和正常 forward 的投影完全一样，只是输入只有 prefix 部分。</p>
+<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+<div class="tens t-blue"><div class="tl">输入</div><div class="ts">[1, P, 4096]</div></div>
+<span class="arr">→</span>
+<div class="tens t-orange"><div class="tl">in_proj_qkv</div><div class="ts">[1, P, 8192]</div></div>
+<div class="tens t-orange"><div class="tl">in_proj_z</div><div class="ts">[1, P, 4096]</div></div>
+<div class="tens t-orange"><div class="tl">in_proj_b</div><div class="ts">[1, P, 32]</div></div>
+<div class="tens t-orange"><div class="tl">in_proj_a</div><div class="ts">[1, P, 32]</div></div>
+</div>
+</li>
+<li class="st-o">
+<h4>Causal Conv1D 预处理（带状态）</h4>
+<p>1D 因果卷积，kernel=4。处理完后保存卷积状态（最后 3 个 token 的特征）。</p>
+<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+<div class="tens t-orange"><div class="tl">conv 后的 Q</div><div class="ts">[1, P, 16, 128]</div></div>
+<div class="tens t-orange"><div class="tl">conv 后的 K</div><div class="ts">[1, P, 16, 128]</div></div>
+<div class="tens t-orange"><div class="tl">conv 后的 V</div><div class="ts">[1, P, 32, 128]</div></div>
+</div>
+<div style="margin-top:6px">
+<div class="tens t-cyan"><div class="tl">C<sub>prefix</sub>（要保存！）</div><div class="ts">[1, 8192, 3]</div></div>
+<span style="font-size:11px;color:var(--t3)">← 固定大小，供 Phase 1 的 Conv1D 初始化</span>
+</div>
+</li>
+<li class="st-o">
+<h4>GatedDeltaNet 递推：从 S<sub>0</sub>=0 开始，处理 P 个 token</h4>
+<p>调用 <code>chunk_gated_delta_rule(initial_state=零矩阵, output_final_state=True)</code></p>
+<div style="margin-top:6px">
+<div class="tens t-red"><div class="tl">S<sub>0</sub>（初始）</div><div class="ts">全零 [1, 32, 128, 128]</div></div>
+<span class="arr">→ 处理 P 个 token →</span>
+<div class="tens t-cyan"><div class="tl">S<sub>prefix</sub>（要保存！）</div><div class="ts">[1, 32, 128, 128]</div></div>
+</div>
+</li>
+<li class="st-c">
+<h4>保存两个状态到状态池</h4>
+<p>写入预分配的 ssm_state 和 conv_state 张量池，按 slot 索引存储。</p>
+<div style="margin-top:6px;background:var(--bg);border-radius:8px;padding:10px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">
+ssm_state[<span style="color:var(--green)">provider_slot</span>] = S<sub>prefix</sub> &nbsp; <span style="color:var(--t3)"># <span class="dim">[1, 32, 128, 128]</span></span><br>
+conv_state[<span style="color:var(--green)">provider_slot</span>] = C<sub>prefix</sub> &nbsp; <span style="color:var(--t3)"># <span class="dim">[1, 8192, 3]</span></span>
+</div>
+</li>
+</ol>
+</div>
+</div>
+
+<div class="p">
+<div class="ph"><span class="dot" style="background:var(--green)"></span><h3>Phase 1 — 拷贝状态，每条序列只算 suffix</h3></div>
+<div class="pb">
+
+<ol class="steps">
+<li class="st-c">
+<h4>把 S<sub>prefix</sub> 和 C<sub>prefix</sub> 拷贝到每个 reuser 的 slot</h4>
+<p>纯 GPU 显存拷贝，极快（每个 slot ~1MB）。</p>
+<div style="margin-top:6px;background:var(--bg);border-radius:8px;padding:10px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">
+<span class="cm"># 拷贝给所有 reuser</span><br>
+ssm_state[<span style="color:var(--green)">reuser_slot</span>] = ssm_state[<span style="color:var(--green)">provider_slot</span>]<br>
+conv_state[<span style="color:var(--green)">reuser_slot</span>] = conv_state[<span style="color:var(--green)">provider_slot</span>]
+</div>
+</li>
+<li class="st-c">
+<h4>标记 reuser "有初始状态"</h4>
+<div style="margin-top:6px;background:var(--bg);border-radius:8px;padding:10px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">
+has_initial_state[<span style="color:var(--green)">reuser_idx</span>] = <span style="color:var(--purple)">True</span>
+</div>
+<p style="color:var(--t2);margin-top:6px">设为 True 后，GDN forward 就<strong>不会</strong>清零 initial_state，而是直接用里面已有的 S<sub>prefix</sub>。</p>
+</li>
+<li class="st-g">
+<h4>正常 forward suffix tokens</h4>
+<p>GDN forward 自动执行以下逻辑（<strong>vLLM 已实现，我们不用改</strong>）：</p>
+<div style="margin-top:6px;background:var(--bg);border-radius:8px;padding:10px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--t2)">
+<span class="cm"># 从状态池取出当前序列的状态</span><br>
+initial_state = ssm_state[<span style="color:var(--blue)">slot_idx</span>]  <span class="cm"># ← 就是 S<sub>prefix</sub> <span class="dim">[1, 32, 128, 128]</span></span><br>
+<br>
+<span class="cm"># has_initial_state=True → 不清零</span><br>
+<span style="color:var(--cyan)">initial_state[~has_initial_state] = 0</span>  <span class="cm"># reuser 被跳过</span><br>
+<br>
+<span class="cm"># 跑 GDN，从 S<sub>prefix</sub> 开始处理 suffix</span><br>
+output, S_final = chunk_gated_delta_rule(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;q, k, v, g, beta,        <span class="cm"># suffix tokens 的投影结果</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--cyan)">initial_state=initial_state</span>,  <span class="cm"># ← 非零！<span class="dim">[1, 32, 128, 128]</span></span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;output_final_state=True,<br>
+)<br>
+<span class="cm"># output: <span class="dim">[1, S_suffix, 32, 128]</span></span><br>
+<span class="cm"># S_final: <span class="dim">[1, 32, 128, 128]</span> (prefix+suffix 合并后的完整状态)</span><br>
+<br>
+<span class="cm"># 写回最终状态</span><br>
+ssm_state[<span style="color:var(--blue)">slot_idx</span>] = S_final
+</div>
+</li>
+</ol>
+
+<div class="info info-g">
+<span class="ic">✓</span>
+<div class="tx">
+<strong>Phase 1 中，Provider 和 Reuser 的计算路径完全相同。</strong><br>
+区别仅在于：Provider 的 slot 里有 Phase 0 写入的 S<sub>prefix</sub>，Reuser 的 slot 里是我们拷贝过去的同一份 S<sub>prefix</sub>。<br>
+GDN forward 不知道也不关心这个区别，它只看 <code>has_initial_state</code> 标记和 slot 里的值。
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<!-- ===================== 差异代码 ===================== -->
+<div class="sec" id="s-diff">
+<h2><span class="n" style="background:var(--greenbg);color:var(--green)">03</span>差异代码（每行改动都有注释）</h2>
+<p class="d">绿色行是新加的代码。每一行改动都有说明为什么要加。</p>
+
+<!-- config.py -->
+<div class="diff">
+<div class="diff-h"><span class="fp">prefix_sharing/core/config.py</span><span class="tag tag-mod">MODIFY +5 行</span></div>
+<div class="diff-b">
+<div class="ln hdr"><span class="num"></span><span class="code">@dataclass(frozen=True) class PrefixSharingConfig: 后面新增字段</span></div>
+<div class="ln ctx"><span class="num">65</span><span class="code">    model_type: str = "text_only_causal_lm"</span></div>
+<div class="ln ctx"><span class="num"></span><span class="code"></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># ── 混合注意力模型配置（支持 Qwen 3.5 等混合层架构）──</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    layer_types: list[str] | None = None</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># e.g. ["full_attention","linear_attention","linear_attention","linear_attention", ...]</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># None = 所有层都是 full_attention（向后兼容）</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    full_attention_interval: int = 4  <span class="cm"># layer_types 未指定时，每 N 层一个 full_attention</span></span></div>
+</div>
+</div>
+
+<!-- planner.py -->
+<div class="diff">
+<div class="diff-h"><span class="fp">prefix_sharing/core/planner.py — PrefixSharingPlan dataclass</span><span class="tag tag-mod">MODIFY +8 行</span></div>
+<div class="diff-b">
+<div class="ln hdr"><span class="num"></span><span class="code">PrefixSharingPlan 的字段末尾新增：</span></div>
+<div class="ln ctx"><span class="num">123</span><span class="code">    prefix_last_restore: list[PrefixLastRestoreSpec] = field(default_factory=list)</span></div>
+<div class="ln ctx"><span class="num"></span><span class="code"></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># ── 混合注意力层类型（Qwen 3.5 等模型需要）──</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    layer_types: list[str] = field(default_factory=list)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># 每层的类型：None 或空列表 = 所有层都是 full_attention</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    full_attn_layer_ids: list[int] = field(default_factory=list)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># e.g. [0, 4, 8, 12, 16, 20, 24, 28] — 参与 KV cache 共享的层</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    linear_attn_layer_ids: list[int] = field(default_factory=list)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># e.g. [1,2,3,5,6,7,...] — 参与状态矩阵共享的层</span></span></div>
+<div class="ln ctx"><span class="num"></span><span class="code"></span></div>
+<div class="ln hdr"><span class="num"></span><span class="code">新增辅助方法：</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="kw">def</span> <span class="fn">layer_type_of</span>(self, layer_id: int) -> str:</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="cm">"""返回指定层的类型。非混合模型默认返回 "full_attention"。"""</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="kw">if not</span> self.layer_types:</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            <span class="kw">return</span> <span class="st">"full_attention"</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="kw">return</span> self.layer_types[layer_id]</span></div>
+</div>
+</div>
+
+<!-- context.py -->
+<div class="diff">
+<div class="diff-h"><span class="fp">prefix_sharing/integrations/context.py — PrefixSharingRuntimeContext</span><span class="tag tag-mod">MODIFY +4 行</span></div>
+<div class="diff-b">
+<div class="ln hdr"><span class="num"></span><span class="code">PrefixSharingRuntimeContext dataclass 新增字段：</span></div>
+<div class="ln ctx"><span class="num">25</span><span class="code">    prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)</span></div>
+<div class="ln ctx"><span class="num"></span><span class="code"></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># ── Linear Attention 状态共享 ──</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    linear_state_injected_layers: set[int] = field(default_factory=set)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># 已完成状态注入的 layer_id 集合，避免重复拷贝</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    ssm_state_pool: Any | None = None  <span class="cm"># 预分配的 ssm_state 张量池引用</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    conv_state_pool: Any | None = None <span class="cm"># 预分配的 conv_state 张量池引用</span></span></div>
+</div>
+</div>
+
+<!-- torch_ref.py -->
+<div class="diff">
+<div class="diff-h"><span class="fp">prefix_sharing/backends/torch_ref.py — TorchReferenceBackend</span><span class="tag tag-add">ADD METHOD +8 行</span></div>
+<div class="diff-b">
+<div class="ln hdr"><span class="num"></span><span class="code">在 attention() 方法后面新增：</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="kw">def</span> <span class="fn">snapshot_linear_state</span>(</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        self,</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        ssm_state_pool: Any,   <span class="cm"># <span class="dim">[num_slots, B, 32, 128, 128]</span></span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        conv_state_pool: Any,  <span class="cm"># <span class="dim">[num_slots, B, 8192, 3]</span></span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        *, src_slot: int, dst_slots: list[int],</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    ) -> None:</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="cm">"""将 provider 的 prefix 状态拷贝到所有 reuser slot。"""</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="kw">for</span> dst <span class="kw">in</span> dst_slots:</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            ssm_state_pool[dst].copy_(ssm_state_pool[src_slot])</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            conv_state_pool[dst].copy_(conv_state_pool[src_slot])</span></div>
+</div>
+</div>
+
+<!-- megatron_runtime.py — THE KEY CHANGE -->
+<div class="diff">
+<div class="diff-h"><span class="fp">prefix_sharing/integrations/megatron_runtime.py — maybe_run_prefix_sharing_attention()</span><span class="tag tag-mod">MODIFY 核心 +22 行</span></div>
+<div class="diff-b">
+<div class="ln hdr"><span class="num"></span><span class="code">在函数开头 ctx 检查之后，现有逻辑之前，插入层类型路由：</span></div>
+<div class="ln ctx"><span class="num">28</span><span class="code">    ctx = current_prefix_sharing_context()</span></div>
+<div class="ln ctx"><span class="num">29</span><span class="code">    if ctx is None:</span></div>
+<div class="ln ctx"><span class="num">30</span><span class="code">        return None</span></div>
+<div class="ln ctx"><span class="num">31</span><span class="code"></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    plan = ctx.prefix_sharing_plan</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    layer_id = int(getattr(attention_module, "layer_number", 0) or 0)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    layer_type = plan.layer_type_of(layer_id)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code"></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># ── Linear Attention 层：状态注入 + 走原始 forward ──</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="kw">if</span> layer_type == <span class="st">"linear_attention"</span>:</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="cm"># 首次进入该层时，把 provider 的 prefix 状态拷贝给 reuser</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="kw">if</span> layer_id <span class="kw">not in</span> ctx.linear_state_injected_layers:</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            backend = ctx.backend or TorchReferenceBackend()</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            provider_slot = _get_provider_slot(plan)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            reuser_slots = _get_reuser_slots(plan)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            backend.snapshot_linear_state(</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">                ctx.ssm_state_pool, ctx.conv_state_pool,  <span class="cm"># <span class="dim">[slots, B, 32, 128, 128]</span>, <span class="dim">[slots, B, 8192, 3]</span></span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">                src_slot=provider_slot, dst_slots=reuser_slots,</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            )</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">            ctx.linear_state_injected_layers.add(layer_id)</span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="cm"># 返回 None → 走原始 Megatron GDN forward</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="cm"># has_initial_state=True 会让 GDN 使用 slot 里的 S_prefix</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">        <span class="kw">return</span> None</span></div>
+<div class="ln add"><span class="num">+</span><span class="code"></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># ── Full Attention 层：走现有 KV cache 共享逻辑 ──</span></span></div>
+<div class="ln add"><span class="num">+</span><span class="code">    <span class="cm"># （下面的代码不变，处理 packed_seq_params、RoPE、build_kv、attention）</span></span></div>
+<div class="ln ctx"><span class="num">32</span><span class="code">    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":</span></div>
+<div class="ln ctx"><span class="num">33</span><span class="code">        raise RuntimeError("prefix sharing phase 1 requires ...")</span></div>
+<div class="ln ctx"><span class="num">...</span><span class="code">    <span class="cm"># ... 后续 RoPE + build_kv + attention 逻辑完全不变 ...</span></span></div>
+</div>
+</div>
+
+<div class="info info-i">
+<span class="ic">ℹ</span>
+<div class="tx">
+<strong>为什么 Linear Attention 路径直接 return None？</strong><br>
+因为 vLLM 的 GDN forward 已经实现了 <code>has_initial_state</code> 机制。
+我们在 Phase 0 把 S<sub>prefix</sub> 写入了 ssm_state 池，
+在进入 forward 前把 S<sub>prefix</sub> 拷贝到了 reuser 的 slot 并设置了 <code>has_initial_state=True</code>。
+GDN forward 自己会读取 slot 里的状态、不清零、从 S<sub>prefix</sub> 开始递推。
+所以我们不需要拦截 GDN 的 forward，让它自己跑就行。
+</div>
+</div>
+
+<!-- Summary table -->
+<div class="p" style="margin-top:24px">
+<div class="ph"><span class="dot" style="background:var(--green)"></span><h3>改动汇总</h3></div>
+<div class="pb">
+<table class="tbl">
+<tr><th>文件</th><th>改动类型</th><th>行数</th><th>说明</th></tr>
+<tr><td style="color:var(--orange)">core/config.py</td><td><span class="bdg" style="background:var(--orangebg);color:var(--orange)">MOD</span></td><td style="color:var(--green)">+5</td><td>加 layer_types 和 full_attention_interval 字段</td></tr>
+<tr><td style="color:var(--orange)">core/planner.py</td><td><span class="bdg" style="background:var(--orangebg);color:var(--orange)">MOD</span></td><td style="color:var(--green)">+8</td><td>Plan 加 layer_types / full_attn_layer_ids / linear_attn_layer_ids + layer_type_of()</td></tr>
+<tr><td style="color:var(--orange)">integrations/context.py</td><td><span class="bdg" style="background:var(--orangebg);color:var(--orange)">MOD</span></td><td style="color:var(--green)">+4</td><td>RuntimeContext 加 ssm_state_pool / conv_state_pool / injected 集合</td></tr>
+<tr><td style="color:var(--orange)">backends/torch_ref.py</td><td><span class="bdg" style="background:var(--greenbg);color:var(--green)">ADD</span></td><td style="color:var(--green)">+8</td><td>新增 snapshot_linear_state() 方法</td></tr>
+<tr><td style="color:var(--orange)">integrations/megatron_runtime.py</td><td><span class="bdg" style="background:var(--orangebg);color:var(--orange)">MOD</span></td><td style="color:var(--green)">+22</td><td>按 layer_type 路由：linear→状态注入+return None，full→现有逻辑</td></tr>
+<tr style="border-top:2px solid var(--bdr)"><td><strong>合计</strong></td><td></td><td><strong style="color:var(--cyan)">~47 行</strong></td><td>GDN forward 零修改，无新数据结构</td></tr>
+</table>
+</div>
+</div>
+</div>
+
+</div><!-- w -->
+
+<script>
+const secs=document.querySelectorAll('.sec[id]'),as=document.querySelectorAll('nav.top a');
+function up(){let c='';secs.forEach(s=>{if(s.getBoundingClientRect().top<70)c=s.id});as.forEach(a=>{a.classList.toggle('active',a.getAttribute('href')==='#'+c)})}
+window.addEventListener('scroll',up,{passive:true});up();
+</script>
+</body>
+</html>
