@@ -147,7 +147,7 @@ pip install transformer-engine
 
 | 配置文件 | actor | critic | ref |
 |----------|-------|--------|-----|
-| `ppo_trainer` | megatron_actor | dp_critic | dp_ref |
+| `ppo_trainer` | dp_actor | dp_critic | dp_ref |
 | `ppo_megatron_trainer` | megatron_actor | megatron_critic | megatron_ref |
 
 ### mbridge 与 megatron-bridge
