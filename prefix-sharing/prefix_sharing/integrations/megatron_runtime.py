@@ -18,8 +18,6 @@ def maybe_run_prefix_sharing_attention(
     attention_mask: Any,
     rotary_pos_emb: Any,
     packed_seq_params: Any,
-    *,
-    mscale: float = 1.0,
 ) -> tuple[Any, Any] | None:
     """Run prefix-sharing attention when a runtime context is active.
 
@@ -50,7 +48,6 @@ def maybe_run_prefix_sharing_attention(
         q_pos_emb,
         k_pos_emb,
         ctx.kept_position_ids,
-        mscale=mscale,
     )
 
     backend = ctx.backend or TorchReferenceBackend()
@@ -84,8 +81,6 @@ def _apply_positioned_rope(
     q_pos_emb: Any,
     k_pos_emb: Any,
     kept_position_ids: Any,
-    *,
-    mscale: float,
 ) -> tuple[Any, Any]:
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
@@ -130,8 +125,6 @@ def _apply_positioned_rope(
             q_freqs,
             config=attention_module.config,
             cu_seqlens=None,
-            mscale=mscale,
-            cp_group=attention_module.pg_collection.cp,
         ).squeeze(1)
     if k_pos_emb is not None:
         k_freqs = k_pos_emb.index_select(0, positions)
@@ -140,8 +133,6 @@ def _apply_positioned_rope(
             k_freqs,
             config=attention_module.config,
             cu_seqlens=None,
-            mscale=mscale,
-            cp_group=attention_module.pg_collection.cp,
         ).squeeze(1)
     return query, key
 
