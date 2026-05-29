@@ -37,3 +37,6 @@ outputs/
 
 # Backup git directories
 .git.bak/
+
+# Agent
+CODEBUDDY.*
