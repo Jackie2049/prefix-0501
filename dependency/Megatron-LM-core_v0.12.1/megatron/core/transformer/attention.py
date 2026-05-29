@@ -578,6 +578,34 @@ class Attention(MegatronModule, ABC):
             key = key.squeeze(1)
             value = value.squeeze(1)
 
+        
+        ######### prefix-sharing #########
+        # Megatron attention 是计算图的核心，必须在 attention 计算前拦截，
+        # 在 prefix token 位置注入预计算的 KV 缓存，跳过重复计算，从而实现前缀复用
+        import logging
+        prefix_log = logging.getLogger(__file__)
+        try:
+            prefix_log.warning("\n\n\nprefix hook try to run\n\n\n")
+            from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_attention
+            prefix_sharing_output = maybe_run_prefix_sharing_attention(
+                self,
+                query,
+                key,
+                value,
+                attention_mask,
+                rotary_pos_emb,
+                packed_seq_params,
+            )
+        except ModuleNotFoundError:
+            prefix_log.warning("\n\n\nprefix hook fail to import module\n\n\n")
+            prefix_sharing_output = None
+        if prefix_sharing_output is not None:
+            prefix_log.warning("\n\n\nprefix hook success, begin to return\n\n\n")
+            return prefix_sharing_output
+        prefix_log.warning("\n\n\nprefix hook failed\n\n\n")
+        ######### prefix-sharing #########
+
+
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
