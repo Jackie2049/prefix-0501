@@ -249,9 +249,13 @@ prefix-sharing/
 │  ────────────────────────                               │
 │  backend.build_kv() + backend.attention()                 │
 │  ├── 裁剪：移除 reuser 的 prefix tokens                  │
-│  ├── 存储：provider KV 存入 PrefixKVStore (按 layer_id/tp_rank)│
-│  ├── 注入：从 PrefixKVStore 加载 prefix KV 到 reuser    │
+│  ├── 存储：provider KV 存入 PrefixAttentionStore (按 layer_id/tp_rank)│
+│  ├── 注入：从 PrefixAttentionStore 加载 prefix KV 到 reuser    │
 │  └── 执行：单次前向传播（One-Forward）                    │
+│                                                         │
+│  HybridAttention 预留路径：                              │
+│  ├── full gated attention：KV injection 后应用当前 token gate│
+│  └── gated deltanet：PrefixDeltanetStore 复用 prefix state│
 └─────────────────────────────────────────────────────────┘
      │
      ▼
@@ -291,7 +295,7 @@ prefix-sharing/
      │────────────────────────────────────────────────────────────────────>│
      │                   │                        │  6. 创建 PrefixSharingRuntimeContext
      │                   │                        │  7. ContextVar.set(ctx)   │
-     │                   │                        │     初始化 PrefixKVStore  │
+     │                   │                        │     初始化 PrefixAttentionStore  │
      │                   │                        │                         │
      │                   │                        │  8. yield ctx            │
      │<────────────────────────────────────────────────────────────────────│
@@ -322,7 +326,7 @@ prefix-sharing/
 | 步骤 | 调用方 | 被调用方 | 职责 |
 |:----:|:-------|:---------|:-----|
 | 1-4 | `MegatronPPOActor` | `build_prefix_sharing_micro_batch` | 前缀检测、batch 裁剪、构建 RuntimeState |
-| 5-8 | `verl_mcore` | `prefix_sharing_runtime_context` (ContextManager) | 初始化线程安全的运行时上下文，包括 `PrefixKVStore` |
+| 5-8 | `verl_mcore` | `prefix_sharing_runtime_context` (ContextManager) | 初始化线程安全的运行时上下文，包括 `PrefixAttentionStore` |
 | 9 | `verl actor` | `Megatron SelfAttention.forward` | 进入 Megatron attention 计算 |
 | 10-14 | `SelfAttention` | `maybe_run_prefix_sharing_attention` | 拦截 attention，执行 RoPE + KV 扩展 + attention |
 | 15 | ContextManager | `ctx.store.close()` | 清理 KV cache，释放资源 |
@@ -342,7 +346,18 @@ prefix-sharing/
 | **Restore** | `hidden_states`, `plan` | `restored_states` | prefix-last 位置恢复独立计算 |
 | **Head** | `restored_states` | `logits` | 输出头计算最终结果 |
 
-#### 3.3.4 与训练框架的集成点
+#### 3.3.4 HybridAttention 预适配
+
+Qwen3.5/Qwen3.6 的 HybridAttention 同时包含 full gated attention 与 GatedDeltaNet。prefix-sharing 侧保持框架无关，只表达当前明确需要支持的两类可复用状态：
+
+| 路径 | 可复用状态 | 当前实现 |
+|------|------------|----------|
+| full gated attention | prefix K/V | 使用 `PrefixAttentionStore` 存储 `StoredAttentionKV`；attention 输出后应用当前 kept token 的 gate，gate 不缓存 |
+| GatedDeltaNet | prefix recurrent state / conv state / cache params | 使用 `PrefixDeltanetStore` 存储 `StoredDeltanetState`；reference backend 用 recurrent trajectory 验证 provider prefix state → reuser suffix initial state |
+
+后续当支持 Qwen3.5/Qwen3.6 的 verl + MindSpeed + MindSpeed-MM 训练引擎进入 `dependency/` 后，只在 integration 层补 thin patch：full attention 接 KV injection，GatedDeltaNet 接 activation/cache-param 复用入口。
+
+#### 3.3.5 与训练框架的集成点
 
 ```
 ┌──────────────────────────────────────────┐
@@ -553,7 +568,7 @@ _current_context: ContextVar[PrefixSharingRuntimeContext | None] = ContextVar(
 class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan   # 执行计划
     packed_batch_layout: PackedBatchLayout    # packed runtime 坐标
-    store: PrefixKVStore                     # 每层 KV 缓存
+    store: PrefixAttentionStore              # 每层 attention KV 缓存
     backend: Any | None = None                # 后端实现
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
 
@@ -562,7 +577,7 @@ def prefix_sharing_runtime_context(runtime_state):
     ctx = PrefixSharingRuntimeContext(
         prefix_sharing_plan=runtime_state.prefix_sharing_plan,
         packed_batch_layout=runtime_state.packed_batch_layout,
-        store=PrefixKVStore(),  # 初始化空存储
+        store=PrefixAttentionStore(),  # 初始化空 attention store
         backend=runtime_state.backend,
         prefix_last_restore_indices=build_indices(runtime_state.prefix_sharing_plan, runtime_state.packed_batch_layout),
     )
@@ -579,7 +594,7 @@ def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
 
 **设计要点**:
 - 使用 Python `ContextVar` 实现线程安全，支持异步/并发
-- `PrefixKVStore` 按 `(forward_id, micro_batch_id, layer_id, batch_idx, tp_rank)` 索引 KV
+- `PrefixAttentionStore` 按 `(forward_id, micro_batch_id, layer_id, batch_idx, prefix_state_type, tp_rank)` 索引 KV
 - Context 退出时自动调用 `store.close()` 清理资源
 
 #### 4.2.3 megatron_runtime.py - Attention 拦截执行
@@ -690,7 +705,7 @@ def _apply_positioned_rope(..., packed_position_ids, ...):
 │                                                                  │
 │  context.py:                                                     │
 │    - ContextVar 管理，thread-local 存储                           │
-│    - PrefixKVStore: 按 (layer, tp_rank, batch_idx) 索引 KV        │
+│    - PrefixAttentionStore: 按 (layer, tp_rank, batch_idx) 索引 KV │
 │                                                                  │
 │  megatron_runtime.py:                                            │
 │    - 拦截 attention，执行 RoPE + build_kv + attention             │
