@@ -65,6 +65,12 @@ class TorchReferenceBackend:
         value_rows = _split_packed(value, prefix_sharing_plan.kept_lengths_q)
         expanded_keys = []
         expanded_values = []
+        # This loop relies on the current online detector invariant that a provider
+        # appears before every reuser that loads from it. All rows' QKV tensors have
+        # already been produced in parallel by this point; the ordering here only
+        # controls KV assembly before attention. Do not reorder or parallelize this
+        # loop unless provider dependencies are handled explicitly, e.g. by a
+        # topology-aware build phase.
         for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
             if not prefix_sharing_plan.is_reuser(batch_index):
                 slot_id = PrefixKVSlotId(
@@ -74,6 +80,7 @@ class TorchReferenceBackend:
                     batch_index,
                     tp_rank,
                 )
+                # Publish this row's KV so later reusers in this micro-batch can load it.
                 store.store(
                     slot_id,
                     key_tensor=key_row,
@@ -92,6 +99,7 @@ class TorchReferenceBackend:
                     provider,
                     tp_rank,
                 )
+                # Load the already-published provider KV before building this reuser's expanded KV.
                 entry = store.load(provider_slot_id)
                 prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
                 expanded_key = torch.cat([entry.key_tensor[:prefix_len], key_row], dim=0)
@@ -103,6 +111,7 @@ class TorchReferenceBackend:
                     batch_index,
                     tp_rank,
                 )
+                # Publish the expanded reuser KV because a later row may reuse this longer prefix.
                 store.store(
                     own_slot_id,
                     key_tensor=expanded_key,
