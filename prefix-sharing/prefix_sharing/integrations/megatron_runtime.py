@@ -52,10 +52,25 @@ def maybe_run_prefix_sharing_attention(
     )
 
     backend = ctx.backend or TorchReferenceBackend()
-    tp_rank = _tensor_parallel_rank()
+    global_rank, tp_rank, tp_size = _read_parallel_rank_info()
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
 
     prefix_log.warning("\n\n\ntry to build kv\n\n\n")
+    prefix_log.warning(
+        "[PS][attention][rank=%s tp=%s/%s layer=%s] enter prefix-sharing path: "
+        "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
+        "padded_lengths=%s, cu_seqlens=%s",
+        global_rank,
+        tp_rank,
+        tp_size,
+        layer_id,
+        tuple(query.shape),
+        tuple(key.shape),
+        tuple(value.shape),
+        packed_batch_layout.valid_lengths,
+        packed_batch_layout.padded_lengths,
+        packed_batch_layout.cu_seqlens,
+    )
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
@@ -64,6 +79,16 @@ def maybe_run_prefix_sharing_attention(
         packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=tp_rank,
+    )
+    prefix_log.warning(
+        "[PS][attention][rank=%s tp=%s/%s layer=%s] built expanded kv: "
+        "expanded_key_shape=%s, expanded_value_shape=%s",
+        global_rank,
+        tp_rank,
+        tp_size,
+        layer_id,
+        tuple(expanded_key.shape),
+        tuple(expanded_value.shape),
     )
     core_attn_out = backend.attention(
         query,
@@ -140,10 +165,26 @@ def _apply_positioned_rope(
     return query, key
 
 
-def _tensor_parallel_rank() -> int:
+def _read_parallel_rank_info() -> tuple[int | str, int, int]:
+    global_rank: int | str = "unknown"
+    tp_rank = 0
+    tp_size = 1
+
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            global_rank = int(dist.get_rank())
+    except Exception:
+        pass
+
     try:
         from megatron.core import parallel_state
 
-        return int(parallel_state.get_tensor_model_parallel_rank())
+        tp_size = int(parallel_state.get_tensor_model_parallel_world_size())
+        if hasattr(parallel_state, "get_tensor_model_parallel_rank"):
+            tp_rank = int(parallel_state.get_tensor_model_parallel_rank())
     except Exception:
-        return 0
+        pass
+
+    return global_rank, tp_rank, tp_size
