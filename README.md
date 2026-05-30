@@ -29,11 +29,12 @@ export VLLM_ASCEND_ENABLE_NZ=0       # NPU 专用：禁用 NZ 格式
 export ENABLE_PREFIX_SHARING=1        # 启用 prefix sharing
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+    --config-name='ppo_megatron_trainer' \
     data.train_files=/path/to/data/512_gsm8k/train.parquet \
     data.val_files=/path/to/data/512_gsm8k/test.parquet \
-    data.train_batch_size=32 \
-    data.max_prompt_length=512 \
-    data.max_response_length=128 \
+    data.train_batch_size=8 \
+    data.max_prompt_length=128 \
+    data.max_response_length=32 \
     actor_rollout_ref.model.path=/path/to/Qwen2.5-0.5B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -55,9 +56,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
-    trainer.save_freq=3 \
-    trainer.test_freq=1 \
-    trainer.total_epochs=3 \
+    trainer.total_training_steps=1 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=-1 \
+    trainer.total_epochs=1 \
     2>&1 | tee log/verl_prefix_demo.log
 ```
 
@@ -69,11 +71,12 @@ export HYDRA_FULL_ERROR=1
 export ENABLE_PREFIX_SHARING=1          # 启用 prefix sharing
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+    --config-name='ppo_megatron_trainer' \
     data.train_files=/path/to/data/512_gsm8k/train.parquet \
     data.val_files=/path/to/data/512_gsm8k/test.parquet \
-    data.train_batch_size=32 \
-    data.max_prompt_length=512 \
-    data.max_response_length=128 \
+    data.train_batch_size=8 \
+    data.max_prompt_length=128 \
+    data.max_response_length=32 \
     actor_rollout_ref.model.path=/path/to/Qwen2.5-0.5B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -93,9 +96,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
-    trainer.save_freq=3 \
-    trainer.test_freq=1 \
-    trainer.total_epochs=3 \
+    trainer.total_training_steps=1 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=-1 \
+    trainer.total_epochs=1 \
     2>&1 | tee log/verl_prefix_demo.log
 ```
 
