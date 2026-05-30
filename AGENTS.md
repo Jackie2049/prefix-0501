@@ -40,6 +40,7 @@ prefix-0501/
 | `docs/concepts.md` | 当前概念、术语、核心语义和设计约定；用于语义争议或命名分歧时对齐 |
 | `docs/overview.md` | 当前项目架构、模块关系和主要数据流 |
 | `docs/overview.puml` | 当前架构图（PlantUML） |
+| `docs/pending-items.md` | 当前明确遗留事项、兼容性缺口和后续待验证场景 |
 | `docs/legacy/` | 历史 `doc-*` 文档归档；只作背景参考，不作为当前实现规范 |
 
 文档维护原则：
@@ -47,6 +48,7 @@ prefix-0501/
 - 后续开发**不要求**每次记录工作进展日志。
 - 概念、术语、语义约定变化时，按需更新 `docs/concepts.md`。
 - 架构、模块边界、数据流变化时，按需更新 `docs/overview.md` 和 `docs/overview.puml`。
+- 明确遗留事项、暂不处理的兼容性缺口或待验证场景，统一记录到 `docs/pending-items.md`。
 - `docs/legacy/` 默认只读，除非用户明确要求整理历史材料。
 - 关键设计决策若来自参考代码分析，需回源码验证是否在主流程中被调用。
 
@@ -58,6 +60,7 @@ prefix-0501/
 | 理解架构 / 模块关系 | `docs/overview.md` / `docs/overview.puml` |
 | 查概念 / 术语 | `docs/concepts.md` |
 | 理解历史方案 | `docs/legacy/` |
+| 查遗留事项 | `docs/pending-items.md` |
 | 了解模块分层 | `prefix-sharing/prefix_sharing/` 下 `core/`、`backends/`、`integrations/`，并参考 `docs/overview.md` |
 
 ---
@@ -169,4 +172,5 @@ PYTHONPATH=prefix-sharing pytest -q \
 - 概念与语义约定：[`docs/concepts.md`](docs/concepts.md)
 - 架构说明：[`docs/overview.md`](docs/overview.md)
 - 架构图：[`docs/overview.puml`](docs/overview.puml)
+- 遗留事项：[`docs/pending-items.md`](docs/pending-items.md)
 - 历史归档：[`docs/legacy/`](docs/legacy/)

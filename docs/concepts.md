@@ -127,11 +127,10 @@
 
 **说明**：
 - 由 `build_prefix_sharing_micro_batch()` 在 forward 前构建，携带 micro-batch 的前缀分析结果
-- 包含四个核心字段：
+- 包含三个核心字段：
   - `prefix_sharing_plan`: 前缀共享计划（哪些序列共享、保留范围、恢复点映射）
   - `backend`: 后端执行引擎（如 `TorchReferenceBackend`），负责 KV 缓存的存储与检索
-  - `kept_position_ids`: 裁剪后保留的 position ids，用于 THD 格式下的位置对齐
-  - `prefix_last_restore_slots`: 需要从 provider 复制到 reuser 的 KV 位置映射（1D 展开后）
+  - `packed_batch_layout`: 真实 packed batch 布局，包含 valid/padded lengths、packed position ids 和 valid token mask
 - 通过 `prefix_sharing_runtime_context` context manager 注入执行上下文，使 attention 层无需修改函数签名即可获取状态
 - 采用 `contextvars` 机制实现跨层隐式传递，避免在 verl actor 和 Megatron attention 之间显式传递参数
 
@@ -143,12 +142,13 @@
 **设计目的**：
 - 解决框架层与算子层之间缺乏直接参数传递通道的问题
 - 确保 KV 缓存的读写位置与原始序列位置在 THD（packed）格式下精确对齐
-- 保持计算图完整性（`kept_position_ids` 和 `prefix_last_restore_slots` 中的位置信息）
+- 保持计算图完整性，prefix KV store 只保存有效 token KV，不保存 packed padding
 
 **相关代码**：
-- `PrefixSharingRuntimeState` 数据类定义：`prefix_sharing/integrations/verl_mcore.py:52-56`
+- `PrefixSharingRuntimeState` 数据类定义：`prefix_sharing/integrations/verl_mcore.py`
 - 构建逻辑：`build_prefix_sharing_micro_batch()` in `prefix_sharing/integrations/verl_mcore.py:194-340`
-- 上下文管理器：`prefix_sharing_runtime_context()` in `prefix_sharing/integrations/context.py:34-53`
+- packed layout：`prefix_sharing/backends/packed_layout.py`
+- 上下文管理器：`prefix_sharing_runtime_context()` in `prefix_sharing/integrations/context.py`
 
 ---
 
@@ -176,7 +176,8 @@
 | 复用关系 | `PrefixReuseSpec` | `reuse_specs` | - |
 | 前缀组 | `PrefixGroup` | `groups`, `member_indices` | - |
 | 前缀长度 | `prefix_len` | `prefix_lens` | - |
-| 前缀共享运行时状态 | `PrefixSharingRuntimeState` | `prefix_sharing_plan`, `backend`, `kept_position_ids`, `prefix_last_restore_slots` | - |
+| Packed batch 布局 | `PackedBatchLayout` | `valid_lengths`, `padded_lengths`, `packed_position_ids`, `valid_token_mask` | - |
+| 前缀共享运行时状态 | `PrefixSharingRuntimeState` | `prefix_sharing_plan`, `backend`, `packed_batch_layout` | - |
 
 ### 文档命名
 

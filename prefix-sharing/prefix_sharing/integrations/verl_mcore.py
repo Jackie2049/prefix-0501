@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, Sequence, TypeVar
 
+from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.batch_trim import (
@@ -44,8 +45,7 @@ T = TypeVar("T")
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
-    kept_position_ids: Any
-    packed_cu_seqlens: list[int]
+    packed_batch_layout: PackedBatchLayout
 
 
 @dataclass(frozen=True)
@@ -111,8 +111,9 @@ class VerlMCoreBatchAdapter:
         runtime_state = PrefixSharingRuntimeState(
             prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
             backend=TorchReferenceBackend(),
-            kept_position_ids=None,
-            packed_cu_seqlens=list(prefix_sharing_batch.prefix_sharing_plan.cu_seqlens_q),
+            packed_batch_layout=PackedBatchLayout.from_valid_lengths(
+                prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
+            ),
         )
         return _prefix_sharing_runtime_context(runtime_state)
 
@@ -289,10 +290,6 @@ def build_prefix_sharing_micro_batch(
     trimmed_micro_batch["attention_mask"] = new_attention_mask
     trimmed_micro_batch["position_ids"] = new_position_ids
 
-    # Compute 1D positions in THD compact tensor
-    # Simulate preprocess_packed_seqs alignment to get cu_seqlens_padded
-    import torch
-    seqlens_in_batch = new_attention_mask.sum(dim=-1, dtype=torch.int32)
     try:
         from megatron.core import parallel_state as mpu
         tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -301,18 +298,14 @@ def build_prefix_sharing_micro_batch(
         tp_size = 1
         cp_size = 1
     align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
-    pad_sizes = (align_size - seqlens_in_batch % align_size) % align_size
-    seqlens_padded = seqlens_in_batch + pad_sizes
-    cu_seqlens_padded = torch.zeros(len(seqlens_in_batch) + 1, dtype=torch.int32)
-    cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
-    cu_seqlens_cpu = cu_seqlens_padded.tolist()
-
-    kept_position_ids = _concat_tensors(kept_position_rows)
+    packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
+        kept_position_rows,
+        align_size=int(align_size),
+    )
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         backend=backend or TorchReferenceBackend(),
-        kept_position_ids=kept_position_ids,
-        packed_cu_seqlens=[int(value) for value in cu_seqlens_cpu],
+        packed_batch_layout=packed_batch_layout,
     )
     logger.warning(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
@@ -354,14 +347,6 @@ def _clone_batch(batch: Any) -> Any:
     if hasattr(batch, "copy"):
         return batch.copy()
     return dict(batch)
-
-
-def _concat_tensors(tensors: Sequence[Any]) -> Any:
-    if not tensors:
-        raise RuntimeError("prefix sharing produced an empty packed query")
-    first = tensors[0]
-    torch = importlib.import_module("torch")
-    return torch.cat([tensor.to(first.device) for tensor in tensors], dim=0)
 
 
 def _read_actor_bool(config: Any, dotted_name: str, default: bool) -> bool:

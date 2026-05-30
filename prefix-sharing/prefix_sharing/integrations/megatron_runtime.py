@@ -37,17 +37,18 @@ def maybe_run_prefix_sharing_attention(
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
     if rotary_pos_emb is None:
         raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb")
-    if ctx.kept_position_ids is None:
-        raise RuntimeError("prefix sharing context is missing kept_position_ids")
+    if ctx.packed_batch_layout.packed_position_ids is None:
+        raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
     q_pos_emb, k_pos_emb = rotary_pos_emb
+    packed_batch_layout = ctx.packed_batch_layout
     query, key = _apply_positioned_rope(
         attention_module,
         query,
         key,
         q_pos_emb,
         k_pos_emb,
-        ctx.kept_position_ids,
+        packed_batch_layout.packed_position_ids,
     )
 
     backend = ctx.backend or TorchReferenceBackend()
@@ -60,6 +61,7 @@ def maybe_run_prefix_sharing_attention(
         value,
         ctx.store,
         ctx.prefix_sharing_plan,
+        packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=tp_rank,
     )
@@ -68,6 +70,7 @@ def maybe_run_prefix_sharing_attention(
         expanded_key,
         expanded_value,
         ctx.prefix_sharing_plan,
+        packed_batch_layout=packed_batch_layout,
         attention_mask=attention_mask,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
@@ -80,15 +83,15 @@ def _apply_positioned_rope(
     key: Any,
     q_pos_emb: Any,
     k_pos_emb: Any,
-    kept_position_ids: Any,
+    packed_position_ids: Any,
 ) -> tuple[Any, Any]:
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
-    positions = kept_position_ids.to(device=query.device, dtype=torch.long)
+    positions = packed_position_ids.to(device=query.device, dtype=torch.long)
     max_needed = positions.max().item() + 1
 
     # Extend q_pos_emb / k_pos_emb when they are shorter than the largest
-    # position_id needed by kept_position_ids.  THD-mode generated pos_emb
+    # position_id needed by packed_position_ids.  THD-mode generated pos_emb
     # only covers positions 0 .. max_seqlen_q-1, which is too small because
     # prefix-sharing preserves the original position_ids (e.g. suffix starts
     # at position 75).
