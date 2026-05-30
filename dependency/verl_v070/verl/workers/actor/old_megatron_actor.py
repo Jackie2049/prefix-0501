@@ -250,107 +250,78 @@ class MegatronPPOActor(BasePPOActor):
             batch_size = input_ids.size(0)
             response = batch["responses"]
             response_length = response.size(1)
-
             with torch.no_grad():
-                do_validate = os.getenv("PREFIX_SHARING_VALIDATE_PRECISION") == "1"
-
-                def _run_forward_once():
-                    out = self.forward_backward_batch(
-                        data,
-                        forward_only=True,
-                        post_process_fn=compute_logprobs_fn,
-                        calculate_entropy=calculate_entropy,
-                        use_dynamic_bsz=use_dynamic_bsz,
-                        micro_batch_size=micro_batch_size,
-                        max_token_len=max_token_len,
-                    )
-                    if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                        if calculate_entropy:
-                            lp = [o[0]["log_probs"] for o in out["output"]]
-                            et = [o[1] for o in out["output"]]
-                        else:
-                            lp = [o["log_probs"] for o in out["output"]]
-                            et = None
-                        lp = torch.cat(lp, dim=0).to(torch.float32)
-                        if use_dynamic_bsz:
-                            indices = out["indices"]
-                            indices = list(itertools.chain.from_iterable(indices))
-                            assert len(indices) == lp.size(0), f"{len(indices)} vs {lp.size()}"
-                            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                            lp = lp[revert_indices]
+                output = self.forward_backward_batch(
+                    data,
+                    forward_only=True,
+                    post_process_fn=compute_logprobs_fn,
+                    calculate_entropy=calculate_entropy,
+                    use_dynamic_bsz=use_dynamic_bsz,
+                    micro_batch_size=micro_batch_size,
+                    max_token_len=max_token_len,
+                )
+                if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                    # only on last rank. It should be on every tp rank
+                    if calculate_entropy:
+                        log_probs = [o[0]["log_probs"] for o in output["output"]]  # (bs, seq_size)
                     else:
-                        lp = torch.empty(
-                            size=(batch_size, response_length),
-                            dtype=torch.float32,
-                            device=input_ids.device,
+                        log_probs = [o["log_probs"] for o in output["output"]]  # (bs, seq_size)
+                    log_probs = torch.cat(log_probs, dim=0).to(torch.float32)
+                    if use_dynamic_bsz:
+                        indices = output["indices"]
+                        indices = list(itertools.chain.from_iterable(indices))
+                        assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
+                        revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                        log_probs = log_probs[revert_indices]
+                else:
+                    log_probs = torch.empty(
+                        size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
+                    )
+                log_probs = log_probs.to(get_device_id())
+                # broadcast across pp ranks
+                torch.distributed.broadcast(
+                    tensor=log_probs,
+                    src=mpu.get_pipeline_model_parallel_last_rank(),
+                    group=mpu.get_pipeline_model_parallel_group(),
+                    async_op=False,
+                )
+                log_probs = log_probs.to("cpu")
+                if calculate_entropy:
+                    # Note that o[0] is metrics, o[1] is entropy
+                    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                        entropys = torch.cat([o[1] for o in output["output"]], dim=0)
+                        entropys = entropys.to(torch.float32)
+                        if use_dynamic_bsz:
+                            indices = output["indices"]
+                            indices = list(itertools.chain.from_iterable(indices))
+                            assert len(indices) == entropys.size(0), f"{len(indices)} vs. {entropys.size()}"
+                            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                            entropys = entropys[revert_indices]
+                    else:
+                        entropys = torch.empty(
+                            size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
                         )
-                        et = None
-
-                    lp = lp.to(get_device_id())
+                    # broadcast across pp ranks
+                    entropys = entropys.to(get_device_id())
                     torch.distributed.broadcast(
-                        tensor=lp,
+                        tensor=entropys,
                         src=mpu.get_pipeline_model_parallel_last_rank(),
                         group=mpu.get_pipeline_model_parallel_group(),
                         async_op=False,
                     )
-                    lp = lp.to("cpu")
+                    entropys = entropys.to("cpu")
+                layers_topk_idx = None
 
-                    et_out = None
-                    if calculate_entropy:
-                        if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                            et = torch.cat(et, dim=0).to(torch.float32)
-                            if use_dynamic_bsz:
-                                et = et[revert_indices]
-                        else:
-                            et = torch.empty(
-                                size=(batch_size, response_length),
-                                dtype=torch.float32,
-                                device=input_ids.device,
-                            )
-                        et = et.to(get_device_id())
-                        torch.distributed.broadcast(
-                            tensor=et,
-                            src=mpu.get_pipeline_model_parallel_last_rank(),
-                            group=mpu.get_pipeline_model_parallel_group(),
-                            async_op=False,
-                        )
-                        et_out = et.to("cpu")
-
-                    layers_topk_idx = None
-                    if RouterReplayHelper.is_r2_record_action(self.tf_config):
-                        layers_topk_idx = out["mini_layer_topk_idx_tensor"].to(torch.uint8)
-                        if use_dynamic_bsz:
-                            indices = out["indices"]
-                            indices = list(itertools.chain.from_iterable(indices))
-                            assert len(indices) == layers_topk_idx.size(0), f"{len(indices)} vs. {layers_topk_idx.size()}"
-                            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                            layers_topk_idx = layers_topk_idx[revert_indices]
-                        layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
-                    return lp, et_out, layers_topk_idx
-
-                if do_validate:
-                    from prefix_sharing.integrations.precision_validator import PrecisionValidator
-                    validator = PrecisionValidator(self)
-
-                    # Run 1: Optimized
-                    log_probs, entropys, layers_topk_idx = _run_forward_once()
-
-                    # Snapshot & restore weights (no-op for forward_only, but keeps API uniform)
-                    validator.save_weights()
-                    validator.restore_weights()
-
-                    # Run 2: Baseline (prefix sharing disabled)
-                    with validator.baseline_mode():
-                        log_probs_base, entropys_base, _ = _run_forward_once()
-
-                    # Compare
-                    validator.compare_tensors("log_probs", log_probs, log_probs_base)
-                    if calculate_entropy:
-                        validator.compare_tensors("entropy", entropys, entropys_base)
-                    validator.print_report()
-                else:
-                    log_probs, entropys, layers_topk_idx = _run_forward_once()
-
+                if RouterReplayHelper.is_r2_record_action(self.tf_config):
+                    # (bs, max_seq_len/response_len,local_layer_num,topk)
+                    layers_topk_idx = output["mini_layer_topk_idx_tensor"].to(torch.uint8)
+                    if use_dynamic_bsz:
+                        indices = output["indices"]
+                        indices = list(itertools.chain.from_iterable(indices))
+                        assert len(indices) == layers_topk_idx.size(0), f"{len(indices)} vs. {layers_topk_idx.size()}"
+                        revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                        layers_topk_idx = layers_topk_idx[revert_indices]
+                    layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
@@ -619,7 +590,7 @@ class MegatronPPOActor(BasePPOActor):
             # 在 forward 前读取和修改 micro-batch，识别micro-batch内的共同前缀，并构建运行时状态，
             # 这是 prefix-sharing 的入口点，需要在数据进入模型前完成 micro-batch 重组
             prefix_sharing_runtime_state = None
-            if build_prefix_sharing_micro_batch is not None and not getattr(self, '_force_disable_prefix_sharing', False):
+            if build_prefix_sharing_micro_batch is not None:
                 batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(
                     batch,
                     self.config,
