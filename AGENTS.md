@@ -131,7 +131,14 @@ PYTHONPATH=prefix-sharing pytest -q \
 - commit 完成后按用户要求或仓库协作约定尝试 push；若网络或权限策略阻止 push，需报告本地分支 ahead 状态。
 - 如果修改未完成或只做了一半，**不要 commit**
 - commit message 格式：`[type] <中文简要说明>`
-- type 取值：`feat`(特性)、`fix`(修复)、`chore`(琐事)、`test`(测试)、`doc`(文档)
+- type 取值：
+  - `feat`：新特性或能力
+  - `fix`：修复 bug 或错误行为
+  - `refactor`：不改变外部行为的代码整理；包括重命名、结构调整，以及在源码中补充/改写**语义说明性注释**（帮助理解实现约束与不变量，但不改运行逻辑）
+  - `test`：仅测试相关改动
+  - `doc`：仅 `docs/` 等文档内容改动
+  - `chore`：与业务代码语义无关的仓库维护；如依赖快照、CI、脚本、配置、ignore 规则等
+- 选型提示：改源码注释以澄清实现语义时用 `refactor`，不要误标为 `chore`；改 `docs/` 下文档时用 `doc`
 
 ### Cursor Agent 特殊规则
 
