@@ -2,6 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.logprob import (
@@ -91,6 +92,64 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
     assert store.load(reuser_slot_id).key_tensor.shape[0] == 4
     assert expanded_key.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
     assert expanded_value.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "padded_lengths", "cu_seqlens", "padding_indices"),
+    [
+        (2, [6, 2], [0, 6, 8], [5]),
+        (4, [8, 4], [0, 8, 12], [5, 6, 7, 10, 11]),
+        (8, [8, 8], [0, 8, 16], [5, 6, 7, 10, 11, 12, 13, 14, 15]),
+    ],
+)
+def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
+    tp_size,
+    padded_lengths,
+    cu_seqlens,
+    padding_indices,
+):
+    prefix_sharing_plan = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)).plan(
+        [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]],
+        forward_id=3,
+        micro_batch_id=1,
+    )
+    layout = PackedBatchLayout(
+        valid_lengths=[5, 2],
+        padded_lengths=padded_lengths,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max(padded_lengths),
+    )
+    backend = TorchReferenceBackend()
+    store = PrefixKVStore()
+    query = torch.randn(layout.total_padded_length, 2)
+    key = torch.arange(layout.total_padded_length * 2, dtype=torch.float32).reshape(-1, 2)
+    value = key + 100
+
+    expanded_key, expanded_value = backend.build_kv(
+        key,
+        value,
+        store,
+        prefix_sharing_plan,
+        packed_batch_layout=layout,
+        layer_id=0,
+    )
+    output = backend.attention(
+        query,
+        expanded_key,
+        expanded_value,
+        prefix_sharing_plan,
+        packed_batch_layout=layout,
+    )
+
+    provider_slot_id = PrefixKVSlotId(prefix_sharing_plan.forward_id, prefix_sharing_plan.micro_batch_id, 0, 0, 0)
+    reuser_slot_id = PrefixKVSlotId(prefix_sharing_plan.forward_id, prefix_sharing_plan.micro_batch_id, 0, 1, 0)
+    assert store.load(provider_slot_id).key_tensor.shape[0] == 5
+    assert store.load(reuser_slot_id).key_tensor.shape[0] == 5
+    assert expanded_key.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
+    assert expanded_value.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
+    assert output.shape == query.shape
+    for padding_index in padding_indices:
+        assert output[padding_index].abs().sum().item() == 0
 
 
 def test_prefix_last_restore_tensor_keeps_autograd_path():

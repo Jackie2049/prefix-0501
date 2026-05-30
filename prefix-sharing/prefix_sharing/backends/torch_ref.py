@@ -11,6 +11,7 @@ import math
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
+from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
@@ -57,15 +58,28 @@ class TorchReferenceBackend:
         store: PrefixKVStore,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
+        packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
         torch = _torch()
-        key_rows = _split_packed(key, prefix_sharing_plan.kept_lengths_q)
-        value_rows = _split_packed(value, prefix_sharing_plan.kept_lengths_q)
+        layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        # Input K/V still follow the framework's padded packed layout; only
+        # valid tokens may enter the store or expanded KV.
+        key_rows = _split_packed(key, layout.padded_lengths)
+        value_rows = _split_packed(value, layout.padded_lengths)
         expanded_keys = []
         expanded_values = []
+        # This loop relies on the current online detector invariant that a provider
+        # appears before every reuser that loads from it. All rows' QKV tensors have
+        # already been produced in parallel by this point; the ordering here only
+        # controls KV assembly before attention. Do not reorder or parallelize this
+        # loop unless provider dependencies are handled explicitly, e.g. by a
+        # topology-aware build phase.
         for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
+            valid_length = layout.valid_lengths[batch_index]
+            valid_key_row = key_row[:valid_length]
+            valid_value_row = value_row[:valid_length]
             if not prefix_sharing_plan.is_reuser(batch_index):
                 slot_id = PrefixKVSlotId(
                     prefix_sharing_plan.forward_id,
@@ -74,15 +88,16 @@ class TorchReferenceBackend:
                     batch_index,
                     tp_rank,
                 )
+                # Publish this row's KV so later reusers in this micro-batch can load it.
                 store.store(
                     slot_id,
-                    key_tensor=key_row,
-                    value_tensor=value_row,
-                    prefix_len=key_row.shape[0],
+                    key_tensor=valid_key_row,
+                    value_tensor=valid_value_row,
+                    prefix_len=valid_key_row.shape[0],
                     overwrite=True,
                 )
-                expanded_keys.append(key_row)
-                expanded_values.append(value_row)
+                expanded_keys.append(valid_key_row)
+                expanded_values.append(valid_value_row)
             else:
                 provider = prefix_sharing_plan.provider_index[batch_index]
                 provider_slot_id = PrefixKVSlotId(
@@ -92,10 +107,11 @@ class TorchReferenceBackend:
                     provider,
                     tp_rank,
                 )
+                # Load the already-published provider KV before building this reuser's expanded KV.
                 entry = store.load(provider_slot_id)
                 prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
-                expanded_key = torch.cat([entry.key_tensor[:prefix_len], key_row], dim=0)
-                expanded_value = torch.cat([entry.value_tensor[:prefix_len], value_row], dim=0)
+                expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
+                expanded_value = torch.cat([entry.value_tensor[:prefix_len], valid_value_row], dim=0)
                 own_slot_id = PrefixKVSlotId(
                     prefix_sharing_plan.forward_id,
                     prefix_sharing_plan.micro_batch_id,
@@ -103,6 +119,7 @@ class TorchReferenceBackend:
                     batch_index,
                     tp_rank,
                 )
+                # Publish the expanded reuser KV because a later row may reuse this longer prefix.
                 store.store(
                     own_slot_id,
                     key_tensor=expanded_key,
@@ -114,21 +131,45 @@ class TorchReferenceBackend:
                 expanded_values.append(expanded_value)
         return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
 
-    def attention(self, query: Any, key: Any, value: Any, prefix_sharing_plan: PrefixSharingPlan, **_: Any) -> Any:
+    def attention(
+        self,
+        query: Any,
+        key: Any,
+        value: Any,
+        prefix_sharing_plan: PrefixSharingPlan,
+        *,
+        packed_batch_layout: Any | None = None,
+        **_: Any,
+    ) -> Any:
         torch = _torch()
-        query_rows = _split_packed(query, prefix_sharing_plan.kept_lengths_q)
+        layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        # Query keeps the framework packed shape, so split by padded lengths.
+        # K/V were already depadded and prefix-expanded by build_kv().
+        query_rows = _split_packed(query, layout.padded_lengths)
         key_rows = _split_packed(key, prefix_sharing_plan.expanded_lengths_kv)
         value_rows = _split_packed(value, prefix_sharing_plan.expanded_lengths_kv)
         outputs = []
         for batch_index, (q_row, k_row, v_row) in enumerate(zip(query_rows, key_rows, value_rows)):
+            valid_length = layout.valid_lengths[batch_index]
+            # Padding query slots are layout-only; they must not participate in attention.
+            q_valid = q_row[:valid_length]
             prefix_len = prefix_sharing_plan.q_position_offsets[batch_index]
+            if valid_length == 0:
+                outputs.append(torch.zeros_like(q_row))
+                continue
             mask = _causal_q_kv_mask(
-                q_len=q_row.shape[0],
+                q_len=q_valid.shape[0],
                 kv_len=k_row.shape[0],
                 q_start=prefix_len,
-                device=q_row.device,
+                device=q_valid.device,
             )
-            outputs.append(_attention_row(q_row, k_row, v_row, mask))
+            valid_output = _attention_row(q_valid, k_row, v_row, mask)
+            if valid_length == q_row.shape[0]:
+                outputs.append(valid_output)
+                continue
+            padded_output = torch.zeros_like(q_row)
+            padded_output[:valid_length] = valid_output
+            outputs.append(padded_output)
         return torch.cat(outputs, dim=0)
 
 

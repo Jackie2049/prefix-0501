@@ -110,7 +110,54 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 - 必须关闭 `use_fused_kernels=False`
 - NPU 需设置 `VLLM_ASCEND_ENABLE_NZ=0` 并通过 `override_transformer_config.use_flash_attn=True` 启用 flash attention
 
-## 3. 前置环境安装
+## 3. 进阶场景
+
+### 并行策略
+
+在第 2 节的 NPU 或 GPU 启动命令基础上，追加或覆盖以下增量配置：
+
+```bash
+trainer.n_gpus_per_node=2 \
+trainer.nnodes=1 \
+actor_rollout_ref.model.use_remove_padding=True \
+actor_rollout_ref.model.use_fused_kernels=False \
+actor_rollout_ref.actor.megatron.use_remove_padding=True \
+actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2 \
+actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
+actor_rollout_ref.actor.megatron.context_parallel_size=1 \
+actor_rollout_ref.ref.megatron.use_remove_padding=True \
+actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2 \
+actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1 \
+actor_rollout_ref.ref.megatron.context_parallel_size=1 \
+actor_rollout_ref.rollout.tensor_model_parallel_size=1
+```
+
+第一轮建议先保持 `actor_rollout_ref.rollout.tensor_model_parallel_size=1`，只验证 Megatron actor/ref 的 TP=2 prefix-sharing 路径。若需要同时验证 rollout TP，再单独改为 `2`。
+
+建议测试顺序：
+
+1. `ENABLE_PREFIX_SHARING=0` 跑 TP=2，确认原始 Megatron TP 环境可用。
+2. `ENABLE_PREFIX_SHARING=1` 跑 TP=2，确认 prefix-sharing 路径可用。
+3. 首轮保持 `trainer.total_training_steps=1`、`trainer.total_epochs=1`、`trainer.val_before_train=False`、`trainer.save_freq=-1`、`trainer.test_freq=-1`。
+
+日志中可关注以下信号，每个 Megatron TP rank 都应分别打印自己的 `tp_rank` 和 `tp_size`：
+
+```text
+[PS][prepare] config.enable_prefix_sharing=True
+[PS][prepare] PATH 6: sharing detected
+[PS][prepare][global_rank=0 tp_rank=0/tp_size=2 cp_rank=0/cp_size=1] packed_batch_layout: valid_lengths=..., padded_lengths=..., cu_seqlens=...
+[PS][prepare][global_rank=1 tp_rank=1/tp_size=2 cp_rank=0/cp_size=1] packed_batch_layout: valid_lengths=..., padded_lengths=..., cu_seqlens=...
+[PS][attention][global_rank=0 tp_rank=0/tp_size=2 layer=...] enter prefix-sharing path: query_shape=..., key_shape=..., value_shape=...
+[PS][attention][global_rank=1 tp_rank=1/tp_size=2 layer=...] enter prefix-sharing path: query_shape=..., key_shape=..., value_shape=...
+[PS][attention][global_rank=0 tp_rank=0/tp_size=2 layer=...] built expanded kv: expanded_key_shape=..., expanded_value_shape=...
+[PS][attention][global_rank=1 tp_rank=1/tp_size=2 layer=...] built expanded kv: expanded_key_shape=..., expanded_value_shape=...
+```
+
+如果只看到 `tp_rank=0/tp_size=2` 而没有 `tp_rank=1/tp_size=2`，优先检查日志聚合方式是否只收集了 rank0；若确认 rank1 日志也被收集但没有 prefix-sharing attention 日志，再排查 TP rank1 是否进入了 Megatron actor/ref forward。`global_rank` 是 torch distributed global rank，不等价于 TP rank；判断 TP 路径是否覆盖完整应看 `tp_rank`。`padded_lengths` 应体现 TP padding，例如有效长度 `[5, 2]` 在 TP=2 下会变成 `[6, 2]`。
+
+如果出现 `PATH 5: no sharing detected`，说明当前 micro-batch 没检测到共享前缀，不代表 TP 失败。可使用 `actor_rollout_ref.rollout.n=8` 等配置增加同 prompt 多 response 的概率。
+
+## 4. 前置环境安装
 
 ### verl 依赖
 
@@ -127,7 +174,7 @@ bash scripts/install_vllm_sglang_mcore.sh
 
 MindSpeed 是华为 Ascend NPU 适配层，需要根据 NPU 环境单独安装，请参考 MindSpeed 官方文档和团队经验。
 
-## 4. 常见问题
+## 5. 常见问题
 
 ### numpy 版本
 
