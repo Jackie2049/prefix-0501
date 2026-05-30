@@ -25,19 +25,29 @@ class PrecisionValidator:
         self._param_snapshots: dict[str, torch.Tensor] = {}
         self.reports: list[dict[str, Any]] = []
 
+    def _get_modules(self):
+        """Return a flat list of nn.Module objects from actor_module."""
+        actor_module = self.actor.actor_module
+        if isinstance(actor_module, (list, tuple, torch.nn.ModuleList)):
+            return list(actor_module)
+        return [actor_module]
+
     def save_weights(self) -> None:
         """Snapshot current model parameters."""
-        self._param_snapshots = {
-            name: param.detach().clone()
-            for name, param in self.actor.actor_module.named_parameters()
-        }
+        self._param_snapshots = {}
+        for idx, module in enumerate(self._get_modules()):
+            for name, param in module.named_parameters():
+                key = f"{idx}.{name}"
+                self._param_snapshots[key] = param.detach().clone()
 
     def restore_weights(self) -> None:
         """Restore model parameters from snapshots."""
         with torch.no_grad():
-            for name, param in self.actor.actor_module.named_parameters():
-                if name in self._param_snapshots:
-                    param.copy_(self._param_snapshots[name])
+            for idx, module in enumerate(self._get_modules()):
+                for name, param in module.named_parameters():
+                    key = f"{idx}.{name}"
+                    if key in self._param_snapshots:
+                        param.copy_(self._param_snapshots[key])
 
     @contextmanager
     def baseline_mode(self):
