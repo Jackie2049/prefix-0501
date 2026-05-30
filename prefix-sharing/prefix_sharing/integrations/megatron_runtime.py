@@ -57,7 +57,7 @@ def maybe_run_prefix_sharing_attention(
 
     prefix_log.warning("\n\n\ntry to build kv\n\n\n")
     prefix_log.warning(
-        "[PS][attention][rank=%s tp=%s/%s layer=%s] enter prefix-sharing path: "
+        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] enter prefix-sharing path: "
         "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
         "padded_lengths=%s, cu_seqlens=%s",
         global_rank,
@@ -81,7 +81,7 @@ def maybe_run_prefix_sharing_attention(
         tp_rank=tp_rank,
     )
     prefix_log.warning(
-        "[PS][attention][rank=%s tp=%s/%s layer=%s] built expanded kv: "
+        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] built expanded kv: "
         "expanded_key_shape=%s, expanded_value_shape=%s",
         global_rank,
         tp_rank,

@@ -297,7 +297,7 @@ def build_prefix_sharing_micro_batch(
         align_size=int(align_size),
     )
     logger.warning(
-        "[PS][prepare][rank=%s tp=%s/%s cp=%s/%s] packed_batch_layout: "
+        "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s] packed_batch_layout: "
         "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
         "total_valid=%s, total_padded=%s",
         global_rank,
