@@ -13,6 +13,9 @@ from typing import Any
 
 import torch
 
+import logging
+precision_logger = logging.getLogger(__file__)
+
 
 class PrecisionValidator:
     """Validate prefix sharing precision by comparing optimized vs baseline."""
@@ -113,9 +116,9 @@ class PrecisionValidator:
     def print_report(self) -> None:
         """Print report to stdout and save JSON."""
 
-        print("\n" + "=" * 70)
-        print("  PREFIX SHARING PRECISION VALIDATION REPORT")
-        print("=" * 70)
+        precision_logger.warning("\n" + "=" * 70)
+        precision_logger.warning("  PREFIX SHARING PRECISION VALIDATION REPORT")
+        precision_logger.warning("=" * 70)
 
         all_pass = True
         for r in self.reports:
@@ -124,22 +127,22 @@ class PrecisionValidator:
                 all_pass = False
 
             if r.get("status") == "skipped":
-                print(f"  [SKIP] {r['name']}: {r['reason']}")
+                precision_logger.warning(f"  [SKIP] {r['name']}: {r['reason']}")
             elif r.get("status") == "error":
-                print(f"  [ERR ] {r['name']}: {r['reason']}")
+                precision_logger.warning(f"  [ERR ] {r['name']}: {r['reason']}")
             else:
                 extra = ""
                 if "max_rel_diff" in r:
                     extra = f", max_rel_diff={r['max_rel_diff']:.6e}"
-                print(
+                precision_logger.warning(
                     f"  [{status}] {r['name']}: shape={r['shape']}, "
                     f"max_diff={r['max_diff']:.6e}, mean_diff={r['mean_diff']:.6e}"
                     f"{extra}"
                 )
 
-        print("-" * 70)
-        print(f"  OVERALL: {'ALL PASS' if all_pass else 'SOME FAILED'}")
-        print("=" * 70 + "\n")
+        precision_logger.warning("-" * 70)
+        precision_logger.warning(f"  OVERALL: {'ALL PASS' if all_pass else 'SOME FAILED'}")
+        precision_logger.warning("=" * 70 + "\n")
 
         try:
             report_dir = "precision_reports"
@@ -149,6 +152,6 @@ class PrecisionValidator:
             )
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump(self.reports, f, indent=2, ensure_ascii=False)
-            print(f"  Detailed report saved to: {report_path}\n")
+            precision_logger.warning(f"  Detailed report saved to: {report_path}\n")
         except Exception as exc:
-            print(f"  Warning: failed to save report: {exc}\n")
+            precision_logger.warning(f"  Warning: failed to save report: {exc}\n")
