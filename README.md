@@ -112,6 +112,55 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 
 ## 3. 进阶场景
 
+### 开启 Flash Attention
+
+Flash Attention 在两个层面起作用：**训练引擎**（Megatron/MindSpeed 的 attention 计算）和 **prefix-sharing 后端**（共享前缀的 attention 调度）。两者的配置方式不同，需分别设置。
+
+#### 训练引擎层面
+
+训练引擎的 flash attention 通过 Megatron 的 `use_flash_attn` 参数控制：
+
+**NPU 环境**（必须开启）
+
+NPU 不支持 `flash-attn` pip 包，而是通过 MindSpeed/CANN 的 `npu_fusion_attention` 融合算子实现 flash attention。需在启动命令中通过 `override_transformer_config` 为 actor 和 ref 分别开启：
+
+```bash
+export VLLM_ASCEND_ENABLE_NZ=0
+
+# 在启动命令中追加：
++actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
++actor_rollout_ref.ref.megatron.override_transformer_config.use_flash_attn=True \
+```
+
+> 注意：使用 MindSpeed 作为训练后端时，flash attention **必须开启**。NPU 的 flash attention 为非确定性计算，与 `--make-vocab-size-divisible-by` 的确定性模式不兼容。
+
+**GPU 环境**（默认已支持）
+
+GPU 环境通过 verl 前置安装脚本安装 `flash-attn` 包。Megatron core 会自动检测并使用 `flash-attn`，通常无需额外配置。如需显式开启：
+
+```bash
++actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
++actor_rollout_ref.ref.megatron.override_transformer_config.use_flash_attn=True \
+```
+
+#### Prefix-Sharing 后端层面
+
+prefix-sharing 的 attention 计算通过 `backend` 参数选择后端实现，当前支持：
+
+| 后端 | 硬件 | 说明 |
+|------|------|------|
+| `torch_ref`（默认） | GPU + NPU | 纯 PyTorch 实现，兼容性最好 |
+| `flash_atten_gpu` | 仅 GPU | 基于 `flash-attn` 包的 `flash_attn_varlen_func`，性能更优 |
+| `flash_atten_npu` | NPU | 占位符，暂未实现 |
+
+如需在 GPU 上使用 flash attention 加速 prefix-sharing 路径，通过环境变量或配置设置：
+
+```bash
+export PREFIX_SHARING_BACKEND=flash_atten_gpu
+```
+
+> 注意：`flash_atten_gpu` 后端要求输入为 THD（varlen）格式，需确保 `use_remove_padding=True`。NPU 环境目前只能使用 `torch_ref` 后端，`flash_atten_npu` 尚在开发中。
+
 ### 并行策略
 
 在第 2 节的 NPU 或 GPU 启动命令基础上，追加或覆盖以下增量配置：
