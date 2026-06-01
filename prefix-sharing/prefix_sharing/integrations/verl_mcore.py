@@ -290,7 +290,8 @@ def build_prefix_sharing_micro_batch(
     trimmed_micro_batch["position_ids"] = new_position_ids
 
     # Compute 1D positions in THD compact tensor
-    # Simulate preprocess_packed_seqs alignment to get cu_seqlens_padded
+    # Must match preprocess_packed_seqs alignment exactly, including fp8 padding
+    import math
     import torch
     seqlens_in_batch = new_attention_mask.sum(dim=-1, dtype=torch.int32)
     try:
@@ -300,11 +301,29 @@ def build_prefix_sharing_micro_batch(
     except (ImportError, RuntimeError, AssertionError):
         tp_size = 1
         cp_size = 1
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    original_align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    align_size = original_align_size
+
+    # fp8 padding: match preprocess_packed_seqs logic from util.py
+    use_fp8_padding = False
+    if model_config is not None:
+        fp8 = getattr(model_config, 'fp8', None)
+        use_fp8_padding = fp8 in ("e4m3", "hybrid")
+    if use_fp8_padding:
+        align_size = math.lcm(16, align_size)
+
     pad_sizes = (align_size - seqlens_in_batch % align_size) % align_size
     seqlens_padded = seqlens_in_batch + pad_sizes
     cu_seqlens_padded = torch.zeros(len(seqlens_in_batch) + 1, dtype=torch.int32)
     cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
+
+    # fp8 last sequence padding: match preprocess_packed_seqs total alignment
+    if use_fp8_padding:
+        align_size_last = original_align_size * 128
+        pad_size_last = (align_size_last - cu_seqlens_padded[-1] % align_size_last) % align_size_last
+        cu_seqlens_padded[-1] += pad_size_last
+        seqlens_padded[-1] += pad_size_last
+
     cu_seqlens_cpu = cu_seqlens_padded.tolist()
 
     kept_position_ids = _concat_tensors(kept_position_rows)
