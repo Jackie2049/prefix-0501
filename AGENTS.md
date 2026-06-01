@@ -40,6 +40,7 @@ prefix-0501/
 | `docs/concepts.md` | 当前概念、术语、核心语义和设计约定；用于语义争议或命名分歧时对齐 |
 | `docs/overview.md` | 当前项目架构、模块关系和主要数据流 |
 | `docs/overview.puml` | 当前架构图（PlantUML） |
+| `docs/pending-items.md` | 当前明确遗留事项、兼容性缺口和后续待验证场景 |
 | `docs/legacy/` | 历史 `doc-*` 文档归档；只作背景参考，不作为当前实现规范 |
 
 文档维护原则：
@@ -47,6 +48,7 @@ prefix-0501/
 - 后续开发**不要求**每次记录工作进展日志。
 - 概念、术语、语义约定变化时，按需更新 `docs/concepts.md`。
 - 架构、模块边界、数据流变化时，按需更新 `docs/overview.md` 和 `docs/overview.puml`。
+- 明确遗留事项、暂不处理的兼容性缺口或待验证场景，统一记录到 `docs/pending-items.md`。
 - `docs/legacy/` 默认只读，除非用户明确要求整理历史材料。
 - 关键设计决策若来自参考代码分析，需回源码验证是否在主流程中被调用。
 
@@ -58,6 +60,7 @@ prefix-0501/
 | 理解架构 / 模块关系 | `docs/overview.md` / `docs/overview.puml` |
 | 查概念 / 术语 | `docs/concepts.md` |
 | 理解历史方案 | `docs/legacy/` |
+| 查遗留事项 | `docs/pending-items.md` |
 | 了解模块分层 | `prefix-sharing/prefix_sharing/` 下 `core/`、`backends/`、`integrations/`，并参考 `docs/overview.md` |
 
 ---
@@ -131,7 +134,14 @@ PYTHONPATH=prefix-sharing pytest -q \
 - commit 完成后按用户要求或仓库协作约定尝试 push；若网络或权限策略阻止 push，需报告本地分支 ahead 状态。
 - 如果修改未完成或只做了一半，**不要 commit**
 - commit message 格式：`[type] <中文简要说明>`
-- type 取值：`feat`(特性)、`fix`(修复)、`chore`(琐事)、`test`(测试)、`doc`(文档)
+- type 取值：
+  - `feat`：新特性或能力
+  - `fix`：修复 bug 或错误行为
+  - `refactor`：不改变外部行为的代码整理；包括重命名、结构调整，以及在源码中补充/改写**语义说明性注释**（帮助理解实现约束与不变量，但不改运行逻辑）
+  - `test`：仅测试相关改动
+  - `doc`：仅 `docs/` 等文档内容改动
+  - `chore`：与业务代码语义无关的仓库维护；如依赖快照、CI、脚本、配置、ignore 规则等
+- 选型提示：改源码注释以澄清实现语义时用 `refactor`，不要误标为 `chore`；改 `docs/` 下文档时用 `doc`
 
 ### Cursor Agent 特殊规则
 
@@ -162,4 +172,5 @@ PYTHONPATH=prefix-sharing pytest -q \
 - 概念与语义约定：[`docs/concepts.md`](docs/concepts.md)
 - 架构说明：[`docs/overview.md`](docs/overview.md)
 - 架构图：[`docs/overview.puml`](docs/overview.puml)
+- 遗留事项：[`docs/pending-items.md`](docs/pending-items.md)
 - 历史归档：[`docs/legacy/`](docs/legacy/)

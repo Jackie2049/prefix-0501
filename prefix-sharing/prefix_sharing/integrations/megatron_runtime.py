@@ -18,8 +18,6 @@ def maybe_run_prefix_sharing_attention(
     attention_mask: Any,
     rotary_pos_emb: Any,
     packed_seq_params: Any,
-    *,
-    mscale: float = 1.0,
 ) -> tuple[Any, Any] | None:
     """Run prefix-sharing attention when a runtime context is active.
 
@@ -39,38 +37,65 @@ def maybe_run_prefix_sharing_attention(
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
     if rotary_pos_emb is None:
         raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb")
-    if ctx.kept_position_ids is None:
-        raise RuntimeError("prefix sharing context is missing kept_position_ids")
+    if ctx.packed_batch_layout.packed_position_ids is None:
+        raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
     q_pos_emb, k_pos_emb = rotary_pos_emb
+    packed_batch_layout = ctx.packed_batch_layout
     query, key = _apply_positioned_rope(
         attention_module,
         query,
         key,
         q_pos_emb,
         k_pos_emb,
-        ctx.kept_position_ids,
-        mscale=mscale,
+        packed_batch_layout.packed_position_ids,
     )
 
     backend = ctx.backend or TorchReferenceBackend()
-    tp_rank = _tensor_parallel_rank()
+    global_rank, tp_rank, tp_size = _read_parallel_rank_info()
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
 
     prefix_log.warning("\n\n\ntry to build kv\n\n\n")
+    prefix_log.warning(
+        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] enter prefix-sharing path: "
+        "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
+        "padded_lengths=%s, cu_seqlens=%s",
+        global_rank,
+        tp_rank,
+        tp_size,
+        layer_id,
+        tuple(query.shape),
+        tuple(key.shape),
+        tuple(value.shape),
+        packed_batch_layout.valid_lengths,
+        packed_batch_layout.padded_lengths,
+        packed_batch_layout.cu_seqlens,
+    )
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
         ctx.store,
         ctx.prefix_sharing_plan,
+        packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=tp_rank,
+    )
+    prefix_log.warning(
+        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] built expanded kv: "
+        "expanded_key_shape=%s, expanded_value_shape=%s",
+        global_rank,
+        tp_rank,
+        tp_size,
+        layer_id,
+        tuple(expanded_key.shape),
+        tuple(expanded_value.shape),
     )
     core_attn_out = backend.attention(
         query,
         expanded_key,
         expanded_value,
         ctx.prefix_sharing_plan,
+        packed_batch_layout=packed_batch_layout,
         attention_mask=attention_mask,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
@@ -83,17 +108,15 @@ def _apply_positioned_rope(
     key: Any,
     q_pos_emb: Any,
     k_pos_emb: Any,
-    kept_position_ids: Any,
-    *,
-    mscale: float,
+    packed_position_ids: Any,
 ) -> tuple[Any, Any]:
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
-    positions = kept_position_ids.to(device=query.device, dtype=torch.long)
+    positions = packed_position_ids.to(device=query.device, dtype=torch.long)
     max_needed = positions.max().item() + 1
 
     # Extend q_pos_emb / k_pos_emb when they are shorter than the largest
-    # position_id needed by kept_position_ids.  THD-mode generated pos_emb
+    # position_id needed by packed_position_ids.  THD-mode generated pos_emb
     # only covers positions 0 .. max_seqlen_q-1, which is too small because
     # prefix-sharing preserves the original position_ids (e.g. suffix starts
     # at position 75).
@@ -130,8 +153,6 @@ def _apply_positioned_rope(
             q_freqs,
             config=attention_module.config,
             cu_seqlens=None,
-            mscale=mscale,
-            cp_group=attention_module.pg_collection.cp,
         ).squeeze(1)
     if k_pos_emb is not None:
         k_freqs = k_pos_emb.index_select(0, positions)
@@ -140,16 +161,30 @@ def _apply_positioned_rope(
             k_freqs,
             config=attention_module.config,
             cu_seqlens=None,
-            mscale=mscale,
-            cp_group=attention_module.pg_collection.cp,
         ).squeeze(1)
     return query, key
 
 
-def _tensor_parallel_rank() -> int:
+def _read_parallel_rank_info() -> tuple[int | str, int, int]:
+    global_rank: int | str = "unknown"
+    tp_rank = 0
+    tp_size = 1
+
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            global_rank = int(dist.get_rank())
+    except Exception:
+        pass
+
     try:
         from megatron.core import parallel_state
 
-        return int(parallel_state.get_tensor_model_parallel_rank())
+        tp_size = int(parallel_state.get_tensor_model_parallel_world_size())
+        if hasattr(parallel_state, "get_tensor_model_parallel_rank"):
+            tp_rank = int(parallel_state.get_tensor_model_parallel_rank())
     except Exception:
-        return 0
+        pass
+
+    return global_rank, tp_rank, tp_size

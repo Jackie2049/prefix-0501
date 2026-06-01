@@ -38,6 +38,7 @@ class PrefixAttentionBackend(Protocol):
         store: Any,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
+        packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:

@@ -1,0 +1,15 @@
+# entry file : pretrain_gpt_usecase.py
+
+spec:
+  data_path: /home/dataset/model/gpt-3.5/alpaca_text_document
+  vocab_file: /home/dataset/model/gpt-3.5/vocab.json
+  merge_file: /home/dataset/model/gpt-3.5/merges.txt
+  checkpoint_path: ./ckpt
+  nnodes: 1
+  train_samples: 1280
+  micro_batch_size: 4 # MBS
+  batch_size: 32 # GBS
+  moe_grouped_gemm: 0
+
+products:
+ - { use_mcore: [ True, False ], tp_size: [ 2 ], pp_size: [ 2 ], extra_args: [ '"--lr-decay-samples 320 --rampup-batch-size 8 8 400"' ] }
