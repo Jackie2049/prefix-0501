@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from prefix_sharing.backends.factory import get_backend_instance
-from prefix_sharing.backends.gpu_flash_attn import GpuFlashAttentionBackend
-from prefix_sharing.backends.npu_flash_attn import NpuFlashAttentionBackend
+from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
+from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 
@@ -18,11 +18,11 @@ def test_factory_torch_ref() -> None:
     assert backend.capabilities.name == "torch_ref"
 
 
-def test_factory_gpu_flash_attn() -> None:
-    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="gpu_flash_attn")
+def test_factory_flash_atten_gpu() -> None:
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_gpu")
     backend = get_backend_instance(config)
     assert isinstance(backend, GpuFlashAttentionBackend)
-    assert backend.capabilities.name == "gpu_flash_attn"
+    assert backend.capabilities.name == "flash_atten_gpu"
     assert backend.capabilities.supports_flash_attention
 
 
@@ -40,13 +40,13 @@ def test_resolve_backend_explicit() -> None:
 
 
 def test_resolve_backend_from_config() -> None:
-    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="gpu_flash_attn")
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_gpu")
     resolved = get_backend_instance(config)
     assert isinstance(resolved, GpuFlashAttentionBackend)
 
 
 def test_config_validates_backends() -> None:
-    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="gpu_flash_attn")
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_gpu")
     config.validate()
 
     bad_config = PrefixSharingConfig(enable_prefix_sharing=True, backend="not_real")

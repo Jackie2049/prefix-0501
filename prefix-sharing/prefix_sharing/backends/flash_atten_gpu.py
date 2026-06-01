@@ -13,7 +13,7 @@ from functools import lru_cache
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
-from prefix_sharing.backends.flash_atten_port import FlashAttentionMixin, FlashBackendValidationError
+from prefix_sharing.backends.flash_atten_base import FlashAttentionMixin, FlashBackendValidationError
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
@@ -50,7 +50,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
     """
 
     capabilities = BackendCapabilities(
-        name="gpu_flash_attn",
+        name="flash_atten_gpu",
         supports_cpu=False,
         supports_cuda=True,
         supports_cann=False,

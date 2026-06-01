@@ -20,7 +20,7 @@ pytest.importorskip("flash_attn")
 
 import torch  # noqa: E402
 
-from prefix_sharing.backends.gpu_flash_attn import GpuFlashAttentionBackend  # noqa: E402
+from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend  # noqa: E402
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend  # noqa: E402 
 
 
@@ -44,7 +44,7 @@ def _make_plan(batch_sizes: list[int], prefix_lens: list[int]) -> Any:
     * prefix_lens[i] = number of prefix tokens shared by sample i
       (0 means the sample is a provider / no sharing).
     """
-    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="gpu_flash_attn")
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_gpu")
     planner = PrefixSharingPlanner(config)
 
     # We need real input_ids to feed the planner, but for these tests we only
@@ -150,7 +150,7 @@ def _run_forward_backward(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_same_q_kv_lengths(
+def test_flash_atten_gpu_same_q_kv_lengths(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -167,7 +167,7 @@ def test_gpu_flash_attn_same_q_kv_lengths(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_vs_torch_ref(
+def test_flash_atten_gpu_vs_torch_ref(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -187,7 +187,7 @@ def test_gpu_flash_attn_vs_torch_ref(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_gqa(
+def test_flash_atten_gpu_gqa(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -203,7 +203,7 @@ def test_gpu_flash_attn_gqa(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_backward_smoke(backend: GpuFlashAttentionBackend) -> None:
+def test_flash_atten_gpu_backward_smoke(backend: GpuFlashAttentionBackend) -> None:
     """Smoke test for gradient flow through the FA kernel."""
     plan = _make_plan(batch_sizes=[4, 6], prefix_lens=[0, 2])
     q, k, v = _random_qkv(
@@ -226,7 +226,7 @@ def test_gpu_flash_attn_backward_smoke(backend: GpuFlashAttentionBackend) -> Non
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_backward_vs_torch_ref(
+def test_flash_atten_gpu_backward_vs_torch_ref(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -244,7 +244,7 @@ def test_gpu_flash_attn_backward_vs_torch_ref(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_multi_reusers(
+def test_flash_atten_gpu_multi_reusers(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -263,7 +263,7 @@ def test_gpu_flash_attn_multi_reusers(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_gqa_vs_torch_ref(
+def test_flash_atten_gpu_gqa_vs_torch_ref(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -281,7 +281,7 @@ def test_gpu_flash_attn_gqa_vs_torch_ref(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_mixed_lengths(
+def test_flash_atten_gpu_mixed_lengths(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -300,7 +300,7 @@ def test_gpu_flash_attn_mixed_lengths(
 
 @pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_various_head_dims(
+def test_flash_atten_gpu_various_head_dims(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
     head_dim: int,
@@ -316,7 +316,7 @@ def test_gpu_flash_attn_various_head_dims(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_multi_reusers_backward(
+def test_flash_atten_gpu_multi_reusers_backward(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -332,7 +332,7 @@ def test_gpu_flash_attn_multi_reusers_backward(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_mixed_lengths_backward(
+def test_flash_atten_gpu_mixed_lengths_backward(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
 ) -> None:
@@ -349,7 +349,7 @@ def test_gpu_flash_attn_mixed_lengths_backward(
 
 @pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_various_head_dims_backward(
+def test_flash_atten_gpu_various_head_dims_backward(
     backend: GpuFlashAttentionBackend,
     ref_backend: TorchReferenceBackend,
     head_dim: int,
@@ -366,8 +366,8 @@ def test_gpu_flash_attn_various_head_dims_backward(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_flash_attn_validate_checks_import() -> None:
+def test_flash_atten_gpu_validate_checks_import() -> None:
     """validate() should succeed when flash-attn is importable."""
     backend = GpuFlashAttentionBackend()
-    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="gpu_flash_attn")
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_gpu")
     backend.validate(config)

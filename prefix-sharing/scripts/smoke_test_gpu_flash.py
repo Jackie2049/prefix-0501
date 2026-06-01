@@ -20,14 +20,14 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from prefix_sharing.backends.gpu_flash_attn import GpuFlashAttentionBackend
+from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 
 
 def _make_plan(batch_sizes: list[int], prefix_lens: list[int]):
-    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="gpu_flash_attn")
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_gpu")
     planner = PrefixSharingPlanner(config)
     input_ids = [list(range(s)) for s in batch_sizes]
     plan = planner.plan(input_ids)
