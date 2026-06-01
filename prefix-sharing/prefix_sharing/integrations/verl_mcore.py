@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, Sequence, TypeVar
 
-from prefix_sharing.backends.factory import resolve_backend
+from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.batch_trim import (
@@ -110,7 +110,7 @@ class VerlMCoreBatchAdapter:
 
         runtime_state = PrefixSharingRuntimeState(
             prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
-            backend=resolve_backend(self.config),
+            backend=get_backend_instance(self.config),
             packed_batch_layout=PackedBatchLayout.from_valid_lengths(
                 prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
             ),
@@ -144,7 +144,7 @@ class VerlMCoreIntegration:
     def install(self, model_config: Any | None = None) -> PatchHandle:
         self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
         self._ensure_verl_importable()
-        backend = resolve_backend(self.config, self.backend)
+        backend = get_backend_instance(self.config, self.backend)
         return MegatronAttentionIntegration(config=self.config, backend=backend).install(
             model_config=model_config
         )
@@ -314,7 +314,7 @@ def build_prefix_sharing_micro_batch(
     )
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        backend=resolve_backend(config, backend),
+        backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
     )
     logger.warning(

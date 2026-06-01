@@ -13,7 +13,7 @@ from functools import lru_cache
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
-from prefix_sharing.backends.flash_common import FlashAttentionMixin, FlashBackendValidationError
+from prefix_sharing.backends.flash_atten_port import FlashAttentionMixin, FlashBackendValidationError
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from prefix_sharing.backends.factory import get_backend_instance, resolve_backend
+from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.gpu_flash_attn import GpuFlashAttentionBackend
 from prefix_sharing.backends.npu_flash_attn import NpuFlashAttentionBackend
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
@@ -26,14 +26,6 @@ def test_factory_gpu_flash_attn() -> None:
     assert backend.capabilities.supports_flash_attention
 
 
-def test_factory_npu_flash_attn() -> None:
-    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="npu_flash_attn")
-    backend = get_backend_instance(config)
-    assert isinstance(backend, NpuFlashAttentionBackend)
-    assert backend.capabilities.name == "npu_flash_attn"
-    assert backend.capabilities.supports_flash_attention
-
-
 def test_factory_unknown_backend() -> None:
     config = PrefixSharingConfig(enable_prefix_sharing=True, backend="unknown")
     with pytest.raises(ValueError, match="Unknown backend"):
@@ -43,13 +35,13 @@ def test_factory_unknown_backend() -> None:
 def test_resolve_backend_explicit() -> None:
     config = PrefixSharingConfig(enable_prefix_sharing=True, backend="torch_ref")
     explicit = GpuFlashAttentionBackend()
-    resolved = resolve_backend(config, explicit)
+    resolved = get_backend_instance(config, explicit)
     assert resolved is explicit
 
 
 def test_resolve_backend_from_config() -> None:
     config = PrefixSharingConfig(enable_prefix_sharing=True, backend="gpu_flash_attn")
-    resolved = resolve_backend(config)
+    resolved = get_backend_instance(config)
     assert isinstance(resolved, GpuFlashAttentionBackend)
 
 

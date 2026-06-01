@@ -8,14 +8,18 @@ from prefix_sharing.backends.base import PrefixAttentionBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 
 
-def get_backend_instance(config: PrefixSharingConfig) -> PrefixAttentionBackend:
-    """Create a backend instance matching ``config.backend``.
+def get_backend_instance(
+    config: PrefixSharingConfig, backend: Any | None = None
+) -> PrefixAttentionBackend:
+    """Return an explicit ``backend`` if given, otherwise build from ``config``.
 
-    Supported values:
+    Supported values for ``config.backend``:
     * ``"torch_ref"``      -> :class:`~prefix_sharing.backends.torch_ref.TorchReferenceBackend`
     * ``"gpu_flash_attn"`` -> :class:`~prefix_sharing.backends.gpu_flash_attn.GpuFlashAttentionBackend`
     * ``"npu_flash_attn"`` -> :class:`~prefix_sharing.backends.npu_flash_attn.NpuFlashAttentionBackend`
     """
+    if backend is not None:
+        return backend
     if config.backend == "torch_ref":
         from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 
@@ -32,10 +36,3 @@ def get_backend_instance(config: PrefixSharingConfig) -> PrefixAttentionBackend:
         f"Unknown backend '{config.backend}'. "
         f"Supported: torch_ref, gpu_flash_attn, npu_flash_attn"
     )
-
-
-def resolve_backend(config: PrefixSharingConfig, backend: Any | None = None) -> PrefixAttentionBackend:
-    """Return an explicit ``backend`` if given, otherwise build from ``config``."""
-    if backend is not None:
-        return backend
-    return get_backend_instance(config)
