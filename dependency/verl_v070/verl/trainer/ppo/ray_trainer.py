@@ -1291,6 +1291,14 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        
+
+        # 使用真实数据替换rollout的数据，通过USE_FIXED_ROLLOUT环境变量控制
+        import os
+        if os.environ.get("USE_FIXED_ROLLOUT", None):
+            from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
+            patch_fixed_rollout(self, json_path="/absolute/path/to/your_data.json")
+
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
