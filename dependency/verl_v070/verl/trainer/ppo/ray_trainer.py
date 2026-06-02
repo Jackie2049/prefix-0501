@@ -1293,11 +1293,12 @@ class RayPPOTrainer:
         self._load_checkpoint()
         
 
-        # 使用真实数据替换rollout的数据，通过USE_FIXED_ROLLOUT环境变量控制
+        # 使用真实数据替换rollout的数据，通过USE_FIXED_ROLLOUT环境变量指定JSON路径
         import os
-        if os.environ.get("USE_FIXED_ROLLOUT", None):
+        json_path = os.environ.get("USE_FIXED_ROLLOUT", None)
+        if json_path:
             from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
-            patch_fixed_rollout(self, json_path="/absolute/path/to/your_data.json")
+            patch_fixed_rollout(self, json_path=json_path)
 
 
         current_epoch = self.global_steps // len(self.train_dataloader)
