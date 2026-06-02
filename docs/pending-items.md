@@ -4,6 +4,14 @@
 
 ## 当前事项
 
+### 2026-05-30：接入支持 Qwen3.5/Qwen3.6 HybridAttention 的训练引擎
+
+**问题**：当前 `dependency/` 中的 verl / Megatron 快照尚未支持 Qwen3.5/Qwen3.6 的 HybridAttention 训练主路径。prefix-sharing 本轮只在 `prefix-sharing` 侧准备 full gated attention KV 复用和 gated delta net activation state 复用的框架无关抽象，暂不做训练引擎侵入式接入。
+
+**方案**：后续待 verl + MindSpeed + MindSpeed-MM 的 Qwen3.5/Qwen3.6 模型仓和 RL 适配代码进入 `dependency/` 后，补充 thin integration / patch：full attention 接 `PrefixAttentionStore` 的 KV injection，gated delta net 接 `PrefixDeltanetStore` 或等价 cache-param 复用入口，并补齐真实引擎下的精度一致性测试。
+
+当前 `PrefixSharingRuntimeContext` 仍只持有 `PrefixAttentionStore`，这是因为现有 runtime context 只服务 Megatron attention hook。后续接入真实 HybridAttention 训练引擎时，需要扩展 runtime context / runtime state，使其能同时承载 attention KV store 和 GatedDeltaNet state store，并明确两类 store 的生命周期、layer 维度隔离、TP rank 隔离和 context 清理逻辑。
+
 ### 2026-05-30：补充 `use_fp8_padding=True` 的 packed layout 对齐与测试
 
 **问题**：TP v1 只支持 CP=1、非 FP8 padding 主路径。verl 在 `use_fp8_padding=True` 时会改变 packed padding 规则：先使用 `lcm(16, align_size)` 对每个序列长度做 padding，再对最后一行追加额外 padding 以满足 Transformer Engine 的总长度对齐要求。当前 `PackedBatchLayout` 尚未实现这套 FP8 padding 规则。
