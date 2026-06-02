@@ -73,6 +73,45 @@ except ModuleNotFoundError:
     restore_suffix_first_log_probs_from_prefix = None
 ######### prefix-sharing #########
 
+######### training monitor #########
+try:
+    from prefix_sharing.tools.training_monitor import (
+        MemoryMonitor,
+        Stopwatch,
+        current_stopwatch,
+        training_monitor_context,
+    )
+except ModuleNotFoundError:
+    MemoryMonitor = None
+    Stopwatch = None
+    current_stopwatch = None
+    training_monitor_context = None
+
+
+def _print_monitor_stats(mon, sw):
+    """Print monitoring stats via logger.warning (rank 0 only)."""
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    mem = mon.summary() if mon else {}
+    if mem.get("num_samples", 0):
+        logger.warning(
+            "MONITOR HBM  peak_occupied=%(peak_occupied_gib).1f  "
+            "peak_reserved=%(peak_reserved_gib).1f  "
+            "peak_allocated=%(peak_allocated_gib).1f  GiB"
+            % mem
+        )
+    if sw:
+        for phase, info in sw.summary().get("phases", {}).items():
+            logger.warning(
+                "MONITOR TIME  %(phase)s  total=%(total_s).3fs  "
+                "count=%(count)d  avg=%(avg_s).4f  "
+                "min=%(min_s).4f  max=%(max_s).4f  "
+                "median=%(median_s).4f  p99=%(p99_s).4f  "
+                "stddev=%(stddev_s).4f"
+                % {"phase": phase, **info}
+            )
+######### training monitor #########
+
 __all__ = ["MegatronPPOActor"]
 
 logger = logging.getLogger(__file__)
@@ -491,6 +530,11 @@ class MegatronPPOActor(BasePPOActor):
         forward_backward_func = get_forward_backward_func()
 
         def loss_func(output, data, meta_info):
+            ######### training monitor #########
+            _sw_bwd = current_stopwatch()
+            if _sw_bwd is not None:
+                _sw_bwd.lap("bwd_start")
+            ######### training monitor #########
             # For memory efficiency
             # We move calculation of entropy to compute_log_probs, forward_only == True
             log_probs = None
@@ -615,6 +659,11 @@ class MegatronPPOActor(BasePPOActor):
             batch = next(batch_iter)
             batch = batch.to(get_device_id())
             batch = batch.contiguous()
+            ######### training monitor #########
+            _sw = current_stopwatch()
+            if _sw is not None:
+                _sw.start("forward")
+            ######### training monitor #########
             ######### prefix-sharing #########
             # 在 forward 前读取和修改 micro-batch，识别micro-batch内的共同前缀，并构建运行时状态，
             # 这是 prefix-sharing 的入口点，需要在数据进入模型前完成 micro-batch 重组
@@ -738,6 +787,12 @@ class MegatronPPOActor(BasePPOActor):
                     )
                 ######### prefix-sharing #########
 
+            ######### training monitor #########
+            if _sw is not None:
+                _sw.stop("forward")
+                _sw.lap("fwd_done")
+            ######### training monitor #########
+
             if forward_only:
                 meta_info = None
             else:
@@ -823,10 +878,22 @@ class MegatronPPOActor(BasePPOActor):
             and users have to combine the output in each dp rank manually.
 
         """
+        ######### training monitor #########
+        _mon = MemoryMonitor(interval=0.05) if MemoryMonitor is not None else None
+        _sw = Stopwatch() if Stopwatch is not None else None
+        _ctx = training_monitor_context(_mon, _sw) if training_monitor_context is not None else nullcontext()
+        with _ctx:
+            if _mon is not None:
+                _mon.start()
+        ######### training monitor #########
         metrics = {}
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
         for data in dataloader:
+            ######### training monitor #########
+            if _sw is not None:
+                _sw.start("minibatch")
+            ######### training monitor #########
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             self.actor_optimizer.zero_grad()
@@ -856,9 +923,18 @@ class MegatronPPOActor(BasePPOActor):
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
+            ######### training monitor #########
+            if _sw is not None:
+                _sw.start("update")
+            ######### training monitor #########
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
+            ######### training monitor #########
+            if _sw is not None:
+                _sw.stop("update")
+                _sw.stop("minibatch")
+            ######### training monitor #########
 
             if update_successful:
                 # allgather already execute in optimizer.step in new megatron
@@ -877,4 +953,9 @@ class MegatronPPOActor(BasePPOActor):
             self.prof.stop_and_save()
             self.prof.stop_trace()
         get_torch_device().empty_cache()
+        ######### training monitor #########
+        if _mon is not None:
+            _mon.stop()
+        _print_monitor_stats(_mon, _sw)
+        ######### training monitor #########
         return metrics
