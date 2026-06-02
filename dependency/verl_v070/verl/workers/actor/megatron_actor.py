@@ -535,6 +535,8 @@ class MegatronPPOActor(BasePPOActor):
             _sw_bwd = current_stopwatch()
             if _sw_bwd is not None:
                 _sw_bwd.lap("bwd_start")
+                if not forward_only:
+                    _sw_bwd.start("backward")
             ######### training monitor #########
             # For memory efficiency
             # We move calculation of entropy to compute_log_probs, forward_only == True
@@ -843,6 +845,13 @@ class MegatronPPOActor(BasePPOActor):
             )
         # loss_reduces contains the stats returned from loss_func
 
+        ######### training monitor #########
+        if not forward_only:
+            _sw_after = current_stopwatch()
+            if _sw_after is not None:
+                _sw_after.stop("backward")
+        ######### training monitor #########
+
         if self.has_multi_modal_inputs:
             data.batch.pop("multi_modal_inputs")
             data.batch.pop("multi_modal_inputs_idx")
@@ -886,77 +895,77 @@ class MegatronPPOActor(BasePPOActor):
         with _ctx:
             if _mon is not None:
                 _mon.start()
-        ######### training monitor #########
-        metrics = {}
-        if self.use_torch_profiler and self.prof and self.prof.enable:
-            self.prof.start()
-        for data in dataloader:
             ######### training monitor #########
-            if _sw is not None:
-                _sw.start("minibatch")
-            ######### training monitor #########
-            if self.config.router_replay.mode in ["R2", "R3"]:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-            self.actor_optimizer.zero_grad()
-            # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
-            for chunk in self.actor_module:
-                # if use distributed optimizer, zero grad buffer will be handled by optimizer
-                chunk.zero_grad_buffer()
-
-            calculate_entropy = self.config.entropy_coeff != 0
-            if data.meta_info.get("micro_batch_size", None) is not None:
-                micro_batch_size = data.meta_info["micro_batch_size"]
-            else:
-                micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
-            max_token_len = None
-            if self.config.use_dynamic_bsz:
-                max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
-            metric_micro_batch = self.forward_backward_batch(
-                data,
-                calculate_entropy=calculate_entropy,
-                use_dynamic_bsz=self.config.use_dynamic_bsz,
-                micro_batch_size=micro_batch_size,
-                max_token_len=max_token_len,
-                mini_batch_size=self.config.ppo_mini_batch_size,
-            )
-            metric_micro_batch = metric_micro_batch["output"]
-            for metric in metric_micro_batch:
-                # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
-                append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
-
-            ######### training monitor #########
-            if _sw is not None:
-                _sw.start("update")
-            ######### training monitor #########
-            update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
-            data = {"actor/grad_norm": grad_norm}
-            append_to_dict(metrics, data)
-            ######### training monitor #########
-            if _sw is not None:
-                _sw.stop("update")
-                _sw.stop("minibatch")
-            ######### training monitor #########
-
-            if update_successful:
-                # allgather already execute in optimizer.step in new megatron
-                pass
-            else:
-                raise NotImplementedError
+            metrics = {}
             if self.use_torch_profiler and self.prof and self.prof.enable:
-                self.prof.step()
+                self.prof.start()
+            for data in dataloader:
+                ######### training monitor #########
+                if _sw is not None:
+                    _sw.start("minibatch")
+                ######### training monitor #########
+                if self.config.router_replay.mode in ["R2", "R3"]:
+                    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+                self.actor_optimizer.zero_grad()
+                # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
+                for chunk in self.actor_module:
+                    # if use distributed optimizer, zero grad buffer will be handled by optimizer
+                    chunk.zero_grad_buffer()
 
-            if self.config.router_replay.mode in ["R2", "R3"]:
-                RouterReplay.clear_global_router_replay_action()
-                RouterReplay.clear_global_indices()
+                calculate_entropy = self.config.entropy_coeff != 0
+                if data.meta_info.get("micro_batch_size", None) is not None:
+                    micro_batch_size = data.meta_info["micro_batch_size"]
+                else:
+                    micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
+                max_token_len = None
+                if self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+                metric_micro_batch = self.forward_backward_batch(
+                    data,
+                    calculate_entropy=calculate_entropy,
+                    use_dynamic_bsz=self.config.use_dynamic_bsz,
+                    micro_batch_size=micro_batch_size,
+                    max_token_len=max_token_len,
+                    mini_batch_size=self.config.ppo_mini_batch_size,
+                )
+                metric_micro_batch = metric_micro_batch["output"]
+                for metric in metric_micro_batch:
+                    # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
+                    append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
-        # add empty cache after each compute
-        if self.use_torch_profiler and self.prof and self.prof.enable:
-            self.prof.stop_and_save()
-            self.prof.stop_trace()
-        get_torch_device().empty_cache()
-        ######### training monitor #########
-        if _mon is not None:
-            _mon.stop()
-        _print_monitor_stats(_mon, _sw)
+                ######### training monitor #########
+                if _sw is not None:
+                    _sw.start("update")
+                ######### training monitor #########
+                update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+                data = {"actor/grad_norm": grad_norm}
+                append_to_dict(metrics, data)
+                ######### training monitor #########
+                if _sw is not None:
+                    _sw.stop("update")
+                    _sw.stop("minibatch")
+                ######### training monitor #########
+
+                if update_successful:
+                    # allgather already execute in optimizer.step in new megatron
+                    pass
+                else:
+                    raise NotImplementedError
+                if self.use_torch_profiler and self.prof and self.prof.enable:
+                    self.prof.step()
+
+                if self.config.router_replay.mode in ["R2", "R3"]:
+                    RouterReplay.clear_global_router_replay_action()
+                    RouterReplay.clear_global_indices()
+
+            # add empty cache after each compute
+            if self.use_torch_profiler and self.prof and self.prof.enable:
+                self.prof.stop_and_save()
+                self.prof.stop_trace()
+            get_torch_device().empty_cache()
+            ######### training monitor #########
+            if _mon is not None:
+                _mon.stop()
+            _print_monitor_stats(_mon, _sw)
         ######### training monitor #########
         return metrics
