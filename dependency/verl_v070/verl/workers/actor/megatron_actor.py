@@ -531,12 +531,14 @@ class MegatronPPOActor(BasePPOActor):
         forward_backward_func = get_forward_backward_func()
 
         def loss_func(output, data, meta_info):
+            nonlocal _backward_started
             ######### training monitor #########
             _sw_bwd = current_stopwatch()
             if _sw_bwd is not None:
                 _sw_bwd.lap("bwd_start")
                 if not forward_only:
                     _sw_bwd.start("backward")
+                    _backward_started = True
             ######### training monitor #########
             # For memory efficiency
             # We move calculation of entropy to compute_log_probs, forward_only == True
@@ -639,6 +641,10 @@ class MegatronPPOActor(BasePPOActor):
             append_to_dict(metrics, stats)
             return policy_loss, [metrics, ret_entropy]
 
+        ######### training monitor #########
+        _backward_started = False
+        ######### training monitor #########
+
         def forward_step(batch_iter, model, return_schedule_plan: bool = False):
             """
             Args:
@@ -646,6 +652,8 @@ class MegatronPPOActor(BasePPOActor):
                 model: the model
                 return_schedule_plan: whether to return the schedule plan, for 1f1b overlap
             """
+            nonlocal _backward_started
+
             if return_schedule_plan:
                 assert self.tf_config.overlap_moe_expert_parallel_comm, (
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
@@ -665,6 +673,9 @@ class MegatronPPOActor(BasePPOActor):
             ######### training monitor #########
             _sw = current_stopwatch()
             if _sw is not None:
+                # Stop the previous microbatch's backward (for microbatch 2..N)
+                if _backward_started:
+                    _sw.stop("backward")
                 _sw.start("forward")
             ######### training monitor #########
             ######### prefix-sharing #########
