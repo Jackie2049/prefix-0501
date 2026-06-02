@@ -90,14 +90,39 @@
 
 ---
 
-### KV Cache Reuse（KV 缓存复用）
+### Activation Reuse（前缀复用）
 
-**定义**：在 attention 计算中，复用已计算好的 key/value 缓存，避免重复计算的技术。
+**定义**：在 micro-batch 内，provider 序列计算并存储 prefix 的中间状态，reuser 序列复用这些状态以避免重复计算的通用机制。
 
 **说明**：
-- 在 prefix-sharing 场景下，provider 计算 prefix 的 KV，reuser 直接复用
-- 复用时需要确保梯度正确传播（不能 detach）
-- 技术实现上涉及 attention 层的修改，将 provider 的 KV 拼接到 reuser 的 KV 中
+- Prefix reuse 是核心优化思想，具体实现方式取决于 mixer 类型
+- 所有复用机制都必须保留完整 autograd 计算图（不能 `detach`），确保梯度正确回传
+- Reuser 的 prefix tokens 不参与实际计算，但仍需参与 logprob 计算（通过 Prefix-Last Restore）
+
+**两种实现方式**：
+
+1. **KV Cache Reuse（KV 缓存复用）**
+   - **适用场景**：Softmax Attention（如 Llama、Qwen2 等标准 Transformer）
+   - **机制**：provider 计算并缓存 prefix 的 key/value 张量；reuser 将 provider KV 与自身 suffix KV 拼接后计算 attention
+   - **存储结构**：`PrefixAttentionStore`，存储 `StoredAttentionKV` 条目
+   - **关键约束**：KV 张量必须保留梯度，拼接操作需维持计算图连续性
+
+2. **State Reuse（激活状态复用）**
+   - **适用场景**：当前仅面向 Qwen3.5/Qwen3.6 的 GatedDeltaNet
+   - **机制**：provider 计算 prefix 后发布其内部状态（recurrent state、conv state 等）；reuser 在 prefix 边界读取状态并继续计算 suffix
+   - **存储结构**：`PrefixDeltanetStore`，存储 `StoredDeltanetState`
+   - **关键约束**：状态张量必须保留梯度；gate 等当前 token 计算的值不属于可复用 prefix state
+
+**相关代码**：
+- Attention 后端接口：`PrefixAttentionBackend`
+- GatedDeltaNet 后端接口：`PrefixDeltanetBackend`
+- KV 复用实现：`TorchReferenceBackend.build_kv()`
+- State 复用实现：`TorchReferenceBackend.build_deltanet_states()`
+- 存储基类：`PrefixActivationStore`
+- KV 专用存储：`PrefixAttentionStore`
+- State 专用存储：`PrefixDeltanetStore`
+- 存储条目类型：`StoredAttentionKV`、`StoredDeltanetState`
+- Slot ID 类型：`PrefixActivationSlotId`
 
 ---
 
@@ -196,7 +221,9 @@
 | Reuse Relation | 复用关系 | reuser 从 provider 复用指定长度 prefix |
 | Prefix Group | 前缀共享组 | 调试/统计视图，不是核心语义 |
 | Prefix Detection | 前缀检测 | 识别 per-sample 复用关系的过程 |
-| KV Cache Reuse | KV 缓存复用 | 复用已计算的 KV |
+| Prefix Reuse | 前缀复用 | 复用 provider prefix 中间状态的通用机制 |
+| KV Cache Reuse | KV 缓存复用 | Softmax Attention 的前缀复用实现 |
+| Activation State Reuse | 激活状态复用 | 当前用于 GatedDeltaNet 的前缀状态复用 |
 | Token Sequence | Token 序列 | 整数序列 |
 | Batch | 批次 | 一次处理的多个序列 |
 | PrefixSharingRuntimeState | 前缀共享运行时状态 | 连接框架层与算子层的状态载体 |

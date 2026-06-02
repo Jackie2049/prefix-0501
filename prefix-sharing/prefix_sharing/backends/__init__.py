@@ -1,5 +1,5 @@
 """Attention backend adapters."""
 
-from prefix_sharing.backends.base import BackendCapabilities, PrefixAttentionBackend
+from prefix_sharing.backends.base import BackendCapabilities, PrefixAttentionBackend, PrefixDeltanetBackend
 
-__all__ = ["BackendCapabilities", "PrefixAttentionBackend"]
+__all__ = ["BackendCapabilities", "PrefixAttentionBackend", "PrefixDeltanetBackend"]
