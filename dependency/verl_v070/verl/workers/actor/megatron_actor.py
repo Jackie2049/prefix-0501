@@ -329,7 +329,7 @@ class MegatronPPOActor(BasePPOActor):
                     return lp, et_out, layers_topk_idx
 
                 if do_validate:
-                    from prefix_sharing.integrations.precision_validator import PrecisionValidator
+                    from prefix_sharing.tools.precision_validator import PrecisionValidator
                     validator = PrecisionValidator(self)
 
                     # Run 1: Optimized
