@@ -95,9 +95,10 @@ def _print_monitor_stats(mon, sw):
     mem = mon.summary() if mon else {}
     if mem.get("num_samples", 0):
         logger.warning(
-            "MONITOR HBM  peak_occupied=%(peak_occupied_gib).1f  "
+            "MONITOR HBM  peak_allocated=%(peak_allocated_gib).1f  "
+            "avg_allocated=%(avg_allocated_gib).1f  "
             "peak_reserved=%(peak_reserved_gib).1f  "
-            "peak_allocated=%(peak_allocated_gib).1f  GiB"
+            "avg_reserved=%(avg_reserved_gib).1f  GiB"
             % mem
         )
     if sw:

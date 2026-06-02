@@ -92,17 +92,15 @@ class MemorySnapshot:
     timestamp: float
     allocated_gb: float  # memory_allocated()  – tensor 占用
     reserved_gb: float   # memory_reserved()  – 分配器保留（含缓存）
-    occupied_gb: float   # mem_get_info() → total - free – 设备级已占用
 
 
 class MemoryMonitor:
     """Background-thread memory sampler for CUDA / NPU devices.
 
-    Each sample records three metrics:
+    Each sample records two metrics:
 
     * **allocated** – memory actively holding tensors (``memory_allocated()``)
     * **reserved**  – memory reserved by the caching allocator (``memory_reserved()``)
-    * **occupied**  – real device-level used memory (``mem_get_info()`` total - free)
 
     Call ``start()`` before the region of interest and ``stop()`` after::
 
@@ -112,9 +110,8 @@ class MemoryMonitor:
         mon.stop()
         s = mon.summary()
         logger.warning(
-            f"Peak  occupied={s['peak_occupied_gib']:.1f} GiB  "
-            f"reserved={s['peak_reserved_gib']:.1f} GiB  "
-            f"allocated={s['peak_allocated_gib']:.1f} GiB"
+            f"Peak  allocated={s['peak_allocated_gib']:.1f} GiB  "
+            f"reserved={s['peak_reserved_gib']:.1f} GiB"
         )
     """
 
@@ -146,11 +143,6 @@ class MemoryMonitor:
         if self._thread is not None:
             self._thread.join(timeout=3)
 
-    @property
-    def total_gb(self) -> float:
-        """Total device memory (GiB)."""
-        return self._get_total_gb()
-
     def snapshot(self) -> MemorySnapshot:
         """One-shot query of all memory metrics without starting the thread."""
         return self._sample_once()
@@ -169,33 +161,24 @@ class MemoryMonitor:
             return 0.0
         return max(s.reserved_gb for s in self._samples)
 
-    @property
-    def peak_occupied_gb(self) -> float:
-        if not self._samples:
-            return 0.0
-        return max(s.occupied_gb for s in self._samples)
-
     def summary(self) -> dict:
-        """Aggregate all three memory metrics.
+        """Aggregate memory metrics.
 
-        Returns keys ``peak_{allocated,reserved,occupied}_gib``,
-        ``avg_{allocated,reserved,occupied}_gib``, plus metadata.
+        Returns keys ``peak_{allocated,reserved}_gib``,
+        ``avg_{allocated,reserved}_gib``, plus metadata.
         """
         if not self._samples:
             return {"device_type": self.device_type, "num_samples": 0}
         al = [s.allocated_gb for s in self._samples]
         rs = [s.reserved_gb for s in self._samples]
-        oc = [s.occupied_gb for s in self._samples]
         return {
             "device_type": self.device_type,
             "num_samples": len(self._samples),
             "interval_s": self.interval,
             "peak_allocated_gib": round(max(al), 3),
             "peak_reserved_gib": round(max(rs), 3),
-            "peak_occupied_gib": round(max(oc), 3),
             "avg_allocated_gib": round(sum(al) / len(al), 3),
             "avg_reserved_gib": round(sum(rs) / len(rs), 3),
-            "avg_occupied_gib": round(sum(oc) / len(oc), 3),
         }
 
     # ------------------------------------------------------------------
@@ -222,31 +205,17 @@ class MemoryMonitor:
         if self.device_type == "npu":
             allocated = _torch.npu.memory_allocated()
             reserved = _torch.npu.memory_reserved()
-            free, total = _torch.npu.mem_get_info()
         elif self.device_type == "cuda":
             allocated = _torch.cuda.memory_allocated()
             reserved = _torch.cuda.memory_reserved()
-            free, total = _torch.cuda.mem_get_info()
         else:
-            return MemorySnapshot(time.time(), 0.0, 0.0, 0.0)
+            return MemorySnapshot(time.time(), 0.0, 0.0)
 
         return MemorySnapshot(
             timestamp=time.time(),
             allocated_gb=allocated / (1024**3),
             reserved_gb=reserved / (1024**3),
-            occupied_gb=(total - free) / (1024**3),
         )
-
-    def _get_total_gb(self) -> float:
-        import torch as _torch
-
-        if self.device_type == "npu":
-            _, total = _torch.npu.mem_get_info()
-            return total / (1024**3)
-        if self.device_type == "cuda":
-            _, total = _torch.cuda.mem_get_info()
-            return total / (1024**3)
-        return 0.0
 
     def _sample_loop(self) -> None:
         while self._running:
