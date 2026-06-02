@@ -250,3 +250,6 @@ router_replay:
   # Required when mode is 'replay'
   replay_file: null
 
+# Prefix sharing configuration (optional)
+prefix_sharing_config: {}
+

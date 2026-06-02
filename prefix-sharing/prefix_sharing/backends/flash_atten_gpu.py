@@ -9,6 +9,7 @@ shorter Q (suffix only) but full-length KV (prefix + suffix).
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Any
 
@@ -17,6 +18,8 @@ from prefix_sharing.backends.flash_atten_base import FlashAttentionMixin, FlashB
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
@@ -61,6 +64,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
 
     def __init__(self) -> None:
         self._torch_ref = TorchReferenceBackend()
+        logger.info("[flash_atten_gpu] GpuFlashAttentionBackend initialized")
 
     # ------------------------------------------------------------------
     # Validation
@@ -69,6 +73,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         config.validate(model_config=model_config)
         # Eager import check so that mis-configured environments fail fast.
         _import_flash_attn_varlen()
+        logger.info("[flash_atten_gpu] validate passed, flash-attn available")
 
     # ------------------------------------------------------------------
     # RoPE & KV build: reuse the reference implementation
@@ -114,6 +119,11 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         )
 
         flash_attn_varlen_func = _import_flash_attn_varlen()
+        logger.info(
+            "[flash_atten_gpu] attention on device=%s, q_shape=%s, k_shape=%s, "
+            "max_seqlen_q=%s, max_seqlen_kv=%s",
+            q.device, tuple(q.shape), tuple(k.shape), max_seqlen_q, max_seqlen_kv
+        )
 
         try:
             out = flash_attn_varlen_func(

@@ -306,6 +306,15 @@ class AgentLoopBase(ABC):
         if remove_system_prompt:
             prompt_ids = prompt_ids[len(self.system_prompt) :]
 
+        prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
+        if len(prompt_ids) > prompt_length:
+            logger.warning(
+                "Prompt length %d exceeds configured prompt_length %d, truncating from the left.",
+                len(prompt_ids),
+                prompt_length,
+            )
+            prompt_ids = prompt_ids[-prompt_length:]
+
         return prompt_ids
 
     @abstractmethod

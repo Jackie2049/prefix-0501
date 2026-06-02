@@ -178,15 +178,16 @@ class AsyncRolloutRequest(BaseModel):
                 tokenization_dict_with_prompt["attention_mask"],
             )
             if values["input_ids"].shape[-1] > max_prompt_len:
-                # Only log the warning to avoid truncating in the middle of generation prompt. Consider raising an
-                # error for this case in the future.
                 # Ensure batch_data_id exists with default value if not provided
                 if "batch_data_id" not in values:
                     values["batch_data_id"] = cls.model_fields["batch_data_id"].default
                 logger.warning(
                     f"Prompt {values['batch_data_id']} has length {values['input_ids'].shape[-1]} "
-                    f"which is greater than max_prompt_len {max_prompt_len} after applied chat template with tools."
+                    f"which is greater than max_prompt_len {max_prompt_len} after applied chat template with tools. "
+                    f"Truncating from the left."
                 )
+                values["input_ids"] = values["input_ids"][-max_prompt_len:]
+                values["attention_mask"] = values["attention_mask"][-max_prompt_len:]
 
             # Process multi_modal_inputs
             multi_modal_inputs = tokenization_dict_with_prompt.copy()
