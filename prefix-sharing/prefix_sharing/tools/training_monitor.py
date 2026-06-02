@@ -10,12 +10,75 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Iterator, Literal
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# ContextVar – 无需修改函数签名即可在嵌套调用链中访问 mon / sw
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrainingMonitorState:
+    """Holds the active ``MemoryMonitor`` and ``Stopwatch`` for the current training step.
+
+    Accessed via ``current_memory_monitor()`` / ``current_stopwatch()`` from
+    any nested function without passing parameters.
+    """
+
+    mon: MemoryMonitor | None
+    sw: Stopwatch | None
+
+
+_monitor_ctx: ContextVar[TrainingMonitorState | None] = ContextVar(
+    "training_monitor_context",
+    default=None,
+)
+
+
+def current_memory_monitor() -> MemoryMonitor | None:
+    """Return the active ``MemoryMonitor`` (or ``None`` outside a monitoring context)."""
+    state = _monitor_ctx.get()
+    return state.mon if state is not None else None
+
+
+def current_stopwatch() -> Stopwatch | None:
+    """Return the active ``Stopwatch`` (or ``None`` outside a monitoring context)."""
+    state = _monitor_ctx.get()
+    return state.sw if state is not None else None
+
+
+@contextmanager
+def training_monitor_context(
+    mon: MemoryMonitor | None = None,
+    sw: Stopwatch | None = None,
+) -> Iterator[TrainingMonitorState]:
+    """Context manager that makes *mon* and *sw* available via ``current_*()`` getters.
+
+    Usage (in ``update_policy``, no signature changes needed)::
+
+        mon = MemoryMonitor(interval=0.05)
+        sw = Stopwatch()
+        with training_monitor_context(mon, sw):
+            mon.start()
+            for data in dataloader:
+                ...   # inside forward_step, call current_stopwatch().start("microbatch")
+            mon.stop()
+            ... print stats ...
+    """
+    state = TrainingMonitorState(mon=mon, sw=sw)
+    token = _monitor_ctx.set(state)
+    try:
+        yield state
+    finally:
+        _monitor_ctx.reset(token)
+
 
 # ---------------------------------------------------------------------------
 # MemoryMonitor
