@@ -101,16 +101,50 @@ def _print_monitor_stats(mon, sw):
             "avg_reserved=%(avg_reserved_gib).1f  GiB"
             % mem
         )
-    if sw:
-        for phase, info in sw.summary().get("phases", {}).items():
-            logger.warning(
-                "MONITOR TIME  %(phase)s  total=%(total_s).3fs  "
-                "count=%(count)d  avg=%(avg_s).4f  "
-                "min=%(min_s).4f  max=%(max_s).4f  "
-                "median=%(median_s).4f  p99=%(p99_s).4f  "
-                "stddev=%(stddev_s).4f"
-                % {"phase": phase, **info}
-            )
+    if not sw:
+        return
+    phases = sw.summary().get("phases", {})
+    if not phases:
+        return
+
+    # Ordered phases for breakdown display
+    phase_order = ["forward", "backward", "update", "minibatch"]
+    mb_total = phases.get("minibatch", {}).get("total_s", None)
+
+    # Collect visible sub-items (everything except minibatch)
+    sub_items = [p for p in phase_order if p != "minibatch" and p in phases]
+
+    lines = ["MONITOR TIME BREAKDOWN"]
+    for idx, p in enumerate(phase_order):
+        info = phases.get(p)
+        if info is None:
+            continue
+        if p == "minibatch":
+            prefix = ""
+            pct = ""
+        elif mb_total:
+            is_last = (sub_items.index(p) == len(sub_items) - 1)
+            prefix = "  └─ " if is_last else "  ├─ "
+            pct = f" ({info['total_s'] / mb_total * 100:.0f}%)"
+        else:
+            prefix = "  "
+            pct = ""
+        stats = f"total={info['total_s']:.3f}s  count={info['count']}  avg={info['avg_s']:.4f}s"
+        lines.append(f"  {prefix}{p:12s}: {stats}{pct}")
+
+    if mb_total is not None:
+        sub_sum = sum(phases.get(p, {}).get("total_s", 0.0) for p in sub_items)
+        overhead = mb_total - sub_sum
+        if overhead > 0.001 and overhead / mb_total > 0.001:
+            lines.insert(-1, f"  └─ {'overhead':12s}: total={overhead:.3f}s  ({overhead / mb_total * 100:.0f}%)")
+            # Update the previous last-sub-item from └─ to ├─
+            for i in range(len(lines) - 2, 0, -1):
+                if "  └─ " in lines[i]:
+                    lines[i] = lines[i].replace("  └─ ", "  ├─ ", 1)
+                    break
+
+    for line in lines:
+        logger.warning(line)
 ######### training monitor #########
 
 __all__ = ["MegatronPPOActor"]
