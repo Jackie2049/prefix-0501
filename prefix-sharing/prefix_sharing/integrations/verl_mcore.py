@@ -349,8 +349,27 @@ def restore_suffix_first_log_probs_from_prefix(
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
         return log_probs
-    if not ctx.parallel_info.is_pipeline_last_stage:
+    parallel_info = ctx.parallel_info
+    if not parallel_info.is_pipeline_last_stage:
+        logger.warning(
+            "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
+            "skip prefix-last restore on non-last PP stage: restore_indices=%s",
+            parallel_info.global_rank,
+            parallel_info.pp_rank,
+            parallel_info.pp_size,
+            parallel_info.is_pipeline_last_stage,
+            len(ctx.prefix_last_restore_indices),
+        )
         return log_probs
+    logger.warning(
+        "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
+        "running prefix-last restore: restore_indices=%s",
+        parallel_info.global_rank,
+        parallel_info.pp_rank,
+        parallel_info.pp_size,
+        parallel_info.is_pipeline_last_stage,
+        len(ctx.prefix_last_restore_indices),
+    )
     restored = log_probs.clone()
     for index in ctx.prefix_last_restore_indices:
         provider_logits = logits[
