@@ -3,6 +3,43 @@
 This module provides tools to compare the numerical output of prefix-sharing
 optimized runs against baseline (prefix-sharing disabled) runs on the same
 input data and model weights.
+
+AttentionProbe
+--------------
+Captures per-layer SelfAttention outputs via forward hooks.  The hooks fire
+regardless of whether ``maybe_run_prefix_sharing_attention`` intercepted the
+call or the normal Megatron attention path was taken, so the same probe works
+for both the optimized and baseline forward pass.
+
+Usage::
+
+    from prefix_sharing.tools.precision_validator import (
+        AttentionProbe,
+        PrecisionValidator,
+    )
+
+    validator = PrecisionValidator(actor)
+    probe = AttentionProbe(actor.actor_module)
+
+    # Baseline forward
+    validator.save_weights()
+    with validator.baseline_mode():
+        with probe:
+            ... model forward (loss.backward(), optimizer.step()) ...
+    baseline = dict(probe.collected)
+
+    # Prefix sharing forward (reuse same weights)
+    validator.restore_weights()
+    probe.clear()
+    with probe:
+        ... model forward ...
+    ps = dict(probe.collected)
+
+    # Compare attention outputs layer-by-layer
+    for layer_name in baseline:
+        validator.compare_tensors(f"attention/{layer_name}",
+                                  baseline[layer_name], ps[layer_name])
+    validator.print_report()
 """
 
 import json
@@ -15,6 +52,79 @@ import torch
 
 import logging
 precision_logger = logging.getLogger(__file__)
+
+
+class AttentionProbe:
+    """Capture ``SelfAttention`` forward outputs for precision comparison.
+
+    Registers ``register_forward_hook`` on every module whose class name is
+    ``"SelfAttention"``.  The hook fires *after* ``forward()`` returns — this
+    captures the final attention output (``core_attn_out`` after
+    ``linear_proj``) regardless of whether prefix sharing or normal Megatron
+    attention was executed.
+
+    Captured tensors are detached and moved to CPU to minimise memory impact.
+    """
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.model = model
+        self.collected: dict[str, torch.Tensor] = {}
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        self._register()
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def clear(self) -> None:
+        """Discard all captured tensors (call between baseline / ps runs)."""
+        self.collected.clear()
+
+    def close(self) -> None:
+        """Remove all forward hooks."""
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+    # ------------------------------------------------------------------
+    # Context-manager protocol – alias for clear … forward … collect
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "AttentionProbe":
+        self.collected.clear()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _register(self) -> None:
+        def _is_self_attention(mod: torch.nn.Module) -> bool:
+            cls_name = type(mod).__name__
+            if cls_name == "SelfAttention":
+                return True
+            return False
+
+        for name, mod in self.model.named_modules():
+            if _is_self_attention(mod):
+                handle = mod.register_forward_hook(self._make_hook(name))
+                self._handles.append(handle)
+
+        if not self._handles:
+            precision_logger.warning(
+                "[AttentionProbe] No SelfAttention modules found in model."
+            )
+
+    def _make_hook(
+        self, module_name: str
+    ) -> Any:
+        def _hook(_module: Any, _input: Any, output: Any) -> None:
+            tensor = output[0] if isinstance(output, (tuple, list)) else output
+            self.collected[module_name] = tensor.detach().cpu()
+        return _hook
 
 
 class PrecisionValidator:
