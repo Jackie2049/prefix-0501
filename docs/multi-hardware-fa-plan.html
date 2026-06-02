@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Prefix Sharing 多硬件 FA 适配方案 — CUDA + NPU 统一架构</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.75; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  h1 { text-align: center; font-size: 28px; color: #58a6ff; margin-bottom: 6px; }
+  h1 span { color: #8b949e; font-size: 14px; font-weight: normal; display: block; margin-top: 4px; }
+  h2 { font-size: 21px; color: #79c0ff; margin: 44px 0 16px; border-left: 4px solid #58a6ff; padding-left: 14px; }
+  h3 { font-size: 16px; color: #d2a8ff; margin: 24px 0 10px; }
+  h4 { font-size: 14px; color: #e6edf3; margin: 16px 0 6px; }
+  p, li { color: #b1bac4; font-size: 14px; }
+  p { margin-bottom: 8px; }
+  ul, ol { margin-left: 20px; margin-bottom: 8px; }
+  li { margin-bottom: 2px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 22px; margin: 14px 0; overflow-x: auto; }
+  .card-title { font-size: 15px; color: #58a6ff; font-weight: 600; margin-bottom: 12px; text-align: center; }
+  .caption { text-align: center; color: #8b949e; font-size: 12px; margin-top: 8px; font-style: italic; }
+  svg text { font-family: "PingFang SC", "Microsoft YaHei", monospace; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .tag-new { background: #1f3d1f; color: #3fb950; }
+  .tag-mod { background: #1f2d3d; color: #58a6ff; }
+  .tag-keep { background: #21262d; color: #8b949e; }
+  .note { background: #1c2128; border-left: 3px solid #f0883e; padding: 10px 14px; margin: 14px 0; border-radius: 0 6px 6px 0; }
+  .note strong { color: #f0883e; }
+  code { background: #1c2128; padding: 1px 5px; border-radius: 3px; font-size: 12px; color: #e6edf3; }
+  .file-header { background: #161b22; border: 1px solid #30363d; border-radius: 8px 8px 0 0; padding: 8px 14px; font-size: 12px; color: #58a6ff; font-weight: 600; font-family: monospace; }
+  .file-body { background: #0d1117; border: 1px solid #30363d; border-top: none; border-radius: 0 0 8px 8px; padding: 14px; font-family: monospace; font-size: 11.5px; color: #e6edf3; white-space: pre; overflow-x: auto; line-height: 1.55; }
+  .file-body .c { color: #8b949e; }
+  .file-body .k { color: #d2a8ff; }
+  .file-body .f { color: #3fb950; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+  th { background: #21262d; color: #e6edf3; padding: 7px 10px; text-align: left; border-bottom: 2px solid #30363d; }
+  td { padding: 5px 10px; border-bottom: 1px solid #21262d; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Prefix Sharing 多硬件 FA 适配方案
+  <span>CUDA (TE) + NPU (npu_fusion_attention) + CPU/GPU Fallback 统一架构</span>
+</h1>
+
+
+<!-- ===================== Section 0: API Landscape ===================== -->
+<h2>0. 三个平台的 Attention API 对比</h2>
+
+<div class="card">
+  <div class="card-title">各平台融合 attention kernel 的 mask 能力对比</div>
+  <svg viewBox="0 0 920 310" width="920">
+    <rect x="0" y="0" width="920" height="310" rx="8" fill="#0d1117"/>
+
+    <!-- NVIDIA CUDA -->
+    <rect x="15" y="10" width="290" height="145" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+    <text x="160" y="32" fill="#3fb950" font-size="13" text-anchor="middle" font-weight="bold">NVIDIA CUDA</text>
+    <text x="160" y="48" fill="#8b949e" font-size="11" text-anchor="middle">TE DotProductAttention</text>
+    <text x="30" y="70" fill="#3fb950" font-size="11">✓ attention_bias (post_scale_bias)</text>
+    <text x="30" y="88" fill="#3fb950" font-size="11">✓ THD packed (cu_seqlens)</text>
+    <text x="30" y="106" fill="#3fb950" font-size="11">✓ cu_seqlens_q ≠ cu_seqlens_k</text>
+    <text x="30" y="124" fill="#8b949e" font-size="11">bias shape: [B, H, max_q, max_kv]</text>
+    <text x="30" y="142" fill="#8b949e" font-size="11">bias 值: 0.0 可见, -inf mask</text>
+    <text x="30" y="160" fill="#d2a8ff" font-size="11">依赖: transformer_engine >= 1.2.0</text>
+
+    <!-- Huawei NPU -->
+    <rect x="315" y="10" width="290" height="145" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="32" fill="#58a6ff" font-size="13" text-anchor="middle" font-weight="bold">Huawei NPU (Ascend)</text>
+    <text x="460" y="48" fill="#8b949e" font-size="11" text-anchor="middle">npu_fusion_attention</text>
+    <text x="330" y="70" fill="#58a6ff" font-size="11">✓ atten_mask (bool tensor)</text>
+    <text x="330" y="88" fill="#58a6ff" font-size="11">✓ TND packed (actual_seq_qlen/kvlen)</text>
+    <text x="330" y="106" fill="#58a6ff" font-size="11">✓ qlen ≠ kvlen</text>
+    <text x="330" y="124" fill="#8b949e" font-size="11">mask shape: (seq_q, seq_kv) bool</text>
+    <text x="330" y="142" fill="#8b949e" font-size="11">mask 值: True=mask, False=可见</text>
+    <text x="330" y="160" fill="#d2a8ff" font-size="11">依赖: torch_npu + MindSpeed</text>
+
+    <!-- Fallback -->
+    <rect x="615" y="10" width="290" height="145" rx="8" fill="#161b22" stroke="#8b949e"/>
+    <text x="760" y="32" fill="#8b949e" font-size="13" text-anchor="middle" font-weight="bold">Fallback (CPU/任意)</text>
+    <text x="760" y="48" fill="#8b949e" font-size="11" text-anchor="middle">TorchReferenceBackend</text>
+    <text x="630" y="70" fill="#8b949e" font-size="11">✓ 纯 PyTorch，任意设备</text>
+    <text x="630" y="88" fill="#f85149" font-size="11">✗ O(N²) 显存，逐行循环</text>
+    <text x="630" y="106" fill="#8b949e" font-size="11">自定义 causal mask</text>
+    <text x="630" y="124" fill="#8b949e" font-size="11">einsum + softmax + einsum</text>
+    <text x="630" y="142" fill="#8b949e" font-size="11">作为数值参考和 fallback</text>
+    <text x="630" y="160" fill="#d2a8ff" font-size="11">依赖: 无（纯 PyTorch）</text>
+
+    <!-- Key insight -->
+    <rect x="15" y="170" width="890" height="125" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="2"/>
+    <text x="460" y="192" fill="#f0883e" font-size="14" text-anchor="middle" font-weight="bold">关键差异：Mask 参数格式不同，需要统一抽象</text>
+
+    <text x="30" y="218" fill="#3fb950" font-size="12">CUDA TE: core_attention_bias = FloatTensor[B, 1, max_q, max_kv]   0.0 / -inf</text>
+    <text x="30" y="238" fill="#58a6ff" font-size="12">NPU CANN: atten_mask          = BoolTensor[max_q, max_kv]         True=mask / False=visible</text>
+    <text x="30" y="258" fill="#8b949e" font-size="12">Fallback:  手动 _causal_q_kv_mask() 构造 bool → masked_fill(-inf)</text>
+    <text x="30" y="280" fill="#d2a8ff" font-size="12" font-weight="bold">解决方案：统一构造 bool mask → 各 backend 按自己 API 转换格式</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 1: Architecture ===================== -->
+<h2>1. 统一架构：Backend 抽象层</h2>
+
+<div class="card">
+  <div class="card-title">三层架构：统一 mask 构造 + 平台适配 backend</div>
+  <svg viewBox="0 0 920 430" width="920">
+    <defs>
+      <marker id="a-bl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+      <marker id="a-gn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <!-- Layer 1: Megatron Hook -->
+    <rect x="20" y="10" width="880" height="55" rx="8" fill="#21262d" stroke="#484f58"/>
+    <text x="460" y="30" fill="#8b949e" font-size="12" text-anchor="middle">Megatron attention.py hook</text>
+    <text x="460" y="48" fill="#8b949e" font-size="11" text-anchor="middle">maybe_run_prefix_sharing_attention() → 调用 ctx.backend</text>
+
+    <!-- Layer 2: Platform-agnostic mask -->
+    <rect x="20" y="80" width="880" height="120" rx="10" fill="#1c2128" stroke="#d2a8ff" stroke-width="2"/>
+    <text x="460" y="102" fill="#d2a8ff" font-size="14" text-anchor="middle" font-weight="bold">Layer 2: 统一 mask 构造 (平台无关)</text>
+
+    <rect x="40" y="112" width="250" height="35" rx="6" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="165" y="133" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">build_kv() — 继承 torch_ref</text>
+
+    <rect x="310" y="112" width="280" height="35" rx="6" fill="#1f3d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="450" y="133" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">build_block_causal_mask() ★ 统一构造</text>
+    <text x="450" y="150" fill="#8b949e" font-size="9" text-anchor="middle">输出: BoolTensor [max_q, max_kv], True=masked</text>
+
+    <rect x="610" y="112" width="270" height="35" rx="6" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="745" y="133" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">prepare_cu_seqlens() ★ 统一</text>
+    <text x="745" y="150" fill="#8b949e" font-size="9" text-anchor="middle">cu_q = kept_q, cu_kv = expanded_kv</text>
+
+    <text x="460" y="185" fill="#8b949e" font-size="11" text-anchor="middle">mask 和 cu_seqlens 对所有平台语义一致，只有格式转换不同</text>
+
+    <!-- Layer 3: Platform backends -->
+    <rect x="20" y="215" width="880" height="200" rx="10" fill="#161b22" stroke="#30363d"/>
+    <text x="460" y="237" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="bold">Layer 3: 平台 Backend (各平台转换 + 调用 native kernel)</text>
+
+    <!-- NPU Backend -->
+    <rect x="35" y="250" width="270" height="150" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+    <text x="170" y="270" fill="#58a6ff" font-size="12" text-anchor="middle" font-weight="bold">NpuFlashBackend ★</text>
+    <text x="50" y="292" fill="#e6edf3" font-size="10">mask 转换: 无需转换！直接传</text>
+    <text x="50" y="308" fill="#e6edf3" font-size="10">bool mask → npu_fusion_attention</text>
+    <text x="50" y="330" fill="#58a6ff" font-size="10" font-family="monospace">npu_fusion_attention(</text>
+    <text x="50" y="346" fill="#8b949e" font-size="10" font-family="monospace">  q, k, v, n_heads, 'TND',</text>
+    <text x="50" y="362" fill="#58a6ff" font-size="10" font-family="monospace">  atten_mask=mask,</text>
+    <text x="50" y="378" fill="#8b949e" font-size="10" font-family="monospace">  actual_seq_qlen=cu_q,</text>
+    <text x="50" y="394" fill="#8b949e" font-size="10" font-family="monospace">  actual_seq_kvlen=cu_kv)</text>
+
+    <!-- CUDA Backend -->
+    <rect x="325" y="250" width="270" height="150" rx="8" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="270" fill="#3fb950" font-size="12" text-anchor="middle" font-weight="bold">CudaFlashBackend ★</text>
+    <text x="340" y="292" fill="#e6edf3" font-size="10">mask 转换: bool → float bias</text>
+    <text x="340" y="308" fill="#e6edf3" font-size="10">mask → masked_fill(0.0, -inf)</text>
+    <text x="340" y="330" fill="#3fb950" font-size="10" font-family="monospace">te.pytorch.DotProductAttention(</text>
+    <text x="340" y="346" fill="#8b949e" font-size="10" font-family="monospace">  q, k, v,</text>
+    <text x="340" y="362" fill="#3fb950" font-size="10" font-family="monospace">  core_attention_bias=bias,</text>
+    <text x="340" y="378" fill="#8b949e" font-size="10" font-family="monospace">  cu_seqlens_q=cu_q,</text>
+    <text x="340" y="394" fill="#8b949e" font-size="10" font-family="monospace">  cu_seqlens_k=cu_kv)</text>
+
+    <!-- Fallback -->
+    <rect x="615" y="250" width="270" height="150" rx="8" fill="#1c2128" stroke="#8b949e"/>
+    <text x="750" y="270" fill="#8b949e" font-size="12" text-anchor="middle" font-weight="bold">TorchRefBackend (fallback)</text>
+    <text x="630" y="292" fill="#8b949e" font-size="10">mask 转换: bool → masked_fill</text>
+    <text x="630" y="308" fill="#8b949e" font-size="10">逐行 einsum + softmax</text>
+    <text x="630" y="340" fill="#8b949e" font-size="10" font-family="monospace">for row in rows:</text>
+    <text x="630" y="356" fill="#8b949e" font-size="10" font-family="monospace">  mask = causal_mask(q_start)</text>
+    <text x="630" y="372" fill="#8b949e" font-size="10" font-family="monospace">  out = einsum(q, k)</text>
+    <text x="630" y="388" fill="#8b949e" font-size="10" font-family="monospace">  out = softmax(mask(out))</text>
+    <text x="630" y="404" fill="#8b949e" font-size="10" font-family="monospace">  out = einsum(out, v)</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 2: Block-Causal Mask ===================== -->
+<h2>2. 核心：统一 Block-Causal Mask 构造</h2>
+
+<p>三个平台共享同一个 mask 构造逻辑，只是格式转换不同。</p>
+
+<div class="card">
+  <div class="card-title">build_block_causal_mask() — 输出 BoolTensor，平台无关</div>
+  <svg viewBox="0 0 920 260" width="920">
+    <rect x="0" y="0" width="920" height="260" rx="8" fill="#0d1117"/>
+
+    <text x="20" y="22" fill="#e6edf3" font-size="13" font-weight="bold">输入: PrefixSharingPlan（已有 cu_seqlens_q, cu_seqlens_kv, prefix_lens, is_reuser 等）</text>
+    <text x="20" y="42" fill="#3fb950" font-size="13" font-weight="bold">输出: BoolTensor [max_seqlen_q, max_seqlen_kv]，True = masked（不可见），False = visible</text>
+
+    <!-- Provider mask -->
+    <g transform="translate(30, 55)">
+      <text x="0" y="12" fill="#3fb950" font-size="12" font-weight="bold">Provider (q=kv=6):</text>
+      <text x="150" y="12" fill="#8b949e" font-size="11">torch.triu(ones(6,6), diagonal=1).bool()</text>
+      <!-- 6x6 upper triangular -->
+      <rect x="0" y="18" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="20" y="18" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="40" y="18" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="60" y="18" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="80" y="18" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="100" y="18" width="20" height="18" fill="#3d1f1f" rx="2"/>
+      <rect x="0" y="36" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="20" y="36" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="40" y="36" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="60" y="36" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="80" y="36" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="100" y="36" width="20" height="18" fill="#3d1f1f" rx="2"/>
+      <text x="140" y="50" fill="#8b949e" font-size="10">... 标准上三角 bool</text>
+    </g>
+
+    <!-- Reuser mask -->
+    <g transform="translate(300, 55)">
+      <text x="0" y="12" fill="#58a6ff" font-size="12" font-weight="bold">Reuser (prefix=3, q=3, kv=6):</text>
+      <text x="0" y="32" fill="#8b949e" font-size="10">Q\KV</text>
+      <text x="25" y="32" fill="#58a6ff" font-size="9">k0</text><text x="45" y="32" fill="#58a6ff" font-size="9">k1</text><text x="65" y="32" fill="#58a6ff" font-size="9">k2</text><text x="85" y="32" fill="#d2a8ff" font-size="9">k3</text><text x="105" y="32" fill="#d2a8ff" font-size="9">k4</text><text x="125" y="32" fill="#d2a8ff" font-size="9">k5</text>
+
+      <!-- Q0: prefix(0,1,2)=F, suffix(3)=F, rest=T -->
+      <text x="10" y="50" fill="#d2a8ff" font-size="9">q0</text>
+      <rect x="25" y="38" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="45" y="38" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="65" y="38" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="85" y="38" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="105" y="38" width="20" height="18" fill="#3d1f1f" rx="2"/><rect x="125" y="38" width="20" height="18" fill="#3d1f1f" rx="2"/>
+
+      <!-- Q1: prefix=F, suffix(3,4)=F, rest=T -->
+      <text x="10" y="68" fill="#d2a8ff" font-size="9">q1</text>
+      <rect x="25" y="56" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="45" y="56" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="65" y="56" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="85" y="56" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="105" y="56" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="125" y="56" width="20" height="18" fill="#3d1f1f" rx="2"/>
+
+      <!-- Q2: prefix=F, suffix(3,4,5)=F -->
+      <text x="10" y="86" fill="#d2a8ff" font-size="9">q2</text>
+      <rect x="25" y="74" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="45" y="74" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="65" y="74" width="20" height="18" fill="#1f3d5c" rx="2"/><rect x="85" y="74" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="105" y="74" width="20" height="18" fill="#1f3d1f" rx="2"/><rect x="125" y="74" width="20" height="18" fill="#1f3d1f" rx="2"/>
+
+      <text x="175" y="55" fill="#8b949e" font-size="9">= False (可见)</text>
+      <rect x="160" y="62" width="14" height="14" fill="#3d1f1f" rx="2"/>
+      <text x="175" y="73" fill="#f85149" font-size="9">= True (masked)</text>
+    </g>
+
+    <!-- Format conversion table -->
+    <rect x="550" y="50" width="350" height="155" rx="8" fill="#161b22" stroke="#d2a8ff"/>
+    <text x="725" y="70" fill="#d2a8ff" font-size="12" text-anchor="middle" font-weight="bold">各平台格式转换</text>
+    <text x="570" y="92" fill="#58a6ff" font-size="11">NPU:  直接传 bool mask ✓</text>
+    <text x="570" y="112" fill="#3fb950" font-size="11">CUDA: ~mask → masked_fill(-inf) → float</text>
+    <text x="570" y="132" fill="#8b949e" font-size="11">Fallback: ~mask → masked_fill(min_val)</text>
+    <text x="570" y="160" fill="#d2a8ff" font-size="11" font-weight="bold">mask 语义统一：True=不可见</text>
+    <text x="570" y="180" fill="#d2a8ff" font-size="11" font-weight="bold">NPU 原生就是这个语义！</text>
+
+    <!-- Construction pseudocode -->
+    <text x="20" y="228" fill="#e6edf3" font-size="12" font-weight="bold">构造逻辑（Python）:</text>
+    <text x="20" y="248" fill="#8b949e" font-size="11" font-family="monospace">mask = full(max_q, max_kv, True)                          ← 全部 mask</text>
+    <text x="20" y="265" fill="#8b949e" font-size="11" font-family="monospace">mask[i, :kv_len] = True; mask[i, :q_len, :kv_len] 区域内按规则填 False</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 3: NPU Backend Code ===================== -->
+<h2>3. NPU Backend 详细代码</h2>
+
+<div class="file-header">prefix_sharing/backends/npu_flash.py  ★ 新建 (~100 行)</div>
+<div class="file-body"><span class="k">"""NPU (Huawei Ascend) Flash Attention backend via npu_fusion_attention.
+
+Uses npu_fusion_attention with TND layout, actual_seq_qlen/kvlen,
+and atten_mask for block-causal masking. Zero FLOPs waste.
+"""</span>
+
+<span class="k">from</span> __future__ <span class="k">import</span> annotations
+<span class="k">from</span> typing <span class="k">import</span> Any
+
+<span class="k">import</span> torch
+
+<span class="k">from</span> prefix_sharing.backends.base <span class="k">import</span> BackendCapabilities
+<span class="k">from</span> prefix_sharing.backends.torch_ref <span class="k">import</span> TorchReferenceBackend
+<span class="k">from</span> prefix_sharing.backends.mask <span class="k">import</span> build_block_causal_mask
+<span class="k">from</span> prefix_sharing.core.planner <span class="k">import</span> PrefixSharingPlan
+
+
+<span class="k">class</span> <span class="f">NpuFlashBackend</span>(TorchReferenceBackend):
+<span class="c">    """NPU-optimized backend using npu_fusion_attention."""</span>
+
+    capabilities = BackendCapabilities(
+        name=<span class="f">"npu_flash"</span>,
+        supports_cpu=<span class="k">False</span>,
+        supports_cuda=<span class="k">False</span>,
+        supports_cann=<span class="k">True</span>,
+        supports_different_q_kv_lengths=<span class="k">True</span>,
+        supports_prefix_last_restore=<span class="k">True</span>,
+    )
+
+    <span class="c"># build_kv() 完全继承 TorchReferenceBackend</span>
+
+    <span class="k">def</span> <span class="f">attention</span>(
+        self,
+        query: Any,           <span class="c"># [total_q, num_heads, head_dim] TND</span>
+        key: Any,             <span class="c"># [total_kv, num_heads, head_dim] TND</span>
+        value: Any,
+        plan: PrefixSharingPlan,
+        **kwargs: Any,
+    ) -> Any:
+        <span class="k">from</span> mindspeed.ops <span class="k">import</span> npu_fusion_attention
+
+        num_heads = query.shape[1]
+        head_dim = query.shape[2]
+        scale = head_dim ** -0.5
+
+        <span class="c"># Step 1: 统一构造 block-causal mask</span>
+        atten_mask = build_block_causal_mask(plan, device=query.device)
+
+        <span class="c"># Step 2: cu_seqlens → Python list (npu_fusion_attention 要求 list)</span>
+        cu_q = plan.cu_seqlens_q
+        cu_kv = plan.cu_seqlens_kv
+        <span class="k">if</span> isinstance(cu_q, torch.Tensor):
+            cu_q = cu_q.tolist()
+        <span class="k">if</span> isinstance(cu_kv, torch.Tensor):
+            cu_kv = cu_kv.tolist()
+
+        <span class="c"># Step 3: 调用 npu_fusion_attention (TND packed format)</span>
+        <span class="c"># sparse_mode=0: 使用 atten_mask 参数控制 mask</span>
+        output, _, _, _, _, _, _ = npu_fusion_attention(
+            query, key, value,
+            num_heads,
+            <span class="f">'TND'</span>,                    <span class="c"># packed layout</span>
+            atten_mask=atten_mask,     <span class="c"># BoolTensor, True=masked</span>
+            scale=scale,
+            keep_prob=1.0,             <span class="c"># no dropout during training</span>
+            sparse_mode=0,             <span class="c"># use atten_mask</span>
+            actual_seq_qlen=cu_q,     <span class="c"># list: [0, q1, q1+q2, ...]</span>
+            actual_seq_kvlen=cu_kv,   <span class="c"># list: [0, kv1, kv1+kv2, ...]</span>
+        )
+        <span class="k">return</span> output</div>
+
+
+<!-- ===================== Section 4: Shared mask module ===================== -->
+<h2>4. <span class="tag tag-new">新建</span> backends/mask.py — 统一 mask 构造（共享）</h2>
+
+<div class="file-header">prefix_sharing/backends/mask.py  ★ 新建 (~60 行，三个 backend 共享)</div>
+<div class="file-body"><span class="k">"""Platform-agnostic block-causal mask construction for prefix-sharing.
+
+Output: BoolTensor [max_seqlen_q, max_seqlen_kv]
+Semantics: True = position is MASKED (not visible), False = visible
+This matches npu_fusion_attention's atten_mask convention directly.
+CUDA/TE converts ~mask to float bias; Fallback uses it with masked_fill.
+"""</span>
+
+<span class="k">import</span> torch
+<span class="k">from</span> prefix_sharing.core.planner <span class="k">import</span> PrefixSharingPlan
+
+
+<span class="k">def</span> <span class="f">build_block_causal_mask</span>(
+    plan: PrefixSharingPlan,
+    device: torch.device = torch.device(<span class="f">'cpu'</span>),
+) -> torch.Tensor:
+    <span class="c">"""Build per-sequence block-causal attention mask.
+
+    For each sequence i:
+      - Provider/standalone: standard upper-triangular causal mask
+      - Reuser: prefix columns all-visible + suffix causal
+    """</span>
+    max_q = plan.max_seqlen_q
+    max_kv = plan.max_seqlen_kv
+
+    <span class="c"># Start with all True (all masked)</span>
+    mask = torch.ones(max_q, max_kv, dtype=torch.bool, device=device)
+
+    <span class="k">for</span> i <span class="k">in</span> range(plan.batch_size):
+        q_len = plan.kept_lengths_q[i]
+        kv_len = plan.expanded_lengths_kv[i]
+
+        <span class="k">if not</span> plan.is_reuser(i):
+            <span class="c"># Provider: standard causal → upper triangle = True</span>
+            <span class="c"># Only need to set the lower triangle (including diag) to False</span>
+            <span class="k">for</span> qi <span class="k">in</span> range(q_len):
+                mask[qi, :qi + 1] = <span class="k">False</span>
+        <span class="k">else</span>:
+            p = plan.prefix_lens[i]
+            <span class="c"># Reuser: prefix all visible + suffix causal</span>
+            <span class="k">for</span> qi <span class="k">in</span> range(q_len):
+                mask[qi, :p] = <span class="k">False</span>            <span class="c"># prefix columns visible</span>
+                mask[qi, p:p + qi + 1] = <span class="k">False</span> <span class="c"># suffix causal</span>
+
+    <span class="k">return</span> mask
+
+
+<span class="k">def</span> <span class="f">mask_to_te_bias</span>(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    <span class="c">"""Convert bool mask to TE float bias: visible→0.0, masked→-inf."""</span>
+    <span class="c"># mask=True → masked → -inf; mask=False → visible → 0.0</span>
+    <span class="k">return</span> torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, float(<span class="f">'-inf'</span>))</div>
+
+
+<!-- ===================== Section 5: CUDA Backend Code ===================== -->
+<h2>5. CUDA Backend（TE bias）— 复用 mask + 转换</h3>
+
+<div class="file-header">prefix_sharing/backends/cuda_flash.py  ★ 新建 (~80 行)</div>
+<div class="file-body"><span class="k">"""CUDA Flash Attention backend via Transformer Engine.
+
+Shares build_block_causal_mask with NPU backend,
+converts bool mask to TE float bias.
+"""</span>
+
+<span class="k">from</span> __future__ <span class="k">import</span> annotations
+<span class="k">from</span> typing <span class="k">import</span> Any
+
+<span class="k">import</span> torch
+
+<span class="k">from</span> prefix_sharing.backends.base <span class="k">import</span> BackendCapabilities
+<span class="k">from</span> prefix_sharing.backends.torch_ref <span class="k">import</span> TorchReferenceBackend
+<span class="k">from</span> prefix_sharing.backends.mask <span class="k">import</span> build_block_causal_mask, mask_to_te_bias
+<span class="k">from</span> prefix_sharing.core.planner <span class="k">import</span> PrefixSharingPlan
+
+
+<span class="k">class</span> <span class="f">CudaFlashBackend</span>(TorchReferenceBackend):
+    capabilities = BackendCapabilities(
+        name=<span class="f">"cuda_flash"</span>,
+        supports_cpu=<span class="k">False</span>,
+        supports_cuda=<span class="k">True</span>,
+        supports_cann=<span class="k">False</span>,
+        supports_different_q_kv_lengths=<span class="k">True</span>,
+        supports_prefix_last_restore=<span class="k">True</span>,
+    )
+
+    <span class="c"># build_kv() 完全继承 TorchReferenceBackend</span>
+
+    <span class="k">def</span> <span class="f">attention</span>(
+        self, query, key, value, plan: PrefixSharingPlan, **kwargs
+    ) -> Any:
+        <span class="k">import</span> transformer_engine <span class="k">as</span> te
+
+        num_heads = query.shape[1]
+        head_dim = query.shape[2]
+        scale = head_dim ** -0.5
+
+        <span class="c"># Step 1: 统一构造 bool mask（与 NPU 相同）</span>
+        bool_mask = build_block_causal_mask(plan, device=query.device)
+
+        <span class="c"># Step 2: 转换为 TE float bias</span>
+        bias = mask_to_te_bias(bool_mask, dtype=query.dtype)
+        <span class="c"># bias: [max_q, max_kv], 0.0=visible, -inf=masked</span>
+
+        <span class="c"># Step 3: cu_seqlens tensors</span>
+        cu_q = torch.tensor(plan.cu_seqlens_q, dtype=torch.int32, device=query.device)
+        cu_kv = torch.tensor(plan.cu_seqlens_kv, dtype=torch.int32, device=key.device)
+
+        <span class="c"># Step 4: 调用 TE</span>
+        te_attn = te.pytorch.DotProductAttention(
+            num_attention_heads=num_heads,
+            kv_channels=head_dim,
+            attention_dropout=0.0,
+            attn_mask_type=<span class="f">'padding'</span>,
+            softmax_scale=scale,
+        )
+        output = te_attn(
+            query.unsqueeze(1), key.unsqueeze(1), value.unsqueeze(1),
+            attention_mask=<span class="f">'padding'</span>,
+            core_attention_bias_type=<span class="f">'post_scale_bias'</span>,
+            core_attention_bias=bias,
+            qkv_format=<span class="f">'thd'</span>,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_kv,
+            max_seqlen_q=plan.max_seqlen_q,
+            max_seqlen_k=plan.max_seqlen_kv,
+        )
+        <span class="k">return</span> output.squeeze(1)</div>
+
+
+<!-- ===================== Section 6: Backend Factory ===================== -->
+<h2>6. Backend 工厂：自动选择平台</h2>
+
+<div class="file-header">prefix_sharing/backends/cuda_ref.py  (改写为工厂)</div>
+<div class="file-body"><span class="c">"""Backend factory: auto-detect platform and return the right backend."""</span>
+
+<span class="k">from</span> __future__ <span class="k">import</span> annotations
+
+
+<span class="k">def</span> <span class="f">create_backend</span>(name: str = <span class="f">"auto"</span>):
+    <span class="c">"""Create the best available backend for the current platform.
+
+    name options: "auto" | "npu_flash" | "cuda_flash" | "torch_ref"
+    "auto" picks the fastest available kernel.
+    """</span>
+    <span class="k">if</span> name <span class="k">in</span> (<span class="f">"auto"</span>, <span class="f">"npu_flash"</span>):
+        <span class="k">try</span>:
+            <span class="k">from</span> prefix_sharing.backends.npu_flash <span class="k">import</span> NpuFlashBackend
+            <span class="k">return</span> NpuFlashBackend()
+        <span class="k">except</span> ImportError:
+            <span class="k">pass</span>
+
+    <span class="k">if</span> name <span class="k">in</span> (<span class="f">"auto"</span>, <span class="f">"cuda_flash"</span>):
+        <span class="k">try</span>:
+            <span class="k">from</span> prefix_sharing.backends.cuda_flash <span class="k">import</span> CudaFlashBackend
+            <span class="k">return</span> CudaFlashBackend()
+        <span class="k">except</span> ImportError:
+            <span class="k">pass</span>
+
+    <span class="c"># Fallback: pure PyTorch (CPU/CUDA/NPU any device)</span>
+    <span class="k">from</span> prefix_sharing.backends.torch_ref <span class="k">import</span> TorchReferenceBackend
+    <span class="k">return</span> TorchReferenceBackend()</div>
+
+
+<!-- ===================== Section 7: Full comparison ===================== -->
+<h2>7. 三平台完整对比</h2>
+
+<div class="card">
+  <table>
+    <tr><th></th><th>NPU (Ascend)</th><th>CUDA (NVIDIA)</th><th>Fallback</th></tr>
+    <tr><td><strong>Backend 类</strong></td><td><code>NpuFlashBackend</code></td><td><code>CudaFlashBackend</code></td><td><code>TorchReferenceBackend</code></td></tr>
+    <tr><td><strong>Kernel</strong></td><td>npu_fusion_attention</td><td>TE DotProductAttention</td><td>Python einsum loop</td></tr>
+    <tr><td><strong>Layout</strong></td><td>TND</td><td>THD</td><td>split per row</td></tr>
+    <tr><td><strong>cu_seqlens 参数</strong></td><td>actual_seq_qlen/kvlen (list)</td><td>cu_seqlens_q/k (tensor)</td><td>_split_packed (list)</td></tr>
+    <tr><td><strong>Mask 参数</strong></td><td>atten_mask (bool tensor)</td><td>core_attention_bias (float)</td><td>_causal_q_kv_mask (bool)</td></tr>
+    <tr><td><strong>Mask 格式</strong></td><td>True=masked, False=vis</td><td>0.0=vis, -inf=masked</td><td>bool → masked_fill(-inf)</td></tr>
+    <tr><td><strong>Q padding</strong></td><td>否</td><td>否</td><td>否</td></tr>
+    <tr><td><strong>FLOPs 浪费</strong></td><td>0</td><td>0</td><td>0</td></tr>
+    <tr><td><strong>Attention 显存</strong></td><td>O(N)</td><td>O(N)</td><td>O(N²)</td></tr>
+    <tr><td><strong>依赖</strong></td><td>torch_npu + MindSpeed</td><td>transformer_engine >= 1.2</td><td>torch</td></tr>
+    <tr><td><strong>build_kv</strong></td><td colspan="3">完全继承 TorchReferenceBackend（Provider 存/Reuser cat）</td></tr>
+    <tr><td><strong>mask 构造</strong></td><td colspan="3">共享 build_block_causal_mask()，输出统一 bool mask</td></tr>
+    <tr><td><strong>新增代码</strong></td><td>~100 行</td><td>~80 行</td><td>0 (已有)</td></tr>
+  </table>
+</div>
+
+
+<!-- ===================== Section 8: File tree ===================== -->
+<h2>8. 文件清单</h2>
+
+<div class="card">
+  <svg viewBox="0 0 700 260" width="700">
+    <rect x="0" y="0" width="700" height="260" rx="8" fill="#0d1117"/>
+    <text x="20" y="22" fill="#8b949e" font-size="12" font-family="monospace">prefix_sharing/backends/</text>
+
+    <text x="40" y="48" fill="#3fb950" font-size="12" font-family="monospace">mask.py            ★ 新建 — 统一 mask 构造 + 格式转换</text>
+    <text x="40" y="68" fill="#3fb950" font-size="12" font-family="monospace">npu_flash.py       ★ 新建 — NPU npu_fusion_attention</text>
+    <text x="40" y="88" fill="#3fb950" font-size="12" font-family="monospace">cuda_flash.py      ★ 新建 — CUDA TE DotProductAttention</text>
+    <text x="40" y="108" fill="#58a6ff" font-size="12" font-family="monospace">cuda_ref.py         改写 — 工厂函数 create_backend()</text>
+    <text x="40" y="128" fill="#58a6ff" font-size="12" font-family="monospace">base.py             +1 字段</text>
+    <text x="40" y="148" fill="#8b949e" font-size="12" font-family="monospace">torch_ref.py        不动</text>
+    <text x="40" y="168" fill="#8b949e" font-size="12" font-family="monospace">cann_ref.py         可删除（被 npu_flash 替代）</text>
+
+    <line x1="20" y1="185" x2="680" y2="185" stroke="#30363d"/>
+
+    <text x="20" y="205" fill="#8b949e" font-size="12" font-family="monospace">其他改动（与之前方案相同）:</text>
+    <text x="40" y="225" fill="#58a6ff" font-size="12" font-family="monospace">core/config.py     — backend 默认 "auto"</text>
+    <text x="40" y="245" fill="#58a6ff" font-size="12" font-family="monospace">integrations/      — 使用 create_backend()</text>
+  </svg>
+</div>
+
+<div class="note">
+  <strong>核心设计</strong>：三个 backend 共享 <code>build_block_causal_mask()</code> 和 <code>build_kv()</code>（继承 torch_ref）。差异只在 <code>attention()</code> 方法中：
+  mask 格式转换（NPU 直接传 bool，CUDA 转 float bias，Fallback 用 masked_fill）和调用不同的底层 kernel。新增代码共约 240 行，torch_ref 不改，始终作为 fallback。
+</div>
+
+</div>
+</body>
+</html>

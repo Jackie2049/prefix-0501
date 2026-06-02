@@ -112,6 +112,37 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 
 ## 3. 进阶场景
 
+### 开启 Flash Attention 后端
+
+prefix-sharing 在 attention 阶段支持三种后端，可通过环境变量 `PREFIX_SHARING_BACKEND` 或 `PrefixSharingConfig.backend` 选择：
+
+| 后端 | 硬件 | 实现 | 适用场景 |
+|------|------|------|----------|
+| `torch_ref`（默认） | GPU + NPU | 纯 PyTorch 逐行 attention | 兼容性最好，作为 correctness oracle |
+| `flash_atten_gpu` | 仅 GPU | Transformer Engine `DotProductAttention`（含 reuser 时） / `flash_attn_varlen_func`（provider-only 时） | GPU 加速 |
+| `flash_atten_npu` | 仅 NPU | MindSpeed `npu_fusion_attention`（TND 布局 + `atten_mask`） | NPU 加速 |
+
+```bash
+# GPU
+export PREFIX_SHARING_BACKEND=flash_atten_gpu
+# NPU
+export PREFIX_SHARING_BACKEND=flash_atten_npu
+```
+
+#### ⚠️ 关于 mask 正确性
+
+reuser 的 attention mask 必须使用**绝对位置**的 block-causal 形式：prefix 列全可见 + suffix 列下三角。
+直接调用 `flash_attn_varlen_func(causal=True)` 是**错误**的——FA 的 `causal=True` 是段内相对位置，会让 reuser Q[i] 只看到 KV[0..i]，把 suffix KV 全部屏蔽掉。
+
+本仓库的实现：
+
+- `prefix_sharing/backends/block_causal_mask.py` 是 mask 的单一真相源，输出 `True = masked` 的 BoolTensor。
+- GPU 后端在检测到 reuser 时切换到 Transformer Engine 的 `core_attention_bias` 路径（接受 float `-inf` 偏置）。
+- NPU 后端直接把 BoolTensor 喂给 `npu_fusion_attention(atten_mask=...)`。
+- provider-only 退化场景下 GPU 后端走 `flash_attn_varlen_func(causal=True)` 快速路径（与绝对位置 causal 等价）。
+
+详见 `docs/pr6-fusion-plan.html` 与 `docs/multi-hardware-fa-plan.html`。
+
 ### 并行策略
 
 在第 2 节的 NPU 或 GPU 启动命令基础上，追加或覆盖以下增量配置：

@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Prefix Sharing 梯度回传正确性分析</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.8; }
+  .container { max-width: 1060px; margin: 0 auto; padding: 40px 24px; }
+  h1 { text-align: center; font-size: 30px; color: #58a6ff; margin-bottom: 6px; }
+  h1 span { color: #8b949e; font-size: 15px; font-weight: normal; display: block; margin-top: 4px; }
+  h2 { font-size: 22px; color: #79c0ff; margin: 48px 0 18px; border-left: 4px solid #58a6ff; padding-left: 16px; }
+  h3 { font-size: 17px; color: #d2a8ff; margin: 28px 0 10px; }
+  p, li { color: #b1bac4; font-size: 14.5px; }
+  p { margin-bottom: 10px; }
+  ul { margin-left: 22px; margin-bottom: 10px; }
+  li { margin-bottom: 3px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; margin: 16px 0; overflow-x: auto; }
+  .card-title { font-size: 15px; color: #58a6ff; font-weight: 600; margin-bottom: 14px; text-align: center; }
+  .caption { text-align: center; color: #8b949e; font-size: 12px; margin-top: 10px; font-style: italic; }
+  svg text { font-family: "PingFang SC", "Microsoft YaHei", monospace; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .tag-ok { background: #1f3d1f; color: #3fb950; }
+  .tag-warn { background: #3d2d1f; color: #f0883e; }
+  .tag-bad { background: #3d1f1f; color: #f85149; }
+  .hl { color: #f0883e; font-weight: 600; }
+  .hl-g { color: #3fb950; font-weight: 600; }
+  .hl-b { color: #58a6ff; font-weight: 600; }
+  .math { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 12px 16px; margin: 10px 0; font-family: "Cambria Math", "Times New Roman", monospace; color: #e6edf3; font-size: 14px; overflow-x: auto; }
+  .math .eq { display: block; margin: 4px 0; }
+  .math .comment { color: #8b949e; font-size: 12px; }
+  .verdict { background: #1f2d1f; border: 2px solid #3fb950; border-radius: 10px; padding: 16px 20px; margin: 16px 0; }
+  .verdict-bad { background: #2d1f1f; border-color: #f85149; }
+  .verdict h4 { color: #3fb950; margin-bottom: 6px; }
+  .verdict-bad h4 { color: #f85149; }
+  .proof { background: #1c2128; border-left: 3px solid #d2a8ff; padding: 12px 16px; margin: 12px 0; border-radius: 0 6px 6px 0; }
+  .proof strong { color: #d2a8ff; }
+  code { background: #1c2128; padding: 1px 5px; border-radius: 3px; font-size: 13px; color: #e6edf3; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Prefix Sharing 梯度回传正确性分析
+  <span>严格数学证明 + 代码路径追踪</span>
+</h1>
+
+<!-- ===================== Part 0: Setup ===================== -->
+<h2>0. 分析设定</h2>
+
+<p>考虑一个 micro-batch 内两条序列，Provider P 和 Reuser R，共享前缀长度 <code>prefix_len = p</code>，各自总长分别为 <code>L_P</code> 和 <code>L_R</code>。</p>
+
+<p><strong>关键前提</strong>：P 和 R 的前缀 token <span class="hl-g">完全相同</span>（由 TriePrefixDetector 精确保证），经过同一模型、同一层、同一参数，所以在每一层 <code>l</code>：</p>
+
+<div class="math">
+  <span class="eq">h_P^{(l)}[0..p) = h_R^{(l)}[0..p)   ← 隐藏状态完全相同（归纳法可证）</span>
+  <span class="eq">K_P^{(l)}[0..p) = K_R^{(l)}[0..p)   ← 因此 KV 也完全相同</span>
+  <span class="eq">V_P^{(l)}[0..p) = V_R^{(l)}[0..p)</span>
+</div>
+
+<p>这个等价性是整个梯度正确性的基石。下面逐环节分析。</p>
+
+
+<!-- ===================== Part 1: KV Store ===================== -->
+<h2>1. PrefixKVStore：梯度是否保留？</h2>
+
+<div class="card">
+  <div class="card-title">代码追踪：store 存的是什么？</div>
+  <svg viewBox="0 0 880 180" width="880">
+    <rect x="0" y="0" width="880" height="180" rx="8" fill="#0d1117"/>
+    <!-- Store code -->
+    <text x="20" y="28" fill="#8b949e" font-size="12" font-family="monospace"># prefix_store.py:79-97</text>
+    <text x="20" y="50" fill="#d2a8ff" font-size="12" font-family="monospace">def store(self, slot_id, *, key_tensor, value_tensor, ...):</text>
+    <text x="20" y="70" fill="#e6edf3" font-size="12" font-family="monospace">    self._entries[slot_id] = StoredPrefixKV(</text>
+    <text x="20" y="90" fill="#e6edf3" font-size="12" font-family="monospace">        key_tensor=<tspan fill="#3fb950">key_tensor</tspan>,      <tspan fill="#3fb950">← 直接引用，没有 detach()!</tspan></text>
+    <text x="20" y="110" fill="#e6edf3" font-size="12" font-family="monospace">        value_tensor=<tspan fill="#3fb950">value_tensor</tspan>,  <tspan fill="#3fb950">← 直接引用，没有 detach()!</tspan></text>
+    <text x="20" y="130" fill="#e6edf3" font-size="12" font-family="monospace">    )</text>
+
+    <!-- Load code -->
+    <text x="480" y="28" fill="#8b949e" font-size="12" font-family="monospace"># prefix_store.py:99-104</text>
+    <text x="480" y="50" fill="#d2a8ff" font-size="12" font-family="monospace">def load(self, slot_id):</text>
+    <text x="480" y="70" fill="#e6edf3" font-size="12" font-family="monospace">    return self._entries[slot_id]</text>
+    <text x="480" y="100" fill="#3fb950" font-size="13" font-family="monospace">← 返回原始 StoredPrefixKV 对象</text>
+    <text x="480" y="120" fill="#3fb950" font-size="13" font-family="monospace">← key_tensor 就是存入时的引用</text>
+    <text x="480" y="140" fill="#3fb950" font-size="13" font-family="monospace">← autograd 图完整保留</text>
+
+    <!-- Arrow -->
+    <path d="M 420 90 L 480 90" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrow-g)"/>
+    <defs><marker id="arrow-g2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker></defs>
+    <path d="M 420 90 L 475 90" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrow-g2)"/>
+  </svg>
+</div>
+
+<div class="verdict">
+  <h4>结论：梯度保留 ✓</h4>
+  <p>Store 只保存 Python 引用，没有任何 <code>detach()</code>、<code>clone()</code> 或序列化操作。Provider 的 K/V tensor 在存入和取出时 autograd 计算图完全一致。</p>
+</div>
+
+
+<!-- ===================== Part 2: build_kv ===================== -->
+<h2>2. build_kv()：torch.cat 的梯度行为</h2>
+
+<div class="card">
+  <div class="card-title">KV 扩展的两种路径</div>
+  <svg viewBox="0 0 880 250" width="880">
+    <defs>
+      <marker id="a-bl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+      <marker id="a-gn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+      <marker id="a-rd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f85149"/></marker>
+    </defs>
+
+    <!-- Provider path -->
+    <text x="30" y="25" fill="#3fb950" font-size="14" font-weight="bold">Provider P 路径</text>
+    <rect x="30" y="40" width="120" height="36" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="90" y="62" fill="#e6edf3" font-size="11" text-anchor="middle">K_P (全序列)</text>
+    <line x1="150" y1="58" x2="190" y2="58" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+    <rect x="190" y="40" width="100" height="36" rx="6" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="240" y="55" fill="#3fb950" font-size="11" text-anchor="middle">store(K_P)</text>
+    <text x="240" y="68" fill="#8b949e" font-size="9" text-anchor="middle">引用，不 detach</text>
+    <line x1="290" y1="58" x2="330" y2="58" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+    <rect x="330" y="40" width="140" height="36" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="400" y="62" fill="#e6edf3" font-size="11" text-anchor="middle">expanded_keys.append</text>
+
+    <!-- Reuser path -->
+    <text x="30" y="115" fill="#f85149" font-size="14" font-weight="bold">Reuser R 路径</text>
+    <rect x="30" y="130" width="120" height="36" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="90" y="152" fill="#e6edf3" font-size="11" text-anchor="middle">K_R_suffix</text>
+
+    <text x="175" y="152" fill="#8b949e" font-size="14">+</text>
+
+    <rect x="195" y="130" width="120" height="36" rx="6" fill="#1f3d5c" stroke="#58a6ff"/>
+    <text x="255" y="145" fill="#58a6ff" font-size="11" text-anchor="middle">store.load(P)</text>
+    <text x="255" y="158" fill="#58a6ff" font-size="10" text-anchor="middle">[:prefix_len]</text>
+
+    <line x1="315" y1="148" x2="355" y2="148" stroke="#f85149" stroke-width="1.5" marker-end="url(#a-rd)"/>
+
+    <rect x="355" y="125" width="170" height="46" rx="6" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+    <text x="440" y="145" fill="#f85149" font-size="12" text-anchor="middle" font-weight="bold">torch.cat([K_P[:p], K_R_s])</text>
+    <text x="440" y="162" fill="#8b949e" font-size="10" text-anchor="middle">→ expanded_key (新 tensor)</text>
+
+    <!-- Backward gradient arrows -->
+    <text x="30" y="200" fill="#f0883e" font-size="14" font-weight="bold">Backward 梯度拆分</text>
+    <text x="30" y="225" fill="#8b949e" font-size="12">∂L/∂expanded_key</text>
+    <text x="230" y="225" fill="#f0883e" font-size="14">→</text>
+    <text x="250" y="225" fill="#8b949e" font-size="12">torch.cat 的 backward 自动拆分为：</text>
+    <text x="270" y="245" fill="#58a6ff" font-size="12">∂L/∂K_P[:p]  → 累加到 Provider 的 K_P（通过 store 引用）</text>
+    <text x="270" y="245" fill="#58a6ff" font-size="12">∂L/∂K_P[:p]</text>
+    <text x="600" y="245" fill="#8b949e" font-size="12">→ 累加到 Provider 的 K_P</text>
+    <text x="270" y="245" fill="#d2a8ff" font-size="12">∂L/∂K_R_s</text>
+    <text x="410" y="245" fill="#8b949e" font-size="12">→ 流回 Reuser 的 K_R_suffix</text>
+  </svg>
+</div>
+
+<div class="proof">
+  <strong>数学验证：</strong>
+  <p>令 <code>expanded_K = torch.cat([K_P[:p], K_R_s], dim=0)</code>，其中 <code>K_P</code> 是 Provider 的 key，<code>K_R_s</code> 是 Reuser 的 suffix key。</p>
+  <p>Backward 时，PyTorch autograd 对 <code>torch.cat</code> 的梯度处理是：<strong>将输出梯度沿 <code>cat</code> 的分界点拆分回各输入</strong>。</p>
+  <p>因此：<code>∂L/∂K_P[:p]</code>（来自 R 的 attention）和 <code>∂L/∂K_P</code>（来自 P 自己的 attention）会自动累加到同一个 tensor 上。</p>
+</div>
+
+<div class="verdict">
+  <h4>结论：torch.cat 梯度正确 ✓</h4>
+  <p>PyTorch 的 <code>torch.cat</code> 原生支持 autograd。梯度会沿 cat 边界正确拆分回各输入 tensor。Provider 的 KV 同时接收来自自身 attention 和所有 Reuser attention 的梯度，自动累加。</p>
+</div>
+
+
+<!-- ===================== Part 3: Attention ===================== -->
+<h2>3. Attention 计算：逐行显式计算是否有梯度问题？</h2>
+
+<div class="card">
+  <div class="card-title">当前实现：显式 einsum + softmax</div>
+  <svg viewBox="0 0 880 160" width="880">
+    <rect x="0" y="0" width="880" height="160" rx="8" fill="#0d1117"/>
+    <text x="20" y="25" fill="#8b949e" font-size="12" font-family="monospace"># torch_ref.py:151-174 (简化)</text>
+    <text x="20" y="50" fill="#e6edf3" font-size="12" font-family="monospace">scores = torch.einsum("qhd,khd->hqk", q_row, k_row) / scale  <tspan fill="#3fb950">← 可导</tspan></text>
+    <text x="20" y="72" fill="#e6edf3" font-size="12" font-family="monospace">scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)  <tspan fill="#3fb950">← 可导</tspan></text>
+    <text x="20" y="94" fill="#e6edf3" font-size="12" font-family="monospace">probs = torch.softmax(scores, dim=-1)  <tspan fill="#3fb950">← 可导</tspan></text>
+    <text x="20" y="116" fill="#e6edf3" font-size="12" font-family="monospace">output = torch.einsum("hqk,khd->qhd", probs, v_row)  <tspan fill="#3fb950">← 可导</tspan></text>
+    <text x="20" y="145" fill="#3fb950" font-size="13" font-family="monospace">每一步都是标准可微操作，PyTorch autograd 原生支持 backward。</text>
+  </svg>
+</div>
+
+<p><span class="tag tag-ok">关键点</span> <code>masked_fill</code> 用 <code>-inf</code>（即 <code>finfo.min</code>）填充 masked 位置。Softmax 对 <code>-inf</code> 输出 0，backward 时这些位置的梯度也为 0，不会影响可见区域的梯度。</p>
+
+<div class="verdict">
+  <h4>结论：Attention 计算梯度正确 ✓</h4>
+  <p>全部使用标准可微操作（einsum、masked_fill、softmax），PyTorch autograd 原生支持。custom causal mask 不引入任何不可导操作。</p>
+</div>
+
+
+<!-- ===================== Part 4: Core Proof ===================== -->
+<h2>4. 核心证明：梯度是否与原始（无 prefix sharing）等价？</h2>
+
+<p>这是最关键的问题。令 <code>θ</code> 为模型参数（如 <code>W_k</code>），证明：</p>
+
+<div class="math">
+  <span class="eq" style="font-size:16px; color:#e6edf3;">∂(L_P + L_R) / ∂θ  在 prefix-sharing 下 == 原始（无共享）下</span>
+</div>
+
+<h3>4.1 原始情况（无 prefix sharing）</h3>
+
+<div class="math">
+  <span class="eq">K_P = W_k · h_P    ← Provider 的 KV，经过 P 的完整 forward</span>
+  <span class="eq">K_R = W_k · h_R    ← Reuser 的 KV，经过 R 的完整 forward（含前缀）</span>
+  <span class="eq">out_P = Attn(Q_P, K_P, V_P, causal_mask)</span>
+  <span class="eq">out_R = Attn(Q_R, K_R, V_R, causal_mask)</span>
+  <span class="eq">L = L_P(out_P) + L_R(out_R)</span>
+  <span class="eq"></span>
+  <span class="eq">∂L/∂W_k = ∂L_P/∂K_P · ∂(W_k·h_P)/∂W_k + ∂L_R/∂K_R · ∂(W_k·h_R)/∂W_k</span>
+  <span class="eq">        = ∂L_P/∂K_P · h_P^T + ∂L_R/∂K_R · h_R^T</span>
+  <span class="comment">其中 ∂L_R/∂K_R 包含前缀和后缀两部分位置</span>
+</div>
+
+<h3>4.2 Prefix Sharing 情况</h3>
+
+<div class="math">
+  <span class="eq">K_P = W_k · h_P                        ← Provider 不变</span>
+  <span class="eq">K_R_s = W_k · h_R_s                    ← Reuser 只算 suffix</span>
+  <span class="eq">K_R_exp = cat([K_P[:p], K_R_s])        ← 注入 Provider 前缀</span>
+  <span class="eq">out_P = Attn(Q_P, K_P, V_P, causal)    ← Provider 不变</span>
+  <span class="eq">out_R = Attn(Q_R_s, K_R_exp, V_R_exp, shifted_causal)</span>
+  <span class="eq">L = L_P(out_P) + L_R(out_R)</span>
+</div>
+
+<div class="proof">
+  <strong>证明链：</strong>
+
+  <p><strong>Step 1</strong>：前缀 token 完全相同 → Layer 0 的 embedding 相同 → Layer 0 的 hidden state 相同</p>
+
+  <p><strong>Step 2</strong>（归纳假设）：若 Layer l-1 的 <code>h_P[:p] = h_R[:p]</code>，则 Layer l 的 KV 有：</p>
+  <div class="math">
+    <span class="eq">K_P^{(l)}[:p] = W_k · h_P^{(l)}[:p] = W_k · h_R^{(l)}[:p] = K_R^{(l)}[:p]</span>
+    <span class="comment">因为同一模型、同一参数、同一输入 → 同一输出</span>
+  </div>
+
+  <p><strong>Step 3</strong>：R 的 attention 在 prefix-sharing 下使用的 <code>K_R_exp = cat([K_P[:p], K_R_s])</code>，而原始的 <code>K_R = [K_R[:p], K_R[p:]]</code>。由于 <code>K_P[:p] = K_R[:p]</code>，所以 <code>K_R_exp == K_R</code>。</p>
+
+  <p><strong>Step 4</strong>：因此 R 的 attention 输出完全相同 → R 的 loss 完全相同 → <code>∂L_R/∂K_R_exp</code> 在数值上等于 <code>∂L_R/∂K_R</code>。</p>
+
+  <p><strong>Step 5</strong>：梯度通过 <code>torch.cat</code> 拆分：</p>
+  <div class="math">
+    <span class="eq">∂L/∂W_k = ∂L_P/∂K_P · h_P^T + ∂L_R/∂K_R_exp · h_R_exp^T</span>
+    <span class="eq">        = ∂L_P/∂K_P · h_P^T + ∂L_R/∂K_P[:p] · h_P[:p]^T + ∂L_R/∂K_R_s · h_R_s^T</span>
+    <span class="eq">        = ∂L_P/∂K_P · h_P^T + ∂L_R/∂K_R[:p] · h_R[:p]^T + ∂L_R/∂K_R[p:] · h_R[p:]^T</span>
+    <span class="comment">因为 K_P[:p]=K_R[:p], h_P[:p]=h_R[:p], ∂L_R/∂K_P[:p]=∂L_R/∂K_R[:p]</span>
+    <span class="eq">        = ∂L_P/∂K_P · h_P^T + ∂L_R/∂K_R · h_R^T</span>
+    <span class="eq">        = 原始梯度 ✓</span>
+  </div>
+</div>
+
+<div class="verdict">
+  <h4>结论：梯度数学等价 ✓</h4>
+  <p>因为 P 和 R 的前缀 token 完全相同（由 TriePrefixDetector 精确保证），经过同一模型同一参数，每一层的隐藏状态、KV 都完全相同。因此 <code>torch.cat([K_P[:p], K_R_s])</code> 等价于原始的 <code>K_R</code>，梯度在数值上完全一致。</p>
+</div>
+
+
+<!-- ===================== Part 5: Multi-Reuser ===================== -->
+<h2>5. 多个 Reuser 共享同一 Provider 的梯度累加</h2>
+
+<div class="card">
+  <div class="card-title">场景：1 个 Provider P，N 个 Reuser R1...RN 共享同一前缀</div>
+  <svg viewBox="0 0 880 320" width="880">
+    <defs>
+      <marker id="a-fw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+      <marker id="a-bw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f85149"/></marker>
+    </defs>
+
+    <!-- Provider -->
+    <rect x="340" y="20" width="160" height="50" rx="8" fill="#1f3d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="420" y="42" fill="#3fb950" font-size="13" text-anchor="middle" font-weight="bold">Provider P</text>
+    <text x="420" y="58" fill="#8b949e" font-size="11" text-anchor="middle">K_P → Store</text>
+
+    <!-- Reusers -->
+    <rect x="80" y="110" width="140" height="40" rx="6" fill="#3d1f1f" stroke="#f85149"/>
+    <text x="150" y="134" fill="#f85149" font-size="12" text-anchor="middle">R1: cat([K_P[:p], K_R1_s])</text>
+    <rect x="340" y="110" width="140" height="40" rx="6" fill="#3d1f1f" stroke="#f85149"/>
+    <text x="410" y="134" fill="#f85149" font-size="12" text-anchor="middle">R2: cat([K_P[:p], K_R2_s])</text>
+    <rect x="600" y="110" width="140" height="40" rx="6" fill="#3d1f1f" stroke="#f85149"/>
+    <text x="670" y="134" fill="#f85149" font-size="12" text-anchor="middle">RN: cat([K_P[:p], K_RN_s])</text>
+
+    <!-- Forward arrows: P → Ri -->
+    <line x1="380" y1="70" x2="150" y2="110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-fw)"/>
+    <line x1="420" y1="70" x2="410" y2="110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-fw)"/>
+    <line x1="460" y1="70" x2="670" y2="110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-fw)"/>
+
+    <!-- Backward arrows: Ri → P -->
+    <line x1="150" y1="150" x2="370" y2="200" stroke="#f85149" stroke-width="2" marker-end="url(#a-bw)"/>
+    <line x1="410" y1="150" x2="420" y2="200" stroke="#f85149" stroke-width="2" marker-end="url(#a-bw)"/>
+    <line x1="670" y1="150" x2="470" y2="200" stroke="#f85149" stroke-width="2" marker-end="url(#a-bw)"/>
+
+    <!-- Provider gradient accumulation -->
+    <rect x="280" y="195" width="280" height="50" rx="8" fill="#3d2d1f" stroke="#f0883e" stroke-width="2"/>
+    <text x="420" y="215" fill="#f0883e" font-size="12" text-anchor="middle" font-weight="bold">K_P 梯度自动累加</text>
+    <text x="420" y="235" fill="#e6edf3" font-size="11" text-anchor="middle">∂L_P/∂K_P + ∂L_R1/∂K_P[:p] + ... + ∂L_RN/∂K_P[:p]</text>
+
+    <!-- Equivalence -->
+    <rect x="120" y="265" width="640" height="45" rx="8" fill="#1f2d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="440" y="285" fill="#3fb950" font-size="13" text-anchor="middle" font-weight="bold">等价于原始场景下 ∂L_R1/∂K_R1[:p]·∂K_R1[:p]/∂W_k + ... + ∂L_RN/∂K_RN[:p]·∂K_RN[:p]/∂W_k</text>
+    <text x="440" y="303" fill="#8b949e" font-size="11" text-anchor="middle">因为每个 Ri 的 K_Ri[:p] = K_P[:p]，梯度路径等价，只是经过 P 的计算图而非 Ri 的</text>
+  </svg>
+</div>
+
+<div class="verdict">
+  <h4>结论：多 Reuser 梯度累加正确 ✓</h4>
+  <p>PyTorch autograd 在同一个 tensor 上自动累加来自多个消费者的梯度。<code>K_P</code> 被 P 自身 + N 个 Reuser 的 attention 共同引用，backward 时梯度正确累加。</p>
+</div>
+
+
+<!-- ===================== Part 6: Logprob Restore ===================== -->
+<h2>6. Prefix-Last Logprob 恢复的梯度</h2>
+
+<div class="card">
+  <div class="card-title">恢复 Reuser 第一个 suffix token 的 logprob</div>
+  <svg viewBox="0 0 880 200" width="880">
+    <rect x="0" y="0" width="880" height="200" rx="8" fill="#0d1117"/>
+    <text x="20" y="25" fill="#8b949e" font-size="12" font-family="monospace"># verl_mcore.py:336-348</text>
+    <text x="20" y="50" fill="#e6edf3" font-size="12" font-family="monospace">provider_logits = logits[0:1, index.provider_1d_pos:...+1, :]<tspan fill="#3fb950">.clone()</tspan></text>
+    <text x="40" y="70" fill="#3fb950" font-size="11" font-family="monospace">↑ .clone() 不是 .detach()! 保留计算图!</text>
+    <text x="20" y="95" fill="#e6edf3" font-size="12" font-family="monospace">reuse_label = labels[0:1, index.reuse_1d_pos:...+1]</text>
+    <text x="20" y="120" fill="#e6edf3" font-size="12" font-family="monospace">restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)</text>
+    <text x="20" y="145" fill="#e6edf3" font-size="12" font-family="monospace">restored[0, index.reuse_1d_pos] = restored_value.reshape(())</text>
+    <text x="20" y="175" fill="#3fb950" font-size="13" font-family="monospace">梯度路径：∂L/∂restored → ∂restored_value/∂provider_logits → Provider 的计算图 → 模型参数</text>
+  </svg>
+</div>
+
+<div class="proof">
+  <strong>为什么要 .clone() 而不是 .detach()？</strong>
+  <p><code>.clone()</code> 创建 tensor 副本但保留 autograd 计算图。梯度从 restored logprob 回传时会经过 provider_logits 的计算图，最终到达模型参数。</p>
+  <p>如果用 <code>.detach()</code>，梯度会被截断，Provider 的前缀参数就收不到来自 Reuser 首 token 的梯度信号。</p>
+</div>
+
+<div class="verdict">
+  <h4>结论：Logprob 恢复梯度正确 ✓</h4>
+  <p><code>.clone()</code> 保留计算图，梯度从 Reuser 的 loss 流回 Provider 的 logits，再到模型参数。链路完整。</p>
+</div>
+
+
+<!-- ===================== Part 7: Edge Cases ===================== -->
+<h2>7. 潜在风险与边界情况</h2>
+
+<h3>7.1 Store 生命周期：梯度会丢失吗？</h3>
+
+<div class="card">
+  <div class="card-title">context.py 中的生命周期管理</div>
+  <svg viewBox="0 0 880 140" width="880">
+    <rect x="0" y="0" width="880" height="140" rx="8" fill="#0d1117"/>
+    <text x="20" y="25" fill="#8b949e" font-size="12" font-family="monospace"># context.py:66-89</text>
+    <text x="20" y="50" fill="#d2a8ff" font-size="12" font-family="monospace">@contextmanager</text>
+    <text x="20" y="70" fill="#d2a8ff" font-size="12" font-family="monospace">def prefix_sharing_runtime_context(state):</text>
+    <text x="40" y="90" fill="#e6edf3" font-size="12" font-family="monospace">ctx = PrefixSharingRuntimeContext(store=<tspan fill="#3fb950">PrefixKVStore()</tspan>, ...)</text>
+    <text x="40" y="110" fill="#e6edf3" font-size="12" font-family="monospace">try: yield ctx</text>
+    <text x="40" y="130" fill="#f85149" font-size="12" font-family="monospace">finally: ctx.store.close()  <tspan fill="#f0883e">← forward+backward 完成后才 close</tspan></text>
+  </svg>
+</div>
+
+<p><span class="tag tag-ok">安全</span> <code>store.close()</code> 在 <code>finally</code> 块中执行，即 context manager 退出时才清空。只要 <code>with</code> 块包含了整个 forward + backward 过程，梯度就不会丢失。</p>
+
+<p><span class="tag tag-warn">注意</span> 如果 <code>backward()</code> 在 <code>with</code> 块之外调用，Store 已经被 <code>close()</code>，但 <code>close()</code> 只是清空了字典引用，不会删除 tensor 本身。autograd 图中仍然持有 Provider K/V 的引用，<span class="hl">梯度仍能正确回传</span>。但 <code>_ensure_open()</code> 会阻止新的 store/load 操作。</p>
+
+<h3>7.2 RoPE 动态扩展的梯度</h3>
+
+<div class="proof">
+  <strong>RoPE 扩展：<code>extra_angles = extra_positions[:, None, None, None] * step</code></strong>
+  <p><code>step = q_pos_emb[1] - q_pos_emb[0]</code>（两个位置的差值 = inv_freq），<code>extra_positions</code> 是整数 arange（不需要梯度）。</p>
+  <p>梯度只通过 <code>step</code> 流回 <code>q_pos_emb</code>。由于 RoPE 的数学性质 <code>freqs[p] = p × inv_freq</code>（线性），这个外推是精确的，不会引入近似误差。</p>
+</div>
+
+<h3>7.3 混合精度（fp16/bf16）下的数值差异</h3>
+
+<p><span class="tag tag-warn">潜在风险</span> 当前实现使用 <code>torch.einsum</code> + <code>softmax</code> 的显式计算（O(N²) 显存），而原始 Megatron 可能使用 Flash Attention（fused kernel）。两者的 softmax 实现可能有微小的数值差异（约 1e-3 级别），在 fp16 下可能累积。</p>
+
+<p>但这不影响梯度的<strong>数学正确性</strong>，只影响<strong>数值精度</strong>。对训练稳定性的影响需要在实际场景中评估。</p>
+
+<h3>7.4 梯度缩放 / Loss 归一化</h3>
+
+<p><span class="tag tag-warn">潜在风险</span> Prefix Sharing 裁剪了 Reuser 的前缀 token，导致 batch 内总 token 数减少。如果 loss 按总 token 数归一化：</p>
+<ul>
+  <li>原始：<code>loss = sum(per_token_loss) / total_original_tokens</code></li>
+  <li>裁剪后：实际计算的 token 数 &lt; 原始 token 数</li>
+</ul>
+<p>需要确保 loss 归一化使用的是<strong>裁剪后的实际 token 数</strong>还是<strong>原始 token 数</strong>。如果框架自动按 attention_mask 中的有效 token 数归一化，则裁剪后的 loss 会被更少的 token 除，导致梯度略大。</p>
+<p><strong>建议</strong>：在 loss 计算前恢复原始的 token 计数，或在 loss mask 中正确标记。</p>
+
+<h3>7.5 内存压力</h3>
+
+<p><span class="tag tag-warn">潜在风险</span> Provider 的 K/V tensor 需要保留到所有 Reuser 完成 backward。如果一个 Provider 被 N 个 Reuser 共享：</p>
+<ul>
+  <li>Provider 的 KV 计算图在内存中持续存在（不会被提前释放）</li>
+  <li>每个 Reuser 的 <code>torch.cat</code> 创建一个 expanded KV，也需要内存</li>
+  <li>显式 einsum attention 需要 O(N²) 的 attention matrix 显存</li>
+</ul>
+<p>这是 <strong>性能问题</strong>，不是 <strong>正确性问题</strong>。适配 Flash Attention 后 O(N²) 会降为 O(N)。</p>
+
+
+<!-- ===================== Part 8: Summary ===================== -->
+<h2>8. 总结</h2>
+
+<div class="card">
+  <div class="card-title">梯度正确性审计结果</div>
+  <table>
+    <tr><th>环节</th><th>代码位置</th><th>是否有问题</th><th>说明</th></tr>
+    <tr><td>PrefixKVStore 存储</td><td>prefix_store.py:79</td><td><span class="tag tag-ok">OK</span></td><td>直接引用，不 detach</td></tr>
+    <tr><td>Provider KV 存储</td><td>torch_ref.py:70-84</td><td><span class="tag tag-ok">OK</span></td><td>存入原始 tensor，autograd 图完整</td></tr>
+    <tr><td>Reuser KV 拼接</td><td>torch_ref.py:95-98</td><td><span class="tag tag-ok">OK</span></td><td>torch.cat 原生可微，梯度自动拆分</td></tr>
+    <tr><td>RoPE 应用</td><td>megatron_runtime.py:77-137</td><td><span class="tag tag-ok">OK</span></td><td>线性外推精确，index_select 可微</td></tr>
+    <tr><td>Custom causal mask</td><td>torch_ref.py:144-148</td><td><span class="tag tag-ok">OK</span></td><td>mask 不参与梯度，masked_fill(-inf) 正确</td></tr>
+    <tr><td>逐行 attention</td><td>torch_ref.py:117-132</td><td><span class="tag tag-ok">OK</span></td><td>全部标准可微操作</td></tr>
+    <tr><td>Logprob 恢复</td><td>verl_mcore.py:336-348</td><td><span class="tag tag-ok">OK</span></td><td>.clone() 保留计算图</td></tr>
+    <tr><td>数学等价性</td><td>第 4 节证明</td><td><span class="tag tag-ok">OK</span></td><td>前缀 token 相同 → 梯度数值一致</td></tr>
+    <tr><td>多 Reuser 累加</td><td>第 5 节分析</td><td><span class="tag tag-ok">OK</span></td><td>autograd 自动累加到同一 tensor</td></tr>
+    <tr><td>Loss 归一化</td><td>外部框架</td><td><span class="tag tag-warn">需确认</span></td><td>裁剪后 token 数减少可能影响归一化</td></tr>
+    <tr><td>混合精度数值</td><td>全局</td><td><span class="tag tag-warn">需评估</span></td><td>显式计算 vs FA fused kernel 数值差异</td></tr>
+    <tr><td>内存压力</td><td>全局</td><td><span class="tag tag-warn">需优化</span></td><td>O(N²) attention + Provider KV 常驻</td></tr>
+  </table>
+</div>
+
+<div class="verdict">
+  <h4>最终结论：梯度回传数学正确，无本质问题</h4>
+  <p>Prefix Sharing 的梯度回传在数学上是正确的，与"不使用 prefix sharing 的独立计算"完全等价。核心原因是共享前缀 token 在同一模型参数下产生完全相同的隐藏状态和 KV，因此用 Provider 的 KV 替代 Reuser 的 KV 不改变 forward 输出，也不改变 backward 梯度值。</p>
+  <p style="margin-top:8px;">需要关注的是三个<strong>工程层面</strong>的问题：Loss 归一化分母是否需要修正、混合精度下的数值稳定性、以及 O(N²) 的内存压力。</p>
+</div>
+
+</div>
+</body>
+</html>

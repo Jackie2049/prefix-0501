@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>PR #6 融合方案 · Prefix Sharing 多硬件 FA 路径合并</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 1100px; margin: 0 auto; padding: 24px; color: #1f2937; line-height: 1.6; }
+  h1 { border-bottom: 3px solid #2563eb; padding-bottom: 8px; color: #1e3a8a; }
+  h2 { color: #1e40af; border-left: 4px solid #2563eb; padding-left: 12px; margin-top: 40px; }
+  h3 { color: #1d4ed8; margin-top: 28px; }
+  h4 { color: #374151; }
+  code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-family: "JetBrains Mono", Consolas, monospace; font-size: 0.92em; color: #be185d; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 14px 18px; border-radius: 8px; overflow-x: auto; font-size: 0.88em; line-height: 1.5; }
+  pre code { background: transparent; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; }
+  th, td { border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; }
+  th { background: #e0e7ff; color: #1e3a8a; }
+  .ok { background: #dcfce7; color: #166534; padding: 2px 8px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
+  .bad { background: #fee2e2; color: #991b1b; padding: 2px 8px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
+  .warn { background: #fef9c3; color: #854d0e; padding: 2px 8px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
+  .card { border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px 20px; margin: 14px 0; background: #f8fafc; }
+  .card.bad { border-color: #dc2626; background: #fef2f2; }
+  .card.ok { border-color: #16a34a; background: #f0fdf4; }
+  .card.warn { border-color: #ca8a04; background: #fffbeb; }
+  .delta { color: #be185d; font-weight: 600; }
+  .num { color: #0f766e; font-weight: 600; }
+  ul li { margin: 6px 0; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; margin: 10px 0; font-size: 0.9em; }
+  .ascii { font-family: "JetBrains Mono", Consolas, monospace; background: #f8fafc; border: 1px solid #cbd5e1; padding: 12px; border-radius: 6px; white-space: pre; font-size: 0.85em; }
+  .toc { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px 20px; margin: 20px 0; }
+  .toc ol { margin: 6px 0; padding-left: 22px; }
+</style>
+</head>
+<body>
+
+<h1>PR #6 与多硬件 FA 方案融合分析</h1>
+
+<div class="toc">
+<strong>目录</strong>
+<ol>
+  <li><a href="#summary">一句话结论</a></li>
+  <li><a href="#pr6">PR #6 现状盘点</a></li>
+  <li><a href="#crit">PR #6 的关键正确性问题</a></li>
+  <li><a href="#compare">两个方案逐项对比</a></li>
+  <li><a href="#fusion">融合方案（文件级）</a></li>
+  <li><a href="#roadmap">分阶段落地路线</a></li>
+  <li><a href="#risks">风险与回滚</a></li>
+</ol>
+</div>
+
+<h2 id="summary">1. 一句话结论</h2>
+
+<div class="card bad">
+<strong>PR #6 的工程脚手架（factory / mixin / tests / docs）非常优秀，但其 GPU 后端在 reuser 场景下数学上不正确。</strong>
+原因：<code>flash_attn_varlen_func(causal=True)</code> 使用<strong>段内相对位置</strong>的 causal mask，而 prefix sharing 需要<strong>绝对位置</strong>的 block-causal mask（prefix 列全可见 + suffix causal）。
+融合方向：<strong>保留 PR #6 的全部工程骨架，替换 GPU/NPU 两个 attention() 实现为 attention_bias 形态</strong>，并新增统一的 mask 构造模块。
+</div>
+
+<h2 id="pr6">2. PR #6 现状盘点</h2>
+
+<p>PR #6（分支 <code>add_gpu_fa</code>，作者 OwenVigil，7 commits，+962/−5，12 文件改动）主要交付：</p>
+
+<table>
+<tr><th>文件</th><th>类型</th><th>核心内容</th><th>评价</th></tr>
+<tr><td><code>backends/factory.py</code></td><td>新增</td><td>字符串 → backend 实例的工厂函数 <code>get_backend_instance(config, backend=None)</code></td><td><span class="ok">优秀</span></td></tr>
+<tr><td><code>backends/flash_atten_base.py</code></td><td>新增</td><td><code>FlashAttentionMixin</code>：cu_seqlens 校验、THD shape 归一化、<code>_prepare_flash_inputs</code></td><td><span class="ok">优秀</span></td></tr>
+<tr><td><code>backends/flash_atten_gpu.py</code></td><td>新增</td><td><code>GpuFlashAttentionBackend</code>，<code>attention()</code> 调 <code>flash_attn_varlen_func(..., causal=True)</code></td><td><span class="bad">不正确</span></td></tr>
+<tr><td><code>backends/flash_atten_npu.py</code></td><td>新增</td><td>13 行占位类，无实现</td><td><span class="warn">待实现</span></td></tr>
+<tr><td><code>backends/base.py</code></td><td>修改</td><td><code>BackendCapabilities</code> 增加 <code>supports_flash_attention</code></td><td><span class="ok">合理</span></td></tr>
+<tr><td><code>backends/__init__.py</code></td><td>修改</td><td>导出新类与工厂</td><td><span class="ok">合理</span></td></tr>
+<tr><td><code>core/config.py</code></td><td>修改</td><td>validate() 校验 backend ∈ {torch_ref, flash_atten_gpu, flash_atten_npu}</td><td><span class="ok">合理</span></td></tr>
+<tr><td><code>integrations/verl_mcore.py</code></td><td>修改</td><td>3 处 <code>TorchReferenceBackend()</code> → <code>get_backend_instance(config)</code></td><td><span class="ok">合理</span></td></tr>
+<tr><td><code>README.md</code></td><td>修改</td><td>分层说明「训练引擎 FA」vs「prefix-sharing 后端 FA」</td><td><span class="ok">优秀</span></td></tr>
+<tr><td><code>tests/integrated_test/optional/test_gpu_flash_backend.py</code></td><td>新增</td><td>373 行，覆盖前向/反向/GQA/多 reuser/混合长度</td><td><span class="warn">用例全但 atol=5e-2 掩盖误差</span></td></tr>
+<tr><td><code>tests/unit_test/test_backend_factory.py</code></td><td>新增</td><td>6 个工厂单元测试</td><td><span class="ok">合理</span></td></tr>
+<tr><td><code>scripts/smoke_test_gpu_flash.py</code></td><td>新增</td><td>独立 smoke 脚本</td><td><span class="ok">合理</span></td></tr>
+</table>
+
+<h2 id="crit">3. PR #6 的关键正确性问题</h2>
+
+<h3>3.1 问题描述</h3>
+
+<p>PR #6 的 GPU 后端核心调用：</p>
+<pre><code>out = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q, cu_seqlens_kv,
+    max_seqlen_q, max_seqlen_kv,
+    causal=True,        # ⚠️ 关键问题
+    ...
+)</code></pre>
+
+<p><code>flash_attn_varlen_func</code> 在 <code>causal=True</code> 时，对每个 segment 独立应用<strong>段内相对位置</strong>的下三角 mask：<br>
+query 在 segment 内位置 <code>i</code> 只能看 key 在 segment 内位置 <code>0..i</code>。</p>
+
+<p>但 prefix sharing 的 reuser 场景需要<strong>绝对位置</strong>的 block-causal mask：</p>
+
+<div class="ascii">Reuser: Q 是 suffix（绝对位置 P..P+L-1），KV = prefix(P) + suffix(L)
+
+期望的 attention mask（行=Q相对位置，列=KV相对位置）:
+         KV: 0 1 2 ... P-1 | P P+1 ... P+L-1
+Q 0    :   [1 1 1 ... 1   |  1 0  0 ... 0   ]    ← 看 prefix 全部 + suffix[0]
+Q 1    :   [1 1 1 ... 1   |  1 1  0 ... 0   ]    ← 看 prefix 全部 + suffix[0..1]
+...
+Q L-1  :   [1 1 1 ... 1   |  1 1  1 ... 1   ]
+
+FA causal=True 实际给出的 mask（错误）:
+         KV: 0 1 2 ... P-1 | P P+1 ... P+L-1
+Q 0    :   [1 0 0 ... 0   |  0 0  0 ... 0   ]    ← 只看 KV[0]，错过 prefix[1..]
+Q 1    :   [1 1 0 ... 0   |  0 0  0 ... 0   ]
+...
+Q L-1  :   [1 1 1 ... 1   |  0 0  0 ... 0   ]    ← suffix KV 全部被屏蔽！</div>
+
+<p>对于 reuser，<code>cu_seqlens_kv</code> 包含 <code>P+L</code> 个 token（prefix+suffix），但 <code>cu_seqlens_q</code> 只有 <code>L</code> 个。FA 在段内对齐 Q 和 KV 的相对位置 0..L-1，对应到 KV 上是 0..L-1（即 prefix 部分），suffix 部分（KV 的 P..P+L-1）完全被屏蔽。</p>
+
+<h3>3.2 为什么 PR #6 的测试没发现？</h3>
+
+<div class="card warn">
+<code>test_flash_atten_gpu_vs_torch_ref</code> 用 <code>atol=5e-2</code>（fp16）和 <code>atol=2e-1</code>（grad）。这个精度太松：
+<ul>
+  <li>测试输入用 <code>torch.randn(...) * 0.02</code>，本身数值很小，softmax 后概率近似均匀，attention 输出几乎是 value 的简单平均。</li>
+  <li>当 mask 错误地把一些位置置零，输出差异在 <code>1e-2</code> 量级，仍能通过 <code>5e-2</code> 阈值。</li>
+  <li>测试用例 <code>batch_sizes=[8,8], prefix_lens=[0,4]</code> 包含一个 reuser，但 prefix 占比只有 50%，差异被稀释。</li>
+</ul>
+结论：当前的 numerical alignment 测试不足以验证 mask 正确性，需要<strong>显式 mask 断言</strong>。
+</div>
+
+<h3>3.3 PR #6 没有解决，而我们方案回答了的问题</h3>
+
+<table>
+<tr><th>问题</th><th>PR #6</th><th>多硬件 FA 方案</th></tr>
+<tr><td>reuser 如何获得正确的 block-causal mask？</td><td>未处理（依赖 FA causal=True）</td><td>统一构造 <code>build_block_causal_mask(plan)</code>，通过 attention_bias 注入</td></tr>
+<tr><td>NPU 如何支持？</td><td>13 行占位符</td><td><code>npu_fusion_attention(atten_mask=...)</code> 原生支持 BoolTensor</td></tr>
+<tr><td>flash_attn 包不支持 attention_bias 怎么办？</td><td>没意识到这个问题</td><td>GPU 改用 TE <code>DotProductAttention(core_attention_bias=...)</code></td></tr>
+<tr><td> Provider-only 场景如何退化？</td><td>FA causal=True 正确（segment 内 causal = 绝对 causal）</td><td>退化路径：当所有样本都是 provider，mask 退化为标准 causal，TE 内部走 fast path</td></tr>
+</table>
+
+<h2 id="compare">4. 两个方案逐项对比</h2>
+
+<table>
+<tr><th>维度</th><th>PR #6</th><th>多硬件 FA 方案</th><th>胜出</th></tr>
+<tr><td>工程脚手架（factory/mixin/tests/docs）</td><td>完整</td><td>较弱（只有设计，无测试脚手架）</td><td><span class="ok">PR #6</span></td></tr>
+<tr><td>THD 输入归一化</td><td><code>FlashAttentionMixin._prepare_flash_inputs</code> 优雅</td><td>散落在各后端</td><td><span class="ok">PR #6</span></td></tr>
+<tr><td>Mask 构造</td><td>无（依赖 FA causal）</td><td><code>backends/mask.py</code> 单一真相源</td><td><span class="ok">多硬件</span></td></tr>
+<tr><td>GPU 后端正确性</td><td>reuser 场景错误</td><td>TE + attention_bias 正确</td><td><span class="ok">多硬件</span></td></tr>
+<tr><td>NPU 后端</td><td>占位符</td><td><code>npu_fusion_attention</code> 实现</td><td><span class="ok">多硬件</span></td></tr>
+<tr><td>Backend 切换配置</td><td><code>PREFIX_SHARING_BACKEND</code> 环境变量 + config 校验</td><td>同样设计</td><td>持平</td></tr>
+<tr><td>Lazy import</td><td><code>@lru_cache</code> 包装</td><td>函数内 import</td><td><span class="ok">PR #6</span></td></tr>
+<tr><td>与 Megatron hook 集成</td><td>沿用 torch_ref 的 apply_rope / build_kv</td><td>同样设计</td><td>持平</td></tr>
+<tr><td>测试覆盖</td><td>11 个用例 + GQA + 多 reuser + 反向</td><td>仅设计阶段</td><td><span class="ok">PR #6</span></td></tr>
+<tr><td>用户文档</td><td>README 增加「3. 进阶场景」章节</td><td>4 个 HTML 设计文档</td><td>互补</td></tr>
+<tr><td>依赖</td><td>flash-attn（pip）</td><td>transformer-engine（CUDA） / mindspeed（NPU）</td><td>各有取舍</td></tr>
+</table>
+
+<h2 id="fusion">5. 融合方案（文件级）</h2>
+
+<h3>5.1 总原则</h3>
+<div class="card ok">
+<strong>以 PR #6 为基线合并，把多硬件方案的「正确性内核」嵌入 PR #6 的工程骨架。</strong>
+<ul>
+  <li>不另起炉灶，避免冲突 PR #6 已有的 12 个文件改动</li>
+  <li>在 <code>flash_atten_base.py</code> 新增 <code>build_block_causal_mask()</code> 静态方法，作为 mixin 的一部分</li>
+  <li>GPU 后端：<strong>新增 TE 路径</strong>，<strong>降级 flash_attn 路径</strong>（仅 provider-only 场景可用，否则报错）</li>
+  <li>NPU 后端：从占位符变为真实实现</li>
+</ul>
+</div>
+
+<h3>5.2 文件改动清单</h3>
+
+<table>
+<tr><th>文件</th><th>改动类型</th><th>说明</th></tr>
+<tr><td><code>backends/factory.py</code></td><td><span class="ok">保留</span></td><td>PR #6 原版</td></tr>
+<tr><td><code>backends/flash_atten_base.py</code></td><td><span class="warn">扩展</span></td><td>新增 <code>build_block_causal_mask()</code> 和 <code>mask_to_te_bias()</code> 工具方法</td></tr>
+<tr><td><code>backends/flash_atten_gpu.py</code></td><td><span class="bad">替换实现</span></td><td>TE 主路径 + flash_attn 兜底（仅 provider-only）</td></tr>
+<tr><td><code>backends/flash_atten_npu.py</code></td><td><span class="bad">从占位符实现</span></td><td>用 <code>npu_fusion_attention(atten_mask=...)</code></td></tr>
+<tr><td><code>backends/torch_ref.py</code></td><td><span class="ok">保留</span></td><td>不动</td></tr>
+<tr><td><code>backends/__init__.py</code></td><td><span class="ok">保留</span></td><td>PR #6 原版</td></tr>
+<tr><td><code>core/config.py</code></td><td><span class="warn">微调</span></td><td>backend 增加 <code>"flash_atten_gpu_te"</code>（如果保留双路径）或保持单名</td></tr>
+<tr><td><code>integrations/verl_mcore.py</code></td><td><span class="ok">保留</span></td><td>PR #6 原版</td></tr>
+<tr><td><code>tests/integrated_test/optional/test_gpu_flash_backend.py</code></td><td><span class="warn">扩展</span></td><td>新增显式 mask 断言用例 + 减小 atol 至 1e-3</td></tr>
+<tr><td><code>tests/integrated_test/optional/test_npu_flash_backend.py</code></td><td><span class="warn">新增</span></td><td>镜像 GPU 测试，NPU 环境下运行</td></tr>
+<tr><td><code>tests/unit_test/test_block_causal_mask.py</code></td><td><span class="warn">新增</span></td><td>纯 mask 形状/语义单元测试</td></tr>
+<tr><td><code>README.md</code></td><td><span class="warn">补充</span></td><td>说明 reuser 必须走 TE/NPU 路径</td></tr>
+</table>
+
+<h3>5.3 关键代码：统一 mask 构造</h3>
+
+<p>把 mask 构造放到 <code>flash_atten_base.py</code>，作为 mixin 的静态方法（PR #6 已经有 mixin 类，这是最低侵入位置）：</p>
+
+<pre><code># flash_atten_base.py 新增
+
+@staticmethod
+def build_block_causal_mask(
+    plan: PrefixSharingPlan,
+    device: torch.device,
+) -> torch.Tensor:
+    """构造 (total_q, total_kv) 的 BoolTensor。
+    True = masked (不可见), False = visible.
+    统一所有 backend 的 mask 真相源。
+    """
+    total_q = plan.cu_seqlens_q[-1]
+    total_kv = plan.cu_seqlens_kv[-1]
+    mask = torch.ones(total_q, total_kv, dtype=torch.bool, device=device)
+
+    for i in range(plan.batch_size):
+        q_lo = plan.cu_seqlens_q[i]
+        q_hi = plan.cu_seqlens_q[i + 1]
+        kv_lo = plan.cu_seqlens_kv[i]
+        kv_hi = plan.cu_seqlens_kv[i + 1]
+        q_len = q_hi - q_lo
+        kv_len = kv_hi - kv_lo
+
+        if plan.is_reuser(i):
+            p = plan.prefix_lens[i]
+            # prefix columns: all visible
+            mask[q_lo:q_hi, kv_lo:kv_lo + p] = False
+            # suffix columns: causal
+            for qi in range(q_len):
+                mask[q_lo + qi, kv_lo + p:kv_lo + p + qi + 1] = False
+        else:
+            # provider: standard causal
+            for qi in range(q_len):
+                mask[q_lo + qi, kv_lo:kv_lo + qi + 1] = False
+    return mask
+
+@staticmethod
+def mask_to_te_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Bool mask → TE 接受的 float bias. False=0, True=-inf."""
+    return torch.where(
+        mask,
+        torch.full_like(mask, float('-inf'), dtype=dtype),
+        torch.zeros_like(mask, dtype=dtype),
+    )</code></pre>
+
+<h3>5.4 关键代码：GPU 后端替换</h3>
+
+<pre><code># flash_atten_gpu.py (替换 PR #6 的 attention 方法)
+
+def attention(self, query, key, value, plan, **kwargs):
+    self._validate_plan_for_flash(plan)
+
+    # 决策：如果所有样本都是 provider，走 fast path
+    has_reuser = any(plan.is_reuser(i) for i in range(plan.batch_size))
+
+    if has_reuser:
+        return self._attention_via_te(query, key, value, plan, **kwargs)
+    else:
+        return self._attention_via_flash_attn(query, key, value, plan, **kwargs)
+
+def _attention_via_te(self, q, k, v, plan, **kwargs):
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch.attention import DotProductAttention
+
+    bool_mask = self.build_block_causal_mask(plan, device=q.device)
+    bias = self.mask_to_te_bias(bool_mask, dtype=q.dtype)
+
+    # 注意：TE 的 THD 路径要求 q/k/v 是 (1, total, heads, dim) + cu_seqlens
+    q4 = q.unsqueeze(0)
+    k4 = k.unsqueeze(0)
+    v4 = v.unsqueeze(0)
+    cu_q = torch.tensor(plan.cu_seqlens_q, device=q.device, dtype=torch.int32)
+    cu_kv = torch.tensor(plan.cu_seqlens_kv, device=q.device, dtype=torch.int32)
+
+    dpa = DotProductAttention(
+        num_heads=..., gqa_kernel=True,
+        core_attention_bias_type="post_scale_bias",
+    )
+    out = dpa(q4, k4, v4,
+              core_attention_bias=bias,
+              cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv,
+              max_seqlen_q=plan.max_seqlen_q,
+              max_seqlen_kv=plan.max_seqlen_kv,
+              attention_mask_type="padding_causal")
+    return out.squeeze(0)
+
+def _attention_via_flash_attn(self, q, k, v, plan, **kwargs):
+    # 仅 provider-only 场景，FA causal=True 与绝对 causal 等价
+    q, k, v, cu_q, cu_kv, max_q, max_kv = self._prepare_flash_inputs(q, k, v, plan)
+    fa_varlen = _import_flash_attn_varlen()
+    return fa_varlen(q, k, v, cu_q, cu_kv, max_q, max_kv,
+                     causal=True, **kwargs)</code></pre>
+
+<h3>5.5 关键代码：NPU 后端从占位符到实现</h3>
+
+<pre><code># flash_atten_npu.py (替换 PR #6 的 13 行占位符)
+
+from prefix_sharing.backends.flash_atten_base import (
+    FlashAttentionMixin, FlashBackendValidationError,
+)
+from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+from prefix_sharing.backends.base import BackendCapabilities
+
+class NpuFlashAttentionBackend(FlashAttentionMixin):
+    capabilities = BackendCapabilities(
+        name="flash_atten_npu",
+        supports_cpu=False,
+        supports_cuda=False,
+        supports_cann=True,
+        supports_different_q_kv_lengths=True,
+        supports_prefix_last_restore=True,
+        supports_flash_attention=True,
+    )
+
+    def __init__(self):
+        self._torch_ref = TorchReferenceBackend()
+
+    def validate(self, config, model_config=None):
+        config.validate(model_config=model_config)
+        try:
+            from mindspeed.ops import npu_fusion_attention
+        except ImportError as e:
+            raise RuntimeError("NpuFlashAttentionBackend requires MindSpeed") from e
+
+    def apply_rope(self, *args, **kwargs):
+        return self._torch_ref.apply_rope(*args, **kwargs)
+
+    def build_kv(self, *args, **kwargs):
+        return self._torch_ref.build_kv(*args, **kwargs)
+
+    def attention(self, query, key, value, plan, **kwargs):
+        self._validate_plan_for_flash(plan)
+        from mindspeed.ops import npu_fusion_attention
+
+        q, k, v, _, _, _, _ = self._prepare_flash_inputs(
+            query, key, value, plan, attention_mask=kwargs.get("attention_mask")
+        )
+        num_heads = q.shape[1]
+        atten_mask = self.build_block_causal_mask(plan, device=q.device)
+
+        out, _, _, _, _, _, _ = npu_fusion_attention(
+            q, k, v, num_heads, input_layout="TND",
+            atten_mask=atten_mask,
+            actual_seq_qlen=list(plan.cu_seqlens_q[1:]),
+            actual_seq_kvlen=list(plan.cu_seqlens_kv[1:]),
+            scale=kwargs.get("softmax_scale"),
+            keep_prob=1.0 - kwargs.get("dropout_p", 0.0),
+            sparse_mode=0,
+        )
+        return out</code></pre>
+
+<h3>5.6 关键代码：新增显式 mask 测试</h3>
+
+<pre><code># tests/unit_test/test_block_causal_mask.py
+
+def test_block_causal_mask_reuser_sees_full_prefix():
+    """关键断言：reuser Q[0] 能看到 KV 中所有 prefix token 和 suffix[0]。"""
+    plan = _make_plan(batch_sizes=[4, 4], prefix_lens=[0, 2])
+    # sample 0: provider, q_len=4, kv_len=4
+    # sample 1: reuser,   q_len=2, kv_len=4 (prefix=2 + suffix=2)
+
+    mask = FlashAttentionMixin.build_block_causal_mask(plan, device=torch.device("cpu"))
+
+    # sample 1 的 reuser: q 在 mask 行 [4:6], kv 在列 [4:8]
+    reuser_q0_row = mask[4, 4:8]  # q[0] 对所有 KV 的可见性
+    expected = torch.tensor([False, False, False, True])  # P P S0 S1
+    #                                  prefix[0,1] + suffix[0]  可见, suffix[1] 不可见
+    assert torch.equal(reuser_q0_row, expected), \
+        f"Expected [P P S0 !S1], got {reuser_q0_row}"
+
+def test_block_causal_mask_provider_is_standard_causal():
+    plan = _make_plan(batch_sizes=[3], prefix_lens=[0])
+    mask = FlashAttentionMixin.build_block_causal_mask(plan, device=torch.device("cpu"))
+    expected = torch.tril(torch.ones(3, 3, dtype=torch.bool), diagonal=0)
+    expected = ~expected  # True = masked
+    # 我们这里 mask=True 表示屏蔽；tril 上三角=True
+    assert torch.equal(mask, expected)</code></pre>
+
+<div class="card warn">
+这个 mask 单元测试是<strong>最关键的回归保护</strong>。它的存在让 PR #6 类型的错误（误用 FA causal=True）在 CI 阶段就能被发现，而不是依赖 numerical alignment 的 atol 容忍度。
+</div>
+
+<h2 id="roadmap">6. 分阶段落地路线</h2>
+
+<table>
+<tr><th>阶段</th><th>内容</th><th>产物</th><th>验收</th></tr>
+<tr><td><strong>S1</strong>（半天）</td><td>合并 PR #6 工程骨架 + 新增 <code>build_block_causal_mask</code> 静态方法 + 新增 mask 单元测试</td><td>main 上有 factory、mixin、占位 backend、mask 单测全绿</td><td><code>test_block_causal_mask.py</code> 全通过</td></tr>
+<tr><td><strong>S2</strong>（1 天）</td><td>替换 GPU 后端为 TE 实现，保留 flash_attn 兜底分支（仅 provider-only）</td><td><code>flash_atten_gpu.py</code> 双路径</td><td>GPU 集成测试（atol=1e-3）通过；新增 mask 显式断言用例通过</td></tr>
+<tr><td><strong>S3</strong>（1 天）</td><td>实现 NPU 后端 + 镜像测试套件</td><td><code>flash_atten_npu.py</code> 真实实现</td><td>NPU 环境 <code>test_npu_flash_backend.py</code> 全通过</td></tr>
+<tr><td><strong>S4</strong>（半天）</td><td>文档补完 + README 更新 + 性能基线</td><td>更新 README 说明 reuser 必须走 TE/NPU</td><td>三个 backend 在 A100/Ascend 上分别跑通 smoke</td></tr>
+</table>
+
+<h2 id="risks">7. 风险与回滚</h2>
+
+<table>
+<tr><th>风险</th><th>影响</th><th>缓解</th></tr>
+<tr><td>TE 未安装（如 ROCm/老 CUDA）</td><td>GPU 后端无法走 TE 路径</td><td>检测 TE import，若不可用且存在 reuser，抛 <code>FlashBackendValidationError</code> 引导用户切回 <code>torch_ref</code></td></tr>
+<tr><td>npu_fusion_attention 接口在不同 MindSpeed 版本签名不同</td><td>NPU 后端兼容性</td><td>在 <code>validate()</code> 中尝试调用一次空 shape 探测签名</td></tr>
+<tr><td>TE THD 路径在某些 Megatron-LM-core 版本要求 <code>padding_causal</code>，部分版本要求 <code>causal</code></td><td>TE 集成失败</td><td>用 <code>dependency/Megatron-LM-core_v0.12.1</code> 当前快照锁定 <code>padding_causal</code></td></tr>
+<tr><td>用户已基于 PR #6 当前形态写了下游代码</td><td>API 兼容性</td><td>backend 名 <code>"flash_atten_gpu"</code> 不变；只是内部实现切换</td></tr>
+<tr><td>性能：TE 路径在 provider-only 场景可能比 FA 慢</td><td>性能回退</td><td>provider-only 走 FA 兜底；只在 has_reuser 时走 TE</td></tr>
+</table>
+
+<hr>
+<div class="card ok">
+<strong>合并决议建议：</strong>接受 PR #6 的全部工程改动作为基线，在 merge 前/后立即提交一个补丁 PR 完成 §5.3–§5.6 的替换。<br>
+这样既尊重了 PR #6 作者的工程贡献（factory / mixin / 测试 / 文档），又把数学正确性问题以最小侵入方式修复。
+</div>
+
+</body>
+</html>

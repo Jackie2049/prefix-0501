@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Prefix Sharing Flash Attention 适配 — 详细修改方案</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.75; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  h1 { text-align: center; font-size: 30px; color: #58a6ff; margin-bottom: 6px; }
+  h1 span { color: #8b949e; font-size: 15px; font-weight: normal; display: block; margin-top: 4px; }
+  h2 { font-size: 22px; color: #79c0ff; margin: 48px 0 18px; border-left: 4px solid #58a6ff; padding-left: 16px; }
+  h3 { font-size: 17px; color: #d2a8ff; margin: 28px 0 10px; }
+  h4 { font-size: 15px; color: #e6edf3; margin: 18px 0 8px; }
+  p, li { color: #b1bac4; font-size: 14.5px; }
+  p { margin-bottom: 10px; }
+  ul, ol { margin-left: 22px; margin-bottom: 10px; }
+  li { margin-bottom: 3px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; margin: 16px 0; overflow-x: auto; }
+  .card-title { font-size: 15px; color: #58a6ff; font-weight: 600; margin-bottom: 14px; text-align: center; }
+  .caption { text-align: center; color: #8b949e; font-size: 12px; margin-top: 10px; font-style: italic; }
+  svg text { font-family: "PingFang SC", "Microsoft YaHei", monospace; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .tag-new { background: #1f3d1f; color: #3fb950; }
+  .tag-mod { background: #1f2d3d; color: #58a6ff; }
+  .tag-keep { background: #21262d; color: #8b949e; }
+  .tag-del { background: #3d1f1f; color: #f85149; }
+  .note { background: #1c2128; border-left: 3px solid #f0883e; padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0; }
+  .note strong { color: #f0883e; }
+  .hl { color: #f0883e; font-weight: 600; }
+  .hl-g { color: #3fb950; font-weight: 600; }
+  .hl-b { color: #58a6ff; font-weight: 600; }
+  code { background: #1c2128; padding: 1px 5px; border-radius: 3px; font-size: 13px; color: #e6edf3; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13px; }
+  th { background: #21262d; color: #e6edf3; padding: 8px 12px; text-align: left; border-bottom: 2px solid #30363d; }
+  td { padding: 6px 12px; border-bottom: 1px solid #21262d; }
+  .file-header { background: #161b22; border: 1px solid #30363d; border-radius: 8px 8px 0 0; padding: 10px 16px; font-size: 13px; color: #58a6ff; font-weight: 600; font-family: monospace; }
+  .file-body { background: #0d1117; border: 1px solid #30363d; border-top: none; border-radius: 0 0 8px 8px; padding: 16px; font-family: monospace; font-size: 12.5px; color: #e6edf3; white-space: pre; overflow-x: auto; line-height: 1.6; }
+  .file-body .comment { color: #8b949e; }
+  .file-body .keyword { color: #d2a8ff; }
+  .file-body .func { color: #3fb950; }
+  .file-body .str { color: #a5d6ff; }
+  .file-body .added { background: #1f3d1f; display: block; }
+  .file-body .changed { background: #1f2d3d; display: block; }
+  .file-body .removed { background: #3d1f1f; color: #f85149; text-decoration: line-through; display: block; }
+  .diff-label { font-size: 12px; color: #8b949e; margin: 6px 0 2px; font-family: monospace; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Flash Attention 适配详细修改方案
+  <span>基于 Q Padding 策略，逐文件、逐函数、逐行变更说明</span>
+</h1>
+
+
+<!-- ===================== Section 0: Overview ===================== -->
+<h2>0. 改什么、不改什么</h2>
+
+<div class="card">
+  <div class="card-title">修改范围总览</div>
+  <svg viewBox="0 0 900 420" width="900">
+    <defs>
+      <marker id="a-bl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+      <marker id="a-gn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <!-- Legend -->
+    <rect x="30" y="10" width="14" height="14" rx="2" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="50" y="22" fill="#3fb950" font-size="12" font-weight="bold">新增文件/函数</text>
+    <rect x="180" y="10" width="14" height="14" rx="2" fill="#1f2d3d" stroke="#58a6ff"/>
+    <text x="200" y="22" fill="#58a6ff" font-size="12" font-weight="bold">修改现有代码</text>
+    <rect x="340" y="10" width="14" height="14" rx="2" fill="#21262d" stroke="#484f58"/>
+    <text x="360" y="22" fill="#8b949e" font-size="12">不改动</text>
+
+    <!-- File tree -->
+    <text x="30" y="55" fill="#8b949e" font-size="12" font-family="monospace">prefix_sharing/</text>
+
+    <!-- core/ -->
+    <text x="50" y="80" fill="#8b949e" font-size="12" font-family="monospace">core/</text>
+    <rect x="100" y="65" width="130" height="22" rx="4" fill="#21262d" stroke="#484f58"/>
+    <text x="165" y="80" fill="#8b949e" font-size="11" text-anchor="middle" font-family="monospace">config.py</text>
+    <text x="244" y="80" fill="#58a6ff" font-size="11">← +1 字段</text>
+    <rect x="100" y="93" width="130" height="22" rx="4" fill="#21262d" stroke="#484f58"/>
+    <text x="165" y="108" fill="#8b949e" font-size="11" text-anchor="middle" font-family="monospace">planner.py</text>
+    <text x="244" y="108" fill="#8b949e" font-size="11">不改动</text>
+    <rect x="100" y="121" width="130" height="22" rx="4" fill="#21262d" stroke="#484f58"/>
+    <text x="165" y="136" fill="#8b949e" font-size="11" text-anchor="middle" font-family="monospace">prefix_store.py</text>
+    <text x="244" y="136" fill="#8b949e" font-size="11">不改动</text>
+
+    <!-- backends/ -->
+    <text x="50" y="170" fill="#8b949e" font-size="12" font-family="monospace">backends/</text>
+    <rect x="100" y="155" width="160" height="22" rx="4" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="180" y="170" fill="#3fb950" font-size="11" text-anchor="middle" font-family="monospace" font-weight="bold">flash_attn.py ★新建</text>
+    <rect x="100" y="183" width="160" height="22" rx="4" fill="#1f2d3d" stroke="#58a6ff"/>
+    <text x="180" y="198" fill="#58a6ff" font-size="11" text-anchor="middle" font-family="monospace">cuda_ref.py 改写</text>
+    <rect x="100" y="211" width="160" height="22" rx="4" fill="#21262d" stroke="#484f58"/>
+    <text x="180" y="226" fill="#8b949e" font-size="11" text-anchor="middle" font-family="monospace">torch_ref.py 不改</text>
+    <rect x="100" y="239" width="160" height="22" rx="4" fill="#1f2d3d" stroke="#58a6ff"/>
+    <text x="180" y="254" fill="#58a6ff" font-size="11" text-anchor="middle" font-family="monospace">base.py +1 字段</text>
+
+    <!-- integrations/ -->
+    <text x="50" y="288" fill="#8b949e" font-size="12" font-family="monospace">integrations/</text>
+    <rect x="100" y="273" width="180" height="22" rx="4" fill="#1f2d3d" stroke="#58a6ff"/>
+    <text x="190" y="288" fill="#58a6ff" font-size="11" text-anchor="middle" font-family="monospace">megatron_runtime.py 改动</text>
+    <rect x="100" y="301" width="180" height="22" rx="4" fill="#1f2d3d" stroke="#58a6ff"/>
+    <text x="190" y="316" fill="#58a6ff" font-size="11" text-anchor="middle" font-family="monospace">verl_mcore.py 改动</text>
+    <rect x="100" y="329" width="180" height="22" rx="4" fill="#1f2d3d" stroke="#58a6ff"/>
+    <text x="190" y="344" fill="#58a6ff" font-size="11" text-anchor="middle" font-family="monospace">context.py 改动</text>
+
+    <!-- Right side: summary -->
+    <rect x="380" y="50" width="490" height="300" rx="10" fill="#161b22" stroke="#30363d"/>
+    <text x="625" y="75" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="bold">变更统计</text>
+
+    <text x="400" y="105" fill="#3fb950" font-size="13">新建 1 个文件：backends/flash_attn.py</text>
+    <text x="400" y="130" fill="#58a6ff" font-size="13">修改 5 个文件：config, base, cuda_ref, megatron_runtime, verl_mcore, context</text>
+    <text x="400" y="155" fill="#8b949e" font-size="13">不动 3 个文件：planner, prefix_store, torch_ref</text>
+
+    <line x1="400" y1="170" x2="850" y2="170" stroke="#30363d"/>
+    <text x="400" y="195" fill="#f0883e" font-size="13" font-weight="bold">不动 Megatron dependency/attention.py 的 hook 代码</text>
+    <text x="400" y="215" fill="#8b949e" font-size="12">Hook 只看 backend 返回值，不关心内部实现</text>
+    <text x="400" y="235" fill="#8b949e" font-size="12">torch_ref.py 保留作为数值验证的 reference</text>
+
+    <line x1="400" y1="255" x2="850" y2="255" stroke="#30363d"/>
+    <text x="400" y="280" fill="#e6edf3" font-size="13" font-weight="bold">核心策略：Q Padding</text>
+    <text x="400" y="300" fill="#8b949e" font-size="12">Reuser 的 Q 前面填零 → Q 和 KV 等长 → FA causal=True</text>
+    <text x="400" y="320" fill="#8b949e" font-size="12">最后裁剪掉 pad 位置的输出</text>
+    <text x="400" y="340" fill="#8b949e" font-size="12">build_kv() 逻辑完全复用 TorchReferenceBackend</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 1: Data Flow ===================== -->
+<h2>1. 完整数据流：改动前 vs 改动后</h2>
+
+<div class="card">
+  <div class="card-title">改动前（torch_ref 逐行循环）</div>
+  <svg viewBox="0 0 900 220" width="900">
+    <rect x="0" y="0" width="900" height="220" rx="8" fill="#0d1117"/>
+
+    <text x="20" y="25" fill="#8b949e" font-size="12" font-family="monospace">megatron_runtime.py → TorchReferenceBackend</text>
+
+    <rect x="30" y="40" width="120" height="40" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="90" y="58" fill="#e6edf3" font-size="10" text-anchor="middle">apply_positioned</text>
+    <text x="90" y="72" fill="#e6edf3" font-size="10" text-anchor="middle">_rope()</text>
+    <line x1="150" y1="60" x2="180" y2="60" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+
+    <rect x="180" y="40" width="120" height="40" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="240" y="65" fill="#e6edf3" font-size="11" text-anchor="middle">build_kv()</text>
+    <line x1="300" y1="60" x2="330" y2="60" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+
+    <rect x="330" y="35" width="200" height="50" rx="6" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+    <text x="430" y="55" fill="#f85149" font-size="11" text-anchor="middle" font-weight="bold">attention() 逐行循环</text>
+    <text x="430" y="72" fill="#8b949e" font-size="9" text-anchor="middle">for row: einsum → softmax → einsum</text>
+    <text x="430" y="82" fill="#8b949e" font-size="9" text-anchor="middle">O(N²) 显存，Python 慢</text>
+    <line x1="530" y1="60" x2="560" y2="60" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+
+    <rect x="560" y="40" width="100" height="40" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="610" y="58" fill="#e6edf3" font-size="10" text-anchor="middle">reshape</text>
+    <text x="610" y="72" fill="#e6edf3" font-size="10" text-anchor="middle">(t, 1, h)</text>
+    <line x1="660" y1="60" x2="690" y2="60" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+
+    <rect x="690" y="40" width="120" height="40" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="750" y="65" fill="#e6edf3" font-size="11" text-anchor="middle">linear_proj()</text>
+
+    <!-- Q/KV shapes -->
+    <text x="20" y="110" fill="#8b949e" font-size="11" font-family="monospace">Q shape: [sum(kept_lengths_q), num_heads, head_dim]    ← Reuser 只有 suffix 长</text>
+    <text x="20" y="130" fill="#8b949e" font-size="11" font-family="monospace">K shape: [sum(expanded_lengths_kv), num_kv_heads, head_dim] ← 拼接后全长</text>
+    <text x="20" y="150" fill="#f85149" font-size="11" font-family="monospace">问题: Q≠KV 长，每行 (q_len, kv_len, q_start) 不同，无法 batch</text>
+  </svg>
+</div>
+
+<div class="card">
+  <div class="card-title">改动后（FlashAttentionBackend + Q Padding）</div>
+  <svg viewBox="0 0 900 280" width="900">
+    <rect x="0" y="0" width="900" height="280" rx="8" fill="#0d1117"/>
+    <defs>
+      <marker id="a-g2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <text x="20" y="25" fill="#3fb950" font-size="12" font-family="monospace">megatron_runtime.py → FlashAttentionBackend</text>
+
+    <rect x="30" y="40" width="120" height="40" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="90" y="58" fill="#e6edf3" font-size="10" text-anchor="middle">apply_positioned</text>
+    <text x="90" y="72" fill="#e6edf3" font-size="10" text-anchor="middle">_rope()</text>
+    <line x1="150" y1="60" x2="180" y2="60" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+
+    <rect x="180" y="40" width="120" height="40" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="240" y="65" fill="#e6edf3" font-size="11" text-anchor="middle">build_kv()</text>
+    <text x="240" y="78" fill="#8b949e" font-size="9" text-anchor="middle">复用 torch_ref</text>
+    <line x1="300" y1="60" x2="330" y2="60" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a-g2)"/>
+
+    <!-- NEW: pad_query -->
+    <rect x="330" y="35" width="130" height="50" rx="6" fill="#1f3d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="395" y="52" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">pad_query() ★</text>
+    <text x="395" y="67" fill="#8b949e" font-size="9" text-anchor="middle">Reuser Q 前填零</text>
+    <text x="395" y="79" fill="#8b949e" font-size="9" text-anchor="middle">→ Q 和 KV 等长</text>
+    <line x1="460" y1="60" x2="490" y2="60" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a-g2)"/>
+
+    <!-- NEW: flash attention -->
+    <rect x="490" y="30" width="200" height="60" rx="6" fill="#1f3d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="590" y="50" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">flash_attn_varlen_func ★</text>
+    <text x="590" y="65" fill="#8b949e" font-size="9" text-anchor="middle">causal=True, 一次 kernel 全部处理</text>
+    <text x="590" y="78" fill="#3fb950" font-size="9" text-anchor="middle">O(N) 显存，CUDA 快</text>
+    <line x1="690" y1="60" x2="720" y2="60" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a-g2)"/>
+
+    <!-- NEW: trim output -->
+    <rect x="720" y="35" width="130" height="50" rx="6" fill="#1f3d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="785" y="52" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">trim_output() ★</text>
+    <text x="785" y="67" fill="#8b949e" font-size="9" text-anchor="middle">去掉 pad 位置</text>
+    <text x="785" y="79" fill="#8b949e" font-size="9" text-anchor="middle">恢复原始 Q 长度</text>
+
+    <!-- Shapes -->
+    <text x="20" y="120" fill="#3fb950" font-size="11" font-family="monospace">pad 后: Q shape = [sum(expanded_lengths_kv), num_heads, head_dim]</text>
+    <text x="20" y="140" fill="#3fb950" font-size="11" font-family="monospace">        K shape = [sum(expanded_lengths_kv), num_kv_heads, head_dim]</text>
+    <text x="20" y="160" fill="#3fb950" font-size="11" font-family="monospace">        cu_seqlens_q = cu_seqlens_kv  ← 等长！FA causal=True 直接正确</text>
+
+    <!-- Step-by-step -->
+    <rect x="30" y="180" width="840" height="85" rx="8" fill="#161b22" stroke="#30363d"/>
+    <text x="450" y="200" fill="#e6edf3" font-size="12" text-anchor="middle" font-weight="bold">FlashAttentionBackend.attention() 内部 4 步</text>
+    <text x="60" y="222" fill="#3fb950" font-size="11">1. pad_query()     → Reuser Q 前面填 prefix_len 个零向量，拼回 packed tensor</text>
+    <text x="60" y="240" fill="#3fb950" font-size="11">2. flash_attn_varlen_func(q, k, v, cu_seqlens_q=cu_seqlens_kv, cu_seqlens_k=cu_seqlens_kv, causal=True)</text>
+    <text x="60" y="258" fill="#3fb950" font-size="11">3. trim_output()   → 按 kept_lengths_q 裁剪，Reuser 只保留 suffix 部分</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 2: Per-File Changes ===================== -->
+<h2>2. 逐文件详细修改</h2>
+
+
+<!-- ===== File 1: flash_attn.py (NEW) ===== -->
+<h3>2.1 <span class="tag tag-new">新建</span> backends/flash_attn.py</h3>
+
+<p>这是核心新文件，实现 <code>FlashAttentionBackend</code>，包含 3 个新方法。</p>
+
+<div class="file-header">prefix_sharing/backends/flash_attn.py  ★ 新建文件</div>
+<div class="file-body"><span class="keyword">"""Flash Attention backend for prefix-sharing.
+
+Reuses TorchReferenceBackend.build_kv() for KV expansion,
+then pads Reuser Q tokens to match KV length and calls
+flash_attn_varlen_func with causal=True.
+"""</span>
+
+<span class="keyword">from</span> __future__ <span class="keyword">import</span> annotations
+
+<span class="keyword">from</span> typing <span class="keyword">import</span> Any
+
+<span class="keyword">from</span> prefix_sharing.backends.base <span class="keyword">import</span> BackendCapabilities
+<span class="keyword">from</span> prefix_sharing.backends.torch_ref <span class="keyword">import</span> (
+    TorchReferenceBackend,
+    _split_packed,
+)
+<span class="keyword">from</span> prefix_sharing.core.planner <span class="keyword">import</span> PrefixSharingPlan
+
+
+<span class="keyword">class</span> <span class="func">FlashAttentionBackend</span>(TorchReferenceBackend):
+<span class="added">    capabilities = BackendCapabilities(</span>
+<span class="added">        name="flash_attn",</span>
+<span class="added">        supports_cpu=False,</span>
+<span class="added">        supports_cuda=True,</span>
+<span class="added">        supports_cann=False,</span>
+<span class="added">        supports_different_q_kv_lengths=False,  <span class="comment"># pad 后 Q=KV 等长</span></span>
+<span class="added">        supports_prefix_last_restore=True,</span>
+<span class="added">    )</span>
+
+    <span class="comment"># build_kv() 完全继承 TorchReferenceBackend，不 override</span>
+    <span class="comment"># Provider 存 KV，Reuser torch.cat 拼接 — 逻辑不变</span>
+
+<span class="added">    <span class="keyword">def</span> <span class="func">pad_query</span>(</span>
+<span class="added">        self,</span>
+<span class="added">        query: Any,</span>
+<span class="added">        plan: PrefixSharingPlan,</span>
+<span class="added">    ) -> tuple[Any, list[int]]:</span>
+<span class="added">        <span class="comment">"""Pad Reuser Q with zeros so Q length == KV length.</span></span>
+<span class="added"><span class="comment">        Returns (padded_query, padded_cu_seqlens_q).</span></span>
+<span class="added"><span class="comment">        """</span></span>
+<span class="added">        torch = _torch()</span>
+<span class="added">        rows = _split_packed(query, plan.kept_lengths_q)</span>
+<span class="added">        padded_rows = []</span>
+<span class="added">        padded_lengths = []</span>
+<span class="added">        <span class="keyword">for</span> i, row <span class="keyword">in</span> enumerate(rows):</span>
+<span class="added">            <span class="keyword">if</span> plan.is_reuser(i):</span>
+<span class="added">                prefix_len = plan.prefix_lens[i]</span>
+<span class="added">                pad_shape = (prefix_len,) + row.shape[1:]</span>
+<span class="added">                zeros = torch.zeros(pad_shape, dtype=row.dtype, device=row.device)</span>
+<span class="added">                padded_rows.append(torch.cat([zeros, row], dim=0))</span>
+<span class="added">                padded_lengths.append(prefix_len + row.shape[0])</span>
+<span class="added">            <span class="keyword">else</span>:</span>
+<span class="added">                padded_rows.append(row)</span>
+<span class="added">                padded_lengths.append(row.shape[0])</span>
+<span class="added">        <span class="keyword">return</span> torch.cat(padded_rows, dim=0), padded_lengths</span>
+
+<span class="added">    <span class="keyword">def</span> <span class="func">trim_output</span>(</span>
+<span class="added">        self,</span>
+<span class="added">        output: Any,</span>
+<span class="added">        plan: PrefixSharingPlan,</span>
+<span class="added">    ) -> Any:</span>
+<span class="added">        <span class="comment">"""Remove padded positions from Flash Attention output.</span></span>
+<span class="added"><span class="comment">        Reuser rows: drop prefix_len positions from the front.</span></span>
+<span class="added"><span class="comment">        Provider rows: keep all positions unchanged.</span></span>
+<span class="added"><span class="comment">        """</span></span>
+<span class="added">        torch = _torch()</span>
+<span class="added">        padded_lengths = plan.expanded_lengths_kv  <span class="comment"># pad 后 Q 的长度 = KV 长度</span></span>
+<span class="added">        rows = _split_packed(output, padded_lengths)</span>
+<span class="added">        trimmed = []</span>
+<span class="added">        <span class="keyword">for</span> i, row <span class="keyword">in</span> enumerate(rows):</span>
+<span class="added">            <span class="keyword">if</span> plan.is_reuser(i):</span>
+<span class="added">                offset = plan.prefix_lens[i]</span>
+<span class="added">                trimmed.append(row[offset:])  <span class="comment"># 丢弃 pad 部分</span></span>
+<span class="added">            <span class="keyword">else</span>:</span>
+<span class="added">                trimmed.append(row)</span>
+<span class="added">        <span class="keyword">return</span> torch.cat(trimmed, dim=0)</span>
+
+<span class="added">    <span class="keyword">def</span> <span class="func">attention</span>(</span>
+<span class="added">        self,</span>
+<span class="added">        query: Any,</span>
+<span class="added">        key: Any,</span>
+<span class="added">        value: Any,</span>
+<span class="added">        plan: PrefixSharingPlan,</span>
+<span class="added">        **_: Any,</span>
+<span class="added">    ) -> Any:</span>
+<span class="added">        <span class="keyword">from</span> flash_attn <span class="keyword">import</span> flash_attn_varlen_func</span>
+<span class="added">        torch = _torch()</span>
+
+<span class="added">        <span class="comment"># Step 1: Pad Q</span></span>
+<span class="added">        padded_q, padded_lengths = self.pad_query(query, plan)</span>
+
+<span class="added">        <span class="comment"># Step 2: Build cu_seqlens (Q 和 KV 等长)</span></span>
+<span class="added">        cu_seqlens = torch.tensor(</span>
+<span class="added">            [0] + list(_cumsum(padded_lengths)),</span>
+<span class="added">            dtype=torch.int32, device=padded_q.device,</span>
+<span class="added">        )</span>
+<span class="added">        max_seqlen = max(padded_lengths) <span class="keyword">if</span> padded_lengths <span class="keyword">else</span> 0</span>
+
+<span class="added">        <span class="comment"># Step 3: Flash Attention (causal=True, Q=KV 等长)</span></span>
+<span class="added">        output = flash_attn_varlen_func(</span>
+<span class="added">            q=padded_q.unsqueeze(1),   <span class="comment"># [total, 1, heads, dim]</span></span>
+<span class="added">            k=key.unsqueeze(1),</span>
+<span class="added">            v=value.unsqueeze(1),</span>
+<span class="added">            cu_seqlens_q=cu_seqlens,</span>
+<span class="added">            cu_seqlens_k=cu_seqlens,   <span class="comment"># 同一个，Q=KV 等长</span></span>
+<span class="added">            max_seqlen_q=max_seqlen,</span>
+<span class="added">            max_seqlen_k=max_seqlen,</span>
+<span class="added">            causal=True,</span>
+<span class="added">        ).squeeze(1)  <span class="comment"># [total, heads, dim]</span></span>
+
+<span class="added">        <span class="comment"># Step 4: Trim padded positions</span></span>
+<span class="added">        <span class="keyword">return</span> self.trim_output(output, plan)</span>
+
+<span class="added"><span class="keyword">def</span> <span class="func">_cumsum</span>(lengths):</span>
+<span class="added">    total = 0</span>
+<span class="added">    <span class="keyword">for</span> l <span class="keyword">in</span> lengths:</span>
+<span class="added">        total += l</span>
+<span class="added">        <span class="keyword">yield</span> total</span></div>
+
+<div class="caption">约 90 行。build_kv() 完全继承 TorchReferenceBackend，只新增 pad_query / trim_output / attention 三个方法</div>
+
+
+<!-- ===== File 2: base.py ===== -->
+<h3>2.2 <span class="tag tag-mod">修改</span> backends/base.py — 新增 1 个 capability 字段</h3>
+
+<div class="file-header">prefix_sharing/backends/base.py  (2 行改动)</div>
+<div class="file-body"><span class="keyword">@dataclass</span>(frozen=<span class="keyword">True</span>)
+<span class="keyword">class</span> <span class="func">BackendCapabilities</span>:
+    name: str
+    supports_cpu: bool
+    supports_cuda: bool
+    supports_cann: bool
+    supports_different_q_kv_lengths: bool
+    supports_prefix_last_restore: bool
+    supports_fused_rope: bool = False
+    supports_context_parallel: bool = False
+    supports_pipeline_parallel: bool = False
+<span class="added">    supports_flash_attn: bool = False       <span class="comment"># ★ 新增</span></span></div>
+
+
+<!-- ===== File 3: config.py ===== -->
+<h3>2.3 <span class="tag tag-mod">修改</span> core/config.py — 新增 backend 选项</h3>
+
+<div class="file-header">prefix_sharing/core/config.py  (3 行改动)</div>
+<div class="file-body"><span class="keyword">@dataclass</span>(frozen=<span class="keyword">True</span>)
+<span class="keyword">class</span> <span class="func">PrefixSharingConfig</span>:
+    enable_prefix_sharing: bool = False
+    detector: str = "trie"
+<span class="removed">    backend: str = "torch_ref"                     <span class="comment"># 删除旧行</span></span>
+<span class="added">    backend: str = "flash_attn"                    <span class="comment"># ★ 默认改为 flash_attn</span></span>
+    min_prefix_len: int = 1
+    min_group_size: int = 2
+    boundary_strategy: str = "prefix_last_restore"</div>
+
+
+<!-- ===== File 4: cuda_ref.py ===== -->
+<h3>2.4 <span class="tag tag-mod">改写</span> backends/cuda_ref.py</h3>
+
+<div class="file-header">prefix_sharing/backends/cuda_ref.py  (改写)</div>
+<div class="file-body"><span class="removed"><span class="keyword">class</span> <span class="func">CudaReferenceBackend</span>(TorchReferenceBackend):</span>
+<span class="removed">    <span class="keyword">pass</span></span>
+
+<span class="added"><span class="keyword">def</span> <span class="func">create_backend</span>(name: str = "flash_attn"):</span>
+<span class="added">    <span class="comment">"""Factory: pick the right backend by name and runtime availability."""</span></span>
+<span class="added">    <span class="keyword">if</span> name == "flash_attn":</span>
+<span class="added">        <span class="keyword">try</span>:</span>
+<span class="added">            <span class="keyword">from</span> prefix_sharing.backends.flash_attn <span class="keyword">import</span> FlashAttentionBackend</span>
+<span class="added">            <span class="keyword">return</span> FlashAttentionBackend()</span>
+<span class="added">        <span class="keyword">except</span> (ImportError, ModuleNotFoundError):</span>
+<span class="added">            <span class="keyword">pass</span>  <span class="comment"># fallback to torch_ref</span></span>
+<span class="added">    <span class="keyword">from</span> prefix_sharing.backends.torch_ref <span class="keyword">import</span> TorchReferenceBackend</span>
+<span class="added">    <span class="keyword">return</span> TorchReferenceBackend()</span></div>
+
+
+<!-- ===== File 5: context.py ===== -->
+<h3>2.5 <span class="tag tag-mod">修改</span> integrations/context.py — 存储 cu_seqlens tensor</h3>
+
+<div class="file-header">prefix_sharing/integrations/context.py  (新增字段)</div>
+<div class="file-body"><span class="keyword">@dataclass</span>
+<span class="keyword">class</span> <span class="func">PrefixSharingRuntimeContext</span>:
+    prefix_sharing_plan: PrefixSharingPlan
+    store: PrefixKVStore
+    backend: Any | None = None
+    kept_position_ids: Any | None = None
+    prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
+<span class="added">    cu_seqlens_kv_tensor: Any | None = None  <span class="comment"># ★ 新增：KV 的 cu_seqlens as torch tensor</span></span></div>
+
+
+<!-- ===== File 6: megatron_runtime.py ===== -->
+<h3>2.6 <span class="tag tag-mod">修改</span> integrations/megatron_runtime.py — 选择 backend + 传参</h3>
+
+<div class="file-header">prefix_sharing/integrations/megatron_runtime.py  (关键改动)</div>
+<div class="file-body"><span class="keyword">def</span> <span class="func">maybe_run_prefix_sharing_attention</span>(attention_module, query, key, value, ...):
+
+    ctx = current_prefix_sharing_context()
+    <span class="keyword">if</span> ctx <span class="keyword">is None</span>:
+        <span class="keyword">return None</span>
+
+    <span class="comment"># ... RoPE 处理不变 ...</span>
+
+    backend = ctx.backend
+<span class="changed">    <span class="comment"># ★ backend 可能是 FlashAttentionBackend</span></span>
+<span class="changed">    <span class="comment"># ★ build_kv() 在两个 backend 中行为相同（继承）</span></span>
+    expanded_key, expanded_value = backend.build_kv(
+        key, value, ctx.store, ctx.prefix_sharing_plan,
+        layer_id=layer_id, tp_rank=tp_rank,
+    )
+
+<span class="changed">    <span class="comment"># ★ attention() 内部自动处理 pad / FA / trim</span></span>
+    core_attn_out = backend.attention(
+        query, expanded_key, expanded_value,
+        ctx.prefix_sharing_plan,
+        attention_mask=attention_mask,
+    )
+    core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+    <span class="keyword">return</span> attention_module.linear_proj(core_attn_out)</div>
+
+<div class="note">
+  <strong>关键</strong>：megatron_runtime.py 本身逻辑几乎不变！<code>build_kv()</code> 和 <code>attention()</code> 的调用签名完全相同。差别只在 backend 实例不同——<code>FlashAttentionBackend.attention()</code> 内部多了 pad/FA/trim 三步。
+</div>
+
+
+<!-- ===== File 7: verl_mcore.py ===== -->
+<h3>2.7 <span class="tag tag-mod">修改</span> integrations/verl_mcore.py — 用 factory 创建 backend</h3>
+
+<div class="file-header">prefix_sharing/integrations/verl_mcore.py  (2 处改动)</div>
+<div class="file-body"><span class="comment"># 改动 1: import create_backend</span>
+<span class="removed"><span class="keyword">from</span> prefix_sharing.backends.torch_ref <span class="keyword">import</span> TorchReferenceBackend</span>
+<span class="added"><span class="keyword">from</span> prefix_sharing.backends.cuda_ref <span class="keyword">import</span> create_backend</span>
+
+<span class="comment"># 改动 2: build_prefix_sharing_micro_batch 中创建 backend</span>
+<span class="removed">    backend=backend <span class="keyword">or</span> TorchReferenceBackend(),</span>
+<span class="added">    backend=backend <span class="keyword">or</span> create_backend(config.backend),  <span class="comment"># ★ 根据 config 选择</span></span></div>
+
+
+<!-- ===================== Section 3: Data Flow Diagram ===================== -->
+<h2>3. 运行时数据流：Q Padding 逐步图解</h2>
+
+<div class="card">
+  <div class="card-title">以 prefix_len=2 的 Reuser 为例，逐步展示 tensor 变化</div>
+  <svg viewBox="0 0 920 580" width="920">
+    <defs>
+      <marker id="a-dn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- ===== Step 1: build_kv ===== -->
+    <text x="20" y="20" fill="#58a6ff" font-size="13" font-weight="bold">Step 1: build_kv() — 与 torch_ref 完全相同，不改动</text>
+    <text x="20" y="38" fill="#8b949e" font-size="11">Provider 存 KV → Store，Reuser 拼接 Provider 前缀 + 自己后缀</text>
+
+    <g transform="translate(20, 48)">
+      <!-- Provider -->
+      <text x="0" y="15" fill="#3fb950" font-size="11" font-weight="bold">Provider K:</text>
+      <rect x="80" y="0" width="40" height="22" rx="3" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="100" y="15" fill="#58a6ff" font-size="9" text-anchor="middle">k0</text>
+      <rect x="120" y="0" width="40" height="22" rx="3" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="140" y="15" fill="#58a6ff" font-size="9" text-anchor="middle">k1</text>
+      <rect x="160" y="0" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="180" y="15" fill="#3fb950" font-size="9" text-anchor="middle">k2</text>
+      <rect x="200" y="0" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="220" y="15" fill="#3fb950" font-size="9" text-anchor="middle">k3</text>
+      <text x="260" y="15" fill="#8b949e" font-size="10">len=4</text>
+      <text x="310" y="15" fill="#3fb950" font-size="10">→ 存入 Store</text>
+
+      <!-- Reuser -->
+      <text x="0" y="48" fill="#f85149" font-size="11" font-weight="bold">Reuser K:</text>
+      <rect x="80" y="33" width="40" height="22" rx="3" fill="#1f3d5c" stroke="#58a6ff" stroke-dasharray="3"/>
+      <text x="100" y="48" fill="#58a6ff" font-size="9" text-anchor="middle">k0</text>
+      <rect x="120" y="33" width="40" height="22" rx="3" fill="#1f3d5c" stroke="#58a6ff" stroke-dasharray="3"/>
+      <text x="140" y="48" fill="#58a6ff" font-size="9" text-anchor="middle">k1</text>
+      <text x="165" y="48" fill="#8b949e" font-size="12">+</text>
+      <rect x="180" y="33" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="200" y="48" fill="#d2a8ff" font-size="9" text-anchor="middle">k4</text>
+      <rect x="220" y="33" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="240" y="48" fill="#d2a8ff" font-size="9" text-anchor="middle">k5</text>
+      <text x="280" y="48" fill="#8b949e" font-size="10">= cat → len=4</text>
+    </g>
+
+    <line x1="20" y1="105" x2="900" y2="105" stroke="#30363d" stroke-dasharray="4"/>
+
+    <!-- ===== Step 2: pad_query ===== -->
+    <text x="20" y="125" fill="#3fb950" font-size="13" font-weight="bold">Step 2: pad_query() — Reuser Q 前面填零 ★ 新逻辑</text>
+
+    <g transform="translate(20, 135)">
+      <!-- Before -->
+      <text x="0" y="15" fill="#8b949e" font-size="11">Before:</text>
+      <text x="55" y="30" fill="#3fb950" font-size="11">P Q:</text>
+      <rect x="90" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="110" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q0</text>
+      <rect x="130" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="150" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q1</text>
+      <rect x="170" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="190" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q2</text>
+      <rect x="210" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="230" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q3</text>
+      <text x="265" y="30" fill="#8b949e" font-size="10">len=4</text>
+
+      <text x="55" y="55" fill="#f85149" font-size="11">R Q:</text>
+      <rect x="90" y="40" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="110" y="55" fill="#d2a8ff" font-size="9" text-anchor="middle">q4</text>
+      <rect x="130" y="40" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="150" y="55" fill="#d2a8ff" font-size="9" text-anchor="middle">q5</text>
+      <text x="185" y="55" fill="#f85149" font-size="10">len=2 ← 比KV短!</text>
+
+      <!-- Arrow -->
+      <text x="400" y="40" fill="#f0883e" font-size="20">→</text>
+
+      <!-- After -->
+      <text x="440" y="15" fill="#8b949e" font-size="11">After:</text>
+      <text x="495" y="30" fill="#3fb950" font-size="11">P Q:</text>
+      <rect x="530" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="550" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q0</text>
+      <rect x="570" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="590" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q1</text>
+      <rect x="610" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="630" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q2</text>
+      <rect x="650" y="15" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="670" y="30" fill="#3fb950" font-size="9" text-anchor="middle">q3</text>
+      <text x="705" y="30" fill="#8b949e" font-size="10">len=4 不变</text>
+
+      <text x="495" y="55" fill="#f85149" font-size="11">R Q:</text>
+      <rect x="530" y="40" width="40" height="22" rx="3" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="3"/>
+      <text x="550" y="53" fill="#f85149" font-size="8" text-anchor="middle">0</text>
+      <rect x="570" y="40" width="40" height="22" rx="3" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="3"/>
+      <text x="590" y="53" fill="#f85149" font-size="8" text-anchor="middle">0</text>
+      <rect x="610" y="40" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="630" y="55" fill="#d2a8ff" font-size="9" text-anchor="middle">q4</text>
+      <rect x="650" y="40" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="670" y="55" fill="#d2a8ff" font-size="9" text-anchor="middle">q5</text>
+      <text x="705" y="55" fill="#3fb950" font-size="10" font-weight="bold">len=4 = KV len ✓</text>
+    </g>
+
+    <line x1="20" y1="195" x2="900" y2="195" stroke="#30363d" stroke-dasharray="4"/>
+
+    <!-- ===== Step 3: flash_attn_varlen_func ===== -->
+    <text x="20" y="215" fill="#3fb950" font-size="13" font-weight="bold">Step 3: flash_attn_varlen_func(causal=True) — 标准 FA causal mask 自然正确</text>
+
+    <g transform="translate(20, 228)">
+      <!-- Provider segment -->
+      <rect x="0" y="0" width="200" height="100" rx="6" fill="#161b22" stroke="#3fb950"/>
+      <text x="100" y="18" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">Provider segment</text>
+      <text x="15" y="35" fill="#8b949e" font-size="9">KV: 0 1 2 3</text>
+      <text x="15" y="50" fill="#8b949e" font-size="9">Q:  q0 q1 q2 q3</text>
+      <text x="15" y="68" fill="#3fb950" font-size="9">causal: Q[i] 看 KV[0..i]</text>
+      <text x="15" y="83" fill="#3fb950" font-size="9">→ 标准 causal，完全正确</text>
+      <text x="15" y="95" fill="#8b949e" font-size="9">输出: [o0, o1, o2, o3] 全保留</text>
+
+      <!-- Reuser segment -->
+      <rect x="230" y="0" width="460" height="100" rx="6" fill="#161b22" stroke="#f85149"/>
+      <text x="460" y="18" fill="#f85149" font-size="11" text-anchor="middle" font-weight="bold">Reuser segment (Q 已 pad)</text>
+      <text x="245" y="35" fill="#8b949e" font-size="9">KV:   k0  k1  k4  k5    ← Provider前缀 + 自己后缀</text>
+      <text x="245" y="50" fill="#8b949e" font-size="9">Q:    0   0   q4  q5    ← pad零 + 自己suffix</text>
+      <text x="245" y="68" fill="#3fb950" font-size="9">causal=True:  FA 看到的是</text>
+      <text x="245" y="83" fill="#3fb950" font-size="9">  Q[0]=0 → 看 KV[0]      pad输出，丢弃</text>
+      <text x="245" y="95" fill="#3fb950" font-size="9">  Q[1]=0 → 看 KV[0,1]    pad输出，丢弃</text>
+
+      <text x="520" y="68" fill="#58a6ff" font-size="9">  Q[2]=q4 → 看 KV[0,1,2]  ★ 正确！看到前缀k0,k1 + 自己k4</text>
+      <text x="520" y="83" fill="#58a6ff" font-size="9">  Q[3]=q5 → 看 KV[0..3]   ★ 正确！看到全部</text>
+      <text x="520" y="95" fill="#8b949e" font-size="9">输出: [pad, pad, o4, o5]</text>
+    </g>
+
+    <line x1="20" y1="340" x2="900" y2="340" stroke="#30363d" stroke-dasharray="4"/>
+
+    <!-- ===== Step 4: trim_output ===== -->
+    <text x="20" y="360" fill="#3fb950" font-size="13" font-weight="bold">Step 4: trim_output() — 去掉 pad 位置的输出</text>
+
+    <g transform="translate(20, 370)">
+      <text x="0" y="15" fill="#8b949e" font-size="11">FA 输出 (packed):</text>
+      <text x="20" y="35" fill="#3fb950" font-size="11">P:</text>
+      <rect x="50" y="20" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="70" y="35" fill="#3fb950" font-size="9" text-anchor="middle">o0</text>
+      <rect x="90" y="20" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="110" y="35" fill="#3fb950" font-size="9" text-anchor="middle">o1</text>
+      <rect x="130" y="20" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="150" y="35" fill="#3fb950" font-size="9" text-anchor="middle">o2</text>
+      <rect x="170" y="20" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="190" y="35" fill="#3fb950" font-size="9" text-anchor="middle">o3</text>
+      <text x="225" y="35" fill="#3fb950" font-size="10">全保留 ✓</text>
+
+      <text x="20" y="60" fill="#f85149" font-size="11">R:</text>
+      <rect x="50" y="45" width="40" height="22" rx="3" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="3"/>
+      <text x="70" y="58" fill="#f85149" font-size="8" text-anchor="middle">pad</text>
+      <rect x="90" y="45" width="40" height="22" rx="3" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="3"/>
+      <text x="110" y="58" fill="#f85149" font-size="8" text-anchor="middle">pad</text>
+      <rect x="130" y="45" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="150" y="60" fill="#d2a8ff" font-size="9" text-anchor="middle">o4</text>
+      <rect x="170" y="45" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="190" y="60" fill="#d2a8ff" font-size="9" text-anchor="middle">o5</text>
+      <text x="225" y="55" fill="#f0883e" font-size="20">→</text>
+
+      <!-- Trimmed -->
+      <text x="20" y="88" fill="#8b949e" font-size="11">trim 后:</text>
+      <text x="20" y="108" fill="#3fb950" font-size="11">P:</text>
+      <rect x="50" y="93" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="70" y="108" fill="#3fb950" font-size="9" text-anchor="middle">o0</text>
+      <rect x="90" y="93" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="110" y="108" fill="#3fb950" font-size="9" text-anchor="middle">o1</text>
+      <rect x="130" y="93" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="150" y="108" fill="#3fb950" font-size="9" text-anchor="middle">o2</text>
+      <rect x="170" y="93" width="40" height="22" rx="3" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="190" y="108" fill="#3fb950" font-size="9" text-anchor="middle">o3</text>
+
+      <text x="20" y="133" fill="#f85149" font-size="11">R:</text>
+      <rect x="50" y="118" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="70" y="133" fill="#d2a8ff" font-size="9" text-anchor="middle">o4</text>
+      <rect x="90" y="118" width="40" height="22" rx="3" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="110" y="133" fill="#d2a8ff" font-size="9" text-anchor="middle">o5</text>
+      <text x="145" y="133" fill="#3fb950" font-size="10" font-weight="bold">= 最终结果</text>
+    </g>
+
+    <!-- Final result -->
+    <rect x="350" y="375" width="460" height="65" rx="8" fill="#1f2d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="580" y="395" fill="#3fb950" font-size="12" text-anchor="middle" font-weight="bold">最终输出 = torch_ref 逐行计算的输出（数值等价）</text>
+    <text x="580" y="413" fill="#8b949e" font-size="11" text-anchor="middle">shape: [sum(kept_lengths_q), num_heads, head_dim]</text>
+    <text x="580" y="430" fill="#8b949e" font-size="11" text-anchor="middle">后面的 reshape + linear_proj 逻辑不变</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 4: Gradient Safety ===================== -->
+<h2>4. 梯度安全性分析</h2>
+
+<div class="card">
+  <div class="card-title">Q Padding 不影响梯度正确性</div>
+  <svg viewBox="0 0 900 200" width="900">
+    <rect x="0" y="0" width="900" height="200" rx="8" fill="#0d1117"/>
+
+    <text x="20" y="25" fill="#e6edf3" font-size="13" font-weight="bold">Q Padding 引入的新操作及其梯度行为：</text>
+
+    <rect x="30" y="40" width="400" height="40" rx="6" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="230" y="58" fill="#3fb950" font-size="11" text-anchor="middle">torch.zeros(prefix_len, heads, dim) → 梯度 = None</text>
+    <text x="230" y="73" fill="#8b949e" font-size="10" text-anchor="middle">零向量不需要梯度，backward 自动忽略</text>
+
+    <rect x="30" y="90" width="400" height="40" rx="6" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="230" y="108" fill="#3fb950" font-size="11" text-anchor="middle">torch.cat([zeros, suffix_Q]) → 梯度拆分回各输入</text>
+    <text x="230" y="123" fill="#8b949e" font-size="10" text-anchor="middle">suffix_Q 的梯度正确回传，zeros 的梯度被丢弃</text>
+
+    <rect x="30" y="140" width="400" height="40" rx="6" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="230" y="158" fill="#3fb950" font-size="11" text-anchor="middle">flash_attn_varlen_func → 原生 autograd 支持</text>
+    <text x="230" y="173" fill="#8b949e" font-size="10" text-anchor="middle">expanded KV 中的 Provider KV 梯度正确回传</text>
+
+    <rect x="470" y="60" width="400" height="120" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="2"/>
+    <text x="670" y="85" fill="#f0883e" font-size="13" text-anchor="middle" font-weight="bold">trim_output 的梯度</text>
+    <text x="490" y="110" fill="#e6edf3" font-size="11">trim 用的是 tensor 切片（view 操作）</text>
+    <text x="490" y="130" fill="#e6edf3" font-size="11">backward 时梯度 = 在 pad 位置填零后 cat 回去</text>
+    <text x="490" y="150" fill="#3fb950" font-size="11">pad 位置的梯度自然为零（因为输出被丢弃）</text>
+    <text x="490" y="170" fill="#3fb950" font-size="11">suffix 位置的梯度完整保留</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 5: Numerical Equivalence Test ===================== -->
+<h2>5. 数值等价性验证方案</h2>
+
+<div class="card">
+  <div class="card-title">测试策略：torch_ref vs flash_attn 对比</div>
+  <svg viewBox="0 0 900 180" width="900">
+    <rect x="0" y="0" width="900" height="180" rx="8" fill="#0d1117"/>
+
+    <text x="20" y="25" fill="#e6edf3" font-size="13">在 tests/ 中新增 test_flash_attn_backend.py：</text>
+
+    <text x="20" y="52" fill="#58a6ff" font-size="12" font-weight="bold">1. 构造随机 Q, K, V + PrefixSharingPlan（含 Provider 和 Reuser）</text>
+    <text x="20" y="72" fill="#58a6ff" font-size="12" font-weight="bold">2. 分别用 TorchReferenceBackend 和 FlashAttentionBackend 计算 attention 输出</text>
+    <text x="20" y="92" fill="#58a6ff" font-size="12" font-weight="bold">3. 验证 torch.allclose(out_torch, out_flash, atol=1e-3) ← 允许浮点误差</text>
+    <text x="20" y="112" fill="#58a6ff" font-size="12" font-weight="bold">4. 验证 backward 梯度等价：分别 .backward(loss)，对比 K/V 的梯度</text>
+
+    <rect x="500" y="130" width="380" height="35" rx="6" fill="#3d1f1f" stroke="#f85149"/>
+    <text x="690" y="152" fill="#f85149" font-size="12" text-anchor="middle">注意: FA 的 softmax 实现与 torch_ref 可能有 ~1e-3 差异</text>
+    <text x="20" y="152" fill="#8b949e" font-size="12">fp16 下差异可能更大，需要实际测试确定阈值</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 6: Summary ===================== -->
+<h2>6. 总结</h2>
+
+<div class="card">
+  <table>
+    <tr><th>文件</th><th>改动类型</th><th>改动量</th><th>核心内容</th></tr>
+    <tr><td><code>backends/flash_attn.py</code></td><td><span class="tag tag-new">新建</span></td><td>~90 行</td><td>FlashAttentionBackend：pad_query + flash_attn_varlen_func + trim_output</td></tr>
+    <tr><td><code>backends/base.py</code></td><td><span class="tag tag-mod">+1 行</span></td><td>1 行</td><td>BackendCapabilities 新增 supports_flash_attn</td></tr>
+    <tr><td><code>backends/cuda_ref.py</code></td><td><span class="tag tag-mod">改写</span></td><td>~15 行</td><td>空壳改为 create_backend() 工厂函数</td></tr>
+    <tr><td><code>core/config.py</code></td><td><span class="tag tag-mod">+1 行</span></td><td>1 行</td><td>默认 backend 从 "torch_ref" 改为 "flash_attn"</td></tr>
+    <tr><td><code>integrations/context.py</code></td><td><span class="tag tag-mod">+1 行</span></td><td>1 行</td><td>PrefixSharingRuntimeContext 新增 cu_seqlens_kv_tensor 字段</td></tr>
+    <tr><td><code>integrations/megatron_runtime.py</code></td><td><span class="tag tag-mod">微调</span></td><td>~5 行</td><td>backend 选择逻辑 + cu_seqlens 传参</td></tr>
+    <tr><td><code>integrations/verl_mcore.py</code></td><td><span class="tag tag-mod">2 行</span></td><td>2 行</td><td>import 改为 create_backend + 使用 config.backend</td></tr>
+    <tr><td><code>backends/torch_ref.py</code></td><td><span class="tag tag-keep">不动</span></td><td>0</td><td>保留作为 reference 和 fallback</td></tr>
+    <tr><td><code>core/planner.py</code></td><td><span class="tag tag-keep">不动</span></td><td>0</td><td>cu_seqlens_q/kv 已完备</td></tr>
+    <tr><td><code>core/prefix_store.py</code></td><td><span class="tag tag-keep">不动</span></td><td>0</td><td>KV store 不 detach</td></tr>
+    <tr><td><code>dependency/.../attention.py</code></td><td><span class="tag tag-keep">不动</span></td><td>0</td><td>Hook 不关心 backend 内部实现</td></tr>
+  </table>
+</div>
+
+<div class="note">
+  <strong>核心设计原则</strong>：所有改动都在 <code>backends/</code> 层和 <code>integrations/</code> 层。核心语义层（<code>core/</code>）和 Megatron hook 层（<code>attention.py</code>）完全不动。<code>FlashAttentionBackend</code> 继承 <code>TorchReferenceBackend</code>，只 override <code>attention()</code>，新增 <code>pad_query()</code> 和 <code>trim_output()</code>。如果 flash_attn 不可用，自动 fallback 到 torch_ref。
+</div>
+
+</div>
+</body>
+</html>

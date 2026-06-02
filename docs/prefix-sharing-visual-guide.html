@@ -1,0 +1,1137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Prefix Sharing 可视化图解</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.7; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  h1 { text-align: center; font-size: 32px; color: #58a6ff; margin-bottom: 8px; }
+  h1 span { color: #8b949e; font-size: 16px; font-weight: normal; display: block; margin-top: 4px; }
+  h2 { font-size: 24px; color: #79c0ff; margin: 48px 0 20px; border-left: 4px solid #58a6ff; padding-left: 16px; }
+  h3 { font-size: 18px; color: #d2a8ff; margin: 28px 0 12px; }
+  p, li { color: #b1bac4; font-size: 15px; }
+  p { margin-bottom: 12px; }
+  ul { margin-left: 24px; margin-bottom: 12px; }
+  li { margin-bottom: 4px; }
+  .diagram-card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 28px; margin: 20px 0; overflow-x: auto; }
+  .diagram-title { font-size: 16px; color: #58a6ff; font-weight: 600; margin-bottom: 16px; text-align: center; }
+  .caption { text-align: center; color: #8b949e; font-size: 13px; margin-top: 12px; font-style: italic; }
+  svg text { font-family: "PingFang SC", "Microsoft YaHei", monospace; }
+  .step { display: flex; gap: 16px; margin: 16px 0; align-items: flex-start; }
+  .step-num { flex-shrink: 0; width: 36px; height: 36px; border-radius: 50%; background: #1f6feb; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; }
+  .step-body { flex: 1; }
+  .step-body strong { color: #e6edf3; }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 16px 0; }
+  .compare-card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 20px; }
+  .compare-card h4 { font-size: 15px; margin-bottom: 8px; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .tag-problem { background: #3d1f1f; color: #f85149; }
+  .tag-solution { background: #1f3d1f; color: #3fb950; }
+  .tag-key { background: #1f2d3d; color: #58a6ff; }
+  .highlight { color: #f0883e; font-weight: 600; }
+  .note { background: #1c2128; border-left: 3px solid #f0883e; padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0; }
+  .note strong { color: #f0883e; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+  th { background: #21262d; color: #e6edf3; padding: 10px 14px; text-align: left; border-bottom: 2px solid #30363d; }
+  td { padding: 8px 14px; border-bottom: 1px solid #21262d; }
+  td:first-child { color: #e6edf3; font-weight: 500; }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; margin: 12px 0; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .legend-color { width: 16px; height: 16px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Prefix Sharing 可视化图解
+  <span>Prompt 前缀复用 — 训练引擎 Attention 与梯度改造 & Flash Attention 适配</span>
+</h1>
+
+<!-- ===================== Section 1: Problem ===================== -->
+<h2>1. 问题：为什么需要 Prefix Sharing</h2>
+
+<div class="diagram-card">
+  <div class="diagram-title">RL 训练中同 Batch 内多条轨迹共享 Prompt 前缀</div>
+  <svg viewBox="0 0 900 320" width="900">
+    <!-- Batch input -->
+    <text x="20" y="30" fill="#8b949e" font-size="13">同一个 micro-batch 的 4 条序列：</text>
+
+    <!-- Seq 0 (Provider) -->
+    <rect x="60" y="60" width="780" height="40" rx="6" fill="#1c2128" stroke="#30363d"/>
+    <rect x="60" y="60" width="300" height="40" rx="6" fill="#1f3d5c" stroke="#58a6ff"/>
+    <text x="210" y="85" fill="#58a6ff" font-size="13" text-anchor="middle">Prompt 前缀 (300 tokens)</text>
+    <rect x="360" y="60" width="180" height="40" fill="#2d1f3d" stroke="#d2a8ff"/>
+    <text x="450" y="85" fill="#d2a8ff" font-size="13" text-anchor="middle">Response A</text>
+    <rect x="540" y="60" width="300" height="40" rx="0 6 6 0" fill="#3d2d1f" stroke="#f0883e"/>
+    <text x="690" y="85" fill="#f0883e" font-size="13" text-anchor="middle">Response A' (续)</text>
+    <text x="30" y="85" fill="#3fb950" font-size="13" font-weight="bold">P</text>
+
+    <!-- Seq 1 (Reuser) -->
+    <rect x="60" y="120" width="780" height="40" rx="6" fill="#1c2128" stroke="#30363d"/>
+    <rect x="60" y="120" width="300" height="40" fill="#1f3d5c" stroke="#58a6ff" stroke-dasharray="4"/>
+    <text x="210" y="145" fill="#58a6ff" font-size="13" text-anchor="middle">Prompt 前缀 (300 tokens)</text>
+    <rect x="360" y="120" width="200" height="40" fill="#2d1f3d" stroke="#d2a8ff"/>
+    <text x="460" y="145" fill="#d2a8ff" font-size="13" text-anchor="middle">Response B</text>
+    <rect x="560" y="120" width="280" height="40" rx="0 6 6 0" fill="#3d2d1f" stroke="#f0883e"/>
+    <text x="700" y="145" fill="#f0883e" font-size="13" text-anchor="middle">Response B' (续)</text>
+    <text x="30" y="145" fill="#f85149" font-size="13" font-weight="bold">R1</text>
+
+    <!-- Seq 2 (Reuser) -->
+    <rect x="60" y="180" width="780" height="40" rx="6" fill="#1c2128" stroke="#30363d"/>
+    <rect x="60" y="180" width="300" height="40" fill="#1f3d5c" stroke="#58a6ff" stroke-dasharray="4"/>
+    <text x="210" y="205" fill="#58a6ff" font-size="13" text-anchor="middle">Prompt 前缀 (300 tokens)</text>
+    <rect x="360" y="180" width="160" height="40" fill="#2d1f3d" stroke="#d2a8ff"/>
+    <text x="440" y="205" fill="#d2a8ff" font-size="13" text-anchor="middle">Response C</text>
+    <rect x="520" y="180" width="320" height="40" rx="0 6 6 0" fill="#3d2d1f" stroke="#f0883e"/>
+    <text x="680" y="205" fill="#f0883e" font-size="13" text-anchor="middle">Response C' (续)</text>
+    <text x="30" y="205" fill="#f85149" font-size="13" font-weight="bold">R2</text>
+
+    <!-- Seq 3 (Standalone) -->
+    <rect x="60" y="240" width="780" height="40" rx="6" fill="#1c2128" stroke="#30363d"/>
+    <rect x="60" y="240" width="200" height="40" rx="6" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="160" y="265" fill="#3fb950" font-size="13" text-anchor="middle">Prompt 2 (不同)</text>
+    <rect x="260" y="240" width="580" height="40" rx="0 6 6 0" fill="#3d2d1f" stroke="#f0883e"/>
+    <text x="550" y="265" fill="#f0883e" font-size="13" text-anchor="middle">Response D</text>
+    <text x="30" y="265" fill="#8b949e" font-size="13" font-weight="bold">S</text>
+
+    <!-- Legend -->
+    <rect x="60" y="300" width="14" height="14" rx="2" fill="#1f3d5c" stroke="#58a6ff"/>
+    <text x="80" y="312" fill="#8b949e" font-size="12">共享前缀 (重复计算!)</text>
+    <rect x="230" y="300" width="14" height="14" rx="2" fill="#2d1f3d" stroke="#d2a8ff"/>
+    <text x="250" y="312" fill="#8b949e" font-size="12">独立后缀</text>
+    <rect x="370" y="300" width="14" height="14" rx="2" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="390" y="312" fill="#8b949e" font-size="12">独立序列</text>
+
+    <!-- P/R labels -->
+    <text x="500" y="312" fill="#3fb950" font-size="12">P=Provider</text>
+    <text x="600" y="312" fill="#f85149" font-size="12">R=Reuser</text>
+    <text x="700" y="312" fill="#8b949e" font-size="12">S=Standalone</text>
+  </svg>
+  <div class="caption">P(Provider) 正常计算；R(Reuser) 复用 P 的前缀 KV；S(Standalone) 无共享，正常计算</div>
+</div>
+
+<p><span class="tag tag-problem">问题</span> 在 agentic RL 的 tree/step 模式下，同 batch 内 60-80% 的 token 是共享前缀，<span class="highlight">前缀 KV 重复计算浪费大量算力</span>。</p>
+<p><span class="tag tag-solution">方案</span> Provider 只计算一次前缀 KV，Reuser 注入（inject）该 KV，只计算自己的后缀。</p>
+
+<!-- ===================== Section 2: Current Architecture ===================== -->
+<h2>2. 当前方案：Attention 与梯度改造详解</h2>
+
+<h3>2.1 整体数据流（4 步）</h3>
+
+<div class="diagram-card">
+  <div class="diagram-title">Prefix Sharing 完整数据流</div>
+  <svg viewBox="0 0 900 520" width="900">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+      <marker id="arrow-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+      <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+
+    <!-- Step 1: Detect -->
+    <rect x="30" y="20" width="200" height="70" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+    <text x="130" y="48" fill="#58a6ff" font-size="14" text-anchor="middle" font-weight="bold">Step 1: Detect</text>
+    <text x="130" y="68" fill="#8b949e" font-size="12" text-anchor="middle">Trie 前缀检测</text>
+    <text x="130" y="82" fill="#8b949e" font-size="11" text-anchor="middle">找出 P→R 复用关系</text>
+
+    <!-- Step 2: Plan -->
+    <rect x="290" y="20" width="200" height="70" rx="10" fill="#1c2128" stroke="#d2a8ff" stroke-width="2"/>
+    <text x="390" y="48" fill="#d2a8ff" font-size="14" text-anchor="middle" font-weight="bold">Step 2: Plan</text>
+    <text x="390" y="68" fill="#8b949e" font-size="12" text-anchor="middle">生成 PrefixSharingPlan</text>
+    <text x="390" y="82" fill="#8b949e" font-size="11" text-anchor="middle">cu_seqlens, offsets, ranges</text>
+
+    <!-- Step 3: Forward -->
+    <rect x="550" y="20" width="200" height="70" rx="10" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+    <text x="650" y="48" fill="#3fb950" font-size="14" text-anchor="middle" font-weight="bold">Step 3: Forward</text>
+    <text x="650" y="68" fill="#8b949e" font-size="12" text-anchor="middle">裁剪 + KV 注入 + Attn</text>
+    <text x="650" y="82" fill="#8b949e" font-size="11" text-anchor="middle">Hook 拦截 Megatron Attn</text>
+
+    <!-- Step 4: Restore -->
+    <rect x="550" y="110" width="200" height="70" rx="10" fill="#1c2128" stroke="#f0883e" stroke-width="2"/>
+    <text x="650" y="138" fill="#f0883e" font-size="14" text-anchor="middle" font-weight="bold">Step 4: Restore</text>
+    <text x="650" y="158" fill="#8b949e" font-size="12" text-anchor="middle">Prefix-Last Logprob</text>
+    <text x="650" y="172" fill="#8b949e" font-size="11" text-anchor="middle">恢复 Reuser 首 token logprob</text>
+
+    <!-- Arrows -->
+    <line x1="230" y1="55" x2="290" y2="55" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow)"/>
+    <line x1="490" y1="55" x2="550" y2="55" stroke="#d2a8ff" stroke-width="2" marker-end="url(#arrow)"/>
+    <line x1="750" y1="85" x2="750" y2="110" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-g)"/>
+
+    <!-- Detailed: Step 3 inside Megatron Attention -->
+    <rect x="30" y="210" width="840" height="290" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.5" stroke-dasharray="6"/>
+    <text x="450" y="234" fill="#58a6ff" font-size="14" text-anchor="middle" font-weight="bold">Step 3 展开：Megatron Attention Hook 内部流程（逐层）</text>
+
+    <!-- Sub-flow -->
+    <!-- QKV Proj -->
+    <rect x="50" y="250" width="120" height="50" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="110" y="272" fill="#e6edf3" font-size="12" text-anchor="middle">QKV Projection</text>
+    <text x="110" y="289" fill="#8b949e" font-size="10" text-anchor="middle">Megatron 正常执行</text>
+
+    <!-- Hook intercept -->
+    <rect x="220" y="250" width="120" height="50" rx="6" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+    <text x="280" y="272" fill="#f85149" font-size="12" text-anchor="middle" font-weight="bold">Hook 拦截!</text>
+    <text x="280" y="289" fill="#8b949e" font-size="10" text-anchor="middle">跳过剩余 Megatron</text>
+
+    <line x1="170" y1="275" x2="220" y2="275" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- RoPE -->
+    <rect x="390" y="250" width="120" height="50" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="450" y="272" fill="#e6edf3" font-size="12" text-anchor="middle">RoPE</text>
+    <text x="450" y="289" fill="#8b949e" font-size="10" text-anchor="middle">绝对位置偏移</text>
+
+    <line x1="340" y1="275" x2="390" y2="275" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- KV Expand -->
+    <rect x="560" y="250" width="130" height="50" rx="6" fill="#1f2d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="625" y="272" fill="#3fb950" font-size="12" text-anchor="middle" font-weight="bold">KV 扩展</text>
+    <text x="625" y="289" fill="#8b949e" font-size="10" text-anchor="middle">Store + Load + Cat</text>
+
+    <line x1="510" y1="275" x2="560" y2="275" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- Attn compute -->
+    <rect x="740" y="250" width="110" height="50" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="795" y="272" fill="#e6edf3" font-size="12" text-anchor="middle">Attention</text>
+    <text x="795" y="289" fill="#8b949e" font-size="10" text-anchor="middle">逐行 softmax</text>
+
+    <line x1="690" y1="275" x2="740" y2="275" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arrow-g)"/>
+
+    <!-- KV Detail diagram -->
+    <text x="60" y="330" fill="#d2a8ff" font-size="13" font-weight="bold">KV 扩展详解（核心！）</text>
+
+    <!-- Provider row -->
+    <text x="60" y="355" fill="#3fb950" font-size="12" font-weight="bold">Provider P:</text>
+    <rect x="150" y="340" width="180" height="24" rx="4" fill="#1f3d5c" stroke="#58a6ff"/>
+    <text x="240" y="356" fill="#58a6ff" font-size="11" text-anchor="middle">Key/Value (前缀 + 后缀)</text>
+    <text x="360" y="356" fill="#3fb950" font-size="12">→ 存入 PrefixKVStore</text>
+
+    <!-- Reuser row -->
+    <text x="60" y="395" fill="#f85149" font-size="12" font-weight="bold">Reuser R:</text>
+    <rect x="150" y="380" width="80" height="24" rx="4" fill="#1f3d5c" stroke="#58a6ff" stroke-dasharray="4"/>
+    <text x="190" y="396" fill="#58a6ff" font-size="10" text-anchor="middle">Provider KV</text>
+    <text x="242" y="396" fill="#8b949e" font-size="16">+</text>
+    <rect x="260" y="380" width="70" height="24" rx="4" fill="#2d1f3d" stroke="#d2a8ff"/>
+    <text x="295" y="396" fill="#d2a8ff" font-size="10" text-anchor="middle">Own suffix</text>
+    <text x="350" y="396" fill="#f85149" font-size="12">= torch.cat → Expanded KV</text>
+
+    <!-- Gradient flow -->
+    <text x="60" y="440" fill="#f0883e" font-size="13" font-weight="bold">梯度流 (Autograd)</text>
+    <text x="60" y="460" fill="#8b949e" font-size="12">Loss → R 的 Attention 输出 → softmax → Expanded KV (torch.cat)</text>
+    <text x="60" y="478" fill="#8b949e" font-size="12">→ Provider 的前缀 KV（<tspan fill="#3fb950" font-weight="bold">不 detach!</tspan> 梯度自然回传累加）</text>
+
+    <!-- backward arrow -->
+    <path d="M 795 300 L 795 320 L 625 320 L 625 300" stroke="#f85149" stroke-width="1.5" fill="none" stroke-dasharray="4" marker-end="url(#arrow)"/>
+    <text x="720" y="318" fill="#f85149" font-size="10">backward</text>
+  </svg>
+</div>
+
+<h3>2.2 Attention 计算详解：自定义 Causal Mask</h3>
+
+<div class="diagram-card">
+  <div class="diagram-title">当前方案：Reuser 的 Attention Mask（逐行计算）</div>
+  <svg viewBox="0 0 800 360" width="800">
+    <!-- Provider mask -->
+    <text x="20" y="25" fill="#3fb950" font-size="14" font-weight="bold">Provider（标准 Causal）</text>
+    <text x="30" y="50" fill="#8b949e" font-size="11">Q positions: 0 1 2 3 4 5 6 7</text>
+
+    <!-- Grid Provider -->
+    <g transform="translate(30,60)">
+      <!-- Header -->
+      <text x="-5" y="10" fill="#8b949e" font-size="9" text-anchor="end">KV→</text>
+      <text x="20" y="-8" fill="#8b949e" font-size="9">0</text>
+      <text x="50" y="-8" fill="#8b949e" font-size="9">1</text>
+      <text x="80" y="-8" fill="#8b949e" font-size="9">2</text>
+      <text x="110" y="-8" fill="#8b949e" font-size="9">3</text>
+      <text x="140" y="-8" fill="#8b949e" font-size="9">4</text>
+      <text x="170" y="-8" fill="#8b949e" font-size="9">5</text>
+      <text x="200" y="-8" fill="#8b949e" font-size="9">6</text>
+      <text x="230" y="-8" fill="#8b949e" font-size="9">7</text>
+
+      <!-- Row labels -->
+      <text x="-8" y="18" fill="#8b949e" font-size="9" text-anchor="end">0</text>
+      <text x="-8" y="38" fill="#8b949e" font-size="9" text-anchor="end">1</text>
+      <text x="-8" y="58" fill="#8b949e" font-size="9" text-anchor="end">2</text>
+      <text x="-8" y="78" fill="#8b949e" font-size="9" text-anchor="end">3</text>
+      <text x="-8" y="98" fill="#8b949e" font-size="9" text-anchor="end">4</text>
+      <text x="-8" y="118" fill="#8b949e" font-size="9" text-anchor="end">5</text>
+      <text x="-8" y="138" fill="#8b949e" font-size="9" text-anchor="end">6</text>
+      <text x="-8" y="158" fill="#8b949e" font-size="9" text-anchor="end">7</text>
+
+      <!-- Q↓ label -->
+      <text x="-25" y="90" fill="#8b949e" font-size="9" text-anchor="middle" transform="rotate(-90,-25,90)">Q ↓</text>
+
+      <!-- Mask cells: 1=can attend, 0=masked -->
+      <!-- Row 0: 10000000 -->
+      <rect x="5" y="5" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="65" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="95" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="125" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="155" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="185" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <!-- Row 1: 11000000 -->
+      <rect x="5" y="35" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="35" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="65" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="95" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="125" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="155" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="185" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <!-- Row 2: 11100000 -->
+      <rect x="5" y="65" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="65" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="65" y="65" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="95" y="65" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="125" y="65" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="155" y="65" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="185" y="65" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="65" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <!-- Row 3 -->
+      <rect x="5" y="95" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="95" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="65" y="95" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="95" y="95" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="125" y="95" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="155" y="95" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="185" y="95" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="95" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <!-- Row 4 -->
+      <rect x="5" y="125" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="125" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="65" y="125" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="95" y="125" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="125" y="125" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="125" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="185" y="125" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="125" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <!-- Row 5 -->
+      <rect x="5" y="155" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="155" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="65" y="155" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="95" y="155" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="125" y="155" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="155" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="185" y="155" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="155" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <!-- Row 6 -->
+      <rect x="5" y="185" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="185" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="65" y="185" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="95" y="185" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="125" y="185" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="185" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="185" y="185" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="215" y="185" width="24" height="24" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <!-- Row 7 -->
+      <rect x="5" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="35" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="65" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="95" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="125" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="185" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="215" y="215" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+    </g>
+
+    <!-- Reuser mask -->
+    <text x="450" y="25" fill="#f85149" font-size="14" font-weight="bold">Reuser（prefix_len=4, suffix_len=4）</text>
+    <text x="460" y="50" fill="#8b949e" font-size="11">Q positions: 4 5 6 7   （从 prefix_len 开始！）</text>
+    <text x="460" y="65" fill="#8b949e" font-size="11">KV positions: 0 1 2 3 4 5 6 7 （包含注入的前缀 KV）</text>
+
+    <!-- Grid Reuser -->
+    <g transform="translate(460,80)">
+      <!-- Header -->
+      <text x="20" y="-8" fill="#58a6ff" font-size="9">0</text>
+      <text x="50" y="-8" fill="#58a6ff" font-size="9">1</text>
+      <text x="80" y="-8" fill="#58a6ff" font-size="9">2</text>
+      <text x="110" y="-8" fill="#58a6ff" font-size="9">3</text>
+      <text x="140" y="-8" fill="#d2a8ff" font-size="9">4</text>
+      <text x="170" y="-8" fill="#d2a8ff" font-size="9">5</text>
+      <text x="200" y="-8" fill="#d2a8ff" font-size="9">6</text>
+      <text x="230" y="-8" fill="#d2a8ff" font-size="9">7</text>
+      <text x="67" y="-18" fill="#58a6ff" font-size="10">← 注入的 Provider KV →</text>
+      <text x="185" y="-18" fill="#d2a8ff" font-size="10">← Own Suffix KV →</text>
+
+      <!-- Q labels -->
+      <text x="-8" y="18" fill="#d2a8ff" font-size="9" text-anchor="end">4</text>
+      <text x="-8" y="48" fill="#d2a8ff" font-size="9" text-anchor="end">5</text>
+      <text x="-8" y="78" fill="#d2a8ff" font-size="9" text-anchor="end">6</text>
+      <text x="-8" y="108" fill="#d2a8ff" font-size="9" text-anchor="end">7</text>
+
+      <text x="-25" y="60" fill="#d2a8ff" font-size="9" text-anchor="middle" transform="rotate(-90,-25,60)">Q ↓</text>
+
+      <!-- Row Q=4: KV 0,1,2,3,4 visible (kv_pos <= 4) -->
+      <rect x="5" y="5" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="35" y="5" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="65" y="5" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="95" y="5" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="125" y="5" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="5" width="24" height="30" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="185" y="5" width="24" height="30" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="5" width="24" height="30" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+
+      <!-- Row Q=5: KV 0-5 -->
+      <rect x="5" y="40" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="35" y="40" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="65" y="40" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="95" y="40" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="125" y="40" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="40" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="185" y="40" width="24" height="30" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+      <rect x="215" y="40" width="24" height="30" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+
+      <!-- Row Q=6 -->
+      <rect x="5" y="75" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="35" y="75" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="65" y="75" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="95" y="75" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="125" y="75" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="75" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="185" y="75" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="215" y="75" width="24" height="30" fill="#1c2128" stroke="#30363d" stroke-width="0.5"/>
+
+      <!-- Row Q=7 -->
+      <rect x="5" y="110" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="35" y="110" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="65" y="110" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="95" y="110" width="24" height="30" fill="#1f3d5c" stroke="#58a6ff" stroke-width="0.5"/>
+      <rect x="125" y="110" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="155" y="110" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="185" y="110" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+      <rect x="215" y="110" width="24" height="30" fill="#1f3d1f" stroke="#3fb950" stroke-width="0.5"/>
+    </g>
+
+    <!-- Legend -->
+    <g transform="translate(460, 260)">
+      <rect x="0" y="0" width="16" height="16" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="22" y="13" fill="#58a6ff" font-size="12">前缀 KV 区域（Provider 注入）</text>
+      <rect x="0" y="24" width="16" height="16" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="22" y="37" fill="#3fb950" font-size="12">后缀 KV 区域（Causal 可见）</text>
+      <rect x="0" y="48" width="16" height="16" fill="#1c2128" stroke="#30363d"/>
+      <text x="22" y="61" fill="#8b949e" font-size="12">Masked（不可见）</text>
+    </g>
+
+    <!-- Key insight box -->
+    <rect x="30" y="300" width="740" height="45" rx="8" fill="#1f2d1f" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="400" y="320" fill="#3fb950" font-size="13" text-anchor="middle" font-weight="bold">关键：Reuser 的 Q 从位置 prefix_len 开始，mask = (kv_pos ≤ q_pos)，前缀 KV 全部可见</text>
+    <text x="400" y="338" fill="#8b949e" font-size="11" text-anchor="middle">这就是为什么不能用标准 Flash Attention causal=True — 它假设 Q 从位置 0 开始</text>
+  </svg>
+</div>
+
+<h3>2.3 梯度流详解</h3>
+
+<div class="diagram-card">
+  <div class="diagram-title">梯度回传：永不 detach</div>
+  <svg viewBox="0 0 800 280" width="800">
+    <defs>
+      <marker id="arrow-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f85149"/></marker>
+    </defs>
+
+    <!-- Forward direction label -->
+    <text x="400" y="20" fill="#58a6ff" font-size="12" text-anchor="middle">→ Forward →</text>
+    <text x="400" y="270" fill="#f85149" font-size="12" text-anchor="middle">← Backward (梯度) ←</text>
+
+    <!-- Provider forward -->
+    <rect x="50" y="40" width="160" height="50" rx="8" fill="#1f3d1f" stroke="#3fb950"/>
+    <text x="130" y="60" fill="#3fb950" font-size="12" text-anchor="middle" font-weight="bold">Provider P</text>
+    <text x="130" y="78" fill="#8b949e" font-size="11" text-anchor="middle">完整 Forward → K_P, V_P</text>
+
+    <!-- KV Store -->
+    <rect x="280" y="40" width="140" height="50" rx="8" fill="#1c2128" stroke="#f0883e" stroke-width="2"/>
+    <text x="350" y="60" fill="#f0883e" font-size="12" text-anchor="middle" font-weight="bold">PrefixKVStore</text>
+    <text x="350" y="78" fill="#8b949e" font-size="11" text-anchor="middle">store(K_P, V_P) 不 detach!</text>
+
+    <!-- Reuser 1 -->
+    <rect x="500" y="30" width="240" height="36" rx="8" fill="#3d1f1f" stroke="#f85149"/>
+    <text x="620" y="48" fill="#f85149" font-size="11" text-anchor="middle">Reuser R1: Expanded_K = cat(K_P[:prefix], K_R1)</text>
+    <text x="620" y="62" fill="#8b949e" font-size="10" text-anchor="middle">→ Attention → Output_R1</text>
+
+    <!-- Reuser 2 -->
+    <rect x="500" y="76" width="240" height="36" rx="8" fill="#3d1f1f" stroke="#f85149"/>
+    <text x="620" y="94" fill="#f85149" font-size="11" text-anchor="middle">Reuser R2: Expanded_K = cat(K_P[:prefix], K_R2)</text>
+    <text x="620" y="108" fill="#8b949e" font-size="10" text-anchor="middle">→ Attention → Output_R2</text>
+
+    <!-- Reuser N -->
+    <rect x="500" y="122" width="240" height="36" rx="8" fill="#3d1f1f" stroke="#f85149"/>
+    <text x="620" y="140" fill="#f85149" font-size="11" text-anchor="middle">Reuser RN: Expanded_K = cat(K_P[:prefix], K_RN)</text>
+    <text x="620" y="154" fill="#8b949e" font-size="10" text-anchor="middle">→ Attention → Output_RN</text>
+
+    <!-- Arrows: Provider -> Store -->
+    <line x1="210" y1="65" x2="280" y2="65" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow-g)"/>
+    <!-- Store -> Reusers -->
+    <line x1="420" y1="55" x2="500" y2="48" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arrow-r)"/>
+    <line x1="420" y1="65" x2="500" y2="94" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arrow-r)"/>
+    <line x1="420" y1="75" x2="500" y2="140" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arrow-r)"/>
+
+    <!-- Gradient backward arrows -->
+    <text x="130" y="180" fill="#e6edf3" font-size="13" font-weight="bold">梯度回传路径：</text>
+
+    <rect x="50" y="195" width="700" height="60" rx="8" fill="#0d1117" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4"/>
+    <text x="400" y="215" fill="#f85149" font-size="12" text-anchor="middle">∂L/∂K_P = ∂L/∂Out_R1 · ∂Out_R1/∂K_P + ∂L/∂Out_R2 · ∂Out_R2/∂K_P + ... (∀ Reuser)</text>
+    <text x="400" y="238" fill="#8b949e" font-size="12" text-anchor="middle">PyTorch autograd 通过 torch.cat 自动累加：同一 K_P 被 N 个 Reuser 引用 → 梯度从 N 条路径汇聚</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 3: Flash Attention ===================== -->
+<h2>3. Flash Attention 适配：问题与方案</h2>
+
+<h3>3.1 为什么当前方案不兼容 Flash Attention</h3>
+
+<p>要理解这个问题，需要搞清楚三件事：</p>
+<ul>
+  <li><strong>Flash Attention 的 <code>causal=True</code> 到底做了什么</strong></li>
+  <li><strong>Prefix Sharing 的 Reuser 实际需要什么 mask</strong></li>
+  <li><strong>两者为什么对不上</strong></li>
+</ul>
+
+<!-- ===== Diagram 1: FA causal=True internals ===== -->
+<div class="diagram-card">
+  <div class="diagram-title">第一步：理解 Flash Attention causal=True 的内部行为</div>
+  <svg viewBox="0 0 920 340" width="920">
+    <defs>
+      <marker id="a-bl2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <!-- Left: Standard sequence -->
+    <text x="30" y="22" fill="#58a6ff" font-size="14" font-weight="bold">标准场景：一条完整序列 "A B C D"</text>
+    <text x="30" y="40" fill="#8b949e" font-size="12">Q[i] 和 KV[j] 属于同一条序列，位置一一对应</text>
+
+    <g transform="translate(50, 55)">
+      <!-- Sequence bar -->
+      <rect x="0" y="-5" width="360" height="16" rx="3" fill="#21262d" stroke="#484f58"/>
+      <text x="45" y="7" fill="#58a6ff" font-size="10" text-anchor="middle">A(pos0)</text>
+      <text x="135" y="7" fill="#58a6ff" font-size="10" text-anchor="middle">B(pos1)</text>
+      <text x="225" y="7" fill="#58a6ff" font-size="10" text-anchor="middle">C(pos2)</text>
+      <text x="315" y="7" fill="#58a6ff" font-size="10" text-anchor="middle">D(pos3)</text>
+
+      <!-- Grid -->
+      <text x="20" y="24" fill="#8b949e" font-size="9">0</text>
+      <text x="110" y="24" fill="#8b949e" font-size="9">1</text>
+      <text x="200" y="24" fill="#8b949e" font-size="9">2</text>
+      <text x="290" y="24" fill="#8b949e" font-size="9">3</text>
+      <text x="160" y="14" fill="#8b949e" font-size="10">KV positions →</text>
+
+      <!-- Row Q=0: attend [0] only -->
+      <rect x="5" y="30" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="45" y="49" fill="#3fb950" font-size="9" text-anchor="middle">✓ 可见</text>
+      <rect x="95" y="30" width="80" height="30" fill="#1c2128" stroke="#30363d" rx="3"/>
+      <rect x="185" y="30" width="80" height="30" fill="#1c2128" stroke="#30363d" rx="3"/>
+      <rect x="275" y="30" width="80" height="30" fill="#1c2128" stroke="#30363d" rx="3"/>
+
+      <!-- Row Q=1 -->
+      <rect x="5" y="68" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="95" y="68" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="185" y="68" width="80" height="30" fill="#1c2128" stroke="#30363d" rx="3"/>
+      <rect x="275" y="68" width="80" height="30" fill="#1c2128" stroke="#30363d" rx="3"/>
+
+      <!-- Row Q=2 -->
+      <rect x="5" y="106" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="95" y="106" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="185" y="106" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="275" y="106" width="80" height="30" fill="#1c2128" stroke="#30363d" rx="3"/>
+
+      <!-- Row Q=3 -->
+      <rect x="5" y="144" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="95" y="144" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="185" y="144" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <rect x="275" y="144" width="80" height="30" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+
+      <!-- Q labels -->
+      <text x="-10" y="49" fill="#8b949e" font-size="10" text-anchor="end">Q[0]</text>
+      <text x="-10" y="87" fill="#8b949e" font-size="10" text-anchor="end">Q[1]</text>
+      <text x="-10" y="125" fill="#8b949e" font-size="10" text-anchor="end">Q[2]</text>
+      <text x="-10" y="163" fill="#8b949e" font-size="10" text-anchor="end">Q[3]</text>
+
+      <!-- Diagonal line -->
+      <line x1="5" y1="30" x2="355" y2="174" stroke="#f0883e" stroke-width="2" stroke-dasharray="6"/>
+      <text x="370" y="140" fill="#f0883e" font-size="11">对角线</text>
+    </g>
+
+    <!-- Right: Rule explanation -->
+    <g transform="translate(500, 55)">
+      <rect x="0" y="0" width="390" height="180" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+      <text x="195" y="25" fill="#58a6ff" font-size="14" text-anchor="middle" font-weight="bold">Flash Attention causal=True 的 mask 规则</text>
+
+      <text x="20" y="55" fill="#e6edf3" font-size="13">在 FA 内部，对每个 segment：</text>
+
+      <rect x="20" y="65" width="350" height="40" rx="4" fill="#21262d"/>
+      <text x="195" y="82" fill="#f0883e" font-size="13" text-anchor="middle" font-weight="bold">mask[i][j] = (j ≤ i)</text>
+      <text x="195" y="99" fill="#8b949e" font-size="11" text-anchor="middle">Q 的第 i 个 token 只能看到 KV 的第 0..i 个 token</text>
+
+      <text x="20" y="125" fill="#e6edf3" font-size="12">这里的 i, j 是 <tspan fill="#f0883e" font-weight="bold">segment 内部的相对索引</tspan>，</text>
+      <text x="20" y="145" fill="#e6edf3" font-size="12">不是全局绝对位置。</text>
+      <text x="20" y="168" fill="#8b949e" font-size="12">FA 根本不知道什么是"前缀"什么是"后缀"，</text>
+      <text x="20" y="185" fill="#8b949e" font-size="12" fill="#f85149">它只认 "Q[0] 看 KV[0], Q[1] 看 KV[0..1], ..."</text>
+    </g>
+
+    <!-- Bottom: Key insight -->
+    <rect x="30" y="270" width="860" height="55" rx="8" fill="#1f2d3d" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="292" fill="#58a6ff" font-size="14" text-anchor="middle" font-weight="bold">关键认知：FA causal=True 的 mask 只看"在 segment 内第几行/列"，不看绝对位置！</text>
+    <text x="460" y="312" fill="#8b949e" font-size="12" text-anchor="middle">这意味着：如果你把 Reuser 的 suffix Q 和 expanded KV 喂给 FA，FA 会把 suffix Q[0] 当成"segment 内第0行"来算 mask</text>
+  </svg>
+</div>
+
+<!-- ===== Diagram 2: Concrete example ===== -->
+<div class="diagram-card">
+  <div class="diagram-title">第二步：用具体例子看 Reuser 的数据长什么样</div>
+  <svg viewBox="0 0 920 240" width="920">
+
+    <!-- Original full sequence -->
+    <text x="30" y="22" fill="#8b949e" font-size="13">原始完整序列（Reuser R 如果不做 prefix sharing）：</text>
+    <g transform="translate(30, 32)">
+      <rect x="0" y="0" width="100" height="32" rx="4" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="50" y="20" fill="#58a6ff" font-size="11" text-anchor="middle">Token A</text>
+      <rect x="100" y="0" width="100" height="32" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="150" y="20" fill="#58a6ff" font-size="11" text-anchor="middle">Token B</text>
+      <rect x="200" y="0" width="100" height="32" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="250" y="20" fill="#d2a8ff" font-size="11" text-anchor="middle">Token C</text>
+      <rect x="300" y="0" width="100" height="32" rx="0 4 4 0" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="350" y="20" fill="#d2a8ff" font-size="11" text-anchor="middle">Token D</text>
+      <text x="-10" y="20" fill="#8b949e" font-size="11" text-anchor="end">R:</text>
+
+      <text x="50" y="48" fill="#58a6ff" font-size="10" text-anchor="middle">pos 0</text>
+      <text x="150" y="48" fill="#58a6ff" font-size="10" text-anchor="middle">pos 1</text>
+      <text x="250" y="48" fill="#d2a8ff" font-size="10" text-anchor="middle">pos 2</text>
+      <text x="350" y="48" fill="#d2a8ff" font-size="10" text-anchor="middle">pos 3</text>
+    </g>
+    <text x="480" y="50" fill="#8b949e" font-size="12">→ 标准因果模型：每个位置只看 ≤ 自己的位置</text>
+    <text x="480" y="68" fill="#8b949e" font-size="12">→ pos 2 应该能看到 pos 0, 1, 2</text>
+    <text x="480" y="86" fill="#8b949e" font-size="12">→ pos 3 应该能看到 pos 0, 1, 2, 3</text>
+
+    <!-- After prefix sharing -->
+    <text x="30" y="120" fill="#f85149" font-size="13" font-weight="bold">Prefix Sharing 后，Reuser R 的实际数据：</text>
+
+    <g transform="translate(30, 130)">
+      <!-- Q row: only suffix -->
+      <text x="-10" y="18" fill="#d2a8ff" font-size="11" text-anchor="end">Q:</text>
+      <rect x="0" y="2" width="100" height="28" rx="4" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="50" y="20" fill="#d2a8ff" font-size="11" text-anchor="middle">Token C</text>
+      <rect x="100" y="2" width="100" height="28" rx="0 4 4 0" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="150" y="20" fill="#d2a8ff" font-size="11" text-anchor="middle">Token D</text>
+      <text x="230" y="20" fill="#8b949e" font-size="11">← 只有 2 个 token（suffix）</text>
+      <text x="50" y="45" fill="#d2a8ff" font-size="10" text-anchor="middle">绝对位置 = 2</text>
+      <text x="150" y="45" fill="#d2a8ff" font-size="10" text-anchor="middle">绝对位置 = 3</text>
+
+      <!-- KV row: prefix (injected) + suffix -->
+      <text x="-10" y="68" fill="#8b949e" font-size="11" text-anchor="end">KV:</text>
+      <rect x="0" y="52" width="100" height="28" rx="4" fill="#1f3d5c" stroke="#58a6ff" stroke-width="2"/>
+      <text x="50" y="70" fill="#58a6ff" font-size="11" text-anchor="middle">A (注入)</text>
+      <rect x="100" y="52" width="100" height="28" fill="#1f3d5c" stroke="#58a6ff" stroke-width="2"/>
+      <text x="150" y="70" fill="#58a6ff" font-size="11" text-anchor="middle">B (注入)</text>
+      <rect x="200" y="52" width="100" height="28" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="250" y="70" fill="#d2a8ff" font-size="11" text-anchor="middle">C (自己)</text>
+      <rect x="300" y="52" width="100" height="28" rx="0 4 4 0" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="350" y="70" fill="#d2a8ff" font-size="11" text-anchor="middle">D (自己)</text>
+      <text x="430" y="70" fill="#8b949e" font-size="11">← 有 4 个 token（prefix + suffix）</text>
+      <text x="50" y="95" fill="#58a6ff" font-size="10" text-anchor="middle">KV pos 0</text>
+      <text x="150" y="95" fill="#58a6ff" font-size="10" text-anchor="middle">KV pos 1</text>
+      <text x="250" y="95" fill="#d2a8ff" font-size="10" text-anchor="middle">KV pos 2</text>
+      <text x="350" y="95" fill="#d2a8ff" font-size="10" text-anchor="middle">KV pos 3</text>
+    </g>
+
+    <!-- Key observation -->
+    <rect x="520" y="125" width="370" height="100" rx="8" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+    <text x="705" y="148" fill="#f85149" font-size="13" text-anchor="middle" font-weight="bold">关键观察</text>
+    <text x="705" y="170" fill="#e6edf3" font-size="12" text-anchor="middle">Q 有 2 行，KV 有 4 列</text>
+    <text x="705" y="188" fill="#e6edf3" font-size="12" text-anchor="middle">Q 的绝对位置从 2 开始（不是 0！）</text>
+    <text x="705" y="208" fill="#f85149" font-size="12" text-anchor="middle" font-weight="bold">但 FA 不知道绝对位置，它只看行号列号</text>
+  </svg>
+</div>
+
+<!-- ===== Diagram 3: The exact mask mismatch ===== -->
+<div class="diagram-card">
+  <div class="diagram-title">第三步：逐格对比 — 正确的 mask vs FA 生成的 mask</div>
+  <svg viewBox="0 0 920 520" width="920">
+
+    <!-- Correct mask -->
+    <text x="30" y="22" fill="#3fb950" font-size="14" font-weight="bold">正确 mask（当前 torch_ref 按"绝对位置"计算）</text>
+    <text x="30" y="40" fill="#8b949e" font-size="12">规则：Q 在绝对位置 p → 可以看到 KV 的 [0, 1, ..., p] 位置</text>
+
+    <g transform="translate(50, 52)">
+      <!-- Header: KV positions -->
+      <text x="55" y="0" fill="#58a6ff" font-size="11" text-anchor="middle">KV[0]</text>
+      <text x="155" y="0" fill="#58a6ff" font-size="11" text-anchor="middle">KV[1]</text>
+      <text x="255" y="0" fill="#d2a8ff" font-size="11" text-anchor="middle">KV[2]</text>
+      <text x="355" y="0" fill="#d2a8ff" font-size="11" text-anchor="middle">KV[3]</text>
+      <text x="55" y="14" fill="#58a6ff" font-size="9" text-anchor="middle">(注入)</text>
+      <text x="155" y="14" fill="#58a6ff" font-size="9" text-anchor="middle">(注入)</text>
+      <text x="255" y="14" fill="#d2a8ff" font-size="9" text-anchor="middle">(自己的)</text>
+      <text x="355" y="14" fill="#d2a8ff" font-size="9" text-anchor="middle">(自己的)</text>
+
+      <!-- Row Q[0] (绝对位置=2): 应该看到 KV[0], KV[1], KV[2] -->
+      <text x="-10" y="40" fill="#d2a8ff" font-size="11" text-anchor="end">Q[0]</text>
+      <text x="-55" y="40" fill="#8b949e" font-size="9" text-anchor="end">pos=2</text>
+      <rect x="5" y="22" width="90" height="32" fill="#1f3d5c" stroke="#58a6ff" rx="3"/>
+      <text x="50" y="42" fill="#58a6ff" font-size="9" text-anchor="middle">✓ 前缀</text>
+      <rect x="105" y="22" width="90" height="32" fill="#1f3d5c" stroke="#58a6ff" rx="3"/>
+      <text x="150" y="42" fill="#58a6ff" font-size="9" text-anchor="middle">✓ 前缀</text>
+      <rect x="205" y="22" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="250" y="42" fill="#3fb950" font-size="9" text-anchor="middle">✓ 自己</text>
+      <rect x="305" y="22" width="90" height="32" fill="#1c2128" stroke="#30363d" rx="3"/>
+      <text x="350" y="42" fill="#8b949e" font-size="9" text-anchor="middle">✗ 未来</text>
+
+      <!-- Row Q[1] (绝对位置=3): 应该看到全部 -->
+      <text x="-10" y="76" fill="#d2a8ff" font-size="11" text-anchor="end">Q[1]</text>
+      <text x="-55" y="76" fill="#8b949e" font-size="9" text-anchor="end">pos=3</text>
+      <rect x="5" y="58" width="90" height="32" fill="#1f3d5c" stroke="#58a6ff" rx="3"/>
+      <text x="50" y="78" fill="#58a6ff" font-size="9" text-anchor="middle">✓ 前缀</text>
+      <rect x="105" y="58" width="90" height="32" fill="#1f3d5c" stroke="#58a6ff" rx="3"/>
+      <text x="150" y="78" fill="#58a6ff" font-size="9" text-anchor="middle">✓ 前缀</text>
+      <rect x="205" y="58" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="250" y="78" fill="#3fb950" font-size="9" text-anchor="middle">✓ 因果</text>
+      <rect x="305" y="58" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="350" y="78" fill="#3fb950" font-size="9" text-anchor="middle">✓ 自己</text>
+
+      <!-- Annotation -->
+      <text x="200" y="115" fill="#3fb950" font-size="12" text-anchor="middle" font-weight="bold">前缀 KV 全部可见（因为绝对位置 0,1 &lt; 2,3）</text>
+    </g>
+
+    <!-- FA wrong mask -->
+    <text x="520" y="22" fill="#f85149" font-size="14" font-weight="bold">FA causal=True 实际生成的 mask（按"行号/列号"算）</text>
+    <text x="520" y="40" fill="#8b949e" font-size="12">FA 不知道绝对位置！它只看：Q 的第 i 行 → 能看 KV 的第 0..i 列</text>
+
+    <g transform="translate(540, 52)">
+      <!-- Header -->
+      <text x="55" y="0" fill="#8b949e" font-size="11" text-anchor="middle">KV[0]</text>
+      <text x="155" y="0" fill="#8b949e" font-size="11" text-anchor="middle">KV[1]</text>
+      <text x="255" y="0" fill="#8b949e" font-size="11" text-anchor="middle">KV[2]</text>
+      <text x="355" y="0" fill="#8b949e" font-size="11" text-anchor="middle">KV[3]</text>
+      <text x="55" y="14" fill="#8b949e" font-size="9" text-anchor="middle">列 0</text>
+      <text x="155" y="14" fill="#8b949e" font-size="9" text-anchor="middle">列 1</text>
+      <text x="255" y="14" fill="#8b949e" font-size="9" text-anchor="middle">列 2</text>
+      <text x="355" y="14" fill="#8b949e" font-size="9" text-anchor="middle">列 3</text>
+
+      <!-- Row Q[0] (FA: 第0行, j≤0): 只能看 KV[0] -->
+      <text x="-10" y="40" fill="#f85149" font-size="11" text-anchor="end">Q[0]</text>
+      <text x="-55" y="40" fill="#f85149" font-size="9" text-anchor="end">行 0</text>
+      <rect x="5" y="22" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="50" y="42" fill="#3fb950" font-size="9" text-anchor="middle">j=0 ✓</text>
+      <rect x="105" y="22" width="90" height="32" fill="#3d1f1f" stroke="#f85149" stroke-width="2" rx="3"/>
+      <text x="150" y="38" fill="#f85149" font-size="9" text-anchor="middle" font-weight="bold">j=1</text>
+      <text x="150" y="48" fill="#f85149" font-size="8" text-anchor="middle">错误!</text>
+      <rect x="205" y="22" width="90" height="32" fill="#3d1f1f" stroke="#f85149" stroke-width="2" rx="3"/>
+      <text x="250" y="38" fill="#f85149" font-size="9" text-anchor="middle" font-weight="bold">j=2</text>
+      <text x="250" y="48" fill="#f85149" font-size="8" text-anchor="middle">错误!</text>
+      <rect x="305" y="22" width="90" height="32" fill="#1c2128" stroke="#30363d" rx="3"/>
+      <text x="350" y="42" fill="#8b949e" font-size="9" text-anchor="middle">✗ 正确</text>
+
+      <!-- Row Q[1] (FA: 第1行, j≤1): 只能看 KV[0,1] -->
+      <text x="-10" y="76" fill="#f85149" font-size="11" text-anchor="end">Q[1]</text>
+      <text x="-55" y="76" fill="#f85149" font-size="9" text-anchor="end">行 1</text>
+      <rect x="5" y="58" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="50" y="78" fill="#3fb950" font-size="9" text-anchor="middle">j=0 ✓</text>
+      <rect x="105" y="58" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="150" y="78" fill="#3fb950" font-size="9" text-anchor="middle">j=1 ✓</text>
+      <rect x="205" y="58" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="250" y="78" fill="#3fb950" font-size="9" text-anchor="middle">j=2 ✓</text>
+      <rect x="305" y="58" width="90" height="32" fill="#1f3d1f" stroke="#3fb950" rx="3"/>
+      <text x="350" y="78" fill="#3fb950" font-size="9" text-anchor="middle">j=3 ✓</text>
+    </g>
+
+    <!-- Side-by-side comparison for Q[0] row -->
+    <rect x="30" y="185" width="860" height="120" rx="10" fill="#161b22" stroke="#f0883e" stroke-width="2"/>
+    <text x="460" y="210" fill="#f0883e" font-size="15" text-anchor="middle" font-weight="bold">放大看 Q[0] 这一行（绝对位置=2 的 Token C 查询）</text>
+
+    <!-- Correct -->
+    <g transform="translate(50, 220)">
+      <text x="0" y="15" fill="#3fb950" font-size="12" font-weight="bold">正确：Token C 在绝对位置 2，应该看到 A(pos0) + B(pos1) + C(pos2)</text>
+      <rect x="0" y="25" width="80" height="30" rx="4" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="40" y="44" fill="#58a6ff" font-size="10" text-anchor="middle">A ✓</text>
+      <rect x="90" y="25" width="80" height="30" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="130" y="44" fill="#58a6ff" font-size="10" text-anchor="middle">B ✓</text>
+      <rect x="180" y="25" width="80" height="30" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="220" y="44" fill="#3fb950" font-size="10" text-anchor="middle">C ✓</text>
+      <rect x="270" y="25" width="80" height="30" rx="0 4 4 0" fill="#1c2128" stroke="#30363d"/>
+      <text x="310" y="44" fill="#8b949e" font-size="10" text-anchor="middle">D ✗</text>
+    </g>
+
+    <!-- Wrong -->
+    <g transform="translate(500, 220)">
+      <text x="0" y="15" fill="#f85149" font-size="12" font-weight="bold">FA causal：Q[0]（segment内第0行）→ 只看到 KV[0]</text>
+      <rect x="0" y="25" width="80" height="30" rx="4" fill="#1f3d1f" stroke="#3fb950"/>
+      <text x="40" y="44" fill="#3fb950" font-size="10" text-anchor="middle">A ✓</text>
+      <rect x="90" y="25" width="80" height="30" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+      <text x="130" y="40" fill="#f85149" font-size="9" text-anchor="middle" font-weight="bold">B 被</text>
+      <text x="130" y="50" fill="#f85149" font-size="9" text-anchor="middle" font-weight="bold">mask!</text>
+      <rect x="180" y="25" width="80" height="30" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+      <text x="220" y="40" fill="#f85149" font-size="9" text-anchor="middle" font-weight="bold">C 被</text>
+      <text x="220" y="50" fill="#f85149" font-size="9" text-anchor="middle" font-weight="bold">mask!</text>
+      <rect x="270" y="25" width="80" height="30" rx="0 4 4 0" fill="#1c2128" stroke="#30363d"/>
+      <text x="310" y="44" fill="#8b949e" font-size="10" text-anchor="middle">D ✗</text>
+    </g>
+
+    <!-- Consequence -->
+    <rect x="30" y="315" width="860" height="190" rx="10" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="340" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="bold">错误的后果：Token C 查询时，注入的 Provider 前缀 KV (A, B) 被当成了"未来 token"而 mask 掉！</text>
+
+    <!-- Before and After attention -->
+    <g transform="translate(50, 355)">
+      <text x="0" y="15" fill="#3fb950" font-size="12" font-weight="bold">正确 attention（torch_ref）：</text>
+      <text x="0" y="35" fill="#8b949e" font-size="12">output_C = attn(Q_C) × [V_A, V_B, V_C]     ← 看到了完整上下文</text>
+      <text x="0" y="55" fill="#3fb950" font-size="12">→ Token C 基于 A + B + C 三个 token 的信息生成</text>
+    </g>
+    <g transform="translate(500, 355)">
+      <text x="0" y="15" fill="#f85149" font-size="12" font-weight="bold">FA causal=True 错误 attention：</text>
+      <text x="0" y="35" fill="#8b949e" font-size="12">output_C = attn(Q_C) × [V_A]               ← 只看到 A，丢了 B 和 C 自己!</text>
+      <text x="0" y="55" fill="#f85149" font-size="12">→ Token C 只基于 A 的信息，语义完全错误！</text>
+    </g>
+
+    <text x="460" y="470" fill="#8b949e" font-size="13" text-anchor="middle">同理，Q[1]（Token D）在 FA 看来是"第1行"，mask=j≤1 → 看到 KV[0,1]</text>
+    <text x="460" y="490" fill="#8b949e" font-size="13" text-anchor="middle">这恰好碰巧正确（pos3 应看 KV[0..3]，FA 的 j≤1 给了 [0,1]，加上 j≤1 本身就是 [0,1]）</text>
+  </svg>
+</div>
+
+<!-- ===== Diagram 4: Root cause summary ===== -->
+<div class="diagram-card">
+  <div class="diagram-title">根因总结：两套"位置体系"的冲突</div>
+  <svg viewBox="0 0 920 260" width="920">
+
+    <!-- Two systems -->
+    <rect x="30" y="20" width="410" height="100" rx="10" fill="#1f2d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="235" y="45" fill="#3fb950" font-size="14" text-anchor="middle" font-weight="bold">Prefix Sharing 的 mask 体系（绝对位置）</text>
+    <text x="235" y="68" fill="#e6edf3" font-size="13" text-anchor="middle">mask[i][j] = (j的绝对位置 ≤ Q[i]的绝对位置)</text>
+    <text x="235" y="90" fill="#8b949e" font-size="12" text-anchor="middle">Q[0]的绝对位置=2，所以 KV 绝对位置 0,1,2 都 ≤ 2 → 全可见</text>
+    <text x="235" y="108" fill="#8b949e" font-size="12" text-anchor="middle">"我是后缀第0个，但我前面有前缀，前缀我都要看到"</text>
+
+    <rect x="480" y="20" width="410" height="100" rx="10" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+    <text x="685" y="45" fill="#f85149" font-size="14" text-anchor="middle" font-weight="bold">Flash Attention causal=True（段内索引）</text>
+    <text x="685" y="68" fill="#e6edf3" font-size="13" text-anchor="middle">mask[i][j] = (j ≤ i)  ← 只看段内行号列号</text>
+    <text x="685" y="90" fill="#8b949e" font-size="12" text-anchor="middle">Q[0] 是段内第 0 行 → 只看 KV 列 0</text>
+    <text x="685" y="108" fill="#8b949e" font-size="12" text-anchor="middle">"你是第 0 行，只能看第 0 列，后面都 mask 掉"</text>
+
+    <!-- VS -->
+    <text x="460" y="78" fill="#f0883e" font-size="24" text-anchor="middle" font-weight="bold">≠</text>
+
+    <!-- Root cause box -->
+    <rect x="100" y="135" width="720" height="110" rx="10" fill="#161b22" stroke="#f0883e" stroke-width="2"/>
+    <text x="460" y="160" fill="#f0883e" font-size="14" text-anchor="middle" font-weight="bold">根因：FA 不知道"注入的前缀 KV"和"自己的 suffix KV"有区别</text>
+
+    <text x="130" y="185" fill="#e6edf3" font-size="13">在 FA 看来，Reuser 的 KV 就是一个普通的 [KV0, KV1, KV2, KV3] 序列</text>
+    <text x="130" y="205" fill="#e6edf3" font-size="13">FA 的 causal mask 按"下三角"切：Q[0]→[KV0], Q[1]→[KV0,KK1,KV2,KV3]</text>
+    <text x="130" y="225" fill="#f85149" font-size="13">但 Q[0] 的真实语义是"绝对位置 2"，它应该看到 KV[0,1,2]，FA 只给了 KV[0]</text>
+  </svg>
+</div>
+
+<!-- ===== Diagram 5: varlen perspective ===== -->
+<div class="diagram-card">
+  <div class="diagram-title">补充：flash_attn_varlen_func 的 segment 划分也救不了</div>
+  <svg viewBox="0 0 920 250" width="920">
+
+    <text x="30" y="22" fill="#8b949e" font-size="13">有人可能想：varlen 模式支持 Q 和 KV 不同长度（cu_seqlens_q ≠ cu_seqlens_k），能解决这个问题吗？</text>
+
+    <g transform="translate(30, 40)">
+      <rect x="0" y="0" width="860" height="195" rx="10" fill="#161b22" stroke="#30363d"/>
+      <text x="430" y="25" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="bold">flash_attn_varlen_func 支持 Q/KV 不同长度，但 causal mask 规则不变</text>
+
+      <!-- varlen setup -->
+      <text x="30" y="55" fill="#58a6ff" font-size="12">varlen 参数：</text>
+      <text x="30" y="75" fill="#e6edf3" font-size="12" font-family="monospace">cu_seqlens_q = [0, 2]     ← Reuser Q 有 2 个 token</text>
+      <text x="30" y="95" fill="#e6edf3" font-size="12" font-family="monospace">cu_seqlens_k = [0, 4]     ← expanded KV 有 4 个 token</text>
+      <text x="400" y="75" fill="#8b949e" font-size="12">→ FA 会正确拆分：Q[0..1] 对应 KV[0..3]</text>
+      <text x="400" y="95" fill="#8b949e" font-size="12">→ 长度差异本身不是问题</text>
+
+      <!-- But mask is still wrong -->
+      <text x="30" y="125" fill="#f85149" font-size="13" font-weight="bold">但 causal=True 的 mask 仍然是按"段内相对索引"算：</text>
+      <text x="30" y="148" fill="#e6edf3" font-size="12">Q 段的第 0 行 → 可以看 KV 段的第 0 列（j_q ≤ j_k 约束 = 只有 j_k=0）</text>
+      <text x="30" y="168" fill="#e6edf3" font-size="12">Q 段的第 1 行 → 可以看 KV 段的第 0,1 列</text>
+      <text x="30" y="192" fill="#f85149" font-size="12" font-weight="bold">这和上面的错误完全一样！varlen 解决的是"长度不同"，不是"mask 语义不同"</text>
+    </g>
+  </svg>
+</div>
+
+
+<h3>3.2 方案 A：Q Padding（最简落地，推荐先行）</h3>
+
+<div class="diagram-card">
+  <div class="diagram-title">方案 A：Reuser 的 Q 前面填零，让 Q 和 KV 等长，复用 FA causal=True</div>
+  <svg viewBox="0 0 800 400" width="800">
+    <!-- Before padding -->
+    <text x="20" y="25" fill="#f85149" font-size="13" font-weight="bold">Before：Reuser Q 只有 suffix，KV = prefix + suffix</text>
+
+    <g transform="translate(30, 40)">
+      <!-- Q (short) -->
+      <rect x="0" y="0" width="60" height="30" rx="4" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="30" y="20" fill="#d2a8ff" font-size="11" text-anchor="middle">Q suffix</text>
+      <text x="-10" y="20" fill="#d2a8ff" font-size="11" text-anchor="end">Q:</text>
+
+      <!-- KV (full) -->
+      <rect x="0" y="40" width="60" height="30" rx="4" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="30" y="60" fill="#58a6ff" font-size="11" text-anchor="middle">Prefix KV</text>
+      <rect x="60" y="40" width="60" height="30" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="90" y="60" fill="#d2a8ff" font-size="11" text-anchor="middle">Suffix KV</text>
+      <text x="-10" y="60" fill="#8b949e" font-size="11" text-anchor="end">KV:</text>
+
+      <text x="145" y="35" fill="#f85149" font-size="16">≠</text>
+      <text x="145" y="50" fill="#8b949e" font-size="10">Q≠KV</text>
+      <text x="145" y="65" fill="#8b949e" font-size="10">长度不同</text>
+    </g>
+
+    <!-- After padding -->
+    <text x="250" y="25" fill="#3fb950" font-size="13" font-weight="bold">After：Q 前面 pad 零向量</text>
+
+    <g transform="translate(260, 40)">
+      <!-- Q padded -->
+      <rect x="0" y="0" width="60" height="30" rx="4" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="4"/>
+      <text x="30" y="16" fill="#f85149" font-size="10" text-anchor="middle">zeros</text>
+      <text x="30" y="26" fill="#8b949e" font-size="8" text-anchor="middle">(pad)</text>
+      <rect x="60" y="0" width="60" height="30" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="90" y="20" fill="#d2a8ff" font-size="11" text-anchor="middle">Q suffix</text>
+      <text x="-10" y="20" fill="#d2a8ff" font-size="11" text-anchor="end">Q:</text>
+
+      <!-- KV (full) -->
+      <rect x="0" y="40" width="60" height="30" rx="4" fill="#1f3d5c" stroke="#58a6ff"/>
+      <text x="30" y="60" fill="#58a6ff" font-size="11" text-anchor="middle">Prefix KV</text>
+      <rect x="60" y="40" width="60" height="30" fill="#2d1f3d" stroke="#d2a8ff"/>
+      <text x="90" y="60" fill="#d2a8ff" font-size="11" text-anchor="middle">Suffix KV</text>
+      <text x="-10" y="60" fill="#8b949e" font-size="11" text-anchor="end">KV:</text>
+
+      <text x="145" y="35" fill="#3fb950" font-size="16">=</text>
+      <text x="145" y="50" fill="#8b949e" font-size="10">Q=KV</text>
+      <text x="145" y="65" fill="#8b949e" font-size="10">等长!</text>
+    </g>
+
+    <!-- Resulting mask -->
+    <text x="500" y="25" fill="#3fb950" font-size="13" font-weight="bold">FA causal=True 自动正确!</text>
+
+    <g transform="translate(500, 40)">
+      <text x="20" y="-5" fill="#f85149" font-size="9">0</text>
+      <text x="50" y="-5" fill="#f85149" font-size="9">1</text>
+      <text x="80" y="-5" fill="#d2a8ff" font-size="9">2</text>
+      <text x="110" y="-5" fill="#d2a8ff" font-size="9">3</text>
+
+      <!-- Row Q=0 (pad): causal allows only [0] -->
+      <rect x="5" y="5" width="24" height="24" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="4"/>
+      <text x="17" y="21" fill="#f85149" font-size="8" text-anchor="middle">pad</text>
+      <rect x="35" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d"/>
+      <rect x="65" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d"/>
+      <rect x="95" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d"/>
+      <!-- Row Q=1 (pad): causal allows [0,1] -->
+      <rect x="5" y="35" width="24" height="24" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="4"/>
+      <text x="17" y="51" fill="#f85149" font-size="8" text-anchor="middle">pad</text>
+      <rect x="35" y="35" width="24" height="24" fill="#3d1f1f" stroke="#f85149" stroke-dasharray="4"/>
+      <text x="47" y="51" fill="#f85149" font-size="8" text-anchor="middle">pad</text>
+      <rect x="65" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d"/>
+      <rect x="95" y="35" width="24" height="24" fill="#1c2128" stroke="#30363d"/>
+      <!-- Row Q=2 (real): causal allows [0,1,2] → prefix(0,1) + self(2) -->
+      <rect x="5" y="65" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff"/>
+      <rect x="35" y="65" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff"/>
+      <rect x="65" y="65" width="24" height="24" fill="#1f3d1f" stroke="#3fb950"/>
+      <rect x="95" y="65" width="24" height="24" fill="#1c2128" stroke="#30363d"/>
+      <!-- Row Q=3 (real): causal allows [0,1,2,3] -->
+      <rect x="5" y="95" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff"/>
+      <rect x="35" y="95" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff"/>
+      <rect x="65" y="95" width="24" height="24" fill="#1f3d1f" stroke="#3fb950"/>
+      <rect x="95" y="95" width="24" height="24" fill="#1f3d1f" stroke="#3fb950"/>
+
+      <text x="-5" y="21" fill="#f85149" font-size="9" text-anchor="end">0</text>
+      <text x="-5" y="51" fill="#f85149" font-size="9" text-anchor="end">1</text>
+      <text x="-5" y="81" fill="#d2a8ff" font-size="9" text-anchor="end">2</text>
+      <text x="-5" y="111" fill="#d2a8ff" font-size="9" text-anchor="end">3</text>
+    </g>
+
+    <!-- Summary -->
+    <rect x="30" y="190" width="740" height="190" rx="10" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+    <text x="400" y="215" fill="#3fb950" font-size="15" text-anchor="middle" font-weight="bold">方案 A 完整流程</text>
+
+    <!-- Steps -->
+    <text x="60" y="245" fill="#e6edf3" font-size="12"><tspan fill="#58a6ff" font-weight="bold">1. build_kv()</tspan> 不变：Provider 存 KV，Reuser 用 torch.cat 拼接 Provider 前缀 + 自己后缀</text>
+    <text x="60" y="270" fill="#e6edf3" font-size="12"><tspan fill="#f0883e" font-weight="bold">2. 新增 pad_q()</tspan>：Reuser 的 Q 前面填 prefix_len 个零向量，使 Q 和 KV 等长</text>
+    <text x="60" y="295" fill="#e6edf3" font-size="12"><tspan fill="#d2a8ff" font-weight="bold">3. cu_seqlens_q</tspan>：改为与 cu_seqlens_kv 一致（所有行 Q=KV 等长）</text>
+    <text x="60" y="320" fill="#e6edf3" font-size="12"><tspan fill="#3fb950" font-weight="bold">4. flash_attn_varlen_func(causal=True)</tspan>：一次性处理所有行，标准 causal mask</text>
+    <text x="60" y="345" fill="#e6edf3" font-size="12"><tspan fill="#f85149" font-weight="bold">5. 裁剪输出</tspan>：Reuser 行只保留 suffix 部分的输出，丢弃 pad 位置的结果</text>
+    <text x="60" y="370" fill="#e6edf3" font-size="12"><tspan fill="#8b949e" font-weight="bold">代价</tspan>：pad 区域浪费 FLOPs ≈ prefix_len × num_heads × head_dim（通常可接受）</text>
+  </svg>
+</div>
+
+<h3>3.3 方案 B：Attention Bias（零浪费，进阶优化）</h3>
+
+<div class="diagram-card">
+  <div class="diagram-title">方案 B：不 pad Q，用自定义 attention_bias 实现 Block-Causal Mask</div>
+  <svg viewBox="0 0 800 300" width="800">
+    <!-- Concept -->
+    <text x="30" y="25" fill="#3fb950" font-size="14" font-weight="bold">Reuser 的 Block-Causal Mask（Q 不 pad，保持原始长度）</text>
+
+    <g transform="translate(30, 40)">
+      <text x="20" y="-5" fill="#58a6ff" font-size="9">0</text>
+      <text x="50" y="-5" fill="#58a6ff" font-size="9">1</text>
+      <text x="80" y="-5" fill="#d2a8ff" font-size="9">2</text>
+      <text x="110" y="-5" fill="#d2a8ff" font-size="9">3</text>
+      <text x="67" y="-15" fill="#8b949e" font-size="9">← KV positions →</text>
+
+      <!-- Q=2: all prefix + causal self -->
+      <rect x="5" y="5" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" stroke-width="1.5"/>
+      <rect x="35" y="5" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" stroke-width="1.5"/>
+      <rect x="65" y="5" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="1.5"/>
+      <rect x="95" y="5" width="24" height="24" fill="#1c2128" stroke="#30363d"/>
+      <!-- Q=3 -->
+      <rect x="5" y="35" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" stroke-width="1.5"/>
+      <rect x="35" y="35" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" stroke-width="1.5"/>
+      <rect x="65" y="35" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="1.5"/>
+      <rect x="95" y="35" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" stroke-width="1.5"/>
+
+      <text x="-5" y="21" fill="#d2a8ff" font-size="9" text-anchor="end">2</text>
+      <text x="-5" y="51" fill="#d2a8ff" font-size="9" text-anchor="end">3</text>
+    </g>
+
+    <!-- Annotation -->
+    <rect x="200" y="45" width="260" height="40" rx="6" fill="#1c2128" stroke="#58a6ff"/>
+    <text x="330" y="62" fill="#58a6ff" font-size="12" text-anchor="middle">蓝色列：前缀区域全部可见（不管 Q 位置）</text>
+    <text x="330" y="78" fill="#3fb950" font-size="12" text-anchor="middle">绿色列：后缀区域标准 causal</text>
+
+    <!-- API call -->
+    <rect x="500" y="35" width="270" height="60" rx="8" fill="#1f2d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="635" y="55" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">flash_attn_varlen_func(</text>
+    <text x="635" y="70" fill="#e6edf3" font-size="11" text-anchor="middle">causal=False,</text>
+    <text x="635" y="85" fill="#f0883e" font-size="11" text-anchor="middle">attention_bias=block_causal_mask)</text>
+
+    <!-- Construction -->
+    <text x="30" y="140" fill="#d2a8ff" font-size="14" font-weight="bold">Block-Causal Mask 构造规则：</text>
+
+    <g transform="translate(30, 155)">
+      <rect x="0" y="0" width="740" height="120" rx="8" fill="#161b22" stroke="#30363d"/>
+
+      <text x="20" y="25" fill="#e6edf3" font-size="13" font-weight="bold">对每个 Reuser 行（prefix_len=P, suffix_len=S）：</text>
+
+      <text x="20" y="50" fill="#58a6ff" font-size="12">mask[i][j] = </text>
+      <text x="120" y="50" fill="#3fb950" font-size="12">True</text>
+      <text x="145" y="50" fill="#8b949e" font-size="12">if</text>
+      <text x="160" y="50" fill="#58a6ff" font-size="12"> j &lt; P</text>
+      <text x="210" y="50" fill="#8b949e" font-size="12">（前缀 KV 全可见）</text>
+
+      <text x="140" y="72" fill="#3fb950" font-size="12">True</text>
+      <text x="165" y="72" fill="#8b949e" font-size="12">elif</text>
+      <text x="195" y="72" fill="#d2a8ff" font-size="12">j - P ≤ i</text>
+      <text x="280" y="72" fill="#8b949e" font-size="12">（后缀部分 causal）</text>
+
+      <text x="140" y="94" fill="#f85149" font-size="12">False</text>
+      <text x="175" y="94" fill="#8b949e" font-size="12">otherwise</text>
+
+      <text x="430" y="50" fill="#f0883e" font-size="12">→ 转化为 bias tensor:</text>
+      <text x="430" y="72" fill="#8b949e" font-size="12">visible → 0.0</text>
+      <text x="430" y="94" fill="#8b949e" font-size="12">masked → -inf</text>
+    </g>
+  </svg>
+  <div class="caption">方案 B 无冗余计算，但需要 TE/FA 支持 attention_bias 参数</div>
+</div>
+
+
+<!-- ===================== Section 4: Implementation ===================== -->
+<h2>4. 实施路线图</h2>
+
+<div class="diagram-card">
+  <div class="diagram-title">文件改动与实施顺序</div>
+  <svg viewBox="0 0 900 400" width="900">
+    <defs>
+      <marker id="arrow-w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#e6edf3"/></marker>
+    </defs>
+
+    <!-- Phase 1 -->
+    <rect x="30" y="20" width="840" height="170" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+    <rect x="30" y="20" width="140" height="30" rx="0 0 10 0" fill="#1f3d5c"/>
+    <text x="100" y="40" fill="#58a6ff" font-size="13" text-anchor="middle" font-weight="bold">Phase 1: Q Padding</text>
+
+    <!-- File boxes -->
+    <rect x="50" y="60" width="180" height="55" rx="6" fill="#1f2d1f" stroke="#3fb950"/>
+    <text x="140" y="80" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">新建 flash_attn.py</text>
+    <text x="140" y="98" fill="#8b949e" font-size="10" text-anchor="middle">FlashAttentionBackend</text>
+    <text x="140" y="110" fill="#8b949e" font-size="10" text-anchor="middle">pad_q() + attn() + trim()</text>
+
+    <rect x="260" y="60" width="180" height="55" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="350" y="80" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="bold">修改 context.py</text>
+    <text x="350" y="98" fill="#8b949e" font-size="10" text-anchor="middle">cu_seqlens 存为 tensor</text>
+    <text x="350" y="110" fill="#8b949e" font-size="10" text-anchor="middle">新增 padded_cu_seqlens_q</text>
+
+    <rect x="470" y="60" width="180" height="55" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="560" y="80" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="bold">修改 megatron_runtime.py</text>
+    <text x="560" y="98" fill="#8b949e" font-size="10" text-anchor="middle">选择 Flash backend</text>
+    <text x="560" y="110" fill="#8b949e" font-size="10" text-anchor="middle">传 cu_seqlens tensor</text>
+
+    <rect x="680" y="60" width="170" height="55" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="765" y="80" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="bold">修改 config.py</text>
+    <text x="765" y="98" fill="#8b949e" font-size="10" text-anchor="middle">新增 backend 选项</text>
+    <text x="765" y="110" fill="#8b949e" font-size="10" text-anchor="middle">flash_attn / torch_ref</text>
+
+    <!-- Arrows -->
+    <line x1="230" y1="88" x2="260" y2="88" stroke="#e6edf3" stroke-width="1" marker-end="url(#arrow-w)"/>
+    <line x1="440" y1="88" x2="470" y2="88" stroke="#e6edf3" stroke-width="1" marker-end="url(#arrow-w)"/>
+    <line x1="650" y1="88" x2="680" y2="88" stroke="#e6edf3" stroke-width="1" marker-end="url(#arrow-w)"/>
+
+    <!-- No change -->
+    <rect x="50" y="130" width="200" height="45" rx="6" fill="#161b22" stroke="#30363d" stroke-dasharray="4"/>
+    <text x="150" y="148" fill="#8b949e" font-size="10" text-anchor="middle">planner.py — 无需修改</text>
+    <text x="150" y="163" fill="#8b949e" font-size="10" text-anchor="middle">cu_seqlens_q/kv 已完备</text>
+    <rect x="270" y="130" width="200" height="45" rx="6" fill="#161b22" stroke="#30363d" stroke-dasharray="4"/>
+    <text x="370" y="148" fill="#8b949e" font-size="10" text-anchor="middle">prefix_store.py — 无需修改</text>
+    <text x="370" y="163" fill="#8b949e" font-size="10" text-anchor="middle">KV store 保持不 detach</text>
+    <rect x="490" y="130" width="200" height="45" rx="6" fill="#161b22" stroke="#30363d" stroke-dasharray="4"/>
+    <text x="590" y="148" fill="#8b949e" font-size="10" text-anchor="middle">attention.py — 无需修改</text>
+    <text x="590" y="163" fill="#8b949e" font-size="10" text-anchor="middle">Hook 机制不变</text>
+
+    <!-- Phase 2 -->
+    <rect x="30" y="210" width="840" height="170" rx="10" fill="#1c2128" stroke="#f0883e" stroke-width="2"/>
+    <rect x="30" y="210" width="140" height="30" rx="0 0 10 0" fill="#3d2d1f"/>
+    <text x="100" y="230" fill="#f0883e" font-size="13" text-anchor="middle" font-weight="bold">Phase 2: Bias 优化</text>
+
+    <rect x="50" y="250" width="240" height="50" rx="6" fill="#1f2d1f" stroke="#3fb950"/>
+    <text x="170" y="270" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">实现 block_causal_bias()</text>
+    <text x="170" y="288" fill="#8b949e" font-size="10" text-anchor="middle">构建 [1, 1, max_q, max_kv] bias tensor</text>
+
+    <rect x="320" y="250" width="240" height="50" rx="6" fill="#1f2d1f" stroke="#3fb950"/>
+    <text x="440" y="270" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">FlashAttentionBackend v2</text>
+    <text x="440" y="288" fill="#8b949e" font-size="10" text-anchor="middle">去掉 pad，用 attention_bias</text>
+
+    <rect x="590" y="250" width="260" height="50" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="720" y="270" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="bold">数值验证 & 基准测试</text>
+    <text x="720" y="288" fill="#8b949e" font-size="10" text-anchor="middle">对比 torch_ref / FA-pad / FA-bias</text>
+
+    <line x1="290" y1="275" x2="320" y2="275" stroke="#e6edf3" stroke-width="1" marker-end="url(#arrow-w)"/>
+    <line x1="560" y1="275" x2="590" y2="275" stroke="#e6edf3" stroke-width="1" marker-end="url(#arrow-w)"/>
+
+    <!-- No change note -->
+    <rect x="50" y="315" width="360" height="50" rx="6" fill="#161b22" stroke="#30363d" stroke-dasharray="4"/>
+    <text x="230" y="335" fill="#8b949e" font-size="10" text-anchor="middle">梯度流 — 无需任何改动</text>
+    <text x="230" y="352" fill="#8b949e" font-size="10" text-anchor="middle">Flash Attention autograd 原生支持，torch.cat 梯度回传机制不变</text>
+    <rect x="430" y="315" width="420" height="50" rx="6" fill="#161b22" stroke="#30363d" stroke-dasharray="4"/>
+    <text x="640" y="335" fill="#8b949e" font-size="10" text-anchor="middle">Megatron attention.py hook — 无需修改</text>
+    <text x="640" y="352" fill="#8b949e" font-size="10" text-anchor="middle">Hook 只看 backend 返回值，不关心内部是 pad 还是 bias</text>
+  </svg>
+</div>
+
+<h3>4.1 核心代码骨架（方案 A）</h3>
+
+<div class="diagram-card">
+  <div class="diagram-title">FlashAttentionBackend 关键逻辑伪代码</div>
+  <svg viewBox="0 0 800 380" width="800">
+    <rect x="0" y="0" width="800" height="380" rx="8" fill="#0d1117"/>
+    <text x="20" y="25" fill="#8b949e" font-size="12" font-family="monospace"># backends/flash_attn.py</text>
+    <text x="20" y="48" fill="#d2a8ff" font-size="12" font-family="monospace">class FlashAttentionBackend:</text>
+    <text x="20" y="73" fill="#8b949e" font-size="12" font-family="monospace">  def build_kv(self, key, value, store, plan, **kw):</text>
+    <text x="20" y="93" fill="#8b949e" font-size="12" font-family="monospace">    # 与 TorchReferenceBackend.build_kv 完全相同</text>
+    <text x="20" y="113" fill="#8b949e" font-size="12" font-family="monospace">    # Provider 存 KV，Reuser torch.cat 拼接</text>
+    <text x="20" y="140" fill="#3fb950" font-size="12" font-family="monospace">  def pad_query(self, query, plan):</text>
+    <text x="20" y="160" fill="#e6edf3" font-size="12" font-family="monospace">    rows = split(query, plan.kept_lengths_q)</text>
+    <text x="20" y="180" fill="#e6edf3" font-size="12" font-family="monospace">    padded = []</text>
+    <text x="20" y="200" fill="#58a6ff" font-size="12" font-family="monospace">    for i, row in enumerate(rows):</text>
+    <text x="20" y="220" fill="#e6edf3" font-size="12" font-family="monospace">      if plan.is_reuser(i):</text>
+    <text x="40" y="240" fill="#f0883e" font-size="12" font-family="monospace">zeros(prefix_len, heads, dim))</text>
+    <text x="40" y="258" fill="#f0883e" font-size="12" font-family="monospace">      padded.append(row)  # Provider 不需要 pad</text>
+    <text x="20" y="278" fill="#e6edf3" font-size="12" font-family="monospace">    return torch.cat(padded)</text>
+    <text x="20" y="305" fill="#3fb950" font-size="12" font-family="monospace">  def attention(self, query, key, value, plan, **_):</text>
+    <text x="20" y="325" fill="#e6edf3" font-size="12" font-family="monospace">    cu_q = tensor(plan.cu_seqlens_kv)  # Q 和 KV 等长!</text>
+    <text x="20" y="345" fill="#e6edf3" font-size="12" font-family="monospace">    out = flash_attn_varlen_func(</text>
+    <text x="40" y="362" fill="#e6edf3" font-size="12" font-family="monospace">q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_q,</text>
+    <text x="40" y="378" fill="#e6edf3" font-size="12" font-family="monospace">causal=True)</text>
+  </svg>
+</div>
+
+<!-- Summary -->
+<div class="note">
+  <strong>总结</strong>：Prefix Sharing 的核心是在 Attention 计算前拦截，Provider 算一次前缀 KV 存入 Store，Reuser 拼接 Provider 的前缀 KV + 自己的后缀 KV，用自定义 Causal Mask 做 Attention。梯度通过 torch.cat（不 detach）自然回传。适配 Flash Attention 的最简方案是 <strong>Q Padding</strong>：Reuser 的 Q 前面填零使其与 KV 等长，复用 FA 的 causal=True，最后裁剪输出。
+</div>
+
+</div>
+</body>
+</html>

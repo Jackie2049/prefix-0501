@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Prefix Sharing FA 适配 — 零浪费方案（无 Q Padding）</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.75; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  h1 { text-align: center; font-size: 28px; color: #58a6ff; margin-bottom: 6px; }
+  h1 span { color: #8b949e; font-size: 14px; font-weight: normal; display: block; margin-top: 4px; }
+  h2 { font-size: 21px; color: #79c0ff; margin: 44px 0 16px; border-left: 4px solid #58a6ff; padding-left: 14px; }
+  h3 { font-size: 16px; color: #d2a8ff; margin: 24px 0 10px; }
+  h4 { font-size: 14px; color: #e6edf3; margin: 16px 0 6px; }
+  p, li { color: #b1bac4; font-size: 14px; }
+  p { margin-bottom: 8px; }
+  ul, ol { margin-left: 20px; margin-bottom: 8px; }
+  li { margin-bottom: 2px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 22px; margin: 14px 0; overflow-x: auto; }
+  .card-title { font-size: 15px; color: #58a6ff; font-weight: 600; margin-bottom: 12px; text-align: center; }
+  .caption { text-align: center; color: #8b949e; font-size: 12px; margin-top: 8px; font-style: italic; }
+  svg text { font-family: "PingFang SC", "Microsoft YaHei", monospace; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .tag-new { background: #1f3d1f; color: #3fb950; }
+  .tag-mod { background: #1f2d3d; color: #58a6ff; }
+  .tag-keep { background: #21262d; color: #8b949e; }
+  .note { background: #1c2128; border-left: 3px solid #f0883e; padding: 10px 14px; margin: 14px 0; border-radius: 0 6px 6px 0; }
+  .note strong { color: #f0883e; }
+  code { background: #1c2128; padding: 1px 5px; border-radius: 3px; font-size: 12px; color: #e6edf3; }
+  .file-header { background: #161b22; border: 1px solid #30363d; border-radius: 8px 8px 0 0; padding: 8px 14px; font-size: 12px; color: #58a6ff; font-weight: 600; font-family: monospace; }
+  .file-body { background: #0d1117; border: 1px solid #30363d; border-top: none; border-radius: 0 0 8px 8px; padding: 14px; font-family: monospace; font-size: 12px; color: #e6edf3; white-space: pre; overflow-x: auto; line-height: 1.55; }
+  .file-body .c { color: #8b949e; }
+  .file-body .k { color: #d2a8ff; }
+  .file-body .f { color: #3fb950; }
+  .file-body .a { background: #1f3d1f; display: inline; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+  th { background: #21262d; color: #e6edf3; padding: 7px 10px; text-align: left; border-bottom: 2px solid #30363d; }
+  td { padding: 5px 10px; border-bottom: 1px solid #21262d; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Prefix Sharing 零浪费 FA 适配方案
+  <span>无 Q Padding — 利用 TE attention_bias 实现真正的 Block-Causal Mask</span>
+</h1>
+
+
+<!-- ===================== Section 0: Why no padding ===================== -->
+<h2>0. 为什么 Q Padding 没有性能收益</h2>
+
+<div class="card">
+  <div class="card-title">Q Padding 的 FLOPs 浪费量化</div>
+  <svg viewBox="0 0 900 160" width="900">
+    <rect x="0" y="0" width="900" height="160" rx="8" fill="#0d1117"/>
+
+    <text x="20" y="25" fill="#f85149" font-size="14" font-weight="bold">Q Padding 方案的 FLOPs 浪费 = prefix_len × num_heads × head_dim × num_layers × num_reusers</text>
+
+    <text x="40" y="50" fill="#e6edf3" font-size="12">典型 RL 场景: prefix=300, heads=32, dim=128, layers=32, reusers=4</text>
+    <text x="40" y="70" fill="#f85149" font-size="12" font-weight="bold">浪费 = 300 × 32 × 128 × 32 × 4 = 1.57 × 10⁸ FLOPs/step，约占单层 attention 的 40%</text>
+
+    <rect x="30" y="90" width="840" height="55" rx="8" fill="#161b22" stroke="#f85149" stroke-width="2"/>
+    <text x="450" y="112" fill="#e6edf3" font-size="13" text-anchor="middle">根本问题: pad 的零向量参加了 QK^T 和 softmax 计算，结果虽被丢弃，但 FLOPs 已经花了</text>
+    <text x="450" y="132" fill="#f85149" font-size="13" text-anchor="middle" font-weight="bold">需要: Q 只保留 suffix tokens，但 mask 仍然正确 → 需要 custom attention_bias</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 1: API Reality ===================== -->
+<h2>1. API 现状：两条路径及其能力</h2>
+
+<div class="card">
+  <div class="card-title">flash_attn vs Transformer Engine 的 API 差异</div>
+  <svg viewBox="0 0 900 280" width="900">
+    <rect x="0" y="0" width="900" height="280" rx="8" fill="#0d1117"/>
+
+    <!-- flash_attn -->
+    <rect x="20" y="15" width="420" height="130" rx="8" fill="#3d1f1f" stroke="#f85149" stroke-width="2"/>
+    <text x="230" y="38" fill="#f85149" font-size="13" text-anchor="middle" font-weight="bold">flash_attn_varlen_func（原生 flash_attn 库）</text>
+    <text x="40" y="60" fill="#3fb950" font-size="11">✓ cu_seqlens_q ≠ cu_seqlens_k  ← 支持 Q/KV 不同长</text>
+    <text x="40" y="78" fill="#3fb950" font-size="11">✓ causal=True/False</text>
+    <text x="40" y="96" fill="#3fb950" font-size="11">✓ THD packed format</text>
+    <text x="40" y="118" fill="#f85149" font-size="11" font-weight="bold">✗ 不支持 attention_bias 参数！</text>
+    <text x="40" y="136" fill="#f85149" font-size="11" font-weight="bold">✗ causal=True 只有标准下三角 mask</text>
+
+    <!-- TE -->
+    <rect x="460" y="15" width="420" height="130" rx="8" fill="#1f2d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="670" y="38" fill="#3fb950" font-size="13" text-anchor="middle" font-weight="bold">TEDotProductAttention（Transformer Engine）</text>
+    <text x="480" y="60" fill="#3fb950" font-size="11">✓ cu_seqlens_q ≠ cu_seqlens_k（PackedSeqParams）</text>
+    <text x="480" y="78" fill="#3fb950" font-size="11">✓ THD packed format（TE >= 1.7.0）</text>
+    <text x="480" y="96" fill="#3fb950" font-size="11">✓ attention_bias（TE >= 1.2.0）</text>
+    <text x="480" y="118" fill="#3fb950" font-size="11">✓ post_scale_bias: bias 加在 softmax 前</text>
+    <text x="480" y="136" fill="#3fb950" font-size="11">✓ 底层走 cuDNN/FA，O(N) 显存</text>
+
+    <!-- Conclusion -->
+    <rect x="20" y="160" width="860" height="105" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="2"/>
+    <text x="450" y="183" fill="#f0883e" font-size="14" text-anchor="middle" font-weight="bold">结论：零浪费方案必须走 TE 路径，用 attention_bias 传入 block-causal mask</text>
+
+    <text x="40" y="208" fill="#e6edf3" font-size="12">flash_attn_varlen_func 的 causal=True 是硬编码的标准下三角，无法自定义 → 只能走 Q Padding</text>
+    <text x="40" y="228" fill="#3fb950" font-size="12">TE 的 core_attention_bias 可以在 THD packed format 下传入自定义 bias → 不需要 Q Padding</text>
+    <text x="40" y="248" fill="#8b949e" font-size="12">verl 的 Qwen2-VL 代码已在生产中使用 cu_seqlens_q ≠ cu_seqlens_k → 证明 TE THD 路径成熟可用</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 2: The Approach ===================== -->
+<h2>2. 方案核心：TE attention_bias + Block-Causal Mask</h2>
+
+<div class="card">
+  <div class="card-title">核心思路：用 TE 的 post_scale_bias 实现自定义 mask，Q 不 pad</div>
+  <svg viewBox="0 0 900 340" width="900">
+    <defs>
+      <marker id="a-bl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+      <marker id="a-gn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <!-- Step 1: build_kv (unchanged) -->
+    <rect x="20" y="15" width="160" height="55" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="100" y="35" fill="#e6edf3" font-size="11" text-anchor="middle">build_kv()</text>
+    <text x="100" y="52" fill="#8b949e" font-size="10" text-anchor="middle">复用 torch_ref，不改</text>
+    <text x="100" y="64" fill="#8b949e" font-size="10" text-anchor="middle">KV 拼接逻辑不变</text>
+    <line x1="180" y1="42" x2="215" y2="42" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#a-bl)"/>
+
+    <!-- Step 2: build_bias (NEW) -->
+    <rect x="215" y="10" width="180" height="65" rx="6" fill="#1f3d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="305" y="28" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">build_bias() ★</text>
+    <text x="305" y="44" fill="#8b949e" font-size="10" text-anchor="middle">构造 [B, H, max_q, max_kv]</text>
+    <text x="305" y="56" fill="#8b949e" font-size="10" text-anchor="middle">Provider: 标准 causal</text>
+    <text x="305" y="68" fill="#8b949e" font-size="10" text-anchor="middle">Reuser: block-causal</text>
+    <line x1="395" y1="42" x2="430" y2="42" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a-gn)"/>
+
+    <!-- Step 3: TE forward (NEW) -->
+    <rect x="430" y="5" width="260" height="75" rx="6" fill="#1f3d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="560" y="23" fill="#3fb950" font-size="11" text-anchor="middle" font-weight="bold">te.pytorch.DotProductAttention ★</text>
+    <text x="560" y="39" fill="#8b949e" font-size="10" text-anchor="middle">core_attention_bias_type='post_scale_bias'</text>
+    <text x="560" y="53" fill="#8b949e" font-size="10" text-anchor="middle">cu_seqlens_q ≠ cu_seqlens_k</text>
+    <text x="560" y="67" fill="#8b949e" font-size="10" text-anchor="middle">底层 cuDNN/FA, O(N) 显存, 无浪费</text>
+
+    <!-- Step 4: output -->
+    <line x1="690" y1="42" x2="720" y2="42" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a-gn)"/>
+    <rect x="720" y="15" width="150" height="55" rx="6" fill="#21262d" stroke="#484f58"/>
+    <text x="795" y="35" fill="#e6edf3" font-size="11" text-anchor="middle">直接输出</text>
+    <text x="795" y="52" fill="#8b949e" font-size="10" text-anchor="middle">无需 trim！Q 长度不变</text>
+    <text x="795" y="64" fill="#8b949e" font-size="10" text-anchor="middle">shape [sum(q_lens), H, D]</text>
+
+    <!-- Compare shapes -->
+    <rect x="20" y="95" width="860" height="80" rx="8" fill="#161b22" stroke="#30363d"/>
+    <text x="450" y="115" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="bold">数据形状对比</text>
+    <text x="40" y="138" fill="#f85149" font-size="12">Q Padding 方案:  Q=[sum(expanded_kv), H, D]  ← 比 Q 实际长度大 prefix_len × reusers</text>
+    <text x="40" y="158" fill="#3fb950" font-size="12">本方案 (bias):   Q=[sum(kept_q), H, D]           ← Q 保持原始长度，零浪费！</text>
+
+    <!-- Performance -->
+    <rect x="20" y="190" width="860" height="135" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+    <text x="450" y="215" fill="#3fb950" font-size="14" text-anchor="middle" font-weight="bold">性能收益分析</text>
+
+    <g transform="translate(40, 225)">
+      <text x="0" y="15" fill="#8b949e" font-size="12" font-weight="bold">对比项</text>
+      <text x="200" y="15" fill="#8b949e" font-size="12" font-weight="bold">torch_ref 逐行</text>
+      <text x="400" y="15" fill="#f85149" font-size="12" font-weight="bold">Q Padding FA</text>
+      <text x="600" y="15" fill="#3fb950" font-size="12" font-weight="bold">TE bias (本方案)</text>
+
+      <text x="0" y="40" fill="#e6edf3" font-size="12">Attention 显存</text>
+      <text x="200" y="40" fill="#f85149" font-size="12">O(N²) 每行</text>
+      <text x="400" y="40" fill="#3fb950" font-size="12">O(N) FA</text>
+      <text x="600" y="40" fill="#3fb950" font-size="12">O(N) cuDNN</text>
+
+      <text x="0" y="60" fill="#e6edf3" font-size="12">Python 开销</text>
+      <text x="200" y="40" fill="#f85149" font-size="12"/>
+      <text x="200" y="60" fill="#f85149" font-size="12">for 循环慢</text>
+      <text x="400" y="60" fill="#3fb950" font-size="12">1 次 kernel</text>
+      <text x="600" y="60" fill="#3fb950" font-size="12">1 次 kernel</text>
+
+      <text x="0" y="80" fill="#e6edf3" font-size="12">浪费 FLOPs</text>
+      <text x="200" y="80" fill="#8b949e" font-size="12">无</text>
+      <text x="400" y="80" fill="#f85149" font-size="12">prefix_len×H×D×L×R</text>
+      <text x="600" y="80" fill="#3fb950" font-size="12">0 (零浪费)</text>
+
+      <text x="0" y="100" fill="#e6edf3" font-size="12">额外显存</text>
+      <text x="200" y="100" fill="#8b949e" font-size="12">无</text>
+      <text x="400" y="100" fill="#8b949e" font-size="12">pad Q 向量</text>
+      <text x="600" y="100" fill="#d2a8ff" font-size="12">bias tensor [B,H,maxQ,maxKV]</text>
+    </g>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 3: Block-Causal Bias ===================== -->
+<h2>3. 核心：Block-Causal Bias 张量构造</h2>
+
+<div class="card">
+  <div class="card-title">Provider vs Reuser 的 bias 模式（以 max_q=4, max_kv=6 为例）</div>
+  <svg viewBox="0 0 900 460" width="900">
+
+    <!-- Provider bias -->
+    <text x="20" y="20" fill="#3fb950" font-size="14" font-weight="bold">Provider（标准 causal，q_len=kv_len=6）</text>
+    <text x="20" y="38" fill="#8b949e" font-size="11">bias[i, :, :, :] = 下三角 0，上三角 -inf</text>
+
+    <g transform="translate(40, 48)">
+      <text x="30" y="0" fill="#8b949e" font-size="9">KV→</text>
+      <text x="30" y="15" fill="#8b949e" font-size="9">0</text><text x="60" y="15" fill="#8b949e" font-size="9">1</text><text x="90" y="15" fill="#8b949e" font-size="9">2</text><text x="120" y="15" fill="#8b949e" font-size="9">3</text><text x="150" y="15" fill="#8b949e" font-size="9">4</text><text x="180" y="15" fill="#8b949e" font-size="9">5</text>
+      <!-- 6x6 lower triangular -->
+      <!-- Row 0: 0 -inf -inf -inf -inf -inf -->
+      <rect x="15" y="20" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="27" y="36" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="45" y="20" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="57" y="36" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="75" y="20" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="87" y="36" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="105" y="20" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="117" y="36" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="135" y="20" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="147" y="36" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="165" y="20" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="177" y="36" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <!-- Row 1 -->
+      <rect x="15" y="50" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="27" y="66" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="45" y="50" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="57" y="66" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="75" y="50" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="87" y="66" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="105" y="50" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="117" y="66" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="135" y="50" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="147" y="66" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="165" y="50" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="177" y="66" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <!-- Row 2 -->
+      <rect x="15" y="80" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="27" y="96" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="45" y="80" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="57" y="96" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="75" y="80" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="87" y="96" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="105" y="80" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="117" y="96" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="135" y="80" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="147" y="96" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="165" y="80" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="177" y="96" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <!-- Rows 3-5: continue lower triangular pattern (abbreviated) -->
+      <text x="120" y="130" fill="#8b949e" font-size="10">... 标准下三角 ...</text>
+    </g>
+
+    <!-- Reuser bias -->
+    <text x="310" y="20" fill="#f85149" font-size="14" font-weight="bold">Reuser（prefix=3, suffix=3, q_len=3, kv_len=6）</text>
+    <text x="310" y="38" fill="#8b949e" font-size="11">Q 只有 suffix 3 个，KV 有 prefix(3)+suffix(3)=6 个</text>
+
+    <g transform="translate(330, 48)">
+      <text x="20" y="0" fill="#8b949e" font-size="9">KV→</text>
+      <text x="20" y="15" fill="#58a6ff" font-size="9">0</text><text x="50" y="15" fill="#58a6ff" font-size="9">1</text><text x="80" y="15" fill="#58a6ff" font-size="9">2</text><text x="110" y="15" fill="#d2a8ff" font-size="9">3</text><text x="140" y="15" fill="#d2a8ff" font-size="9">4</text><text x="170" y="15" fill="#d2a8ff" font-size="9">5</text>
+      <text x="55" y="-8" fill="#58a6ff" font-size="9">← 前缀 KV →</text><text x="145" y="-8" fill="#d2a8ff" font-size="9">← 后缀 KV →</text>
+
+      <!-- Row Q=0 (abs pos=3): attend to KV[0,1,2,3] (prefix all + causal first) -->
+      <text x="0" y="36" fill="#d2a8ff" font-size="9" text-anchor="end">Q0</text>
+      <rect x="5" y="20" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="17" y="36" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="35" y="20" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="47" y="36" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="65" y="20" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="77" y="36" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="95" y="20" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="107" y="36" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="125" y="20" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="137" y="36" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+      <rect x="155" y="20" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="167" y="36" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+
+      <!-- Row Q=1 (abs pos=4): attend to KV[0..4] -->
+      <text x="0" y="66" fill="#d2a8ff" font-size="9" text-anchor="end">Q1</text>
+      <rect x="5" y="50" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="17" y="66" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="35" y="50" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="47" y="66" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="65" y="50" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="77" y="66" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="95" y="50" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="107" y="66" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="125" y="50" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="137" y="66" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="155" y="50" width="24" height="24" fill="#3d1f1f" stroke="#f85149" rx="2"/><text x="167" y="66" fill="#f85149" font-size="8" text-anchor="middle">-∞</text>
+
+      <!-- Row Q=2 (abs pos=5): attend to all -->
+      <text x="0" y="96" fill="#d2a8ff" font-size="9" text-anchor="end">Q2</text>
+      <rect x="5" y="80" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="17" y="96" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="35" y="80" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="47" y="96" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="65" y="80" width="24" height="24" fill="#1f3d5c" stroke="#58a6ff" rx="2"/><text x="77" y="96" fill="#58a6ff" font-size="8" text-anchor="middle">0</text>
+      <rect x="95" y="80" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="107" y="96" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="125" y="80" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="137" y="96" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+      <rect x="155" y="80" width="24" height="24" fill="#1f3d1f" stroke="#3fb950" rx="2"/><text x="167" y="96" fill="#3fb950" font-size="8" text-anchor="middle">0</text>
+    </g>
+
+    <!-- Legend -->
+    <g transform="translate(600, 48)">
+      <rect x="0" y="0" width="16" height="16" fill="#1f3d5c" stroke="#58a6ff" rx="2"/>
+      <text x="22" y="12" fill="#58a6ff" font-size="11">前缀区域 = 0 (全可见)</text>
+      <rect x="0" y="24" width="16" height="16" fill="#1f3d1f" stroke="#3fb950" rx="2"/>
+      <text x="22" y="36" fill="#3fb950" font-size="11">后缀 causal = 0 (可见)</text>
+      <rect x="0" y="48" width="16" height="16" fill="#3d1f1f" stroke="#f85149" rx="2"/>
+      <text x="22" y="60" fill="#f85149" font-size="11">-∞ (masked)</text>
+    </g>
+
+    <!-- Key insight -->
+    <rect x="20" y="210" width="860" height="70" rx="8" fill="#1f2d1f" stroke="#3fb950" stroke-width="2"/>
+    <text x="450" y="232" fill="#3fb950" font-size="13" text-anchor="middle" font-weight="bold">Block-Causal 规则（每个 Reuser 一行规则）</text>
+    <text x="40" y="255" fill="#e6edf3" font-size="12">对 Reuser 的 Q[i]，绝对位置 = prefix_len + i：</text>
+    <text x="40" y="272" fill="#58a6ff" font-size="12">bias[i, j] = 0     if j &lt; prefix_len          ← 前缀 KV 全部可见</text>
+    <text x="320" y="272" fill="#3fb950" font-size="12">| 0     if j - prefix_len ≤ i   ← 后缀部分 causal</text>
+    <text x="580" y="272" fill="#f85149" font-size="12">| -inf  otherwise</text>
+
+    <!-- Bias tensor shape -->
+    <rect x="20" y="295" width="860" height="65" rx="8" fill="#161b22" stroke="#d2a8ff" stroke-width="2"/>
+    <text x="450" y="318" fill="#d2a8ff" font-size="13" text-anchor="middle" font-weight="bold">bias tensor shape: [batch_size, num_heads, max_seqlen_q, max_seqlen_kv]</text>
+    <text x="40" y="340" fill="#e6edf3" font-size="12">每个 sequence 独立的 bias 平面 → TE 按 cu_seqlens 切分后逐段应用 → 各行 mask 互不干扰</text>
+    <text x="40" y="355" fill="#8b949e" font-size="12">通常 num_heads 维度可广播为 [batch, 1, max_q, max_kv]（所有 head 共享同一 mask）→ 显存更省</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 4: Code Changes ===================== -->
+<h2>4. 代码改动详细方案</h2>
+
+<h3>4.1 <span class="tag tag-new">新建</span> backends/flash_attn.py — 核心 ~120 行</h3>
+
+<div class="file-header">prefix_sharing/backends/flash_attn.py</div>
+<div class="file-body"><span class="k">"""TE-based zero-waste Flash Attention backend for prefix-sharing.
+
+Uses Transformer Engine's DotProductAttention with post_scale_bias
+to implement block-causal masking without Q padding.
+"""</span>
+
+<span class="k">from</span> __future__ <span class="k">import</span> annotations
+<span class="k">from</span> typing <span class="k">import</span> Any
+
+<span class="k">import</span> torch
+
+<span class="k">from</span> prefix_sharing.backends.base <span class="k">import</span> BackendCapabilities
+<span class="k">from</span> prefix_sharing.backends.torch_ref <span class="k">import</span> TorchReferenceBackend, _split_packed
+<span class="k">from</span> prefix_sharing.core.planner <span class="k">import</span> PrefixSharingPlan
+
+
+<span class="k">def</span> <span class="f">build_block_causal_bias</span>(
+    plan: PrefixSharingPlan,
+    num_heads: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    <span class="c">"""Construct per-sequence block-causal bias tensor.
+
+    Shape: [batch_size, 1, max_seqlen_q, max_seqlen_kv]
+    Values: 0.0 for visible, -inf for masked.
+    """</span>
+    B = plan.batch_size
+    max_q = plan.max_seqlen_q
+    max_kv = plan.max_seqlen_kv
+
+    bias = torch.full((B, 1, max_q, max_kv), float(<span class="f">'-inf'</span>), device=device, dtype=dtype)
+
+    <span class="k">for</span> i <span class="k">in</span> range(B):
+        q_len = plan.kept_lengths_q[i]
+        kv_len = plan.expanded_lengths_kv[i]
+
+        <span class="k">if not</span> plan.is_reuser(i):
+            <span class="c"># Provider/standalone: standard lower-triangular causal</span>
+            <span class="k">for</span> qi <span class="k">in</span> range(q_len):
+                bias[i, 0, qi, :qi + 1] = 0.0
+        <span class="k">else</span>:
+            <span class="c"># Reuser: prefix columns all visible + suffix causal</span>
+            p = plan.prefix_lens[i]
+            <span class="k">for</span> qi <span class="k">in</span> range(q_len):
+                bias[i, 0, qi, :p] = 0.0               <span class="c"># 前缀全可见</span>
+                bias[i, 0, qi, p:p + qi + 1] = 0.0      <span class="c"># 后缀 causal</span>
+
+    <span class="k">return</span> bias
+
+
+<span class="k">def</span> <span class="f">_make_te_attention</span>(num_heads, kv_channels, softmax_scale):
+    <span class="c">"""Create a TE DotProductAttention instance."""</span>
+    <span class="k">import</span> transformer_engine <span class="k">as</span> te
+    <span class="k">return</span> te.pytorch.DotProductAttention(
+        num_attention_heads=num_heads,
+        kv_channels=kv_channels,
+        attention_dropout=0.0,
+        attn_mask_type=<span class="f">'padding'</span>,        <span class="c"># THD 需要 padding 类 mask</span>
+        softmax_scale=softmax_scale,
+    )
+
+
+<span class="k">class</span> <span class="f">FlashAttentionBackend</span>(TorchReferenceBackend):
+    capabilities = BackendCapabilities(
+        name=<span class="f">"flash_attn"</span>,
+        supports_cpu=False,
+        supports_cuda=True,
+        supports_cann=False,
+        supports_different_q_kv_lengths=True,
+        supports_prefix_last_restore=True,
+    )
+
+    <span class="c"># build_kv() 完全继承 TorchReferenceBackend</span>
+
+    <span class="k">def</span> <span class="f">attention</span>(
+        self,
+        query: Any,
+        key: Any,
+        value: Any,
+        plan: PrefixSharingPlan,
+        **kwargs: Any,
+    ) -> Any:
+        num_heads = query.shape[1]
+        head_dim = query.shape[2]
+        softmax_scale = head_dim ** -0.5
+
+        <span class="c"># Step 1: Construct block-causal bias</span>
+        bias = build_block_causal_bias(
+            plan, num_heads=num_heads,
+            device=query.device, dtype=query.dtype,
+        )
+
+        <span class="c"># Step 2: Prepare cu_seqlens tensors</span>
+        cu_q = torch.tensor(plan.cu_seqlens_q, dtype=torch.int32, device=query.device)
+        cu_kv = torch.tensor(plan.cu_seqlens_kv, dtype=torch.int32, device=key.device)
+
+        <span class="c"># Step 3: Create TE attention module (cached per layer in practice)</span>
+        te_attn = _make_te_attention(num_heads, head_dim, softmax_scale)
+
+        <span class="c"># Step 4: Call TE with bias + THD packed params</span>
+        output = te_attn(
+            query.unsqueeze(1),   <span class="c"># [T, 1, H, D] → TE expects batch dim</span>
+            key.unsqueeze(1),
+            value.unsqueeze(1),
+            attention_mask=<span class="f">'padding'</span>,
+            core_attention_bias_type=<span class="f">'post_scale_bias'</span>,
+            core_attention_bias=bias,
+            qkv_format=<span class="f">'thd'</span>,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_kv,
+            max_seqlen_q=plan.max_seqlen_q,
+            max_seqlen_k=plan.max_seqlen_kv,
+        ).squeeze(1)
+
+        <span class="k">return</span> output</div>
+
+<div class="caption">关键: Q 不 pad，cu_seqlens_q 使用 kept_lengths_q（suffix-only），cu_seqlens_k 使用 expanded_lengths_kv（full）</div>
+
+
+<!-- ===================== Section 5: Data Flow ===================== -->
+<h2>5. 运行时数据流对比</h2>
+
+<div class="card">
+  <div class="card-title">三方案数据流对比</div>
+  <svg viewBox="0 0 900 360" width="900">
+    <defs>
+      <marker id="a-bl2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+      <marker id="a-g3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <!-- torch_ref -->
+    <rect x="20" y="10" width="270" height="155" rx="8" fill="#161b22" stroke="#484f58"/>
+    <text x="155" y="30" fill="#8b949e" font-size="12" text-anchor="middle" font-weight="bold">torch_ref 逐行 (当前)</text>
+    <text x="40" y="50" fill="#e6edf3" font-size="11">build_kv()</text>
+    <text x="40" y="67" fill="#f85149" font-size="11">→ for row: mask+einsum+softmax</text>
+    <text x="40" y="84" fill="#f85149" font-size="11">→ O(N²) 显存, Python 慢</text>
+    <text x="40" y="104" fill="#8b949e" font-size="10">Q=[sum(kept_q), H, D]</text>
+    <text x="40" y="120" fill="#8b949e" font-size="10">K=[sum(expanded_kv), H, D]</text>
+    <text x="40" y="140" fill="#8b949e" font-size="10">无需额外显存</text>
+    <text x="40" y="158" fill="#8b949e" font-size="10">无浪费 FLOPs</text>
+
+    <!-- Q Padding -->
+    <rect x="310" y="10" width="270" height="155" rx="8" fill="#161b22" stroke="#f85149"/>
+    <text x="445" y="30" fill="#f85149" font-size="12" text-anchor="middle" font-weight="bold">Q Padding FA (不推荐)</text>
+    <text x="330" y="50" fill="#e6edf3" font-size="11">build_kv()</text>
+    <text x="330" y="67" fill="#f85149" font-size="11">→ pad_query() 填零</text>
+    <text x="330" y="84" fill="#3fb950" font-size="11">→ flash_attn_varlen(causal=True)</text>
+    <text x="330" y="104" fill="#f85149" font-size="10">Q=[sum(expanded_kv), H, D] ← 填充后!</text>
+    <text x="330" y="120" fill="#8b949e" font-size="10">K=[sum(expanded_kv), H, D]</text>
+    <text x="330" y="140" fill="#f85149" font-size="10">浪费 prefix_len×H×D FLOPs</text>
+    <text x="330" y="158" fill="#8b949e" font-size="10">需 trim_output()</text>
+
+    <!-- TE bias -->
+    <rect x="600" y="10" width="280" height="155" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+    <text x="740" y="30" fill="#3fb950" font-size="12" text-anchor="middle" font-weight="bold">TE bias (本方案 ★)</text>
+    <text x="620" y="50" fill="#e6edf3" font-size="11">build_kv() — 同 torch_ref</text>
+    <text x="620" y="67" fill="#3fb950" font-size="11">→ build_block_causal_bias()</text>
+    <text x="620" y="84" fill="#3fb950" font-size="11">→ TE DotProductAttention(bias)</text>
+    <text x="620" y="104" fill="#3fb950" font-size="10">Q=[sum(kept_q), H, D] ← 原始长度!</text>
+    <text x="620" y="120" fill="#8b949e" font-size="10">K=[sum(expanded_kv), H, D]</text>
+    <text x="620" y="140" fill="#3fb950" font-size="10">0 浪费 FLOPs</text>
+    <text x="620" y="158" fill="#3fb950" font-size="10">无需 trim!</text>
+
+    <!-- Bottom: key differences -->
+    <rect x="20" y="180" width="860" height="165" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="450" y="205" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="bold">关键区别：cu_seqlens 和 mask 的处理方式</text>
+
+    <!-- torch_ref -->
+    <text x="40" y="230" fill="#8b949e" font-size="11" font-weight="bold">torch_ref:</text>
+    <text x="40" y="248" fill="#8b949e" font-size="10">cu_seqlens: 按 kept_lengths_q / expanded_lengths_kv 拆行</text>
+    <text x="40" y="264" fill="#8b949e" font-size="10">mask: _causal_q_kv_mask(q_start=prefix_len) 逐行生成</text>
+    <text x="40" y="280" fill="#8b949e" font-size="10">kernel: Python einsum + softmax</text>
+
+    <!-- Q Padding -->
+    <text x="40" y="306" fill="#f85149" font-size="11" font-weight="bold">Q Padding:</text>
+    <text x="40" y="324" fill="#8b949e" font-size="10">cu_seqlens_q = cu_seqlens_kv (pad 后等长)</text>
+    <text x="40" y="340" fill="#8b949e" font-size="10">mask: FA causal=True (标准下三角)</text>
+
+    <!-- TE bias -->
+    <text x="460" y="306" fill="#3fb950" font-size="11" font-weight="bold">TE bias:</text>
+    <text x="460" y="324" fill="#8b949e" font-size="10">cu_seqlens_q = kept_lengths_q (suffix only, 不 pad!)</text>
+    <text x="460" y="340" fill="#8b949e" font-size="10">cu_seqlens_kv = expanded_lengths_kv (full)</text>
+    <text x="460" y="356" fill="#8b949e" font-size="10">mask: build_block_causal_bias() → TE post_scale_bias</text>
+    <text x="460" y="372" fill="#8b949e" font-size="10">kernel: TE cuDNN, O(N) 显存, CUDA 快</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 6: Bias Optimization ===================== -->
+<h2>6. Bias Tensor 优化：避免 O(B×max_q×max_kv) 显存</h2>
+
+<div class="card">
+  <div class="card-title">优化：构造 bias 时只填充有效区域，TE 会自动忽略超出 cu_seqlens 的部分</div>
+  <svg viewBox="0 0 900 140" width="900">
+    <rect x="0" y="0" width="900" height="140" rx="8" fill="#0d1117"/>
+
+    <text x="20" y="25" fill="#e6edf3" font-size="13" font-weight="bold">优化策略</text>
+
+    <text x="20" y="50" fill="#3fb950" font-size="12">1. shape 用 [batch, 1, max_q, max_kv] — num_heads 维度广播，省 32x 显存</text>
+    <text x="20" y="70" fill="#3fb950" font-size="12">2. 只对 [0:q_len, 0:kv_len] 区域填值，其余保持 -inf（TE 按 cu_seqlens 裁切）</text>
+    <text x="20" y="90" fill="#3fb950" font-size="12">3. Provider 的 causal 部分可用 torch.tril 批量生成，避免逐行循环</text>
+
+    <rect x="20" y="105" width="860" height="25" rx="4" fill="#161b22" stroke="#30363d"/>
+    <text x="450" y="122" fill="#8b949e" font-size="11" text-anchor="middle">典型显存: batch=8, max_q=128, max_kv=512 → bias = 8×1×128×512×2B = 1 MB，可忽略</text>
+  </svg>
+</div>
+
+
+<!-- ===================== Section 7: TE API Verification ===================== -->
+<h2>7. TE API 调用验证</h2>
+
+<div class="card">
+  <div class="card-title">Megatron-LM TEDotProductAttention 如何传递 bias + THD params</div>
+  <svg viewBox="0 0 900 220" width="900">
+    <rect x="0" y="0" width="900" height="220" rx="8" fill="#0d1117"/>
+    <text x="20" y="22" fill="#8b949e" font-size="12" font-family="monospace"># transformer_engine.py:790-821 (Megatron TE wrapper)</text>
+
+    <text x="20" y="48" fill="#8b949e" font-size="12" font-family="monospace">attention_bias_kwargs = {}</text>
+    <text x="20" y="64" fill="#8b949e" font-size="12" font-family="monospace"><tspan fill="#58a6ff">if attention_bias is not None:</tspan></text>
+    <text x="20" y="80" fill="#8b949e" font-size="12" font-family="monospace">    attention_bias_kwargs = dict(</text>
+    <text x="20" y="96" fill="#8b949e" font-size="12" font-family="monospace">        core_attention_bias_type=<span class="f">'post_scale_bias'</span>,</text>
+    <text x="20" y="112" fill="#8b949e" font-size="12" font-family="monospace">        core_attention_bias=attention_bias,</text>
+    <text x="20" y="128" fill="#8b949e" font-size="12" font-family="monospace">    )</text>
+    <text x="20" y="152" fill="#8b949e" font-size="12" font-family="monospace">core_attn_out = super().forward(  <span class="c"># te.pytorch.DotProductAttention</span></text>
+    <text x="20" y="168" fill="#8b949e" font-size="12" font-family="monospace">    query, key, value, attention_mask,</text>
+    <text x="20" y="184" fill="#8b949e" font-size="12" font-family="monospace">    <span class="c"># ★ bias + THD params 同时传入，无互斥</span></text>
+    <text x="20" y="200" fill="#8b949e" font-size="12" font-family="monospace">    **attention_bias_kwargs,</text>
+    <text x="20" y="216" fill="#8b949e" font-size="12" font-family="monospace">    **packed_seq_kwargs,  <span class="c"># cu_seqlens_q, cu_seqlens_kv, qkv_format</span></text>
+  </svg>
+</div>
+
+<div class="note">
+  <strong>关键验证</strong>：Megatron 的 TE wrapper 允许 <code>attention_bias</code> 和 <code>packed_seq_kwargs</code>（THD cu_seqlens）同时传入，没有互斥逻辑。这意味着我们可以直接在 hook 中调用 TE，传入 bias + THD 参数。
+</div>
+
+
+<!-- ===================== Section 8: Gradient ===================== -->
+<h2>8. 梯度安全性</h2>
+
+<div class="card">
+  <table>
+    <tr><th>操作</th><th>梯度行为</th><th>正确性</th></tr>
+    <tr><td>build_kv (继承 torch_ref)</td><td>torch.cat 梯度拆分，Provider KV 累加</td><td><span class="tag tag-new">与当前一致</span></td></tr>
+    <tr><td>build_block_causal_bias</td><td>bias 是整数运算，不参与梯度</td><td><span class="tag tag-new">无影响</span></td></tr>
+    <tr><td>TE DotProductAttention</td><td>原生 autograd，支持 backward</td><td><span class="tag tag-new">TE 保证</span></td></tr>
+    <tr><td>expanded KV 中的 Provider KV</td><td>梯度通过 TE backward → cat → Provider</td><td><span class="tag tag-new">等价于 torch_ref</span></td></tr>
+    <tr><td>Q (不 pad)</td><td>只有 suffix Q 参与计算，梯度完整</td><td><span class="tag tag-new">无 pad = 无额外问题</span></td></tr>
+  </table>
+  <div class="caption">比 Q Padding 方案更简单：没有 pad 向量，没有 trim 切片，梯度路径更直接</div>
+</div>
+
+
+<!-- ===================== Section 9: Summary ===================== -->
+<h2>9. 总结：零浪费方案 vs Q Padding</h2>
+
+<div class="card">
+  <table>
+    <tr><th></th><th>Q Padding FA</th><th>TE bias (本方案)</th></tr>
+    <tr><td>FLOPs 浪费</td><td><span class="tag tag-del">prefix_len × H × D × L × R</span></td><td><span class="tag tag-new">0</span></td></tr>
+    <tr><td>Attention 显存</td><td>O(N)</td><td>O(N)</td></tr>
+    <tr><td>额外显存</td><td>pad Q 向量</td><td>bias tensor ~1MB</td></tr>
+    <tr><td>Kernel</td><td>flash_attn_varlen_func</td><td>TE DotProductAttention</td></tr>
+    <tr><td>Mask</td><td>FA causal=True (标准)</td><td>post_scale_bias (自定义)</td></tr>
+    <tr><td>输出处理</td><td>需要 trim_output()</td><td>直接输出，无需 trim</td></tr>
+    <tr><td>依赖</td><td>flash_attn</td><td>transformer_engine >= 1.2.0</td></tr>
+    <tr><td>Q 形状</td><td>[sum(expanded_kv), H, D] ← 填充后</td><td>[sum(kept_q), H, D] ← 原始长度</td></tr>
+    <tr><td>cu_seqlens_q</td><td>= cu_seqlens_kv (等长)</td><td>≠ cu_seqlens_kv (不同长)</td></tr>
+    <tr><td>代码改动</td><td>~90 行新文件</td><td>~120 行新文件</td></tr>
+  </table>
+</div>
+
+<div class="note">
+  <strong>核心优势</strong>：TE bias 方案 Q 不 pad → 零 FLOPs 浪费 → prefix 越长收益越大。cu_seqlens_q 使用 kept_lengths_q（只有 suffix），cu_seqlens_kv 使用 expanded_lengths_kv（含注入前缀），TE 原生支持两者不等。build_kv() 完全继承 torch_ref 不改，只新增 build_block_causal_bias() 和 TE 调用。
+</div>
+
+</div>
+</body>
+</html>

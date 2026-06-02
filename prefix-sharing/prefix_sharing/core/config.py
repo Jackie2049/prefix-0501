@@ -104,6 +104,12 @@ class PrefixSharingConfig:
             return
         if self.detector != "trie":
             raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
+        supported_backends = {"torch_ref", "flash_atten_gpu", "flash_atten_npu"}
+        if self.backend not in supported_backends:
+            raise PrefixSharingConfigError(
+                f"backend='{self.backend}' is not supported. "
+                f"Supported backends: {sorted(supported_backends)}"
+            )
         if self.boundary_strategy != "prefix_last_restore":
             raise PrefixSharingConfigError(
                 "phase 1 currently implements only "
