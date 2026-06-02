@@ -346,11 +346,20 @@ def restore_suffix_first_log_probs_from_prefix(
     log_probs: Any,
     vocab_parallel_log_probs_fn: Any,
 ) -> Any:
-    """Restore reuser suffix-first logprob from provider prefix-last logits."""
+    """Restore reuser suffix-first logprob from provider prefix-last logits.
+
+    For each reuse row, the first suffix token's logprob is missing because
+    the Q path was trimmed to the suffix. We recover it from the provider's
+    logits at the prefix-last position, using the **first suffix token ID**
+    as the label (not ``labels[reuse_1d_pos]``, which is the label for
+    predicting the *second* suffix token).
+    """
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
         return log_probs
+    import torch
+
     restored = log_probs.clone()
     for index in ctx.prefix_last_restore_indices:
         provider_logits = logits[
@@ -358,11 +367,12 @@ def restore_suffix_first_log_probs_from_prefix(
             index.provider_1d_pos : index.provider_1d_pos + 1,
             :,
         ].clone()
-        reuse_label = labels[
-            0:1,
-            index.reuse_1d_pos : index.reuse_1d_pos + 1,
-        ]
-        restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
+        first_suffix_label = torch.tensor(
+            [[index.first_suffix_token_id]],
+            device=logits.device,
+            dtype=torch.long,
+        )
+        restored_value = vocab_parallel_log_probs_fn(provider_logits, first_suffix_label)
         restored[0, index.reuse_1d_pos] = restored_value.reshape(())
     return restored
 

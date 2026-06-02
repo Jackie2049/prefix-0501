@@ -79,6 +79,7 @@ class PrefixLastRestoreSpec:
     reuse_first_suffix_label_pos: int
     output_slot: int
     group_id: int
+    first_suffix_token_id: int | None = None
 
 
 Range = tuple[int, int]
@@ -262,6 +263,7 @@ class PrefixSharingPlanner:
                             provider_idx_in_batch=provider_index[index],
                             provider_prefix_last_pos=prefix_len - 1,
                             reuse_first_suffix_label_pos=prefix_len,
+                            first_suffix_token_id=input_ids[index][prefix_len],
                             output_slot=0,
                             group_id=group_ids[index],
                         )

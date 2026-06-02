@@ -51,14 +51,16 @@ def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path
     # THD compact format: [1, total_kept_tokens, V]
     # row0 (provider) all 5 tokens, row1 (reuser) suffix 2 tokens (positions 3,4)
     # total = 5 + 2 = 7, align_size=1 so no padding
-    logits = torch.randn(1, 7, 8, requires_grad=True)
-    labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
+    # vocab_size=8, input_ids must stay within [0, 7] for gather
+    vocab_size = 8
+    logits = torch.randn(1, 7, vocab_size, requires_grad=True)
+    labels = torch.tensor([[0, 1, 4, 5, 4, 7, 4]])
     log_probs = torch.zeros(1, 7, requires_grad=True)
     batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5], [1, 2, 3, 6, 7]]),
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
         "position_ids": torch.arange(5).repeat(2, 1),
-        "responses": torch.tensor([[10, 11], [20, 21]]),
+        "responses": torch.tensor([[4, 5], [6, 7]]),
     }
     actor_config = {
         "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},

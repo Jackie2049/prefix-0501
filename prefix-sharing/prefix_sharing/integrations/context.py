@@ -23,6 +23,7 @@ class PackedPrefixLastRestoreIndex:
     provider_idx_in_batch: int
     provider_1d_pos: int
     reuse_1d_pos: int
+    first_suffix_token_id: int | None = None
 
 
 @dataclass
@@ -58,6 +59,7 @@ def _build_prefix_last_restore_indices(
                 provider_idx_in_batch=provider_idx,
                 provider_1d_pos=int(packed_cu_seqlens[provider_idx] + provider_offset),
                 reuse_1d_pos=int(packed_cu_seqlens[reuse_idx] + reuse_offset),
+                first_suffix_token_id=spec.first_suffix_token_id,
             )
         )
     return indices
