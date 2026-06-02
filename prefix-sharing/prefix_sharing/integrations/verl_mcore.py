@@ -32,6 +32,8 @@ from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
+from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
+from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.patch_manager import PatchHandle
 
 import logging
@@ -46,6 +48,7 @@ class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
     packed_batch_layout: PackedBatchLayout
+    parallel_info: MegatronParallelInfo
 
 
 @dataclass(frozen=True)
@@ -114,6 +117,7 @@ class VerlMCoreBatchAdapter:
             packed_batch_layout=PackedBatchLayout.from_valid_lengths(
                 prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
             ),
+            parallel_info=get_megatron_parallel_info(),
         )
         return _prefix_sharing_runtime_context(runtime_state)
 
@@ -290,21 +294,30 @@ def build_prefix_sharing_micro_batch(
     trimmed_micro_batch["attention_mask"] = new_attention_mask
     trimmed_micro_batch["position_ids"] = new_position_ids
 
-    global_rank, tp_rank, tp_size, cp_rank, cp_size = _read_megatron_parallel_state()
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    parallel_info = get_megatron_parallel_info()
+    align_size = (
+        parallel_info.tp_size * parallel_info.cp_size * 2
+        if parallel_info.cp_size > 1
+        else parallel_info.tp_size
+    )
     packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
         kept_position_rows,
         align_size=int(align_size),
     )
     logger.warning(
-        "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s] packed_batch_layout: "
+        "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s "
+        "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] packed_batch_layout: "
         "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
         "total_valid=%s, total_padded=%s",
-        global_rank,
-        tp_rank,
-        tp_size,
-        cp_rank,
-        cp_size,
+        parallel_info.global_rank,
+        parallel_info.tp_rank,
+        parallel_info.tp_size,
+        parallel_info.cp_rank,
+        parallel_info.cp_size,
+        parallel_info.pp_rank,
+        parallel_info.pp_size,
+        parallel_info.is_pipeline_first_stage,
+        parallel_info.is_pipeline_last_stage,
         packed_batch_layout.valid_lengths,
         packed_batch_layout.padded_lengths,
         packed_batch_layout.cu_seqlens,
@@ -316,43 +329,13 @@ def build_prefix_sharing_micro_batch(
         prefix_sharing_plan=prefix_sharing_plan,
         backend=backend or TorchReferenceBackend(),
         packed_batch_layout=packed_batch_layout,
+        parallel_info=parallel_info,
     )
     logger.warning(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
         f"prefix_sharing_runtime_state) with keep_ranges={prefix_sharing_plan.input_keep_ranges}"
     )
     return trimmed_micro_batch, prefix_sharing_runtime_state
-
-
-def _read_megatron_parallel_state() -> tuple[int | str, int, int, int, int]:
-    global_rank: int | str = "unknown"
-    tp_rank = 0
-    tp_size = 1
-    cp_rank = 0
-    cp_size = 1
-
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            global_rank = int(dist.get_rank())
-    except Exception:
-        pass
-
-    try:
-        from megatron.core import parallel_state as mpu
-
-        tp_size = int(mpu.get_tensor_model_parallel_world_size())
-        if hasattr(mpu, "get_tensor_model_parallel_rank"):
-            tp_rank = int(mpu.get_tensor_model_parallel_rank())
-        if hasattr(mpu, "get_context_parallel_world_size"):
-            cp_size = int(mpu.get_context_parallel_world_size())
-        if hasattr(mpu, "get_context_parallel_rank"):
-            cp_rank = int(mpu.get_context_parallel_rank())
-    except (ImportError, RuntimeError, AssertionError, AttributeError):
-        pass
-
-    return global_rank, tp_rank, tp_size, cp_rank, cp_size
 
 
 def restore_suffix_first_log_probs_from_prefix(
@@ -365,6 +348,8 @@ def restore_suffix_first_log_probs_from_prefix(
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
+        return log_probs
+    if not ctx.parallel_info.is_pipeline_last_stage:
         return log_probs
     restored = log_probs.clone()
     for index in ctx.prefix_last_restore_indices:

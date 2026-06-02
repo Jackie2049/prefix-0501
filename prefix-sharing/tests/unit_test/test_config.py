@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import pytest
 
@@ -8,6 +9,8 @@ from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigE
 @dataclass
 class ModelConfig:
     pipeline_model_parallel_size: int = 1
+    virtual_pipeline_model_parallel_size: Optional[int] = None
+    num_layers_per_virtual_pipeline_stage: Optional[int] = None
     context_parallel_size: int = 1
     apply_rope_fusion: bool = False
     fused_single_qkv_rope: bool = False
@@ -22,6 +25,12 @@ def test_disabled_config_does_not_validate_model_constraints():
 def test_enabled_config_accepts_phase_one_constraints():
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     config.validate(ModelConfig())
+
+
+@pytest.mark.parametrize("pp_size", [1, 2, 4, 8])
+def test_enabled_config_accepts_physical_pipeline_parallel_sizes(pp_size):
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    config.validate(ModelConfig(pipeline_model_parallel_size=pp_size))
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", "y"])
@@ -52,7 +61,6 @@ def test_env_var_rejects_invalid_prefix_sharing_value(monkeypatch):
 @pytest.mark.parametrize(
     "field,value,message",
     [
-        ("pipeline_model_parallel_size", 2, "pipeline_model_parallel_size=2"),
         ("context_parallel_size", 2, "context_parallel_size=2"),
         ("apply_rope_fusion", True, "apply_rope_fusion=True"),
         ("fused_single_qkv_rope", True, "fused_single_qkv_rope=True"),
@@ -60,6 +68,22 @@ def test_env_var_rejects_invalid_prefix_sharing_value(monkeypatch):
     ],
 )
 def test_enabled_config_rejects_unsupported_phase_one_constraints(field, value, message):
+    model_config = ModelConfig()
+    setattr(model_config, field, value)
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    with pytest.raises(PrefixSharingConfigError, match=message):
+        config.validate(model_config)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("pipeline_model_parallel_size", 0, "pipeline_model_parallel_size"),
+        ("virtual_pipeline_model_parallel_size", 2, "virtual_pipeline_model_parallel_size"),
+        ("num_layers_per_virtual_pipeline_stage", 8, "num_layers_per_virtual_pipeline_stage"),
+    ],
+)
+def test_enabled_config_rejects_unsupported_pipeline_parallel_variants(field, value, message):
     model_config = ModelConfig()
     setattr(model_config, field, value)
     config = PrefixSharingConfig(enable_prefix_sharing=True)
