@@ -77,19 +77,25 @@ class PrefixSharingConfig:
     integrate_mode: str = "verl_megatron_actor"
     model_type: str = "text_only_causal_lm"  # Model type identifier; phase 1 only supports text-only causal LM
 
-    def __post_init__(self) -> None:
-        if _env_enables_prefix_sharing() and not self.enable_prefix_sharing:
-            object.__setattr__(self, "enable_prefix_sharing", True)
-
     @classmethod
     def from_raw(cls, raw: Any) -> "PrefixSharingConfig":
-        """Build config from bool/mapping/object input and environment overrides."""
+        """Build config from bool/mapping/object input and environment overrides.
 
-        if raw is None or raw is False:
+        Environment variable ``ENABLE_PREFIX_SHARING`` is only consulted when
+        the caller does not supply an explicit ``enable_prefix_sharing`` value
+        (i.e. ``raw`` is ``None``, or a mapping that omits the key).  Explicit
+        ``True`` / ``False`` always wins over the env var.
+        """
+
+        if raw is None:
+            return cls(enable_prefix_sharing=_env_enables_prefix_sharing())
+        if raw is False:
             return cls(enable_prefix_sharing=False)
         if raw is True:
             return cls(enable_prefix_sharing=True)
         values = _to_plain_mapping(raw)
+        if "enable_prefix_sharing" not in values:
+            values["enable_prefix_sharing"] = _env_enables_prefix_sharing()
         return cls(**values)
 
     def validate(self, model_config: Any | None = None, integrate_mode: str | None = None) -> None:
