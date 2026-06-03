@@ -172,7 +172,7 @@ class AsyncRolloutRequest(BaseModel):
                 tokenize=True,
                 return_dict=True,
             )
-            
+
             values["input_ids"], values["attention_mask"] = (
                 tokenization_dict_with_prompt["input_ids"],
                 tokenization_dict_with_prompt["attention_mask"],
