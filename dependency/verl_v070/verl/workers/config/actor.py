@@ -165,6 +165,7 @@ class ActorConfig(BaseConfig):
     ######## prefix sharing ########
     # Prefix sharing configuration
     prefix_sharing_config: dict[str, Any] = field(default_factory=dict)
+    ######## Prefix sharing ########
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
