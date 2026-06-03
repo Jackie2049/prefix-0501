@@ -96,7 +96,7 @@ def _load_json_to_dataproto(json_path: str):
     return data
 
 
-def patch_fixed_rollout(trainer, json_path: str):
+def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
     """Monkey-patch generate_sequences to return fixed data.
 
     Patches both actor_rollout_wg.generate_sequences and
@@ -106,8 +106,23 @@ def patch_fixed_rollout(trainer, json_path: str):
     Args:
         trainer: The RayPPOTrainer / RayMegatronTrainer instance (self in fit()).
         json_path: Absolute path to the JSON file.
+        num_workers: Number of agent loop workers (default 8, matching verl's
+            ``actor_rollout_ref.rollout.agent.num_workers``). The fixed data
+            will be auto-padded to a multiple of this value to avoid
+            DataProto.chunk() equal-division assertion errors.
     """
     fixed_data = _load_json_to_dataproto(json_path)
+
+    # Pad to make divisible by num_workers (prevent chunk() AssertionError)
+    n = len(fixed_data)
+    remainder = n % num_workers
+    if remainder != 0:
+        pad_size = num_workers - remainder
+        fixed_data.padding(pad_size, "last")
+        logger.warning(
+            f"[FixedRollout] Padded from {n} to {n + pad_size} samples"
+            f" (divisible by {num_workers})."
+        )
 
     def _patched(batch, **kwargs):
         logger.warning("[FixedRollout] Returning fixed rollout data, skipping generation.")
