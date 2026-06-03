@@ -111,6 +111,7 @@ def patch_fixed_rollout(trainer, json_path: str):
 
     def _patched(batch, **kwargs):
         logger.warning("[FixedRollout] Returning fixed rollout data, skipping generation.")
+        fixed_data.meta_info["timing"] = {}
         return fixed_data
 
     trainer.actor_rollout_wg.generate_sequences = _patched
