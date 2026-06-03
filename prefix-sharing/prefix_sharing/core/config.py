@@ -61,7 +61,7 @@ class PrefixSharingConfig:
     should fail loudly instead of silently changing training semantics.
     """
 
-    enable_prefix_sharing: bool = False
+    enable_prefix_sharing: bool | None = None
     detector: str = "trie"
     backend: str = "torch_ref"
     min_prefix_len: int = 1  # Prefixes shorter than this won't be cached (too short = not worth it)
@@ -78,14 +78,19 @@ class PrefixSharingConfig:
     model_type: str = "text_only_causal_lm"  # Model type identifier; phase 1 only supports text-only causal LM
 
     def __post_init__(self) -> None:
-        if _env_enables_prefix_sharing() and not self.enable_prefix_sharing:
-            object.__setattr__(self, "enable_prefix_sharing", True)
+        # Resolve unset enable_prefix_sharing from env var.
+        # Explicit constructor arg takes priority over env var;
+        # env var only acts as a fallback when nothing was passed.
+        if self.enable_prefix_sharing is None:
+            object.__setattr__(self, "enable_prefix_sharing", _env_enables_prefix_sharing())
 
     @classmethod
     def from_raw(cls, raw: Any) -> "PrefixSharingConfig":
         """Build config from bool/mapping/object input and environment overrides."""
 
-        if raw is None or raw is False:
+        if raw is None:
+            return cls()
+        if raw is False:
             return cls(enable_prefix_sharing=False)
         if raw is True:
             return cls(enable_prefix_sharing=True)
