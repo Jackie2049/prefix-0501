@@ -884,8 +884,9 @@ class MegatronPPOActor(BasePPOActor):
             _profile_ctx_var.set(None)
             self._profile_mon.stop()
             os.makedirs(profile_output_dir, exist_ok=True)
-            self._profile_mon.save_to_csv(os.path.join(profile_output_dir, "memory_trace.csv"))
-            self._profile_sw.save_to_csv(os.path.join(profile_output_dir, "timing_trace.csv"))
+            rank = torch.distributed.get_rank()
+            self._profile_mon.save_to_csv(os.path.join(profile_output_dir, f"memory_trace_rank{rank}.csv"))
+            self._profile_sw.save_to_csv(os.path.join(profile_output_dir, f"timing_trace_rank{rank}.csv"))
             self._profile_sw = None
             self._profile_mon = None
         ######### profiling #########
