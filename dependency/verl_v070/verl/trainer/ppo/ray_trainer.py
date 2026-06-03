@@ -1292,6 +1292,12 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        # Replace rollout generation with fixed data when USE_FIXED_ROLLOUT env is set
+        json_path = os.environ.get("USE_FIXED_ROLLOUT", None)
+        if json_path:
+            from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
+            patch_fixed_rollout(self, json_path=json_path)
+
         current_epoch = self.global_steps // len(self.train_dataloader)
 
         # perform validation before training
