@@ -172,7 +172,11 @@ class AsyncRolloutRequest(BaseModel):
                 tokenize=True,
                 return_dict=True,
             )
-
+            
+            values["input_ids"], values["attention_mask"] = (
+                tokenization_dict_with_prompt["input_ids"],
+                tokenization_dict_with_prompt["attention_mask"],
+            )
             if values["input_ids"].shape[-1] > max_prompt_len:
                 # Only log the warning to avoid truncating in the middle of generation prompt. Consider raising an
                 # error for this case in the future.

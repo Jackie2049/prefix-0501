@@ -477,7 +477,7 @@ class vLLMHttpServerBase:
 
         # Determine max_tokens from sampling_params or use configured response_length as default
         if "max_tokens" in sampling_params:
-            max_tokens = sampling_params.pop("max_tokens")            
+            max_tokens = sampling_params.pop("max_tokens")
         elif "max_new_tokens" in sampling_params:
             # support sglang-style 'max_new_tokens' param
             max_tokens = sampling_params.pop("max_new_tokens")
