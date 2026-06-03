@@ -20,6 +20,7 @@ class BackendCapabilities:
     supports_fused_rope: bool = False
     supports_context_parallel: bool = False
     supports_pipeline_parallel: bool = False
+    supports_flash_attention: bool = False
     supports_gated_attention: bool = False
     supports_deltanet_state_reuse: bool = False
 
