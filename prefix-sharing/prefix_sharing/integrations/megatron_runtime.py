@@ -59,6 +59,7 @@ def maybe_run_prefix_sharing_attention(
     prefix_log.warning(
         "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
         "enter prefix-sharing path: "
+        "sequence_parallel=%s query_token_length=%s total_padded_length=%s "
         "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
         "padded_lengths=%s, cu_seqlens=%s",
         parallel_info.global_rank,
@@ -67,6 +68,9 @@ def maybe_run_prefix_sharing_attention(
         parallel_info.pp_rank,
         parallel_info.pp_size,
         layer_id,
+        getattr(getattr(attention_module, "config", None), "sequence_parallel", None),
+        query.shape[0],
+        packed_batch_layout.total_padded_length,
         tuple(query.shape),
         tuple(key.shape),
         tuple(value.shape),
