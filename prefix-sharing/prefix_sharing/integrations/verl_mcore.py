@@ -270,6 +270,8 @@ def build_prefix_sharing_micro_batch(
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
         f"prefix_last_restore={prefix_sharing_plan.prefix_last_restore}"
     )
+    if prefix_sharing_plan.has_sharing:
+        logger.info("[PS][prepare] %s", prefix_sharing_plan.summary())
 
     # --- Path 5: no sharing found ---
     if not prefix_sharing_plan.has_sharing:
@@ -372,7 +374,10 @@ def restore_suffix_first_log_probs_from_prefix(
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
         return log_probs
+    if logits is None or log_probs is None:
+        return log_probs
     restored = log_probs.clone()
+    n_restored = 0
     for index in ctx.prefix_last_restore_indices:
         provider_logits = logits[
             0:1,
@@ -385,6 +390,8 @@ def restore_suffix_first_log_probs_from_prefix(
         ]
         restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
         restored[0, index.reuse_1d_pos] = restored_value.reshape(())
+        n_restored += 1
+    logger.debug("[PS][restore] restored %d suffix-first logprobs", n_restored)
     return restored
 
 
