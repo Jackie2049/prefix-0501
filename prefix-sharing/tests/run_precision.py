@@ -305,6 +305,136 @@ def test_identical_sequences(result, device):
         result.check_close("reuser", ps_outs[1], ind_outs[1][s:e])
 
 
+def test_gated_attention_precision(result, device):
+    """Test that gated attention produces correct results with prefix-sharing."""
+    print("\n[test_gated_attention_precision] Gated attention (Qwen3.6-style)")
+    sequences = [[1,2,3,10,20], [1,2,3,30,40,50]]
+    head_dim, num_q_heads, num_kv_heads = 8, 4, 4
+
+    torch.manual_seed(42)
+    config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=2)
+    plan = PrefixSharingPlanner(config).plan(sequences, forward_id=0, micro_batch_id=0)
+    backend = TorchReferenceBackend()
+    store = PrefixAttentionStore()
+
+    result.check_true("has_sharing", plan.has_sharing)
+
+    seq_lens = [len(s) for s in sequences]
+    all_token_ids = set()
+    for seq in sequences:
+        all_token_ids.update(seq)
+    max_tid = max(all_token_ids) + 1
+
+    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
+    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
+    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device) for sl in seq_lens]
+    gate_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device) for sl in seq_lens]
+    k_rows = [k_emb[seq] for seq in sequences]
+    v_rows = [v_emb[seq] for seq in sequences]
+
+    # Independent gated attention
+    ind_outs = []
+    for q, k, v, gate in zip(q_per_pos, k_rows, v_rows, gate_per_pos):
+        scale = math.sqrt(head_dim)
+        scores = torch.einsum("qhd,khd->hqk", q, k) / scale
+        mask = torch.arange(k.shape[0], device=device).unsqueeze(0) <= torch.arange(q.shape[0], device=device).unsqueeze(1)
+        scores = scores.masked_fill(~mask.unsqueeze(0), torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores, dim=-1)
+        attn_out = torch.einsum("hqk,khd->qhd", probs, v)
+        ind_outs.append(attn_out * torch.sigmoid(gate))
+
+    # Prefix-sharing gated attention
+    trimmed_q, trimmed_k, trimmed_v, trimmed_gate = [], [], [], []
+    for i, (q, k, v, g) in enumerate(zip(q_per_pos, k_rows, v_rows, gate_per_pos)):
+        s, e = plan.input_keep_ranges[i]
+        trimmed_q.append(q[s:e])
+        trimmed_k.append(k[s:e])
+        trimmed_v.append(v[s:e])
+        trimmed_gate.append(g[s:e])
+
+    packed_q = torch.cat(trimmed_q, dim=0)
+    packed_k = torch.cat(trimmed_k, dim=0)
+    packed_v = torch.cat(trimmed_v, dim=0)
+    packed_gate = torch.cat(trimmed_gate, dim=0)
+
+    expanded_k, expanded_v = backend.build_kv(packed_k, packed_v, store, plan, layer_id=0)
+    ps_output = backend.gated_attention(packed_q, expanded_k, expanded_v, packed_gate, plan)
+    ps_rows = list(torch.split(ps_output, plan.kept_lengths_q))
+
+    result.check_close("provider_gated", ps_rows[0], ind_outs[0])
+    s, e = plan.input_keep_ranges[1]
+    result.check_close("reuser_gated", ps_rows[1], ind_outs[1][s:e])
+
+
+def test_qwen36_like_gqa_gated(result, device):
+    """Test with Qwen3.6-27B-like parameters: GQA 24:4, head_dim=256, gated."""
+    print("\n[test_qwen36_like_gqa_gated] Qwen3.6-like GQA 24:4 + gated")
+    head_dim, num_q_heads, num_kv_heads = 256, 24, 4
+    # Smaller sequence lengths for CPU feasibility
+    prefix = list(range(100, 116))  # 16 tokens
+    sequences = [
+        prefix + [200+i for i in range(8)],
+        prefix + [300+i for i in range(8)],
+    ]
+
+    torch.manual_seed(42)
+    config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=2)
+    plan = PrefixSharingPlanner(config).plan(sequences, forward_id=0, micro_batch_id=0)
+    backend = TorchReferenceBackend()
+    store = PrefixAttentionStore()
+
+    result.check_true("has_sharing", plan.has_sharing)
+
+    seq_lens = [len(s) for s in sequences]
+    all_token_ids = set()
+    for seq in sequences:
+        all_token_ids.update(seq)
+    max_tid = max(all_token_ids) + 1
+
+    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
+    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
+    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device) for sl in seq_lens]
+    gate_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device) for sl in seq_lens]
+    k_rows = [k_emb[seq] for seq in sequences]
+    v_rows = [v_emb[seq] for seq in sequences]
+
+    # Independent
+    ind_outs = []
+    for q, k, v, gate in zip(q_per_pos, k_rows, v_rows, gate_per_pos):
+        scale = math.sqrt(head_dim)
+        repeat = num_q_heads // num_kv_heads
+        k_exp = k.repeat_interleave(repeat, dim=1)
+        v_exp = v.repeat_interleave(repeat, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", q, k_exp) / scale
+        mask = torch.arange(k_exp.shape[0], device=device).unsqueeze(0) <= torch.arange(q.shape[0], device=device).unsqueeze(1)
+        scores = scores.masked_fill(~mask.unsqueeze(0), torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores, dim=-1)
+        attn_out = torch.einsum("hqk,khd->qhd", probs, v_exp)
+        ind_outs.append(attn_out * torch.sigmoid(gate))
+
+    # Prefix-sharing
+    trimmed_q, trimmed_k, trimmed_v, trimmed_gate = [], [], [], []
+    for i, (q, k, v, g) in enumerate(zip(q_per_pos, k_rows, v_rows, gate_per_pos)):
+        s, e = plan.input_keep_ranges[i]
+        trimmed_q.append(q[s:e])
+        trimmed_k.append(k[s:e])
+        trimmed_v.append(v[s:e])
+        trimmed_gate.append(g[s:e])
+
+    packed_q = torch.cat(trimmed_q, dim=0)
+    packed_k = torch.cat(trimmed_k, dim=0)
+    packed_v = torch.cat(trimmed_v, dim=0)
+    packed_gate = torch.cat(trimmed_gate, dim=0)
+
+    expanded_k, expanded_v = backend.build_kv(packed_k, packed_v, store, plan, layer_id=0)
+    ps_output = backend.gated_attention(packed_q, expanded_k, expanded_v, packed_gate, plan)
+    ps_rows = list(torch.split(ps_output, plan.kept_lengths_q))
+
+    for i in range(2):
+        s, e = plan.input_keep_ranges[i]
+        result.check_close(f"qwen36like_seq{i}", ps_rows[i], ind_outs[i][s:e], atol=1e-4)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -336,6 +466,8 @@ def main():
     test_gradient_preservation(result, args.device)
     test_single_token_suffix(result, args.device)
     test_identical_sequences(result, args.device)
+    test_gated_attention_precision(result, args.device)
+    test_qwen36_like_gqa_gated(result, args.device)
 
     elapsed = time.time() - t0
     ok = result.summary()

@@ -56,6 +56,8 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         supports_different_q_kv_lengths=True,
         supports_prefix_last_restore=True,
         supports_flash_attention=True,
+        supports_gated_attention=True,
+        supports_deltanet_state_reuse=True,
     )
 
     def __init__(self) -> None:
@@ -143,3 +145,56 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
             ) from exc
 
         return out
+
+    # ------------------------------------------------------------------
+    # Gated attention: flash attention + sigmoid gate
+    # ------------------------------------------------------------------
+    def gated_attention(
+        self,
+        query: Any,
+        key: Any,
+        value: Any,
+        gate: Any,
+        prefix_sharing_plan: PrefixSharingPlan,
+        *,
+        packed_batch_layout: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Apply Qwen3.5/3.6-style output gate after flash attention.
+
+        The gate is derived from the current kept hidden states, so prefix
+        sharing must not cache it.
+        """
+        import torch
+
+        attention_output = self.attention(
+            query, key, value, prefix_sharing_plan,
+            packed_batch_layout=packed_batch_layout, **kwargs,
+        )
+        if attention_output.shape != gate.shape:
+            raise ValueError("gate shape must match attention output shape")
+        return attention_output * torch.sigmoid(gate)
+
+    # ------------------------------------------------------------------
+    # DeltaNet state reuse: delegate to reference implementation
+    # ------------------------------------------------------------------
+    def build_deltanet_states(
+        self,
+        state_update: Any,
+        store: Any,
+        prefix_sharing_plan: PrefixSharingPlan,
+        *,
+        packed_batch_layout: Any | None = None,
+        layer_id: int,
+        tp_rank: int = 0,
+    ) -> Any:
+        """Build prefix-expanded GatedDeltaNet recurrent trajectories.
+
+        Delegates to TorchReferenceBackend because state accumulation is a
+        pure PyTorch operation that does not benefit from fused kernels.
+        """
+        return self._torch_ref.build_deltanet_states(
+            state_update, store, prefix_sharing_plan,
+            packed_batch_layout=packed_batch_layout,
+            layer_id=layer_id, tp_rank=tp_rank,
+        )
