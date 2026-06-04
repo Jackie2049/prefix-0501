@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 
+import prefix_sharing
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 
 
@@ -74,3 +75,17 @@ def test_enabled_config_rejects_non_phase_one_modes():
         PrefixSharingConfig(enable_prefix_sharing=True, boundary_strategy="restore_last_prefix_token").validate(ModelConfig())
     with pytest.raises(PrefixSharingConfigError, match="integrate_mode"):
         PrefixSharingConfig(enable_prefix_sharing=True).validate(ModelConfig(), integrate_mode="verl_fsdp")
+
+
+def test_diagnose_returns_status_dict():
+    info = prefix_sharing.diagnose()
+    assert isinstance(info, dict)
+    assert "flash_attn_available" in info
+    assert "megatron_available" in info
+
+    # With config
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="torch_ref")
+    info = prefix_sharing.diagnose(config)
+    assert info["config_enabled"] is True
+    assert info["config_backend"] == "torch_ref"
+    assert "resolved_backend" in info
