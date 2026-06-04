@@ -1306,7 +1306,7 @@ class RayPPOTrainer:
             patch_synthetic_prefix(
                 self,
                 json_path=synthetic_json,
-                batch_size=self.config.data.get("gen_batch_size", 4),
+                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
                 max_prompt_length=self.config.data.max_prompt_length,
                 max_response_length=self.config.data.max_response_length,
             )
