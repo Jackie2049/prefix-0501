@@ -339,11 +339,20 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
     q_heads = q_row.shape[1]
     kv_heads = k_row.shape[1]
     if q_heads != kv_heads:
-        if q_heads % kv_heads != 0:
-            raise ValueError("query heads must be a multiple of kv heads for grouped-query attention")
-        repeat = q_heads // kv_heads
-        k_row = k_row.repeat_interleave(repeat, dim=1)
-        v_row = v_row.repeat_interleave(repeat, dim=1)
+        if q_heads > kv_heads:
+            # GQA: repeat KV heads to match query heads
+            if q_heads % kv_heads != 0:
+                raise ValueError("query heads must be a multiple of kv heads for grouped-query attention")
+            repeat = q_heads // kv_heads
+            k_row = k_row.repeat_interleave(repeat, dim=1)
+            v_row = v_row.repeat_interleave(repeat, dim=1)
+        elif kv_heads > q_heads:
+            # TP partition with replicated KV: repeat Q to match KV heads
+            # Each Q head attends to all its corresponding KV heads
+            if kv_heads % q_heads != 0:
+                raise ValueError("kv heads must be a multiple of q heads for TP partitioning")
+            repeat = kv_heads // q_heads
+            q_row = q_row.repeat_interleave(repeat, dim=1)
 
     # Use SDPA on CUDA for significant speedup (dispatches to FA2/mem-efficient)
     if q_row.is_cuda and hasattr(torch.nn.functional, "scaled_dot_product_attention"):
