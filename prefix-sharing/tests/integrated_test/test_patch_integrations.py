@@ -1,3 +1,7 @@
+import sys
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
@@ -147,3 +151,54 @@ def test_prefix_sharing_enabled_propagates_install_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="install failed"):
         with prefix_sharing_enabled(PrefixSharingConfig(enable_prefix_sharing=True)):
             pass
+
+
+def test_megatron_patch_installs_forward_wrapper(monkeypatch):
+    """Verify that install() actually replaces SelfAttention.forward."""
+    # Create a fake megatron.core.transformer.attention module
+    fake_attention = ModuleType("megatron.core.transformer.attention")
+
+    original_forward_calls = []
+
+    class FakeSelfAttention:
+        def forward(self, hidden_states, **kwargs):
+            original_forward_calls.append(True)
+            return "original_output"
+
+    FakeSelfAttention.forward = FakeSelfAttention.forward
+    fake_attention.SelfAttention = FakeSelfAttention
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.attention", fake_attention)
+    # Also need the parent modules
+    for parent in ["megatron", "megatron.core", "megatron.core.transformer"]:
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, ModuleType(parent))
+
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+    )
+    handle = integration.install(model_config=model_config)
+
+    try:
+        # Without a prefix-sharing context, the patched forward should delegate
+        # to the original (which appends to original_forward_calls)
+        instance = FakeSelfAttention()
+        result = instance.forward(hidden_states="fake", attention_mask=None)
+        assert result == "original_output"
+        assert len(original_forward_calls) == 1
+    finally:
+        handle.disable()
+
+    # After disabling, the original forward is restored
+    original_forward_calls.clear()
+    instance2 = FakeSelfAttention()
+    result2 = instance2.forward(hidden_states="fake", attention_mask=None)
+    assert result2 == "original_output"
+    assert len(original_forward_calls) == 1
+
+    # Verify handle is no longer active
+    assert not handle.active
