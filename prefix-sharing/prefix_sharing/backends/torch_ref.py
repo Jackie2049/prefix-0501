@@ -319,6 +319,13 @@ def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any
 
 
 def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
+    """Compute attention for a single row with causal masking.
+
+    Uses ``torch.nn.functional.scaled_dot_product_attention`` when available
+    (PyTorch >= 2.0) which dispatches to FlashAttention-2 or memory-efficient
+    attention on CUDA. Falls back to manual implementation on CPU or when the
+    SDPA path is not applicable (e.g., 2D inputs).
+    """
     torch = _torch()
     scale = math.sqrt(q_row.shape[-1])
     if q_row.dim() == 2:
@@ -338,6 +345,25 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
         k_row = k_row.repeat_interleave(repeat, dim=1)
         v_row = v_row.repeat_interleave(repeat, dim=1)
 
+    # Use SDPA on CUDA for significant speedup (dispatches to FA2/mem-efficient)
+    if q_row.is_cuda and hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        # SDPA expects (B, H, S, D) format
+        q_4d = q_row.unsqueeze(0).transpose(1, 2)  # (1, H, Q, D)
+        k_4d = k_row.unsqueeze(0).transpose(1, 2)  # (1, H, KV, D)
+        v_4d = v_row.unsqueeze(0).transpose(1, 2)  # (1, H, KV, D)
+        # Convert boolean mask to additive attention mask: 0.0 for attend, -inf for mask
+        attn_mask = torch.zeros_like(mask, dtype=q_row.dtype)
+        attn_mask = attn_mask.masked_fill(~mask, torch.finfo(q_row.dtype).min)
+        # Broadcast mask to (1, H, Q, KV)
+        attn_mask = attn_mask.unsqueeze(0)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_4d, k_4d, v_4d,
+            attn_mask=attn_mask,
+            scale=1.0 / scale,
+        )
+        return out.squeeze(0).transpose(0, 1)  # (Q, H, D)
+
+    # Fallback: manual einsum (slower but works everywhere)
     scores = torch.einsum("qhd,khd->hqk", q_row, k_row) / scale
     scores = scores.masked_fill(~mask.unsqueeze(0), torch.finfo(scores.dtype).min)
     probs = torch.softmax(scores, dim=-1)
