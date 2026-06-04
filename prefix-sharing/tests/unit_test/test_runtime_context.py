@@ -28,8 +28,10 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
         assert not ctx.store.closed
+        assert not ctx.deltanet_store.closed
     assert current_prefix_sharing_context() is None
     assert ctx.store.closed
+    assert ctx.deltanet_store.closed
 
 
 def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices():
