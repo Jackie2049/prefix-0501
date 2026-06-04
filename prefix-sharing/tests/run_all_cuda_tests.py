@@ -168,6 +168,61 @@ def _run_tp_test():
     return 1, 1
 
 
+def _run_logprob_tensor_tests():
+    """Run tensor-based logprob function tests."""
+    import torch
+    from prefix_sharing.core.config import PrefixSharingConfig
+    from prefix_sharing.core.planner import PrefixSharingPlanner
+    from prefix_sharing.core.logprob import (
+        compute_token_logprobs_from_logits,
+        gather_provider_prefix_last_logits,
+        restore_prefix_last_logprobs_tensor,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    passed = 0
+    total = 0
+
+    # Test 1: compute_token_logprobs_from_logits
+    total += 1
+    logits = torch.tensor([[1.0, 2.0, 3.0, 0.5], [0.1, 0.2, 0.3, 0.4]], device=device)
+    labels = torch.tensor([2, 3], device=device)
+    logprobs = compute_token_logprobs_from_logits(logits, labels)
+    expected = torch.log_softmax(logits, dim=-1).gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(logprobs, expected, atol=1e-6)
+    passed += 1
+    print(f"  [PASS] compute_token_logprobs_from_logits: shape={tuple(logprobs.shape)}")
+
+    # Test 2: gather_provider_prefix_last_logits
+    total += 1
+    config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
+    plan = PrefixSharingPlanner(config).plan([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21, 22]])
+    logits = torch.randn(2, 6, 4, device=device)
+    result = gather_provider_prefix_last_logits(logits, plan)
+    assert result.shape == (2, 4)
+    assert torch.equal(result[1], logits[0, 2])
+    assert torch.all(result[0] == 0)
+    passed += 1
+    print(f"  [PASS] gather_provider_prefix_last_logits: shape={tuple(result.shape)}")
+
+    # Test 3: restore_prefix_last_logprobs_tensor
+    total += 1
+    # Padded to max_kept_length (5)
+    suffix_logprobs = torch.zeros(2, 5, device=device)
+    suffix_logprobs[0, :5] = torch.tensor([0.10, 0.11, 0.12, 0.13, 0.14], device=device)
+    suffix_logprobs[1, :3] = torch.tensor([0.21, 0.22, 0.23], device=device)
+    first_suffix = torch.tensor([0.0, 0.20], device=device)
+    restored = restore_prefix_last_logprobs_tensor(suffix_logprobs, first_suffix, plan)
+    assert restored.shape[0] == 2
+    assert torch.allclose(restored[1, 0], first_suffix[1])
+    # Reuser: [first_suffix, suffix_token_0, suffix_token_1, suffix_token_2, 0]
+    assert torch.allclose(restored[1, 1:4], suffix_logprobs[1, :3])
+    passed += 1
+    print(f"  [PASS] restore_prefix_last_logprobs_tensor: shape={tuple(restored.shape)}")
+
+    return passed, total
+
+
 def main():
     print("=" * 60)
     print("Prefix-Sharing CUDA Test Runner")
@@ -183,18 +238,23 @@ def main():
     total_passed = 0
     total_checks = 0
 
-    print("[1/3] Precision tests...")
+    print("[1/4] Precision tests...")
     p, c = _run_precision_tests()
     total_passed += p
     total_checks += c
 
-    print("\n[2/3] E2E pipeline test...")
+    print("\n[2/4] E2E pipeline test...")
     p, c = _run_e2e_test()
     total_passed += p
     total_checks += c
 
-    print("\n[3/3] TP simulation test...")
+    print("\n[3/4] TP simulation test...")
     p, c = _run_tp_test()
+    total_passed += p
+    total_checks += c
+
+    print("\n[4/4] Logprob tensor tests...")
+    p, c = _run_logprob_tensor_tests()
     total_passed += p
     total_checks += c
 
