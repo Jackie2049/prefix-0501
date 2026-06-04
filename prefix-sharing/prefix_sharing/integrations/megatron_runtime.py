@@ -27,12 +27,10 @@ def maybe_run_prefix_sharing_attention(
     """
 
     import logging
-    prefix_log = logging.getLogger(__file__)
-    prefix_log.warning("\n\n\nsuccess come into def maybe_run_prefix_sharing_attention\n\n\n")
+    prefix_log = logging.getLogger(__name__)
 
     ctx = current_prefix_sharing_context()
     if ctx is None:
-        prefix_log.warning("\n\n\nctx is None\n\n\n")
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
@@ -66,21 +64,10 @@ def maybe_run_prefix_sharing_attention(
             # DeltaNet state reuse is handled by a separate integration point.
             return None
 
-    prefix_log.warning("\n\n\ntry to build kv\n\n\n")
-    prefix_log.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] enter prefix-sharing path: "
-        "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
-        "padded_lengths=%s, cu_seqlens=%s",
-        global_rank,
-        tp_rank,
-        tp_size,
-        layer_id,
-        tuple(query.shape),
-        tuple(key.shape),
-        tuple(value.shape),
-        packed_batch_layout.valid_lengths,
-        packed_batch_layout.padded_lengths,
-        packed_batch_layout.cu_seqlens,
+    prefix_log.debug(
+        "[PS][attention][rank=%s tp=%s/%s layer=%s] query=%s key=%s value=%s",
+        global_rank, tp_rank, tp_size, layer_id,
+        tuple(query.shape), tuple(key.shape), tuple(value.shape),
     )
     expanded_key, expanded_value = backend.build_kv(
         key,
@@ -91,15 +78,9 @@ def maybe_run_prefix_sharing_attention(
         layer_id=layer_id,
         tp_rank=tp_rank,
     )
-    prefix_log.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] built expanded kv: "
-        "expanded_key_shape=%s, expanded_value_shape=%s",
-        global_rank,
-        tp_rank,
-        tp_size,
-        layer_id,
-        tuple(expanded_key.shape),
-        tuple(expanded_value.shape),
+    prefix_log.debug(
+        "[PS][attention] built expanded kv: key=%s value=%s",
+        tuple(expanded_key.shape), tuple(expanded_value.shape),
     )
     core_attn_out = backend.attention(
         query,

@@ -205,7 +205,7 @@ def build_prefix_sharing_micro_batch(
     """
 
     batch_size = len(batch["input_ids"]) if "input_ids" in batch else None
-    logger.warning(f"[PS][prepare] ENTER: batch_size={batch_size}, batch_keys={list(batch.keys())}")
+    logger.debug(f"[PS][prepare] ENTER: batch_size={batch_size}, batch_keys={list(batch.keys())}")
 
     config = PrefixSharingConfig.from_raw(
         _read_actor_value(actor_config, "prefix_sharing_config", None)
@@ -213,59 +213,59 @@ def build_prefix_sharing_micro_batch(
 
     # --- Path 1: prefix sharing disabled by config ---
     if not config.enable_prefix_sharing:
-        logger.warning(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enable_prefix_sharing=False), returning (batch, None)")
+        logger.debug(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enable_prefix_sharing=False), returning (batch, None)")
         return batch, None
 
-    logger.warning(f"[PS][prepare] config.enable_prefix_sharing=True, validating config...")
+    logger.debug(f"[PS][prepare] config.enable_prefix_sharing=True, validating config...")
 
     config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
-    logger.warning(f"[PS][prepare] config.validate() returned OK")
+    logger.debug(f"[PS][prepare] config.validate() returned OK")
 
     # --- Path 2: missing use_remove_padding ---
-    logger.warning(f"[PS][prepare] checking megatron.use_remove_padding...")
+    logger.debug(f"[PS][prepare] checking megatron.use_remove_padding...")
     if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
-        logger.warning(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
+        logger.debug(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
         raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
 
     # --- Path 3: multi_modal check ---
-    logger.warning(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
+    logger.debug(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
     multi_modal_inputs = batch.get("multi_modal_inputs")
     if multi_modal_inputs is not None:
         # tensorclass 无法遍历（触发 CUDA 同步），改用底层 td 检查字段数
         import inspect
         is_tensorclass = hasattr(multi_modal_inputs, 'batch_size')
-        logger.warning(f"[PS][prepare] multi_modal_inputs type: tensorclass={is_tensorclass}, type={type(multi_modal_inputs).__name__}")
+        logger.debug(f"[PS][prepare] multi_modal_inputs type: tensorclass={is_tensorclass}, type={type(multi_modal_inputs).__name__}")
         if is_tensorclass:
             _td = getattr(multi_modal_inputs, 'td', None) or getattr(multi_modal_inputs, '_tensordict', None)
             _keys = list(_td.keys()) if _td is not None else []
             has_mm = len(_keys) > 0
-            logger.warning(f"[PS][prepare] tensorclass td keys={_keys}, has_mm={has_mm}")
+            logger.debug(f"[PS][prepare] tensorclass td keys={_keys}, has_mm={has_mm}")
         else:
             has_mm = any(mmi is not None and len(mmi.keys()) > 0 for mmi in multi_modal_inputs)
         if has_mm:
-            logger.warning(f"[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
+            logger.debug(f"[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
             raise RuntimeError("prefix sharing phase 1 supports only text-only actor micro-batches")
-        logger.warning(f"[PS][prepare] multi_modal check PASSED (no real multi-modal content)")
+        logger.debug(f"[PS][prepare] multi_modal check PASSED (no real multi-modal content)")
 
     # --- Read tensors ---
     attention_mask = batch["attention_mask"].to(bool)
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
-    logger.warning(f"[PS][prepare] tensor shapes: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}, position_ids={position_ids.shape}")
+    logger.debug(f"[PS][prepare] tensor shapes: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}, position_ids={position_ids.shape}")
 
     # --- Path 4: wrong tensor dims ---
     if attention_mask.dim() != 2 or input_ids.dim() != 2 or position_ids.dim() != 2:
-        logger.warning(f"[PS][prepare] PATH 4: non-2D tensors detected, raising RuntimeError")
+        logger.debug(f"[PS][prepare] PATH 4: non-2D tensors detected, raising RuntimeError")
         raise RuntimeError("prefix sharing phase 1 expects 2D input_ids/attention_mask/position_ids")
 
     # --- Planning ---
     valid_indices = [attention_mask[row].nonzero(as_tuple=False).flatten() for row in range(input_ids.shape[0])]
     sequences = [input_ids[row, indices].detach().cpu().tolist() for row, indices in enumerate(valid_indices)]
     seq_lens = [len(s) for s in sequences]
-    logger.warning(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
+    logger.debug(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
 
     prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
-    logger.warning(
+    logger.debug(
         f"[PS][prepare] prefix_sharing_plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
         f"prefix_last_restore={prefix_sharing_plan.prefix_last_restore}"
@@ -273,11 +273,11 @@ def build_prefix_sharing_micro_batch(
 
     # --- Path 5: no sharing found ---
     if not prefix_sharing_plan.has_sharing:
-        logger.warning(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
+        logger.debug(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
         return batch, None
 
     # --- Path 6: sharing found, trim the original micro-batch ---
-    logger.warning(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
+    logger.debug(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
     trimmed_micro_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
     new_attention_mask[:] = False
@@ -301,7 +301,7 @@ def build_prefix_sharing_micro_batch(
         kept_position_rows,
         align_size=int(align_size),
     )
-    logger.warning(
+    logger.debug(
         "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s] packed_batch_layout: "
         "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
         "total_valid=%s, total_padded=%s",
@@ -322,7 +322,7 @@ def build_prefix_sharing_micro_batch(
         backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
     )
-    logger.warning(
+    logger.debug(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
         f"prefix_sharing_runtime_state) with keep_ranges={prefix_sharing_plan.input_keep_ranges}"
     )
