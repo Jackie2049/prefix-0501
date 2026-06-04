@@ -16,6 +16,8 @@ from prefix_sharing.integrations.patch_manager import PatchManager
 from prefix_sharing.integrations.verl_mcore import (
     VerlMCoreBatchAdapter,
     VerlMCoreIntegration,
+    _read_actor_bool,
+    _read_actor_value,
     prefix_sharing_enabled,
 )
 
@@ -393,3 +395,28 @@ def test_megatron_patch_uses_get_query_key_value_tensors(monkeypatch):
         assert len(qkv_calls) >= 1, "get_query_key_value_tensors should have been called"
     finally:
         handle.disable()
+
+
+# --- _read_actor_value / _read_actor_bool tests ---
+
+def test_read_actor_value_from_dict():
+    config = {"megatron": {"use_remove_padding": True, "tp_size": 4}}
+    assert _read_actor_value(config, "megatron.use_remove_padding", False) is True
+    assert _read_actor_value(config, "megatron.tp_size", 1) == 4
+
+
+def test_read_actor_value_from_namespace():
+    inner = SimpleNamespace(use_remove_padding=False)
+    config = SimpleNamespace(megatron=inner)
+    assert _read_actor_value(config, "megatron.use_remove_padding", True) is False
+
+
+def test_read_actor_value_returns_default_for_missing_path():
+    assert _read_actor_value({}, "megatron.use_remove_padding", False) is False
+    assert _read_actor_value(None, "foo.bar", 42) == 42
+
+
+def test_read_actor_bool_converts_value():
+    assert _read_actor_bool({"flag": 1}, "flag", False) is True
+    assert _read_actor_bool({"flag": 0}, "flag", True) is False
+    assert _read_actor_bool({}, "flag", True) is True
