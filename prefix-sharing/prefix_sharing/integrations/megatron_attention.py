@@ -70,12 +70,8 @@ def _make_patched_forward(original_forward: Any) -> Any:
         # to the runtime hook which handles RoPE, KV expansion, and attention.
         import torch
 
-        # THD packed mode: QKV projection
-        mixed_layer = self_attention_module.linear_qkv(hidden_states)
-
-        # For remove-padding (THD) mode, Megatron stores projection config
-        # on the module. The mixed qkv tensor shape is [total_tokens, heads * 3 * head_dim]
-        # or [total_tokens, q_tokens + 2 * kv_tokens * head_dim] for GQA.
+        # For remove-padding (THD) mode, use Megatron's own QKV splitting
+        # which correctly handles GQA interleaving (grouped-query layout).
         if hasattr(self_attention_module, "tp_group") and hasattr(
             self_attention_module, "tp_comm_overlap"
         ):
@@ -92,35 +88,21 @@ def _make_patched_forward(original_forward: Any) -> Any:
                 **kwargs,
             )
 
-        # Split QKV
-        config = self_attention_module.config
-        num_q_heads = config.num_attention_heads
-        num_kv_heads = config.num_query_groups
-        hidden_size_per_head = config.kv_channels
-        q_sz = num_q_heads * hidden_size_per_head
-        kv_sz = num_kv_heads * hidden_size_per_head
-
-        # Handle TP-split QKV
-        tp_size = 1
-        try:
-            from megatron.core import parallel_state
-
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        except Exception:
-            pass
-
-        # In TP mode, heads are already split per rank
-        tp_q_sz = q_sz // tp_size
-        tp_kv_sz = kv_sz // tp_size
-
-        query, key, value = torch.split(
-            mixed_layer, [tp_q_sz, tp_kv_sz, tp_kv_sz], dim=-1
+        # Use Megatron's own get_query_key_value_tensors to correctly handle
+        # GQA interleaving and TP head partitioning. This avoids replicating
+        # the complex QKV split logic here.
+        query, key, value = self_attention_module.get_query_key_value_tensors(
+            hidden_states,
         )
 
-        # Reshape to THD: [total_tokens, heads, head_dim]
-        query = query.view(query.shape[0], num_q_heads // tp_size, hidden_size_per_head)
-        key = key.view(key.shape[0], num_kv_heads // tp_size, hidden_size_per_head)
-        value = value.view(value.shape[0], num_kv_heads // tp_size, hidden_size_per_head)
+        # In THD (remove-padding) mode, the tensor shape is [total_tokens, heads, head_dim]
+        # but Megatron's get_query_key_value_tensors may output [sq, b, h, hn].
+        # We need to flatten to [total_tokens, heads, head_dim] for our backends.
+        if query.dim() == 4:
+            # [sq, b, h, hn] -> [sq * b, h, hn] — THD mode has b=1, so just squeeze
+            query = query.reshape(-1, query.shape[-2], query.shape[-1])
+            key = key.reshape(-1, key.shape[-2], key.shape[-1])
+            value = value.reshape(-1, value.shape[-2], value.shape[-1])
 
         from prefix_sharing.integrations.megatron_runtime import (
             maybe_run_prefix_sharing_attention,

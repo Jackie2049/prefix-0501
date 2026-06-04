@@ -202,3 +202,96 @@ def test_megatron_patch_installs_forward_wrapper(monkeypatch):
 
     # Verify handle is no longer active
     assert not handle.active
+
+
+def test_megatron_patch_uses_get_query_key_value_tensors(monkeypatch):
+    """Verify the patched forward calls get_query_key_value_tensors for QKV split."""
+    pytest.importorskip("torch")
+    import torch
+
+    from prefix_sharing.backends.packed_layout import PackedBatchLayout
+    from prefix_sharing.core.planner import PrefixSharingPlanner
+    from prefix_sharing.integrations.context import prefix_sharing_runtime_context
+    from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
+
+    # Create a fake megatron module with get_query_key_value_tensors
+    fake_attention = ModuleType("megatron.core.transformer.attention")
+
+    qkv_calls = []
+
+    class FakeSelfAttention:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                pipeline_model_parallel_size=1,
+                context_parallel_size=1,
+            )
+
+        def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
+            qkv_calls.append(hidden_states)
+            # Return [total_tokens, num_heads, head_dim] tensors
+            n_tokens = hidden_states.shape[0]
+            q = torch.randn(n_tokens, 4, 8)
+            k = torch.randn(n_tokens, 2, 8)
+            v = torch.randn(n_tokens, 2, 8)
+            return q, k, v
+
+        def linear_proj(self, x):
+            return torch.randn(x.shape[0], 4 * 8)
+
+    class FakeOriginal:
+        """Track calls to the original forward."""
+        calls = 0
+
+        @classmethod
+        def __call__(cls, *args, **kwargs):
+            cls.calls += 1
+            return "original"
+
+    fake_attention.SelfAttention = FakeSelfAttention
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.attention", fake_attention)
+    for parent in ["megatron", "megatron.core", "megatron.core.transformer"]:
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, ModuleType(parent))
+
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+    )
+    handle = integration.install(model_config=model_config)
+
+    try:
+        # Create a prefix-sharing context
+        planner = PrefixSharingPlanner(
+            PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=2)
+        )
+        plan = planner.plan([[1, 2, 3, 10], [1, 2, 3, 20]])
+        state = PrefixSharingRuntimeState(
+            prefix_sharing_plan=plan,
+            backend=TorchReferenceBackend(),
+            packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
+        )
+
+        instance = FakeSelfAttention()
+        # Fake packed_seq_params with qkv_format='thd' is needed
+        # But without a full Megatron environment, the hook will hit errors.
+        # We just verify get_query_key_value_tensors was called.
+        with prefix_sharing_runtime_context(state) as ctx:
+            assert ctx is not None
+            # The patched forward will call get_query_key_value_tensors
+            # then fail on Megatron-specific RoPE calls - that's expected.
+            # What matters is qkv_calls was populated.
+            fake_input = torch.randn(5, 32)
+            try:
+                instance.forward(hidden_states=fake_input, attention_mask=None,
+                                 packed_seq_params=None, rotary_pos_emb=None)
+            except (RuntimeError, AttributeError, TypeError):
+                pass  # Expected - missing Megatron runtime deps
+
+        # Verify get_query_key_value_tensors was called
+        assert len(qkv_calls) >= 1, "get_query_key_value_tensors should have been called"
+    finally:
+        handle.disable()
