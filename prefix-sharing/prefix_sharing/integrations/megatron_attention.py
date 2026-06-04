@@ -102,8 +102,11 @@ def _make_patched_forward(original_forward: Any) -> Any:
                 key_value_states=key_value_states,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                sequence_id=sequence_id,
                 **kwargs,
             )
 
@@ -122,6 +125,11 @@ def _make_patched_forward(original_forward: Any) -> Any:
             query = query.reshape(-1, query.shape[-2], query.shape[-1])
             key = key.reshape(-1, key.shape[-2], key.shape[-1])
             value = value.reshape(-1, value.shape[-2], value.shape[-1])
+        elif query.dim() != 3:
+            raise RuntimeError(
+                f"prefix sharing expects QKV tensors with 3 or 4 dims, "
+                f"got query.dim()={query.dim()}, shape={tuple(query.shape)}"
+            )
 
         from prefix_sharing.integrations.megatron_runtime import (
             maybe_run_prefix_sharing_attention,

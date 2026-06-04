@@ -62,3 +62,26 @@ def test_planner_no_shared_prefix_keeps_original_shapes():
     assert prefix_sharing_plan.input_keep_ranges == [(0, 2), (0, 2), (0, 2)]
     assert prefix_sharing_plan.reuse_specs == []
     assert prefix_sharing_plan.prefix_last_restore == []
+
+
+def test_planner_tokens_saved_and_summary():
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3))
+    plan = planner.plan(
+        [[1, 2, 3, 4, 5, 10, 11], [1, 2, 3, 20, 21, 22], [1, 2, 3, 4, 5, 30, 31], [9, 9, 9]],
+        forward_id=7, micro_batch_id=3,
+    )
+    # Reusers: idx 1 (prefix_len=3), idx 2 (prefix_len=5) → saved = 3+5 = 8
+    assert plan.tokens_saved == 8
+    assert plan.total_original_tokens == 7 + 6 + 7 + 3  # 23
+    assert abs(plan.savings_ratio - 8 / 23) < 1e-6
+    s = plan.summary()
+    assert "saved=8/23" in s
+    assert "batch=4" in s
+
+
+def test_planner_tokens_saved_no_sharing():
+    planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2))
+    plan = planner.plan([[1, 2], [1, 3], [4, 5]])
+    assert plan.tokens_saved == 0
+    assert plan.total_original_tokens == 6
+    assert plan.savings_ratio == 0.0

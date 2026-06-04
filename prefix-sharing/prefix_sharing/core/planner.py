@@ -151,6 +151,33 @@ class PrefixSharingPlan:
     def has_sharing(self) -> bool:
         return bool(self.reuse_specs)
 
+    @property
+    def tokens_saved(self) -> int:
+        """Total number of tokens saved by reusing prefix KV instead of recomputing."""
+        return sum(self.prefix_lens[i] for i in range(self.batch_size) if self.is_reuser(i))
+
+    @property
+    def total_original_tokens(self) -> int:
+        """Sum of original sequence lengths before trimming."""
+        return sum(self.original_lengths)
+
+    @property
+    def savings_ratio(self) -> float:
+        """Fraction of tokens saved (0.0 = no sharing, up to ~1.0)."""
+        total = self.total_original_tokens
+        if total == 0:
+            return 0.0
+        return self.tokens_saved / total
+
+    def summary(self) -> str:
+        """One-line summary for logging."""
+        return (
+            f"PS[fw={self.forward_id} mb={self.micro_batch_id}] "
+            f"batch={self.batch_size} sharing={self.has_sharing} "
+            f"saved={self.tokens_saved}/{self.total_original_tokens} "
+            f"({self.savings_ratio:.1%})"
+        )
+
     def is_reuser(self, idx_in_batch: int) -> bool:
         return self.provider_index[idx_in_batch] != idx_in_batch and self.prefix_lens[idx_in_batch] > 0
 
