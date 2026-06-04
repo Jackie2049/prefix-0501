@@ -27,6 +27,7 @@ from prefix_sharing.core.batch_trim import (
     trim_loss_masks,
 )
 from prefix_sharing.core.logprob import restore_prefix_last_logprobs
+from prefix_sharing.core.model_spec import ModelSpec
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
@@ -46,6 +47,7 @@ class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
     packed_batch_layout: PackedBatchLayout
+    model_spec: ModelSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,8 @@ class VerlMCoreBatchAdapter:
     def prefix_sharing_runtime_context(
         self,
         prefix_sharing_batch: VerlMCorePrefixSharingBatch,
+        *,
+        model_spec: ModelSpec | None = None,
     ) -> Iterator[Any]:
         """Open the runtime context consumed by patched attention."""
 
@@ -114,6 +118,7 @@ class VerlMCoreBatchAdapter:
             packed_batch_layout=PackedBatchLayout.from_valid_lengths(
                 prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
             ),
+            model_spec=model_spec,
         )
         return _prefix_sharing_runtime_context(runtime_state)
 

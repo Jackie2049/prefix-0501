@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.core.model_spec import ModelSpec
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import PrefixAttentionStore
 
@@ -33,6 +34,7 @@ class PrefixSharingRuntimeContext:
     store: PrefixAttentionStore
     backend: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
+    model_spec: ModelSpec | None = None
 
 
 def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
@@ -81,6 +83,7 @@ def prefix_sharing_runtime_context(
             prefix_sharing_runtime_state.prefix_sharing_plan,
             prefix_sharing_runtime_state.packed_batch_layout,
         ),
+        model_spec=getattr(prefix_sharing_runtime_state, "model_spec", None),
     )
     token = _current_context.set(ctx)
     try:

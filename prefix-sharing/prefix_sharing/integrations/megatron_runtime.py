@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+from prefix_sharing.core.model_spec import AttentionLayerType
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 
 
@@ -54,6 +55,16 @@ def maybe_run_prefix_sharing_attention(
     backend = ctx.backend or TorchReferenceBackend()
     global_rank, tp_rank, tp_size = _read_parallel_rank_info()
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
+
+    # Determine layer type for HybridAttention models (e.g., Qwen3.6-27B)
+    model_spec = ctx.model_spec
+    if model_spec is not None:
+        layer_type = model_spec.layer_type(layer_id)
+        if layer_type == AttentionLayerType.LINEAR_ATTENTION:
+            # Linear attention layers use recurrent state (GatedDeltaNet),
+            # not standard KV-based attention. Skip KV injection for now;
+            # DeltaNet state reuse is handled by a separate integration point.
+            return None
 
     prefix_log.warning("\n\n\ntry to build kv\n\n\n")
     prefix_log.warning(
