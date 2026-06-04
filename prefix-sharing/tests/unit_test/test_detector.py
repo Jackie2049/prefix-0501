@@ -99,3 +99,48 @@ def test_trie_detector_respects_min_group_size_for_relation_threshold():
     ]
     assert result.provider_index == (0, 1, 0)
     assert result.prefix_lens == (0, 0, 2)
+
+
+def test_trie_detector_identical_sequences():
+    """Identical sequences share the full prefix (common in RL with low temperature)."""
+    detector = TriePrefixDetector(min_prefix_len=3, min_group_size=2)
+    result = detector.detect([[1, 2, 3, 4, 5], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]])
+    assert len(result.reuse_specs) == 2
+    assert all(s.provider_idx_in_batch == 0 and s.prefix_len == 5 for s in result.reuse_specs)
+    assert result.prefix_lens == (0, 5, 5)
+    assert result.is_provider == (True, False, False)
+
+
+def test_trie_detector_single_sequence():
+    """A single sequence has no sharing."""
+    detector = TriePrefixDetector(min_prefix_len=2, min_group_size=2)
+    result = detector.detect([[1, 2, 3, 4, 5]])
+    assert result.reuse_specs == ()
+    assert result.prefix_lens == (0,)
+    assert result.is_provider == (True,)
+
+
+def test_trie_detector_empty_batch():
+    """Empty batch returns empty results."""
+    detector = TriePrefixDetector(min_prefix_len=2, min_group_size=2)
+    result = detector.detect([])
+    assert result.batch_size == 0
+    assert result.reuse_specs == ()
+    assert result.provider_index == ()
+    assert result.prefix_lens == ()
+
+
+def test_trie_detector_no_common_prefix():
+    """Sequences with no common prefix have no sharing."""
+    detector = TriePrefixDetector(min_prefix_len=2, min_group_size=2)
+    result = detector.detect([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    assert result.reuse_specs == ()
+    assert result.prefix_lens == (0, 0, 0)
+
+
+def test_trie_detector_prefix_shorter_than_min():
+    """Common prefix shorter than min_prefix_len triggers no sharing."""
+    detector = TriePrefixDetector(min_prefix_len=3, min_group_size=2)
+    result = detector.detect([[1, 2, 10], [1, 2, 20]])
+    assert result.reuse_specs == ()
+    assert result.prefix_lens == (0, 0)
