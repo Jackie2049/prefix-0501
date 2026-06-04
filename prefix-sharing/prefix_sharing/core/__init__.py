@@ -2,6 +2,7 @@
 
 from prefix_sharing.core.batch_trim import TrimmedBatch, trim_batch, trim_inputs, trim_labels, trim_loss_masks
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
+from prefix_sharing.core.observability import PrefixSharingLayerStats, PrefixSharingStats
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
 from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore, StoredPrefixKV
 from prefix_sharing.core.logprob import (
@@ -18,7 +19,9 @@ __all__ = [
     "PrefixReuseSpec",
     "PrefixKVSlotId",
     "PrefixKVStore",
+    "PrefixSharingLayerStats",
     "PrefixSharingPlan",
+    "PrefixSharingStats",
     "PrefixSharingConfig",
     "PrefixSharingConfigError",
     "PrefixLastRestoreSpec",

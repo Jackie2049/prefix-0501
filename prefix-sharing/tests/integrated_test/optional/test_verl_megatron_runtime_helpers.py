@@ -161,8 +161,9 @@ def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path
             index=reuse_label.unsqueeze(-1),
         ).squeeze(-1)
 
-    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
+        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 1
 
     restored[0, 5].backward()
     assert logits.grad is not None

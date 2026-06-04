@@ -10,6 +10,7 @@ from prefix_sharing.core.logprob import (
     gather_provider_prefix_last_logits,
     restore_prefix_last_logprobs_tensor,
 )
+from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
 
@@ -77,6 +78,10 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
 
     backend = TorchReferenceBackend()
     store = PrefixKVStore()
+    stats = PrefixSharingStats.from_plan(
+        prefix_sharing_plan,
+        PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q),
+    )
     key = torch.arange(sum(prefix_sharing_plan.kept_lengths_q) * 2, dtype=torch.float32).reshape(-1, 2)
     value = key + 100
 
@@ -86,12 +91,21 @@ def test_torch_reference_backend_caches_expanded_reuser_for_later_reuse():
         store,
         prefix_sharing_plan,
         layer_id=0,
+        stats=stats,
     )
 
     reuser_slot_id = PrefixKVSlotId(prefix_sharing_plan.forward_id, prefix_sharing_plan.micro_batch_id, 0, 1, 0)
     assert store.load(reuser_slot_id).key_tensor.shape[0] == 4
     assert expanded_key.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
     assert expanded_value.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
+    layer_stats = stats.layers[0]
+    assert layer_stats.store_count == 3
+    assert layer_stats.reuse_count == 2
+    assert layer_stats.reuse_hit_count == 2
+    assert layer_stats.reuse_miss_count == 0
+    assert layer_stats.reused_prefix_tokens == 7
+    assert layer_stats.expanded_kv_tokens == 12
+    assert stats.layer_matches_expected(0)
 
 
 @pytest.mark.parametrize(
@@ -121,6 +135,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
     )
     backend = TorchReferenceBackend()
     store = PrefixKVStore()
+    stats = PrefixSharingStats.from_plan(prefix_sharing_plan, layout)
     query = torch.randn(layout.total_padded_length, 2)
     key = torch.arange(layout.total_padded_length * 2, dtype=torch.float32).reshape(-1, 2)
     value = key + 100
@@ -132,6 +147,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
         prefix_sharing_plan,
         packed_batch_layout=layout,
         layer_id=0,
+        stats=stats,
     )
     output = backend.attention(
         query,
@@ -147,6 +163,12 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
     assert store.load(reuser_slot_id).key_tensor.shape[0] == 5
     assert expanded_key.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
     assert expanded_value.shape[0] == sum(prefix_sharing_plan.expanded_lengths_kv)
+    layer_stats = stats.layers[0]
+    assert layer_stats.valid_q_tokens == 7
+    assert layer_stats.padded_q_tokens == layout.total_padded_length
+    assert layer_stats.stored_tokens == 10
+    assert layer_stats.reused_prefix_tokens == 3
+    assert stats.layer_matches_expected(0)
     assert output.shape == query.shape
     for padding_index in padding_indices:
         assert output[padding_index].abs().sum().item() == 0

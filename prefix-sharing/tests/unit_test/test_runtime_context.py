@@ -27,6 +27,10 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
         assert ctx.prefix_sharing_plan is prefix_sharing_runtime_state.prefix_sharing_plan
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
+        assert ctx.stats.original_tokens == 11
+        assert ctx.stats.kept_valid_tokens == 8
+        assert ctx.stats.expected_reused_counts_per_layer == 1
+        assert ctx.stats.expected_reused_prefix_tokens_per_layer == 3
         assert not ctx.store.closed
     assert current_prefix_sharing_context() is None
     assert ctx.store.closed
@@ -53,3 +57,4 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
     with prefix_sharing_runtime_context(runtime_state) as ctx:
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 6
+        assert ctx.stats.kept_padded_tokens == 8

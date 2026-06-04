@@ -41,6 +41,7 @@ class PrefixAttentionBackend(Protocol):
         packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
+        stats: Any | None = None,
     ) -> tuple[Any, Any]:
         ...
 

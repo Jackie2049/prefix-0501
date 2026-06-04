@@ -366,6 +366,8 @@ def restore_suffix_first_log_probs_from_prefix(
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
         return log_probs
+    if ctx.stats is not None:
+        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
     restored = log_probs.clone()
     for index in ctx.prefix_last_restore_indices:
         provider_logits = logits[
