@@ -10,7 +10,7 @@ from typing import Any, Iterator
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.model_spec import ModelSpec
 from prefix_sharing.core.planner import PrefixSharingPlan
-from prefix_sharing.core.prefix_store import PrefixAttentionStore
+from prefix_sharing.core.prefix_store import PrefixAttentionStore, PrefixDeltanetStore
 
 
 _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
@@ -32,6 +32,7 @@ class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan
     packed_batch_layout: PackedBatchLayout
     store: PrefixAttentionStore
+    deltanet_store: PrefixDeltanetStore
     backend: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
     model_spec: ModelSpec | None = None
@@ -78,6 +79,7 @@ def prefix_sharing_runtime_context(
         prefix_sharing_plan=prefix_sharing_runtime_state.prefix_sharing_plan,
         packed_batch_layout=prefix_sharing_runtime_state.packed_batch_layout,
         store=PrefixAttentionStore(),
+        deltanet_store=PrefixDeltanetStore(),
         backend=prefix_sharing_runtime_state.backend,
         prefix_last_restore_indices=_build_prefix_last_restore_indices(
             prefix_sharing_runtime_state.prefix_sharing_plan,
@@ -91,3 +93,4 @@ def prefix_sharing_runtime_context(
     finally:
         _current_context.reset(token)
         ctx.store.close()
+        ctx.deltanet_store.close()

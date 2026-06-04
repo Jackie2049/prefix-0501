@@ -72,18 +72,22 @@ class TorchReferenceBackend:
     ) -> tuple[Any, Any]:
         torch = _torch()
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        # Input K/V still follow the framework's padded packed layout; only
-        # valid tokens may enter the store or expanded KV.
         key_rows = _split_packed(key, layout.padded_lengths)
         value_rows = _split_packed(value, layout.padded_lengths)
+
+        # Try optimized fast path for the common RL pattern:
+        # batch_index 0 is provider, all others are reusers from the same provider
+        # with the same prefix length.
+        fast_result = _try_build_kv_fast_path(
+            key_rows, value_rows, store, prefix_sharing_plan, layout,
+            layer_id=layer_id, tp_rank=tp_rank,
+        )
+        if fast_result is not None:
+            return fast_result
+
+        # General path with cascading support
         expanded_keys = []
         expanded_values = []
-        # This loop relies on the current online detector invariant that a provider
-        # appears before every reuser that loads from it. All rows' QKV tensors have
-        # already been produced in parallel by this point; the ordering here only
-        # controls KV assembly before attention. Do not reorder or parallelize this
-        # loop unless provider dependencies are handled explicitly, e.g. by a
-        # topology-aware build phase.
         for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
             valid_length = layout.valid_lengths[batch_index]
             valid_key_row = key_row[:valid_length]
@@ -97,7 +101,6 @@ class TorchReferenceBackend:
                     PREFIX_STATE_TYPE_ATTENTION_KV,
                     tp_rank,
                 )
-                # Publish this row's KV so later reusers in this micro-batch can load it.
                 store.store(
                     slot_id,
                     key_tensor=valid_key_row,
@@ -117,7 +120,6 @@ class TorchReferenceBackend:
                     PREFIX_STATE_TYPE_ATTENTION_KV,
                     tp_rank,
                 )
-                # Load the already-published provider KV before building this reuser's expanded KV.
                 entry = store.load(provider_slot_id)
                 prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
                 expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
@@ -130,7 +132,6 @@ class TorchReferenceBackend:
                     PREFIX_STATE_TYPE_ATTENTION_KV,
                     tp_rank,
                 )
-                # Publish the expanded reuser KV because a later row may reuse this longer prefix.
                 store.store(
                     own_slot_id,
                     key_tensor=expanded_key,
@@ -300,6 +301,98 @@ class TorchReferenceBackend:
             )
             outputs.append(_pad_like_row(suffix_trajectory, update_row))
         return torch.cat(outputs, dim=0)
+
+
+def _try_build_kv_fast_path(
+    key_rows: list[Any],
+    value_rows: list[Any],
+    store: PrefixAttentionStore,
+    plan: PrefixSharingPlan,
+    layout: PackedBatchLayout,
+    *,
+    layer_id: int,
+    tp_rank: int = 0,
+) -> tuple[Any, Any] | None:
+    """Vectorised build_kv for the common RL pattern: one provider, N reusers.
+
+    The pattern: batch_index 0 is a provider; all other rows are reusers that
+    reference batch_index 0 as their provider *with the same prefix_len*.  When
+    this holds we can store the provider KV once and expand every reuser in a
+    single batched ``torch.cat`` instead of looping one-by-one in Python.
+
+    Returns ``None`` when the pattern does not match, so the caller can fall
+    through to the general (cascading / mixed-group) path.
+    """
+    torch = _torch()
+    batch_size = len(key_rows)
+    if batch_size < 2:
+        return None
+
+    # batch 0 must be a provider (provider_index[0] == 0)
+    if plan.provider_index[0] != 0:
+        return None
+
+    provider_prefix_len = plan.prefix_lens[0]
+
+    # All other rows must be reusers from provider 0 with the same prefix_len
+    for i in range(1, batch_size):
+        if plan.provider_index[i] != 0:
+            return None
+        if plan.prefix_lens[i] != provider_prefix_len:
+            return None
+        if provider_prefix_len <= 0:
+            return None
+
+    # --- Pattern matched: execute fast path ---
+
+    # 1. Store provider KV
+    provider_slot = PrefixActivationSlotId(
+        plan.forward_id, plan.micro_batch_id, layer_id, 0,
+        PREFIX_STATE_TYPE_ATTENTION_KV, tp_rank,
+    )
+    provider_valid_len = layout.valid_lengths[0]
+    provider_key = key_rows[0][:provider_valid_len]
+    provider_value = value_rows[0][:provider_valid_len]
+    store.store(
+        provider_slot,
+        key_tensor=provider_key,
+        value_tensor=provider_value,
+        prefix_len=provider_key.shape[0],
+        overwrite=True,
+    )
+
+    # 2. Provider output: its own valid KV
+    expanded_keys = [provider_key]
+    expanded_values = [provider_value]
+
+    # 3. All reusers share the same prefix slice from the provider
+    prefix_key = provider_key[:provider_prefix_len]     # (P, H, D)
+    prefix_value = provider_value[:provider_prefix_len]  # (P, H, D)
+
+    # 4. Expand all reusers at once
+    for i in range(1, batch_size):
+        valid_len = layout.valid_lengths[i]
+        suffix_key = key_rows[i][:valid_len]
+        suffix_value = value_rows[i][:valid_len]
+
+        expanded_key = torch.cat([prefix_key, suffix_key], dim=0)
+        expanded_value = torch.cat([prefix_value, suffix_value], dim=0)
+
+        reuser_slot = PrefixActivationSlotId(
+            plan.forward_id, plan.micro_batch_id, layer_id, i,
+            PREFIX_STATE_TYPE_ATTENTION_KV, tp_rank,
+        )
+        store.store(
+            reuser_slot,
+            key_tensor=expanded_key,
+            value_tensor=expanded_value,
+            prefix_len=expanded_key.shape[0],
+            overwrite=True,
+        )
+        expanded_keys.append(expanded_key)
+        expanded_values.append(expanded_value)
+
+    return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
 
 
 def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:

@@ -199,3 +199,51 @@ def _read_parallel_rank_info() -> tuple[int | str, int, int]:
         pass
 
     return global_rank, tp_rank, tp_size
+
+
+def maybe_run_prefix_sharing_deltanet(
+    attention_module: Any,
+    state_update: Any,
+    packed_seq_params: Any,
+) -> Any | None:
+    """Build prefix-expanded GatedDeltaNet recurrent states for linear attention layers.
+
+    This hook is called from linear attention layers (e.g., Qwen3.6 HybridAttention)
+    where GatedDeltaNet replaces standard KV-based attention. The state update tensor
+    is the recurrent update from the current forward pass; prefix sharing reuses the
+    provider's accumulated state trajectory so reusers can start from the prefix
+    boundary without recomputing the full prefix.
+
+    Returns the expanded state output tensor, or ``None`` when prefix sharing is not
+    active (caller should use the normal Megatron path).
+    """
+    ctx = current_prefix_sharing_context()
+    if ctx is None:
+        return None
+    if not ctx.prefix_sharing_plan.has_sharing:
+        return None
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return None
+
+    backend = ctx.backend or TorchReferenceBackend()
+    _, tp_rank, _ = _read_parallel_rank_info()
+    layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
+
+    # Only process linear attention layers
+    model_spec = ctx.model_spec
+    if model_spec is not None:
+        layer_type = model_spec.layer_type(layer_id)
+        if layer_type != AttentionLayerType.LINEAR_ATTENTION:
+            return None
+
+    packed_batch_layout = ctx.packed_batch_layout
+
+    expanded_state = backend.build_deltanet_states(
+        state_update,
+        ctx.deltanet_store,
+        ctx.prefix_sharing_plan,
+        packed_batch_layout=packed_batch_layout,
+        layer_id=layer_id,
+        tp_rank=tp_rank,
+    )
+    return expanded_state
