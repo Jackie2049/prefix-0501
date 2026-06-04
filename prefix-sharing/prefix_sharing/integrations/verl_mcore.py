@@ -195,6 +195,7 @@ def build_prefix_sharing_micro_batch(
     model_config: Any,
     *,
     backend: Any | None = None,
+    model_spec: ModelSpec | None = None,
 ) -> tuple[Any, PrefixSharingRuntimeState | None]:
     """Trim one verl Megatron actor micro-batch in-place for prefix sharing.
 
@@ -232,7 +233,6 @@ def build_prefix_sharing_micro_batch(
     multi_modal_inputs = batch.get("multi_modal_inputs")
     if multi_modal_inputs is not None:
         # tensorclass 无法遍历（触发 CUDA 同步），改用底层 td 检查字段数
-        import inspect
         is_tensorclass = hasattr(multi_modal_inputs, 'batch_size')
         logger.debug(f"[PS][prepare] multi_modal_inputs type: tensorclass={is_tensorclass}, type={type(multi_modal_inputs).__name__}")
         if is_tensorclass:
@@ -321,6 +321,7 @@ def build_prefix_sharing_micro_batch(
         prefix_sharing_plan=prefix_sharing_plan,
         backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
+        model_spec=model_spec or ModelSpec.from_hf_config(model_config),
     )
     logger.debug(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
