@@ -66,6 +66,25 @@ def _make_patched_forward(original_forward: Any) -> Any:
                 **kwargs,
             )
 
+        # Cross-attention (key_value_states provided) or inference mode:
+        # fall through to original forward, prefix sharing only applies to
+        # self-attention in training.
+        if key_value_states is not None or inference_params is not None:
+            return original_forward(
+                self_attention_module,
+                hidden_states,
+                attention_mask=attention_mask,
+                key_value_states=key_value_states,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_id=sequence_id,
+                **kwargs,
+            )
+
         # Prefix-sharing path: do QKV projection ourselves, then hand off
         # to the runtime hook which handles RoPE, KV expansion, and attention.
         import torch

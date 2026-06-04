@@ -29,6 +29,9 @@ class PatchHandle:
             return
         for record in reversed(self._records):
             setattr(record.target, record.attr_name, record.original)
+            key = (id(record.target), record.attr_name)
+            if PatchManager._active_patches.get(key) is record:
+                del PatchManager._active_patches[key]
         self._active = False
 
     def __enter__(self) -> "PatchHandle":
@@ -46,6 +49,10 @@ class PatchHandle:
 class PatchManager:
     """Install attribute patches and roll back if any step fails."""
 
+    # Class-level registry keyed by (id(target), attr_name) to prevent
+    # double-install of the same patch without disabling the previous one.
+    _active_patches: dict[tuple[int, str], _PatchRecord] = {}
+
     def __init__(self) -> None:
         self._records: list[_PatchRecord] = []
 
@@ -62,17 +69,29 @@ class PatchManager:
         original = getattr(target, attr_name)
         if original is replacement:
             return
+
+        key = (id(target), attr_name)
+        existing = self._active_patches.get(key)
+        if existing is not None and existing.replacement is replacement:
+            # Same replacement already active — no-op
+            return
+        if existing is not None:
+            raise RuntimeError(
+                f"{target!r}.{attr_name} is already patched. Disable the previous "
+                f"patch before installing a new one."
+            )
+
         if signature_check is not None:
             signature_check(original)
-        setattr(target, attr_name, replacement)
-        self._records.append(
-            _PatchRecord(
-                target=target,
-                attr_name=attr_name,
-                original=original,
-                replacement=replacement,
-            )
+        record = _PatchRecord(
+            target=target,
+            attr_name=attr_name,
+            original=original,
+            replacement=replacement,
         )
+        setattr(target, attr_name, replacement)
+        self._records.append(record)
+        self._active_patches[key] = record
 
     def handle(self) -> PatchHandle:
         records = list(self._records)

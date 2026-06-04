@@ -6,6 +6,7 @@ import pytest
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.megatron_attention import (
     IntegrationUnavailable,
@@ -39,6 +40,34 @@ def test_patch_manager_installs_and_disables_patch():
     handle.disable()
     assert target.method() == "original"
     assert not handle.active
+
+
+def test_patch_manager_prevents_double_install():
+    """Double-installing the same patch on the same attr raises RuntimeError."""
+    manager1 = PatchManager()
+    manager1.patch_attr(Target, "method", lambda instance: "patched1")
+    handle1 = manager1.handle()
+
+    try:
+        manager2 = PatchManager()
+        with pytest.raises(RuntimeError, match="already patched"):
+            manager2.patch_attr(Target, "method", lambda instance: "patched2")
+    finally:
+        handle1.disable()
+
+
+def test_patch_manager_allows_reinstall_after_disable():
+    """After disabling, the same attr can be patched again."""
+    manager1 = PatchManager()
+    manager1.patch_attr(Target, "method", lambda instance: "patched1")
+    handle1 = manager1.handle()
+    handle1.disable()
+
+    manager2 = PatchManager()
+    manager2.patch_attr(Target, "method", lambda instance: "patched2")
+    handle2 = manager2.handle()
+    assert Target().method() == "patched2"
+    handle2.disable()
 
 
 def test_patch_manager_context_manager_restores_original():
@@ -202,6 +231,75 @@ def test_megatron_patch_installs_forward_wrapper(monkeypatch):
 
     # Verify handle is no longer active
     assert not handle.active
+
+
+def test_megatron_patch_falls_through_for_cross_attention(monkeypatch):
+    """Verify that key_value_states (cross-attention) falls through to original."""
+    fake_attention = ModuleType("megatron.core.transformer.attention")
+
+    original_forward_calls = []
+
+    class FakeSelfAttention:
+        def forward(self, hidden_states, **kwargs):
+            original_forward_calls.append(kwargs.get("key_value_states"))
+            return "original_output"
+
+    FakeSelfAttention.forward = FakeSelfAttention.forward
+    fake_attention.SelfAttention = FakeSelfAttention
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.attention", fake_attention)
+    for parent in ["megatron", "megatron.core", "megatron.core.transformer"]:
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, ModuleType(parent))
+
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+    )
+    handle = integration.install(model_config=model_config)
+
+    try:
+        # Set up a prefix-sharing context so the cross-attention guard is tested
+        planner = PrefixSharingPlanner(
+            PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=2)
+        )
+        plan = planner.plan([[1, 2, 3, 10], [1, 2, 3, 20]])
+
+        from prefix_sharing.backends.packed_layout import PackedBatchLayout
+        from prefix_sharing.integrations.context import prefix_sharing_runtime_context
+        from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
+
+        state = PrefixSharingRuntimeState(
+            prefix_sharing_plan=plan,
+            backend=TorchReferenceBackend(),
+            packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
+        )
+
+        with prefix_sharing_runtime_context(state):
+            instance = FakeSelfAttention()
+            # key_value_states triggers cross-attention fallback
+            result = instance.forward(
+                hidden_states="fake", attention_mask=None,
+                key_value_states="cross_kv",
+            )
+            assert result == "original_output"
+            assert len(original_forward_calls) == 1
+            assert original_forward_calls[0] == "cross_kv"
+
+        # Also test inference_params fallback (without context now)
+        original_forward_calls.clear()
+        instance2 = FakeSelfAttention()
+        result2 = instance2.forward(
+            hidden_states="fake", attention_mask=None,
+            inference_params="inf_params",
+        )
+        assert result2 == "original_output"
+        assert len(original_forward_calls) == 1
+    finally:
+        handle.disable()
 
 
 def test_megatron_patch_uses_get_query_key_value_tensors(monkeypatch):
