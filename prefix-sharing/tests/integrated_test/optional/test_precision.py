@@ -372,6 +372,9 @@ class TestGradientPreservation:
         k_rows_ind = list(torch.split(all_k.detach().clone().requires_grad_(True), seq_lens))
         v_rows_ind = list(torch.split(all_v.detach().clone().requires_grad_(True), seq_lens))
         q_rows_ind = [torch.randn(sl, head_dim) for sl in seq_lens]
+        # split returns views of a leaf tensor — retain_grad to access .grad on each split
+        for t in k_rows_ind + v_rows_ind:
+            t.retain_grad()
 
         ind_outs = _independent_attention(q_rows_ind, k_rows_ind, v_rows_ind)
         ind_loss = sum(o.sum() for o in ind_outs)
@@ -380,6 +383,8 @@ class TestGradientPreservation:
         # --- Prefix-sharing forward ---
         k_rows_ps = list(torch.split(all_k.detach().clone().requires_grad_(True), seq_lens))
         v_rows_ps = list(torch.split(all_v.detach().clone().requires_grad_(True), seq_lens))
+        for t in k_rows_ps + v_rows_ps:
+            t.retain_grad()
         q_rows_ps = [q.clone() for q in q_rows_ind]
 
         trimmed_k = []

@@ -249,9 +249,17 @@ def test_megatron_patch_falls_through_for_cross_attention(monkeypatch):
     FakeSelfAttention.forward = FakeSelfAttention.forward
     fake_attention.SelfAttention = FakeSelfAttention
     monkeypatch.setitem(sys.modules, "megatron.core.transformer.attention", fake_attention)
-    for parent in ["megatron", "megatron.core", "megatron.core.transformer"]:
-        if parent not in sys.modules:
-            monkeypatch.setitem(sys.modules, parent, ModuleType(parent))
+    # Also patch parent modules — must override even if they already exist
+    # because importlib.import_module may traverse through them
+    fake_core_transformer = ModuleType("megatron.core.transformer")
+    fake_core_transformer.attention = fake_attention
+    fake_core = ModuleType("megatron.core")
+    fake_core.transformer = fake_core_transformer
+    fake_megatron = ModuleType("megatron")
+    fake_megatron.core = fake_core
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer", fake_core_transformer)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core)
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron)
 
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
@@ -326,6 +334,9 @@ def test_megatron_patch_uses_get_query_key_value_tensors(monkeypatch):
                 context_parallel_size=1,
             )
 
+        def forward(self, hidden_states, **kwargs):
+            return "original_output"
+
         def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
             qkv_calls.append(hidden_states)
             # Return [total_tokens, num_heads, head_dim] tensors
@@ -349,9 +360,17 @@ def test_megatron_patch_uses_get_query_key_value_tensors(monkeypatch):
 
     fake_attention.SelfAttention = FakeSelfAttention
     monkeypatch.setitem(sys.modules, "megatron.core.transformer.attention", fake_attention)
-    for parent in ["megatron", "megatron.core", "megatron.core.transformer"]:
-        if parent not in sys.modules:
-            monkeypatch.setitem(sys.modules, parent, ModuleType(parent))
+    # Also patch parent modules — must override even if they already exist
+    # because importlib.import_module may traverse through them
+    fake_core_transformer = ModuleType("megatron.core.transformer")
+    fake_core_transformer.attention = fake_attention
+    fake_core = ModuleType("megatron.core")
+    fake_core.transformer = fake_core_transformer
+    fake_megatron = ModuleType("megatron")
+    fake_megatron.core = fake_core
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer", fake_core_transformer)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core)
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron)
 
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())

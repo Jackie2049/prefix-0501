@@ -90,10 +90,10 @@ def test_restore_prefix_last_logprobs_tensor():
     prefix_sharing_plan = _prefix_sharing_plan()
     # Provider (index 0): kept_length=5 tokens
     # Reuser (index 1): kept_length=3 tokens (suffix only, no first-suffix)
-    suffix_logprobs = torch.tensor([
-        [0.10, 0.11, 0.12, 0.13, 0.14],  # provider: 5 kept tokens
-        [0.21, 0.22, 0.23],              # reuser: 3 kept tokens (suffix tokens after first)
-    ])
+    # Padded to max kept_length (5) since torch.tensor requires uniform dimensions
+    suffix_logprobs = torch.zeros(2, 5)
+    suffix_logprobs[0, :5] = torch.tensor([0.10, 0.11, 0.12, 0.13, 0.14])
+    suffix_logprobs[1, :3] = torch.tensor([0.21, 0.22, 0.23])
     first_suffix_logprobs = torch.tensor([0.0, 0.20])  # restored value for reuser
 
     restored = restore_prefix_last_logprobs_tensor(
@@ -105,4 +105,4 @@ def test_restore_prefix_last_logprobs_tensor():
     assert torch.allclose(restored[0, :5], suffix_logprobs[0])
     # Reuser row has first_suffix prepended
     assert torch.allclose(restored[1, 0], first_suffix_logprobs[1])
-    assert torch.allclose(restored[1, 1:4], suffix_logprobs[1])
+    assert torch.allclose(restored[1, 1:4], suffix_logprobs[1, :3])
