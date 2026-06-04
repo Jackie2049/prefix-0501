@@ -1,3 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "prefix_sharing"
+version = "0.1.0"
+description = "Prefix sharing for RL training acceleration in Megatron"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["prefix_sharing*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/unit_test", "tests/integrated_test", "tests/system_test"]
 pythonpath = ["."]
