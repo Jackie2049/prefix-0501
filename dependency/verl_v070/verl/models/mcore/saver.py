@@ -416,6 +416,39 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
                 src_pp_rank=src_pp_rank,
             )
 
+            # Qwen3.6 HybridAttention: collect beta_proj, decay_proj, gate_proj
+            attn = sync_layer.self_attention
+            if hasattr(attn, 'beta_proj'):
+                _broadcast_tp_shard_tensor(
+                    attn.beta_proj.weight,
+                    f"{layer_name}.self_attn.beta_proj.weight",
+                    src_pp_rank=src_pp_rank,
+                )
+                if attn.beta_proj.bias is not None:
+                    _broadcast_tensor(
+                        attn.beta_proj.bias,
+                        f"{layer_name}.self_attn.beta_proj.bias",
+                        src_pp_rank=src_pp_rank,
+                    )
+            if hasattr(attn, 'decay_proj'):
+                _broadcast_tp_shard_tensor(
+                    attn.decay_proj.weight,
+                    f"{layer_name}.self_attn.decay_proj.weight",
+                    src_pp_rank=src_pp_rank,
+                )
+                if attn.decay_proj.bias is not None:
+                    _broadcast_tensor(
+                        attn.decay_proj.bias,
+                        f"{layer_name}.self_attn.decay_proj.bias",
+                        src_pp_rank=src_pp_rank,
+                    )
+            if hasattr(attn, 'gate_proj'):
+                _broadcast_tp_shard_tensor(
+                    attn.gate_proj.weight,
+                    f"{layer_name}.self_attn.gate_proj.weight",
+                    src_pp_rank=src_pp_rank,
+                )
+
             _broadcast_tensor(
                 sync_layer.mlp.linear_fc1.layer_norm_weight,
                 f"{layer_name}.post_attention_layernorm.weight",
