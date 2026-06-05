@@ -96,6 +96,11 @@ _run   "numerical correctness"   1 $((PORT++)) scripts/gpu_e2e_numerical_correct
 _run   "perf benchmark"          1 $((PORT++)) scripts/gpu_ps_perf_benchmark.py
 _run_tp "TP=2"                   $((PORT++)) scripts/gpu_tp_test.py
 
+# Ray E2E test (optional: skip if Ray not installed)
+if python -c "import ray" 2>/dev/null; then
+    _run "verl+PS+Ray E2E"        1 $((PORT++)) scripts/gpu_e2e_verl_ps_ray.py
+fi
+
 # Standalone python tests (no torchrun, need PYTHONPATH)
 # Find python - prefer conda env python, fall back to system python
 PY=$(which python 2>/dev/null || echo "$HOME/anaconda3/envs/llm/bin/python")
