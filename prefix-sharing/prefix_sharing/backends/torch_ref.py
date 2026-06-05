@@ -235,7 +235,22 @@ class TorchReferenceBackend:
 
         torch = _torch()
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        update_rows = _split_packed(state_update, layout.padded_lengths)
+
+        # Determine split lengths: use valid_lengths if the tensor doesn't
+        # include alignment padding (common in GatedDeltaNet where cumsum
+        # operates on the actual model hidden states, not padded).
+        total_padded = sum(layout.padded_lengths)
+        total_valid = sum(layout.valid_lengths)
+        if total_padded == state_update.shape[0]:
+            split_lengths = layout.padded_lengths
+        elif total_valid == state_update.shape[0]:
+            split_lengths = layout.valid_lengths
+        else:
+            raise ValueError(
+                f"state_update first dim {state_update.shape[0]} matches neither "
+                f"total_padded {total_padded} nor total_valid {total_valid}"
+            )
+        update_rows = _split_packed(state_update, split_lengths)
         outputs = []
         for batch_index, update_row in enumerate(update_rows):
             valid_length = layout.valid_lengths[batch_index]
