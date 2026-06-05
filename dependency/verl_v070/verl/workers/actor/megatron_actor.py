@@ -596,8 +596,6 @@ class MegatronPPOActor(BasePPOActor):
                     self.config,
                     self.tf_config,
                 )
-                logger.warning(f"\n\n\nbuild_prefix_sharing_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
-            else: logger.warning("\n\n\nbuild_prefix_sharing_micro_batch is None\n\n\n")
             ######### prefix-sharing #########
 
             input_ids = batch["input_ids"]
