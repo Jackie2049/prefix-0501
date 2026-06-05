@@ -147,18 +147,9 @@ class GatedDeltaNetAttention(SelfAttention):
         # hidden_states: [sq, b, h]
 
         # QKV projection using inherited linear_qkv
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
-
-        # Split QKV
+        # Use parent's get_query_key_value_tensors for correct GQA interleaved split
+        query, key, value = self.get_query_key_value_tensors(hidden_states, None, True)
         sq, b, _ = hidden_states.size()
-        q_size = self.num_heads_per_tp * self.hidden_size_per_attention_head
-        kv_size = self.num_kv_heads_per_tp * self.hidden_size_per_attention_head
-        query, key, value = mixed_qkv.split([q_size, kv_size, kv_size], dim=-1)
-
-        # Reshape to [sq, b, heads, head_dim]
-        query = query.view(sq, b, self.num_heads_per_tp, self.hidden_size_per_attention_head)
-        key = key.view(sq, b, self.num_kv_heads_per_tp, self.hidden_size_per_attention_head)
-        value = value.view(sq, b, self.num_kv_heads_per_tp, self.hidden_size_per_attention_head)
 
         # Apply QK layernorm if configured
         if self.q_layernorm is not None:
