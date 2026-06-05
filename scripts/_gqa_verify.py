@@ -8,6 +8,7 @@ import os, sys, torch, torch.distributed as dist
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "dependency", "megatron_v0150"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "prefix-sharing"))
 
 from megatron.core import parallel_state as mpu
 from megatron.core.transformer import TransformerConfig

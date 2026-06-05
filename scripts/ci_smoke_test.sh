@@ -86,6 +86,7 @@ else
 fi
 
 PORT=29520
+_run   "GQA verify"              1 $((PORT++)) scripts/_gqa_verify.py
 _run   "mcore verify"            1 $((PORT++)) scripts/gpu_mcore_verify.py
 _run   "E2E mcore Qwen3.6"       1 $((PORT++)) scripts/e2e_mcore_qwen36.py
 _run   "PS+mcore integration"    1 $((PORT++)) scripts/gpu_ps_mcore_integration.py
