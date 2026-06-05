@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.model_spec import AttentionLayerType
@@ -67,9 +70,11 @@ def maybe_run_prefix_sharing_attention(
     backend = ctx.backend or TorchReferenceBackend()
     global_rank, tp_rank, tp_size = _read_parallel_rank_info()
     # Megatron layer_number is 1-indexed; convert to 0-indexed for ModelSpec
-    layer_id = int(getattr(attention_module, "layer_number", 0) or 0) - 1
+    layer_id = _normalize_layer_number(attention_module)
 
     # Determine layer type for HybridAttention models (e.g., Qwen3.6-27B)
+    if layer_id < 0:
+        return None  # Could not determine layer_number, skip PS
     model_spec = ctx.model_spec
     if model_spec is not None:
         layer_type = model_spec.layer_type(layer_id)
@@ -224,6 +229,25 @@ def _apply_fused_rope(
     return query, key
 
 
+def _normalize_layer_number(attention_module: Any) -> int:
+    """Convert Megatron 1-indexed layer_number to 0-indexed for ModelSpec.
+
+    Megatron uses 1-based layer_number (layer 0 has layer_number=1), but
+    ModelSpec.layer_type() expects 0-based layer IDs. This helper safely
+    converts the value and guards against invalid inputs.
+
+    Returns -1 if the layer_number cannot be determined, which will cause
+    ``model_spec.layer_type()`` to treat the layer as unknown (skipping PS).
+    """
+    raw = getattr(attention_module, "layer_number", None)
+    if raw is None:
+        return -1
+    layer_number = int(raw)
+    if layer_number < 1:
+        return -1
+    return layer_number - 1
+
+
 def _read_parallel_rank_info() -> tuple[int | str, int, int]:
     global_rank: int | str = "unknown"
     tp_rank = 0
@@ -271,14 +295,18 @@ def maybe_run_prefix_sharing_deltanet(
     if not ctx.prefix_sharing_plan.has_sharing:
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        logger.debug("[PS][deltanet] skipping: no THD packed_seq_params")
         return None
 
     backend = ctx.backend or TorchReferenceBackend()
     _, tp_rank, _ = _read_parallel_rank_info()
     # Megatron layer_number is 1-indexed; convert to 0-indexed for ModelSpec
-    layer_id = int(getattr(attention_module, "layer_number", 0) or 0) - 1
+    layer_id = _normalize_layer_number(attention_module)
 
     # Only process linear attention layers
+    if layer_id < 0:
+        logger.debug("[PS][deltanet] skipping: could not determine layer_number")
+        return None
     model_spec = ctx.model_spec
     if model_spec is not None:
         layer_type = model_spec.layer_type(layer_id)

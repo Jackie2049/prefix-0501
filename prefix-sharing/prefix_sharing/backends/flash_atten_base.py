@@ -126,6 +126,20 @@ class FlashAttentionMixin:
         max_seqlen_q = prefix_sharing_plan.max_seqlen_q
         max_seqlen_kv = prefix_sharing_plan.max_seqlen_kv
 
+        # Validate that packed tensor dims match cu_seqlens totals.
+        # cu_seqlens[-1] must equal the first dimension of the packed tensor
+        # or Flash Attention may read out of bounds.
+        _cu_q_total = int(cu_seqlens_q[-1])
+        _cu_kv_total = int(cu_seqlens_kv[-1])
+        if q.shape[0] != _cu_q_total:
+            raise ValueError(
+                f"query dim 0 ({q.shape[0]}) != cu_seqlens_q total ({_cu_q_total})"
+            )
+        if k.shape[0] != _cu_kv_total:
+            raise ValueError(
+                f"key dim 0 ({k.shape[0]}) != cu_seqlens_kv total ({_cu_kv_total})"
+            )
+
         # Flash Attention ignores dense attention_mask; if one is passed we
         # simply drop it because cu_seqlens already encodes the per-sample
         # boundaries.  This is consistent with Megatron's THD path.

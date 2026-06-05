@@ -240,8 +240,11 @@ def build_prefix_sharing_micro_batch(
             _keys = list(_td.keys()) if _td is not None else []
             has_mm = len(_keys) > 0
             logger.debug(f"[PS][prepare] tensorclass td keys={_keys}, has_mm={has_mm}")
-        else:
+        elif hasattr(multi_modal_inputs, '__iter__') and not isinstance(multi_modal_inputs, (str, bytes)):
             has_mm = any(mmi is not None and len(mmi.keys()) > 0 for mmi in multi_modal_inputs)
+        else:
+            has_mm = False
+            logger.debug(f"[PS][prepare] multi_modal_inputs non-iterable: {type(multi_modal_inputs).__name__}")
         if has_mm:
             logger.debug(f"[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
             raise RuntimeError("prefix sharing phase 1 supports only text-only actor micro-batches")
@@ -369,7 +372,13 @@ def restore_suffix_first_log_probs_from_prefix(
     log_probs: Any,
     vocab_parallel_log_probs_fn: Any,
 ) -> Any:
-    """Restore reuser suffix-first logprob from provider prefix-last logits."""
+    """Restore reuser suffix-first logprob from provider prefix-last logits.
+
+    Called from the THD (remove-padding) path where ``logits`` and ``labels``
+    have batch dimension 1 (all sequences packed into a single flat dim-1).
+    The ``provider_1d_pos`` / ``reuse_1d_pos`` offsets are absolute positions
+    within that packed sequence.
+    """
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
