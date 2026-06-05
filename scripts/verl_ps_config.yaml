@@ -3,62 +3,62 @@
 # This config demonstrates how to activate prefix-sharing for
 # verl + Megatron + Qwen3.6-27B RL training (GRPO/PPO).
 #
-# Usage:
-#   verl train --config scripts/verl_ps_config.yaml
+# Key config paths used by the prefix-sharing integration:
+#   actor.prefix_sharing_config.*   → PrefixSharingConfig
+#   actor.megatron.use_remove_padding → enables THD packed format
+#   actor.use_fused_kernels         → must be false (Phase-1)
+#   model.*                         → Megatron TransformerConfig (PP, TP, RoPE, etc.)
 
 # ============================================================
-# Prefix-Sharing Configuration
-# ============================================================
 actor:
-  # --- Prefix Sharing (NEW) ---
+  # --- Prefix Sharing ---
   prefix_sharing_config:
-    enable_prefix_sharing: true   # Enable batch-internal prefix KV reuse
+    enable_prefix_sharing: true   # THE key setting — everything else is automatic
     min_prefix_len: 4             # Minimum shared prefix length (tokens)
     min_group_size: 2             # Minimum group size for sharing
     backend: auto                 # auto = flash-attn preferred, torch_ref fallback
-    detector: trie                # Trie-based prefix detection (only option in Phase 1)
 
-  # --- Megatron Requirements ---
+  # --- Megatron ---
   megatron:
     use_remove_padding: true      # REQUIRED: enables THD packed format
-    use_fused_kernels: false      # REQUIRED: must disable fused kernels
 
-  # --- Other actor settings (example values) ---
-  model:
-    path: /path/to/Qwen3.6-27B    # HuggingFace checkpoint path
-    trust_remote_code: true
+  # --- Actor ---
+  use_fused_kernels: false        # REQUIRED: must disable fused kernels (Phase-1)
+
+  # --- Rollout (example) ---
   rollout:
-    n: 8                          # GRPO group size (8 responses per prompt)
+    n: 8                          # GRPO group size
     temperature: 1.0
     top_p: 1.0
     max_new_tokens: 1024
+
+  # --- Optimizer (example) ---
   optim:
     lr: 1e-6
     clip_grad: 1.0
 
 # ============================================================
-# Model Configuration (Megatron-specific)
-# ============================================================
 model:
-  type: Qwen3ForCausalLM          # Maps to Qwen3.6-27B hybrid model
-  use_mbridge: true               # Use mcore path (REQUIRED for prefix-sharing)
-  tensor_model_parallel_size: 2   # TP=2 recommended for 27B model
-  pipeline_model_parallel_size: 1 # PP must be 1 in Phase 1
-  context_parallel_size: 1        # CP must be 1 in Phase 1
-  apply_rope_fusion: false        # Must disable RoPE fusion
-  fused_single_qkv_rope: false    # Must disable fused QKV RoPE
-  use_remove_padding: true        # Must enable THD format
+  type: Qwen3ForCausalLM          # → Qwen3.6-27B HybridAttention
+  use_mbridge: true               # Use mcore path (REQUIRED)
+  path: /path/to/Qwen3.6-27B      # HuggingFace checkpoint
+
+  # Parallelism
+  tensor_model_parallel_size: 2   # TP=2 recommended for 27B
+  pipeline_model_parallel_size: 1 # PP must be 1 (Phase-1 constraint)
+  context_parallel_size: 1        # CP must be 1 (Phase-1 constraint)
+
+  # RoPE (must be disabled for Phase-1)
+  apply_rope_fusion: false
+  fused_single_qkv_rope: false
 
 # ============================================================
-# Phase-1 Constraints (enforced at runtime)
+# Phase-1 Constraints (validated at runtime)
 # ============================================================
-# - pipeline_model_parallel_size must be 1
-# - context_parallel_size must be 1
-# - apply_rope_fusion must be false
-# - fused_single_qkv_rope must be false
-# - use_fused_kernels must be false
-# - use_remove_padding must be true
-# - model_type must be text_only_causal_lm
-# - integrate_mode must be verl_megatron_actor
-#
-# Violating any constraint raises PrefixSharingConfigError.
+# pipeline_model_parallel_size = 1
+# context_parallel_size = 1
+# apply_rope_fusion = false
+# fused_single_qkv_rope = false
+# use_fused_kernels = false
+# use_remove_padding = true
+# model_type = text_only_causal_lm
