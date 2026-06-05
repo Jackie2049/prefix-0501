@@ -591,10 +591,13 @@ class MegatronPPOActor(BasePPOActor):
             # 这是 prefix-sharing 的入口点，需要在数据进入模型前完成 micro-batch 重组
             prefix_sharing_runtime_state = None
             if build_prefix_sharing_micro_batch is not None:
+                from prefix_sharing.core.model_spec import ModelSpec
+                _ps_model_spec = ModelSpec.from_hf_config(self.hf_config)
                 batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(
                     batch,
                     self.config,
                     self.tf_config,
+                    model_spec=_ps_model_spec,
                 )
             ######### prefix-sharing #########
 
