@@ -68,11 +68,6 @@ class PrefixSharingConfig:
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
     boundary_strategy: str = "prefix_last_restore"
 
-    supported_pp_size: int = 1  # Pipeline parallel size supported in phase 1 (1 = no PP)
-    supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
-    supported_rope_fusion: bool = False  # RoPE fusion kernel support (False = must disable)
-    supported_fused_qkv_rope: bool = False  # Fused QKV+RoPE kernel support (False = must disable)
-
     validate_precision: bool = False
     integrate_mode: str = "verl_megatron_actor"
     model_type: str = "text_only_causal_lm"  # Model type identifier; phase 1 only supports text-only causal LM
@@ -130,36 +125,42 @@ class PrefixSharingConfig:
         pp_size = _read_config_value(
             model_config,
             "pipeline_model_parallel_size",
-            _read_config_value(model_config, "pipeline_parallel_size", self.supported_pp_size),
+            _read_config_value(model_config, "pipeline_parallel_size", 1),
         )
         cp_size = _read_config_value(
             model_config,
             "context_parallel_size",
-            self.supported_cp_size,
+            1,
         )
         rope_fusion = _read_config_value(model_config, "apply_rope_fusion", False)
         fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
         model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")
 
-        if pp_size != self.supported_pp_size:
+        # Phase-1 hard constraints (not user-configurable)
+        _PHASE1_PP = 1
+        _PHASE1_CP = 1
+        _PHASE1_ROPE_FUSION = False
+        _PHASE1_FUSED_QKV_ROPE = False
+
+        if pp_size != _PHASE1_PP:
             raise PrefixSharingConfigError(
                 f"[Config Error] pipeline_model_parallel_size={pp_size} 不支持当前阶段。"
                 f"Phase 1 仅支持 pipeline_model_parallel_size=1 (无流水线并行)，"
                 f"请修改配置将 PP 大小设为 1，或禁用 prefix sharing。"
             )
-        if cp_size != self.supported_cp_size:
+        if cp_size != _PHASE1_CP:
             raise PrefixSharingConfigError(
                 f"[Config Error] context_parallel_size={cp_size} 不支持当前阶段。"
                 f"Phase 1 仅支持 context_parallel_size=1 (无上下文并行)，"
                 f"请修改配置将 CP 大小设为 1，或禁用 prefix sharing。"
             )
-        if not self.supported_rope_fusion and rope_fusion:
+        if not _PHASE1_ROPE_FUSION and rope_fusion:
             raise PrefixSharingConfigError(
                 f"[Config Error] apply_rope_fusion=True 不支持当前阶段。"
                 f"Phase 1 要求关闭 rope fusion (apply_rope_fusion=False)，"
                 f"请修改配置或禁用 prefix sharing。"
             )
-        if not self.supported_fused_qkv_rope and fused_qkv_rope:
+        if not _PHASE1_FUSED_QKV_ROPE and fused_qkv_rope:
             raise PrefixSharingConfigError(
                 f"[Config Error] fused_single_qkv_rope=True 不支持当前阶段。"
                 f"Phase 1 要求关闭 fused QKV rope (fused_single_qkv_rope=False)，"
