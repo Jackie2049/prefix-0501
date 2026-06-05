@@ -16,6 +16,7 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEPS = os.path.join(REPO_ROOT, "dependency")
 sys.path.insert(0, os.path.join(DEPS, "megatron_v0150"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "prefix-sharing"))
 # Do NOT add verl_v070 to sys.path - we import our modules via importlib
 
 import torch
