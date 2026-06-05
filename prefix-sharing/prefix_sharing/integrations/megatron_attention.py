@@ -43,7 +43,6 @@ def _make_patched_forward(original_forward: Any) -> Any:
         rotary_pos_sin: Any | None = None,
         attention_bias: Any | None = None,
         packed_seq_params: Any | None = None,
-        sequence_id: Any | None = None,
         **kwargs: Any,
     ) -> Any:
         from prefix_sharing.integrations.context import current_prefix_sharing_context
@@ -62,7 +61,6 @@ def _make_patched_forward(original_forward: Any) -> Any:
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
-                sequence_id=sequence_id,
                 **kwargs,
             )
 
@@ -81,7 +79,6 @@ def _make_patched_forward(original_forward: Any) -> Any:
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
-                sequence_id=sequence_id,
                 **kwargs,
             )
 
@@ -109,7 +106,6 @@ def _make_patched_forward(original_forward: Any) -> Any:
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
-                sequence_id=sequence_id,
                 **kwargs,
             )
 
@@ -172,7 +168,6 @@ def _make_patched_forward(original_forward: Any) -> Any:
             rotary_pos_sin=rotary_pos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
-            sequence_id=sequence_id,
             **kwargs,
         )
 
