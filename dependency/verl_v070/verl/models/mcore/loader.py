@@ -437,6 +437,60 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 f"{layer_name}.self_attn.o_proj.weight",
                 chunk_dim=1,
             )
+
+            # Qwen3.6 HybridAttention: load beta_proj, decay_proj, gate_proj
+            # (only present in GatedDeltaNet linear attention layers)
+            attn = sync_layer.self_attention
+            if dst_pp_rank == pp_rank and hasattr(attn, 'beta_proj'):
+                _broadcast_tp_shard_tensor(
+                    attn.beta_proj.weight,
+                    f"{layer_name}.self_attn.beta_proj.weight",
+                    chunk_dim=0,
+                )
+                if f"{layer_name}.self_attn.beta_proj.bias" in state_dict:
+                    _broadcast_tensor(
+                        attn.beta_proj.bias,
+                        f"{layer_name}.self_attn.beta_proj.bias",
+                    )
+            elif f"{layer_name}.self_attn.beta_proj.weight" in state_dict:
+                # Load beta_proj even if current rank doesn't have the model shard
+                _broadcast_tp_shard_tensor(
+                    None,
+                    f"{layer_name}.self_attn.beta_proj.weight",
+                    chunk_dim=0,
+                )
+
+            if dst_pp_rank == pp_rank and hasattr(attn, 'decay_proj'):
+                _broadcast_tp_shard_tensor(
+                    attn.decay_proj.weight,
+                    f"{layer_name}.self_attn.decay_proj.weight",
+                    chunk_dim=0,
+                )
+                if f"{layer_name}.self_attn.decay_proj.bias" in state_dict:
+                    _broadcast_tensor(
+                        attn.decay_proj.bias,
+                        f"{layer_name}.self_attn.decay_proj.bias",
+                    )
+            elif f"{layer_name}.self_attn.decay_proj.weight" in state_dict:
+                _broadcast_tp_shard_tensor(
+                    None,
+                    f"{layer_name}.self_attn.decay_proj.weight",
+                    chunk_dim=0,
+                )
+
+            if dst_pp_rank == pp_rank and hasattr(attn, 'gate_proj'):
+                _broadcast_tp_shard_tensor(
+                    attn.gate_proj.weight,
+                    f"{layer_name}.self_attn.gate_proj.weight",
+                    chunk_dim=0,
+                )
+            elif f"{layer_name}.self_attn.gate_proj.weight" in state_dict:
+                _broadcast_tp_shard_tensor(
+                    None,
+                    f"{layer_name}.self_attn.gate_proj.weight",
+                    chunk_dim=0,
+                )
+
             _broadcast_tensor(
                 sync_layer.mlp.linear_fc1.layer_norm_weight if dst_pp_rank == pp_rank else None,
                 f"{layer_name}.post_attention_layernorm.weight",

@@ -19,6 +19,8 @@ def get_weight_loader(arch: str):
     _MODEL_WEIGHT_MEGATRON_LOADER_REGISTRY = {
         "LlamaForCausalLM": load_state_dict_to_megatron_gptmodel,
         "Qwen2ForCausalLM": load_state_dict_to_megatron_gptmodel,
+        "Qwen3ForCausalLM": load_state_dict_to_megatron_gptmodel,
+        "Qwen3ForTokenClassification": load_state_dict_to_megatron_gptmodel,
     }
 
     if arch in _MODEL_WEIGHT_MEGATRON_LOADER_REGISTRY:
