@@ -1,6 +1,7 @@
 """Tensor parallel test for HybridAttention model.
 
 Verifies GatedDeltaNet and hybrid model work correctly with TP=2.
+Also tests prefix-sharing backend correctness under TP=2.
 
 Must run with: torchrun --nproc_per_node=2 --nnodes=1 gpu_tp_test.py
 """
@@ -239,6 +240,111 @@ def main():
         torch.cuda.empty_cache()
     except Exception as e:
         check("TP gradient flow", False, str(e))
+        import traceback; traceback.print_exc()
+
+    # Test 4: PS backend correctness with TP=2
+    if rank == 0:
+        print("\n--- Test 4: PS Backend Correctness TP=2 ---")
+
+    try:
+        from prefix_sharing.core.config import PrefixSharingConfig
+        from prefix_sharing.core.planner import PrefixSharingPlanner
+        from prefix_sharing.backends.packed_layout import PackedBatchLayout
+        from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+        from prefix_sharing.core.prefix_store import (
+            PrefixAttentionStore, PrefixDeltanetStore,
+            PREFIX_STATE_TYPE_ATTENTION_KV, PREFIX_STATE_TYPE_DELTANET_STATE,
+            PrefixActivationSlotId,
+        )
+
+        # RL batch n=4
+        prompt_len = 32
+        resp_len = 8
+        torch.manual_seed(400 + rank)
+        prompt_tokens = torch.randint(100, 32000, (prompt_len,)).tolist()
+        sequences = []
+        for _ in range(4):
+            resp = torch.randint(100, 32000, (resp_len,)).tolist()
+            sequences.append(prompt_tokens + resp)
+
+        ps_config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=8, min_group_size=2)
+        plan = PrefixSharingPlanner(ps_config).plan(sequences, forward_id=10, micro_batch_id=0)
+        check("TP PS plan has sharing", plan.has_sharing)
+
+        if plan.has_sharing:
+            backend = TorchReferenceBackend()
+            layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+
+            # KV correctness with tp_rank
+            num_heads_per_tp = 4  # 8 heads / TP=2
+            kv_heads_per_tp = 2   # 4 kv heads / TP=2
+            head_dim = 64
+
+            max_tid = max(max(s) for s in sequences) + 1
+            torch.manual_seed(401 + rank)
+            token_k = torch.randn(max_tid, kv_heads_per_tp, head_dim)
+            token_v = torch.randn(max_tid, kv_heads_per_tp, head_dim)
+
+            ind_keys = [token_k[seq] for seq in sequences]
+            ind_values = [token_v[seq] for seq in sequences]
+
+            trimmed_k, trimmed_v = [], []
+            for i in range(len(sequences)):
+                s, e = plan.input_keep_ranges[i]
+                trimmed_k.append(ind_keys[i][s:e])
+                trimmed_v.append(ind_values[i][s:e])
+
+            packed_k = torch.cat(trimmed_k, dim=0)
+            packed_v = torch.cat(trimmed_v, dim=0)
+            kv_store = PrefixAttentionStore()
+
+            expanded_k, expanded_v = backend.build_kv(
+                packed_k, packed_v, kv_store, plan, layer_id=0, tp_rank=tp_rank,
+            )
+
+            exp_k_rows = list(torch.split(expanded_k, plan.expanded_lengths_kv))
+            exp_v_rows = list(torch.split(expanded_v, plan.expanded_lengths_kv))
+
+            all_kv_ok = True
+            for i in range(len(sequences)):
+                if not torch.allclose(exp_k_rows[i], ind_keys[i], atol=1e-5):
+                    all_kv_ok = False
+                if not torch.allclose(exp_v_rows[i], ind_values[i], atol=1e-5):
+                    all_kv_ok = False
+            check("TP KV expansion matches", all_kv_ok)
+
+            # DeltaNet correctness with tp_rank
+            state_dim = head_dim
+            update_emb = torch.randn(max_tid, num_heads_per_tp, state_dim, state_dim)
+            ind_updates = [update_emb[seq] for seq in sequences]
+            ind_trajs = [u.cumsum(dim=0) for u in ind_updates]
+
+            trimmed_updates = []
+            for i in range(len(sequences)):
+                s, e = plan.input_keep_ranges[i]
+                trimmed_updates.append(ind_updates[i][s:e])
+            packed_updates = torch.cat(trimmed_updates, dim=0)
+
+            dn_store = PrefixDeltanetStore()
+            ps_output = backend.build_deltanet_states(
+                packed_updates, dn_store, plan, layer_id=0, tp_rank=tp_rank,
+            )
+            ps_rows = list(torch.split(ps_output, plan.kept_lengths_q))
+
+            all_dn_ok = True
+            for i in range(len(sequences)):
+                s, e = plan.input_keep_ranges[i]
+                kept_len = e - s
+                if not plan.is_reuser(i):
+                    if not torch.allclose(ps_rows[i][:kept_len], ind_trajs[i][:kept_len], atol=1e-4):
+                        all_dn_ok = False
+                else:
+                    if not torch.allclose(ps_rows[i][:kept_len], ind_trajs[i][s:e], atol=1e-4):
+                        all_dn_ok = False
+            check("TP DeltaNet matches", all_dn_ok)
+
+    except Exception as e:
+        check("TP PS backend", False, str(e))
         import traceback; traceback.print_exc()
 
     # Summary
