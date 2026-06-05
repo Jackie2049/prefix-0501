@@ -85,8 +85,13 @@ def test_patch_manager_context_manager_restores_original():
 def test_megatron_integration_reports_missing_dependency_cleanly():
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
-    with pytest.raises(IntegrationUnavailable, match="Megatron"):
-        integration.install(model_config={})
+    try:
+        import megatron  # noqa: F401
+        # Megatron is available — the test cannot verify the missing-dep path.
+        pytest.skip("megatron is importable in this environment")
+    except ImportError:
+        with pytest.raises(IntegrationUnavailable, match="Megatron"):
+            integration.install(model_config={})
 
 
 def test_verl_integration_reports_missing_dependency_cleanly():
