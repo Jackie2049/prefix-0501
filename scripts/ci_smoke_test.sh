@@ -9,6 +9,12 @@
 
 set -o pipefail
 
+# Activate conda environment if available
+if [ -z "$CONDA_DEFAULT_ENV" ] && [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+    conda activate llm 2>/dev/null || true
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_DIR"
