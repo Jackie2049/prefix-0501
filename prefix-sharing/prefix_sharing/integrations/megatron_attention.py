@@ -87,7 +87,10 @@ def _make_patched_forward(original_forward: Any) -> Any:
 
         # Prefix-sharing path: do QKV projection ourselves, then hand off
         # to the runtime hook which handles RoPE, KV expansion, and attention.
+        import logging
         import torch
+
+        _ps_log = logging.getLogger(__name__)
 
         # For remove-padding (THD) mode, use Megatron's own QKV splitting
         # which correctly handles GQA interleaving (grouped-query layout).
@@ -135,17 +138,27 @@ def _make_patched_forward(original_forward: Any) -> Any:
             maybe_run_prefix_sharing_attention,
         )
 
-        result = maybe_run_prefix_sharing_attention(
-            attention_module=self_attention_module,
-            query=query,
-            key=key,
-            value=value,
-            attention_mask=attention_mask,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-        )
-        if result is not None:
-            return result
+        try:
+            result = maybe_run_prefix_sharing_attention(
+                attention_module=self_attention_module,
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+            )
+            if result is not None:
+                return result
+        except Exception as exc:
+            _ps_log.warning(
+                "[PS] prefix-sharing attention failed at layer %s, "
+                "falling back to original forward: %s",
+                getattr(self_attention_module, "layer_number", "?"),
+                exc,
+            )
 
         # Hook returned None (e.g., linear attention layer) → fall through
         return original_forward(

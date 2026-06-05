@@ -19,6 +19,8 @@ def maybe_run_prefix_sharing_attention(
     attention_mask: Any,
     rotary_pos_emb: Any,
     packed_seq_params: Any,
+    rotary_pos_cos: Any | None = None,
+    rotary_pos_sin: Any | None = None,
 ) -> tuple[Any, Any] | None:
     """Run prefix-sharing attention when a runtime context is active.
 
@@ -34,22 +36,32 @@ def maybe_run_prefix_sharing_attention(
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
-    if rotary_pos_emb is None:
-        raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb")
+    if rotary_pos_emb is None and (rotary_pos_cos is None or rotary_pos_sin is None):
+        raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb or rotary_pos_cos/sin")
     if ctx.packed_batch_layout.packed_position_ids is None:
         raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
-    q_pos_emb, k_pos_emb = rotary_pos_emb
     packed_batch_layout = ctx.packed_batch_layout
-    query, key = _apply_positioned_rope(
-        attention_module,
-        query,
-        key,
-        q_pos_emb,
-        k_pos_emb,
-        packed_batch_layout.packed_position_ids,
-    )
 
+    if rotary_pos_emb is not None:
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+        query, key = _apply_positioned_rope(
+            attention_module,
+            query,
+            key,
+            q_pos_emb,
+            k_pos_emb,
+            packed_batch_layout.packed_position_ids,
+        )
+    else:
+        query, key = _apply_fused_rope(
+            attention_module,
+            query,
+            key,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            packed_batch_layout.packed_position_ids,
+        )
     backend = ctx.backend or TorchReferenceBackend()
     global_rank, tp_rank, tp_size = _read_parallel_rank_info()
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
@@ -90,7 +102,8 @@ def maybe_run_prefix_sharing_attention(
         packed_batch_layout=packed_batch_layout,
         attention_mask=attention_mask,
     )
-    core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+    # Merge heads: (total_tokens, num_heads, head_dim) -> (total_tokens, hidden)
+    core_attn_out = core_attn_out.reshape(core_attn_out.size(0), -1)
     return attention_module.linear_proj(core_attn_out)
 
 
@@ -154,6 +167,57 @@ def _apply_positioned_rope(
             config=attention_module.config,
             cu_seqlens=None,
         ).squeeze(1)
+    return query, key
+
+
+def _apply_fused_rope(
+    attention_module: Any,
+    query: Any,
+    key: Any,
+    rotary_pos_cos: Any,
+    rotary_pos_sin: Any,
+    packed_position_ids: Any,
+) -> tuple[Any, Any]:
+    """Apply RoPE using fused cos/sin embeddings with position indexing.
+
+    This handles the Megatron fused RoPE path where ``rotary_pos_cos`` and
+    ``rotary_pos_sin`` are provided instead of ``rotary_pos_emb``.  We
+    combine cos and sin into a single pos_emb tensor and use the same
+    ``apply_rotary_pos_emb`` helper.
+    """
+    from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+
+    positions = packed_position_ids.to(device=query.device, dtype=torch.long)
+    max_needed = positions.max().item() + 1
+
+    # Combine cos and sin into a single pos_emb tensor: [seq_len, 1, 1, head_dim]
+    # and apply the same extension logic as _apply_positioned_rope.
+    pos_emb = torch.cat([rotary_pos_cos, rotary_pos_sin], dim=-1)  # [seq, 1, 1, 2*half]
+
+    if max_needed > pos_emb.shape[0]:
+        dim_half = pos_emb.shape[-1] // 2
+        step = pos_emb[1:2, :, :, :dim_half] - pos_emb[0:1, :, :, :dim_half]
+        extra_positions = torch.arange(
+            pos_emb.shape[0], max_needed,
+            device=pos_emb.device, dtype=pos_emb.dtype,
+        )
+        extra_angles = extra_positions[:, None, None, None] * step
+        extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
+        pos_emb = torch.cat([pos_emb, extra_emb], dim=0)
+
+    freqs = pos_emb.index_select(0, positions)
+    query = apply_rotary_pos_emb(
+        query.unsqueeze(1),
+        freqs,
+        config=attention_module.config,
+        cu_seqlens=None,
+    ).squeeze(1)
+    key = apply_rotary_pos_emb(
+        key.unsqueeze(1),
+        freqs,
+        config=attention_module.config,
+        cu_seqlens=None,
+    ).squeeze(1)
     return query, key
 
 
