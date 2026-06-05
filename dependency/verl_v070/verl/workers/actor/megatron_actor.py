@@ -66,11 +66,13 @@ try:
     from prefix_sharing.integrations.verl_mcore import (
         build_prefix_sharing_micro_batch,
         restore_suffix_first_log_probs_from_prefix,
+        write_restored_logprobs_to_2d,
     )
 except ModuleNotFoundError:
     prefix_sharing_runtime_context = None
     build_prefix_sharing_micro_batch = None
     restore_suffix_first_log_probs_from_prefix = None
+    write_restored_logprobs_to_2d = None
 ######### prefix-sharing #########
 
 __all__ = ["MegatronPPOActor"]
@@ -707,6 +709,14 @@ class MegatronPPOActor(BasePPOActor):
                         logits_processor_args=logits_processor_args,
                         data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                     )
+                    # Drain logprob restore cache into 2D output.
+                    # All restores (interior-response + prefix-last) are
+                    # computed and cached during the logits_processor stage
+                    # (packed 1D). After postprocess_packed_seqs converts
+                    # back to [B, L] shape, write each cached scalar to the
+                    # correct 2D position so loss_func sees complete rows.
+                    if write_restored_logprobs_to_2d is not None:
+                        output = write_restored_logprobs_to_2d(output)
                 ######### prefix-sharing #########
 
             if forward_only:

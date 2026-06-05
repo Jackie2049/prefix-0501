@@ -27,6 +27,12 @@ class PackedPrefixLastRestoreIndex:
     provider_idx_in_batch: int
     provider_1d_pos: int
     reuse_1d_pos: int
+    is_interior_response: bool = False
+    output_slot: int = 0
+    target_2d_pos: int = -1
+    """Absolute 2D position in output where restored logprob is written."""
+    label_value: int = -1
+    """Actual token ID used as label (needed when label isn't in trimmed packed region)."""
 
 
 @dataclass
@@ -36,6 +42,13 @@ class PrefixSharingRuntimeContext:
     store: PrefixKVStore
     backend: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
+    logprob_restore_cache: dict[tuple[int, int], Any] = field(default_factory=dict)
+    """Cache for restored logprob scalars keyed by (batch_idx, target_2d_pos).
+
+    Populated during packed 1D logits_processor stage with non-detached tensors
+    and drained to 2D output after postprocess_packed_seqs.
+    Holds both interior-response and prefix-last restore entries.
+    """
     stats: PrefixSharingStats | None = None
 
 
@@ -54,15 +67,29 @@ def _build_prefix_last_restore_indices(
         provider_offset = (
             spec.provider_prefix_last_pos - prefix_sharing_plan.input_keep_ranges[provider_idx][0]
         )
-        reuse_offset = (
-            spec.reuse_first_suffix_label_pos - prefix_sharing_plan.input_keep_ranges[reuse_idx][0]
-        )
+        # compute provider_1d_pos: packed index for the provider's logits position
+        provider_1d = packed_batch_layout.packed_index(provider_idx, provider_offset)
+
+        if spec.is_interior_response:
+            # Interior: label is in shared prefix, available in provider's
+            # packed labels at provider_1d_pos + 1.
+            reuse_1d = -1  # sentinel: no slot in reuser packed region
+        else:
+            # Prefix-last: label (reuser's first suffix token) is NOT in
+            # the reuser's trimmed packed labels. We use spec.label_value
+            # directly instead. reuse_1d is a sentinel.
+            reuse_1d = -1
+
         indices.append(
             PackedPrefixLastRestoreIndex(
                 reuse_idx_in_batch=reuse_idx,
                 provider_idx_in_batch=provider_idx,
-                provider_1d_pos=packed_batch_layout.packed_index(provider_idx, provider_offset),
-                reuse_1d_pos=packed_batch_layout.packed_index(reuse_idx, reuse_offset),
+                provider_1d_pos=provider_1d,
+                reuse_1d_pos=reuse_1d,
+                is_interior_response=spec.is_interior_response,
+                output_slot=spec.output_slot,
+                target_2d_pos=spec.target_2d_pos,
+                label_value=spec.label_value,
             )
         )
     return indices

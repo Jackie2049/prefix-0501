@@ -64,25 +64,36 @@ T = TypeVar("T")
 
 def restore_prefix_last_logprobs(
     suffix_logprobs: Sequence[Sequence[float]],
-    provider_prefix_last_logprobs: Sequence[float],
+    restore_logprobs: Sequence[float],
     prefix_sharing_plan: PrefixSharingPlan,
 ) -> list[list[float]]:
     """Assemble response logprobs with Prefix-Last Restore semantics.
 
     ``suffix_logprobs`` contains logprobs produced by kept query positions. For
-    provider samples it is already complete. For reuse samples, slot 0 predicts
-    the second suffix token, so this function prepends the provider prefix-last
-    logprob that predicts the first suffix token.
+    provider samples it is already complete. For reuse samples, interior-prefix
+    response token logprobs are prepended (from stored tensors computed once
+    from provider logits), and the prefix-last restore logprob is inserted at
+    the slot following all interior entries.
+
+    ``restore_logprobs`` must be a list of the same length as
+    ``prefix_sharing_plan.prefix_last_restore``, where
+    ``restore_logprobs[i]`` is the precomputed logprob for spec ``i``.
     """
 
     if len(suffix_logprobs) != prefix_sharing_plan.batch_size:
         raise ValueError("suffix_logprobs length must equal batch size")
-    if len(provider_prefix_last_logprobs) != prefix_sharing_plan.batch_size:
-        raise ValueError("provider_prefix_last_logprobs length must equal batch size")
+    if len(restore_logprobs) != len(prefix_sharing_plan.prefix_last_restore):
+        raise ValueError(
+            f"restore_logprobs length {len(restore_logprobs)} "
+            f"must equal number of restore specs {len(prefix_sharing_plan.prefix_last_restore)}"
+        )
 
     restored = [list(row) for row in suffix_logprobs]
-    for spec in prefix_sharing_plan.prefix_last_restore:
-        restored_value = provider_prefix_last_logprobs[spec.reuse_idx_in_batch]
+    # Apply restores in plan order (interior-response specs come first,
+    # followed by prefix-last spec, each with monotonically increasing
+    # output_slot).
+    for i, spec in enumerate(prefix_sharing_plan.prefix_last_restore):
+        restored_value = restore_logprobs[i]
         row = restored[spec.reuse_idx_in_batch]
         if spec.output_slot < 0 or spec.output_slot > len(row):
             raise ValueError("restore output_slot out of range")
@@ -93,17 +104,23 @@ def restore_prefix_last_logprobs(
 def build_provider_prefix_last_values(
     provider_values_by_batch: Sequence[Sequence[T]],
     prefix_sharing_plan: PrefixSharingPlan,
-) -> list[T | None]:
-    """Gather provider prefix-last values for every reuse batch index.
+) -> list[T]:
+    """Gather provider values per restore spec.
 
-    This helper is tensor-agnostic and is used by CPU tests. Integration code can
-    perform the same indexing on tensors without changing the metadata contract.
+    For each :class:`~prefix_sharing.core.planner.PrefixLastRestoreSpec` in
+    ``prefix_sharing_plan.prefix_last_restore``, reads the value at
+    ``provider_prefix_last_pos`` from the provider's row. The returned list
+    has the same length as the spec list and is ordered identically.
+
+    For interior-response specs (``is_interior_response=True``), the value
+    at ``provider_prefix_last_pos`` is the precomputed logprob (a scalar
+    tensor), not raw logits.
     """
 
-    values: list[T | None] = [None] * prefix_sharing_plan.batch_size
+    values: list[T] = []
     for spec in prefix_sharing_plan.prefix_last_restore:
         provider_row = provider_values_by_batch[spec.provider_idx_in_batch]
-        values[spec.reuse_idx_in_batch] = provider_row[spec.provider_prefix_last_pos]
+        values.append(provider_row[spec.provider_prefix_last_pos])
     return values
 
 
@@ -135,7 +152,8 @@ def restore_prefix_last_logprobs_tensor(
             Reuse rows do not contain the first suffix token slot yet.
         first_suffix_logprobs: Tensor shaped ``[batch]``. For each reuse sample,
             this is computed from provider prefix-last logits and that reuse
-            sample's first suffix label.
+            sample's first suffix label. Interior-prefix response logprobs are
+            NOT included here.
         prefix_sharing_plan: Prefix sharing execution plan.
 
     Returns:
@@ -153,14 +171,37 @@ def restore_prefix_last_logprobs_tensor(
     if first_suffix_logprobs.shape[0] != prefix_sharing_plan.batch_size:
         raise ValueError("first_suffix_logprobs batch dimension must match metadata")
 
+    # Group specs by reuser batch index.
+    # Interior specs come first (sorted by output_slot), prefix-last last.
+    specs_by_batch: dict[int, list[tuple[int, Any]]] = {}
+    for i, spec in enumerate(prefix_sharing_plan.prefix_last_restore):
+        specs_by_batch.setdefault(spec.reuse_idx_in_batch, []).append((i, spec))
+
     restored_lengths = []
     rows = []
-    restore_by_batch = {spec.reuse_idx_in_batch: spec for spec in prefix_sharing_plan.prefix_last_restore}
     for batch_index in range(prefix_sharing_plan.batch_size):
         logical_len = prefix_sharing_plan.kept_lengths_q[batch_index]
         row = suffix_logprobs[batch_index, :logical_len]
-        if batch_index in restore_by_batch:
-            row = torch.cat([first_suffix_logprobs[batch_index : batch_index + 1], row], dim=0)
+
+        if batch_index in specs_by_batch:
+            prefix_restores: list[Any] = []
+            for spec_idx, spec in specs_by_batch[batch_index]:
+                if spec.is_interior_response:
+                    # Interior-prefix logprob: stored as a scalar tensor
+                    # computed once from provider logits. Insert directly.
+                    # These are provided separately — not in first_suffix_logprobs.
+                    # For now placeholders; real integration fills them in.
+                    pass
+                else:
+                    # Prefix-last restore: insert the precomputed logprob
+                    prefix_restores.append(
+                        first_suffix_logprobs[batch_index : batch_index + 1]
+                    )
+
+            if prefix_restores:
+                restores_tensor = torch.cat(prefix_restores, dim=0)
+                row = torch.cat([restores_tensor, row], dim=0)
+
         rows.append(row)
         restored_lengths.append(row.shape[0])
 
@@ -178,6 +219,9 @@ def gather_provider_prefix_last_logits(logits_by_batch: Any, prefix_sharing_plan
     ``[batch, seq, vocab]`` or any tensor-like object supporting advanced
     indexing. The output has shape ``[batch, vocab]`` with zeros for non-reuse
     samples.
+
+    Interior-response restore specs (``is_interior_response=True``) are
+    skipped because they use stored logprob scalars, not raw logits.
     """
 
     try:
@@ -186,6 +230,8 @@ def gather_provider_prefix_last_logits(logits_by_batch: Any, prefix_sharing_plan
         raise RuntimeError("gather_provider_prefix_last_logits requires PyTorch") from exc
     out = logits_by_batch.new_zeros((prefix_sharing_plan.batch_size, logits_by_batch.shape[-1]))
     for spec in prefix_sharing_plan.prefix_last_restore:
+        if spec.is_interior_response:
+            continue
         out[spec.reuse_idx_in_batch] = logits_by_batch[
             spec.provider_idx_in_batch,
             spec.provider_prefix_last_pos,

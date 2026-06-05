@@ -123,11 +123,38 @@ class VerlMCoreBatchAdapter:
         provider_prefix_last_logprobs: Sequence[float],
         prefix_sharing_plan: PrefixSharingPlan,
     ) -> list[list[float]]:
-        """Assemble per-row logprobs with Prefix-Last Restore."""
+        """Assemble per-row logprobs with Prefix-Last Restore.
+
+        ``provider_prefix_last_logprobs`` is indexed by batch position;
+        each interior-prefix response spec maps to its reuser's entry
+        (the logprob is the same for provider and reuser since the
+        label is in the shared prefix).
+        """
+
+        # Build per-spec restore logprobs from per-batch input.
+        # For prefix-last specs: use the directly provided value.
+        # For interior-response specs: the logprob is the same for
+        # provider and reuser because the label is in the shared
+        # prefix, so we use the provider's own logprob at that
+        # position (which equals the reuser's copy).
+        restore_logprobs: list[float] = []
+        for spec in prefix_sharing_plan.prefix_last_restore:
+            if spec.is_interior_response:
+                # Interior logprob: use the provider's (reuser's would
+                # equal it since the label is shared). The caller
+                # provides these in provider_prefix_last_logprobs
+                # keyed by reuse_idx_in_batch.
+                restore_logprobs.append(
+                    provider_prefix_last_logprobs[spec.reuse_idx_in_batch]
+                )
+            else:
+                restore_logprobs.append(
+                    provider_prefix_last_logprobs[spec.reuse_idx_in_batch]
+                )
 
         return restore_prefix_last_logprobs(
             suffix_logprobs,
-            provider_prefix_last_logprobs,
+            restore_logprobs,
             prefix_sharing_plan,
         )
 
@@ -190,6 +217,7 @@ def build_prefix_sharing_micro_batch(
     model_config: Any,
     *,
     backend: Any | None = None,
+    prompt_lens: Sequence[int] | None = None,
 ) -> tuple[Any, PrefixSharingRuntimeState | None]:
     """Trim one verl Megatron actor micro-batch in-place for prefix sharing.
 
@@ -259,7 +287,7 @@ def build_prefix_sharing_micro_batch(
     seq_lens = [len(s) for s in sequences]
     logger.warning(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
 
-    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
+    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences, prompt_lens=prompt_lens)
     logger.warning(
         f"[PS][prepare] prefix_sharing_plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
@@ -361,27 +389,95 @@ def restore_suffix_first_log_probs_from_prefix(
     log_probs: Any,
     vocab_parallel_log_probs_fn: Any,
 ) -> Any:
-    """Restore reuser suffix-first logprob from provider prefix-last logits."""
+    """Compute restore logprobs and cache for later 2D injection.
+
+    All restore entries (interior-response and prefix-last) are handled
+    uniformly:
+
+    - Compute logprob from provider logits at ``provider_1d_pos``:
+      * Interior: label from provider packed labels (shared prefix token).
+      * Prefix-last: label from ``index.label_value`` (reuser's first
+        suffix token, NOT available in trimmed packed labels).
+    - Cache as non-detached scalar tensor keyed by
+      ``(reuse_idx_in_batch, target_2d_pos)``.
+    - **Never write to the 1D packed log_probs tensor** because reuser
+      packed regions have no slots for trimmed positions and the label
+      position in 1D packed does not correspond to the correct 2D
+      position.
+
+    The cache is drained after ``postprocess_packed_seqs`` by
+    :func:`write_restored_logprobs_to_2d`.
+    """
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
         return log_probs
+
+    non_interior_count = sum(1 for idx in ctx.prefix_last_restore_indices if not idx.is_interior_response)
     if ctx.stats is not None:
-        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
-    restored = log_probs.clone()
+        ctx.stats.record_restore(non_interior_count)
+
     for index in ctx.prefix_last_restore_indices:
         provider_logits = logits[
             0:1,
             index.provider_1d_pos : index.provider_1d_pos + 1,
             :,
         ].clone()
-        reuse_label = labels[
-            0:1,
-            index.reuse_1d_pos : index.reuse_1d_pos + 1,
-        ]
-        restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-        restored[0, index.reuse_1d_pos] = restored_value.reshape(())
-    return restored
+
+        if index.is_interior_response:
+            # Interior: label is in shared prefix, available at
+            # provider_1d_pos + 1 in the provider's packed labels.
+            provider_label = labels[
+                0:1,
+                index.provider_1d_pos + 1 : index.provider_1d_pos + 2,
+            ]
+        else:
+            # Prefix-last: label is the reuser's first suffix token,
+            # which is NOT in the reuser's trimmed packed labels.
+            # Use the explicit label_value from planning metadata.
+            import torch
+            provider_label = torch.tensor(
+                [[index.label_value]],
+                device=logits.device,
+                dtype=labels.dtype,
+            )
+
+        restored_logprob = vocab_parallel_log_probs_fn(provider_logits, provider_label).reshape(())
+        ctx.logprob_restore_cache[(index.reuse_idx_in_batch, index.target_2d_pos)] = restored_logprob
+
+    # Return log_probs unchanged — all restores are cached for 2D injection.
+    return log_probs
+
+
+def write_restored_logprobs_to_2d(
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    """Drain the logprob restore cache into the 2D output tensor.
+
+    Called after ``postprocess_packed_seqs`` has converted packed log_probs
+    back to [B, L] shape. Iterates
+    :attr:`PrefixSharingRuntimeContext.logprob_restore_cache` and writes
+    each non-detached scalar tensor to ``output["log_probs"][batch_idx, target_2d_pos]``.
+
+    Must be called while ``prefix_sharing_runtime_context`` is still active
+    (i.e. before the context manager exits).
+
+    Returns:
+        ``output`` with ``log_probs`` mutated in-place.
+    """
+
+    ctx = current_prefix_sharing_context()
+    if ctx is None or not ctx.logprob_restore_cache:
+        return output
+
+    log_probs = output.get("log_probs")
+    if log_probs is None:
+        return output
+
+    for (batch_idx, target_2d_pos), logprob in ctx.logprob_restore_cache.items():
+        log_probs[batch_idx, target_2d_pos] = logprob
+
+    return output
 
 
 def _clone_batch(batch: Any) -> Any:

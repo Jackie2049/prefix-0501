@@ -32,11 +32,13 @@ def test_phase_one_core_system_flow_without_framework_dependencies():
         [-3.1, -3.2],
         [-9.1, -9.2],
     ]
-    first_suffix_logprobs_by_batch = [0.0, -3.0, 0.0]
+    # Per-spec restore logprobs: one value per PrefixLastRestoreSpec.
+    # Here there is exactly one spec (prefix-last for reuser index 1).
+    restore_logprobs = [-3.0]
 
     restored = restore_prefix_last_logprobs(
         suffix_logprobs,
-        first_suffix_logprobs_by_batch,
+        restore_logprobs,
         prefix_sharing_plan,
     )
 
