@@ -827,6 +827,15 @@ class Attention(MegatronModule, ABC):
             prefix_log.debug("prefix hook fail to import module")
 
             prefix_sharing_output = None
+        except (RuntimeError, ValueError, AssertionError) as exc:
+
+            prefix_log.warning(
+                "prefix-sharing attention failed at layer %s, "
+                "falling back to original forward: %s",
+                getattr(self, "layer_number", "?"),
+                exc,
+            )
+            prefix_sharing_output = None
         if prefix_sharing_output is not None:
 
             prefix_log.debug("prefix hook success, begin to return")

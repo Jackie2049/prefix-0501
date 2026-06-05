@@ -73,6 +73,42 @@ def make_tfconfig(hidden=256, num_layers=4, heads=4, kv_heads=2):
     )
 
 
+def build_hybrid_model(tfconfig, vocab_size, max_seq_len, interval=2,
+                        partial_rot=0.5, gate=True):
+    """Build GPTModel with GatedDeltaNet replacing linear attention layers."""
+    block_spec = get_gpt_decoder_block_spec(tfconfig, use_transformer_engine=False)
+    sa_sub = block_spec.layer_specs[0].submodules.self_attention.submodules
+
+    model = GPTModel(
+        config=tfconfig, transformer_layer_spec=block_spec,
+        vocab_size=vocab_size, max_sequence_length=max_seq_len,
+        pre_process=True, post_process=True,
+        share_embeddings_and_output_weights=False,
+        position_embedding_type="rope", rotary_base=10000.0,
+    )
+
+    if interval <= 1:
+        return model
+
+    for i, layer in enumerate(model.decoder.layers):
+        if i % interval != 0:
+            old = layer.self_attention
+            new = GatedDeltaNetAttention(
+                config=tfconfig, submodules=sa_sub,
+                layer_number=old.layer_number, attn_mask_type=old.attn_mask_type,
+                partial_rotary_factor=partial_rot, attn_output_gate=gate,
+            )
+            new.to(next(old.parameters()).device)
+            new.linear_qkv = old.linear_qkv
+            new.linear_proj = old.linear_proj
+            if hasattr(old, 'q_layernorm') and old.q_layernorm is not None:
+                new.q_layernorm = old.q_layernorm
+            if hasattr(old, 'k_layernorm') and old.k_layernorm is not None:
+                new.k_layernorm = old.k_layernorm
+            layer.self_attention = new
+    return model
+
+
 def test_packed_forward_without_prefix_sharing(r):
     """Test 1: Verify standard (non-packed) forward works without prefix-sharing."""
     print("\n--- Test 1: Standard Forward (no prefix-sharing) ---")
@@ -121,7 +157,6 @@ def test_gated_delta_net_packed(r):
 
     try:
         with torch.no_grad():
-            # GatedDeltaNet doesn't need packed_seq_params - it uses cumsum
             out, bias = attn(hidden_states=hidden, attention_mask=None)
         r.check("GDN packed forward runs", True)
         r.check("GDN output shape", out.shape == (total_tokens, 1, 256), f"got {out.shape}")
@@ -147,17 +182,15 @@ def test_prefix_sharing_context_activation(r):
         current_prefix_sharing_context,
     )
 
-    # Create a plan with shared prefix
     sequences = [
-        [1, 2, 3, 4, 10, 11],  # provider
-        [1, 2, 3, 4, 20, 21],  # reuser (shares prefix [1,2,3,4])
+        [1, 2, 3, 4, 10, 11],
+        [1, 2, 3, 4, 20, 21],
     ]
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=2)
     plan = PrefixSharingPlanner(config).plan(sequences)
     r.check("Plan has sharing", plan.has_sharing)
     r.check("Plan keep_ranges", plan.input_keep_ranges is not None)
 
-    # Create runtime state
     model_spec = ModelSpec(
         num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
         head_dim=64, full_attention_interval=2,
@@ -165,7 +198,6 @@ def test_prefix_sharing_context_activation(r):
     packed_layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
     r.check("Packed layout created", packed_layout is not None)
 
-    # Activate context
     from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
     from prefix_sharing.backends.factory import get_backend_instance
 
@@ -186,7 +218,6 @@ def test_prefix_sharing_context_activation(r):
         r.check("Model spec layer_type(0)", model_spec.layer_type(0).value == "full_attention")
         r.check("Model spec layer_type(1)", model_spec.layer_type(1).value == "linear_attention")
 
-    # Context should be deactivated
     active_ctx = current_prefix_sharing_context()
     r.check("Context deactivated", active_ctx is None)
 
@@ -207,7 +238,6 @@ def test_patch_installation(r):
 
     r.check("Forward was patched", original_forward is not patched_forward)
 
-    # Verify patched forward still works without context
     tfconfig = make_tfconfig(hidden=256, num_layers=2, heads=4, kv_heads=2)
     block_spec = get_gpt_decoder_block_spec(tfconfig, use_transformer_engine=False)
     sa_sub = block_spec.layer_specs[0].submodules.self_attention.submodules
@@ -221,7 +251,6 @@ def test_patch_installation(r):
         out, _ = attn(hidden_states=hidden, attention_mask=None)
     r.check("Patched forward works", torch.isfinite(out).all().item())
 
-    # Disable patch
     handle.disable()
     r.check("Forward restored", SelfAttention.forward is original_forward)
 
@@ -250,7 +279,6 @@ def test_gated_delta_net_with_context(r):
         partial_rotary_factor=0.5, attn_output_gate=True,
     ).cuda().bfloat16()
 
-    # Create context
     sequences = [[1, 2, 3, 4, 10], [1, 2, 3, 4, 20]]
     config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=2)
     plan = PrefixSharingPlanner(config).plan(sequences)
@@ -269,7 +297,6 @@ def test_gated_delta_net_with_context(r):
 
     hidden = torch.randn(10, 1, 256, dtype=torch.bfloat16, device="cuda")
 
-    # With context active but NO packed_seq_params, should fall through to normal path
     with prefix_sharing_runtime_context(runtime_state):
         with torch.no_grad():
             out, _ = attn(hidden_states=hidden, attention_mask=None)
@@ -285,42 +312,10 @@ def test_hybrid_model_full_cycle(r):
     print("\n--- Test 6: Hybrid Model Full Cycle ---")
     tfconfig = make_tfconfig(hidden=256, num_layers=4, heads=4, kv_heads=2)
 
-    block_spec = get_gpt_decoder_block_spec(tfconfig, use_transformer_engine=False)
-    sa_submodules = block_spec.layer_specs[0].submodules.self_attention.submodules
-
-    model = GPTModel(
-        config=tfconfig,
-        transformer_layer_spec=block_spec,
-        vocab_size=32000,
-        max_sequence_length=512,
-        pre_process=True, post_process=True,
-        share_embeddings_and_output_weights=False,
-        position_embedding_type="rope",
-        rotary_base=10000.0,
-    )
-
-    # Replace layers 1,3 with GatedDeltaNet
-    for i, layer in enumerate(model.decoder.layers):
-        if i % 2 != 0:
-            old_attn = layer.self_attention
-            new_attn = GatedDeltaNetAttention(
-                config=tfconfig, submodules=sa_submodules,
-                layer_number=old_attn.layer_number,
-                attn_mask_type=old_attn.attn_mask_type,
-                partial_rotary_factor=0.5, attn_output_gate=True,
-            )
-            new_attn.to(next(old_attn.parameters()).device)
-            new_attn.linear_qkv = old_attn.linear_qkv
-            new_attn.linear_proj = old_attn.linear_proj
-            if hasattr(old_attn, 'q_layernorm') and old_attn.q_layernorm is not None:
-                new_attn.q_layernorm = old_attn.q_layernorm
-            if hasattr(old_attn, 'k_layernorm') and old_attn.k_layernorm is not None:
-                new_attn.k_layernorm = old_attn.k_layernorm
-            layer.self_attention = new_attn
-
+    model = build_hybrid_model(tfconfig, vocab_size=32000, max_seq_len=512,
+                                interval=2, partial_rot=0.5, gate=True)
     model = model.cuda().bfloat16()
 
-    # Forward pass
     bsz, seq_len = 2, 16
     input_ids = torch.randint(0, 32000, (bsz, seq_len), device="cuda")
     position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(bsz, -1)
@@ -337,25 +332,92 @@ def test_hybrid_model_full_cycle(r):
         r.check("Hybrid forward", False, str(e))
         import traceback; traceback.print_exc()
 
-    # Gradient pass
-    try:
-        hidden = model.embedding(input_ids, position_ids)
-        mask = ~torch.tril(torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool)).unsqueeze(0).unsqueeze(0)
-        out = model.decoder(hidden, mask)
-        loss = out.sum()
-        loss.backward()
+    hidden = model.embedding(input_ids, position_ids)
+    mask = ~torch.tril(torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool)).unsqueeze(0).unsqueeze(0)
+    out = model.decoder(hidden, mask)
+    loss = out.sum()
+    loss.backward()
 
-        gdn_layers = [i for i, l in enumerate(model.decoder.layers)
-                      if isinstance(l.self_attention, GatedDeltaNetAttention)]
-        r.check("Has GDN layers", len(gdn_layers) > 0)
-        for i in gdn_layers:
-            attn = model.decoder.layers[i].self_attention
-            r.check(f"Layer {i} beta_proj grad", attn.beta_proj.weight.grad is not None)
-    except Exception as e:
-        r.check("Hybrid gradient", False, str(e))
-        import traceback; traceback.print_exc()
+    gdn_layers = [i for i, l in enumerate(model.decoder.layers)
+                  if isinstance(l.self_attention, GatedDeltaNetAttention)]
+    r.check("Has GDN layers", len(gdn_layers) > 0)
+    for i in gdn_layers:
+        attn = model.decoder.layers[i].self_attention
+        r.check(f"Layer {i} beta_proj grad", attn.beta_proj.weight.grad is not None)
 
     del model
+    torch.cuda.empty_cache()
+
+
+def test_patched_model_with_ps_context(r):
+    """Test 7: Monkey-patched model forward with active PS context.
+
+    Verifies the combined path: MegatronAttentionIntegration patch installed on
+    SelfAttention.forward AND prefix_sharing_runtime_context active. This tests
+    that the patched_forward correctly detects the PS context and handles it
+    without crashing, even when attention is called without THD (the normal
+    forward path with PS context present but no sharing at this layer).
+    """
+    print("\n--- Test 7: Patched Model + PS Context ---")
+    from prefix_sharing.core.config import PrefixSharingConfig
+    from prefix_sharing.core.planner import PrefixSharingPlanner
+    from prefix_sharing.core.model_spec import ModelSpec
+    from prefix_sharing.backends.packed_layout import PackedBatchLayout
+    from prefix_sharing.integrations.context import (
+        prefix_sharing_runtime_context,
+        current_prefix_sharing_context,
+    )
+    from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
+    from prefix_sharing.backends.factory import get_backend_instance
+    from prefix_sharing.integrations.megatron_attention import MegatronAttentionIntegration
+
+    # Install monkey-patch
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    backend = get_backend_instance(config)
+    integration = MegatronAttentionIntegration(config=config, backend=backend)
+    handle = integration.install(model_config={})
+
+    # Build hybrid model
+    tfconfig = make_tfconfig(hidden=256, num_layers=2, heads=4, kv_heads=2)
+    model = build_hybrid_model(tfconfig, vocab_size=32000, max_seq_len=512,
+                                interval=2, partial_rot=0.5, gate=True)
+    model = model.cuda().bfloat16()
+
+    # Create PS context (PS active, but no THD - simulates pre-THD phase)
+    sequences = [[1, 2, 3, 4, 10, 11], [1, 2, 3, 4, 20, 21]]
+    ps_config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2, min_group_size=2)
+    plan = PrefixSharingPlanner(ps_config).plan(sequences, forward_id=30, micro_batch_id=0)
+    r.check("PS plan has sharing", plan.has_sharing)
+
+    model_spec = ModelSpec(
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=64, full_attention_interval=2,
+    )
+    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+
+    ps_state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=plan,
+        backend=backend,
+        packed_batch_layout=layout,
+        model_spec=model_spec,
+    )
+
+    # Forward with PS context active (non-THD path)
+    with torch.no_grad():
+        with prefix_sharing_runtime_context(ps_state):
+            bsz, seq_len = 1, 20
+            input_ids = torch.randint(0, 32000, (bsz, seq_len), device="cuda")
+            position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+            hidden = model.embedding(input_ids, position_ids)
+            mask = ~torch.tril(torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool)).unsqueeze(0).unsqueeze(0)
+            out = model.decoder(hidden, mask)
+
+    r.check("Patched model + PS context output finite", torch.isfinite(out).all().item())
+    r.check("Patched model + PS context output shape",
+            out.shape == (seq_len, bsz, 256), f"got {out.shape}")
+
+    del model
+    handle.disable()
     torch.cuda.empty_cache()
 
 
@@ -377,6 +439,7 @@ def main():
     test_patch_installation(r)
     test_gated_delta_net_with_context(r)
     test_hybrid_model_full_cycle(r)
+    test_patched_model_with_ps_context(r)
 
     ok = r.summary()
     if dist.is_initialized():

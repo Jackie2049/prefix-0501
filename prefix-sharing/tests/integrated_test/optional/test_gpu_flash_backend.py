@@ -371,3 +371,63 @@ def test_flash_atten_gpu_validate_checks_import() -> None:
     backend = GpuFlashAttentionBackend()
     config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_gpu")
     backend.validate(config)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_atten_gpu_gated_attention_vs_torch_ref(
+    backend: GpuFlashAttentionBackend,
+    ref_backend: TorchReferenceBackend,
+) -> None:
+    """gated_attention via flash-attn matches torch reference."""
+    plan = _make_plan(batch_sizes=[8, 8], prefix_lens=[0, 4])
+    q, k, v = _random_qkv(
+        total_q=12, total_kv=16, num_heads=4, num_kv_heads=2, head_dim=64, dtype=torch.float16
+    )
+    gate = torch.randn(12, 4, 64, dtype=torch.float16, device=DEVICE) * 2 - 1
+
+    out_fa = backend.gated_attention(q, k, v, gate, plan)
+    out_ref = ref_backend.gated_attention(q, k, v, gate, plan)
+
+    assert out_fa.shape == out_ref.shape == q.shape
+    _assert_outputs_close(out_fa, out_ref, atol=_ATOL_FP16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_atten_gpu_gated_attention_shape(
+    backend: GpuFlashAttentionBackend,
+) -> None:
+    """gated_attention output shape matches input Q shape."""
+    plan = _make_plan(batch_sizes=[4, 6], prefix_lens=[0, 2])
+    q, k, v = _random_qkv(
+        total_q=8, total_kv=10, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
+    )
+    gate = torch.randn(8, 2, 64, dtype=torch.float16, device=DEVICE)
+
+    out = backend.gated_attention(q, k, v, gate, plan)
+    assert out.shape == q.shape
+    assert out.device == q.device
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_atten_gpu_gated_attention_backward_smoke(
+    backend: GpuFlashAttentionBackend,
+) -> None:
+    """Gradient flows through gated_attention."""
+    plan = _make_plan(batch_sizes=[4, 6], prefix_lens=[0, 2])
+    q, k, v = _random_qkv(
+        total_q=8, total_kv=10, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
+    )
+    gate = torch.randn(8, 2, 64, dtype=torch.float16, device=DEVICE)
+
+    q.requires_grad_(True); k.requires_grad_(True); v.requires_grad_(True)
+    gate.requires_grad_(True)
+
+    out = backend.gated_attention(q, k, v, gate, plan)
+    loss = out.sum()
+    loss.backward()
+
+    assert q.grad is not None and not torch.isnan(q.grad).any()
+    assert k.grad is not None and not torch.isnan(k.grad).any()
+    assert v.grad is not None and not torch.isnan(v.grad).any()
+    assert gate.grad is not None and not torch.isnan(gate.grad).any()
