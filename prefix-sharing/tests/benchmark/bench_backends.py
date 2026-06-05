@@ -38,12 +38,13 @@ def bench_torch_ref(sequences, head_dim, num_q_heads, num_kv_heads, device, n_ru
 
     backend = TorchReferenceBackend()
     seq_lens = [len(s) for s in sequences]
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     # Token-based K/V embeddings
     max_tid = max(max(s) for s in sequences) + 1
-    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
-    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
-    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device) for sl in seq_lens]
+    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device, dtype=dtype)
+    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device, dtype=dtype) for sl in seq_lens]
     k_rows = [k_emb[seq] for seq in sequences]
     v_rows = [v_emb[seq] for seq in sequences]
 
@@ -106,11 +107,12 @@ def bench_flash_attn(sequences, head_dim, num_q_heads, num_kv_heads, device, n_r
     # FlashAttention requires 3D THD format
     backend = GpuFlashAttentionBackend()
     seq_lens = [len(s) for s in sequences]
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     max_tid = max(max(s) for s in sequences) + 1
-    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
-    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
-    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device) for sl in seq_lens]
+    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device, dtype=dtype)
+    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device, dtype=dtype) for sl in seq_lens]
     k_rows = [k_emb[seq] for seq in sequences]
     v_rows = [v_emb[seq] for seq in sequences]
 

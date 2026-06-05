@@ -49,9 +49,9 @@ def bench_workload(sequences, num_q_heads, num_kv_heads, head_dim, device, n_run
 
     # Token-ID-based K/V
     max_tid = max(max(s) for s in sequences) + 1
-    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
-    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device)
-    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device) for sl in seq_lens]
+    k_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32)
+    v_emb = torch.randn(max_tid, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32)
+    q_per_pos = [torch.randn(sl, num_q_heads, head_dim, device=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32) for sl in seq_lens]
     k_rows = [k_emb[seq] for seq in sequences]
     v_rows = [v_emb[seq] for seq in sequences]
 
