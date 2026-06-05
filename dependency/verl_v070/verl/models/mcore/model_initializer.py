@@ -274,3 +274,65 @@ class Qwen25VLModel(BaseModelInitializer):
             )
 
         return qwen25_vl_model
+
+
+class Qwen3_6HybridModel(BaseModelInitializer):
+    """Initializer for Qwen3.6 HybridAttention models.
+
+    Qwen3.6 uses interleaved full attention and GatedDeltaNet linear attention:
+    - Layers where layer_idx % full_attention_interval == 0 → standard SelfAttention
+    - All other layers → GatedDeltaNet linear attention
+
+    This initializer creates a standard GPTModel, then replaces the linear
+    attention layers with GatedDeltaNetAttention modules.
+    """
+
+    def get_transformer_layer_spec(self, vp_stage=None):
+        assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
+        extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
+        return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+
+    def initialize(self, **kwargs):
+        model = super().initialize(**kwargs)
+
+        # Read HybridAttention config from hf_config
+        full_attention_interval = getattr(self.hf_config, "full_attention_interval", 1)
+        partial_rotary_factor = getattr(self.hf_config, "partial_rotary_factor", 1.0)
+        attn_output_gate = getattr(self.hf_config, "attn_output_gate", False)
+
+        if full_attention_interval <= 1:
+            # No hybrid attention, all layers are full attention
+            return model
+
+        # Replace linear attention layers with GatedDeltaNetAttention
+        from .gated_delta_net import GatedDeltaNetAttention
+
+        for i, layer in enumerate(model.decoder.layers):
+            if i % full_attention_interval != 0:
+                # This is a linear attention layer — replace SelfAttention
+                old_attn = layer.self_attention
+
+                # Create GatedDeltaNetAttention with same submodules
+                new_attn = GatedDeltaNetAttention(
+                    config=self.tfconfig,
+                    submodules=old_attn.submodules if hasattr(old_attn, 'submodules') else type(old_attn).SelfAttentionSubmodules(),
+                    layer_number=old_attn.layer_number,
+                    attn_mask_type=old_attn.attn_mask_type,
+                    partial_rotary_factor=partial_rotary_factor,
+                    attn_output_gate=attn_output_gate,
+                )
+                new_attn.to(next(old_attn.parameters()).device)
+
+                # Copy weights from old SelfAttention to new GatedDeltaNet
+                # linear_qkv and linear_proj are shared
+                new_attn.linear_qkv = old_attn.linear_qkv
+                new_attn.linear_proj = old_attn.linear_proj
+                if hasattr(old_attn, 'q_layernorm') and old_attn.q_layernorm is not None:
+                    new_attn.q_layernorm = old_attn.q_layernorm
+                if hasattr(old_attn, 'k_layernorm') and old_attn.k_layernorm is not None:
+                    new_attn.k_layernorm = old_attn.k_layernorm
+
+                # Replace the attention module
+                layer.self_attention = new_attn
+
+        return model
