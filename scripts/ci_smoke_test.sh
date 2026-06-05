@@ -95,6 +95,33 @@ _run   "numerical correctness"   1 $((PORT++)) scripts/gpu_e2e_numerical_correct
 _run   "perf benchmark"          1 $((PORT++)) scripts/gpu_ps_perf_benchmark.py
 _run_tp "TP=2"                   $((PORT++)) scripts/gpu_tp_test.py
 
+# Standalone python tests (no torchrun, need PYTHONPATH)
+# Find python - prefer conda env python, fall back to system python
+PY=$(which python 2>/dev/null || echo "$HOME/anaconda3/envs/llm/bin/python")
+
+# Standalone run helper (no torchrun)
+_run_standalone() {
+    local name="$1"; shift
+    echo ""
+    echo "=== $name ==="
+    local out rc=0
+    out=$(CUDA_VISIBLE_DEVICES="$DEV" PYTHONPATH=prefix-sharing $PY "$@" 2>&1) || rc=$?
+    local result_line
+    result_line=$(echo "$out" | grep -E 'Results:')
+    if [ "$rc" -eq 0 ] && echo "$result_line" | grep -q '\[PASS\]'; then
+        PASSED=$((PASSED + 1)); PASS_NAMES+=("$name")
+        local n
+        n=$(echo "$result_line" | grep -oE '[0-9]+/' | tr -d '/')
+        echo "  PASS: ${n:-?} checks"
+    else
+        FAILED=$((FAILED + 1)); FAIL_NAMES+=("$name")
+        echo "  FAIL: exit=$rc  result=$result_line"
+    fi
+}
+
+_run_standalone "hybrid attention" prefix-sharing/tests/run_hybrid_attention.py --device cuda
+_run_standalone "deltanet state reuse" prefix-sharing/tests/run_deltanet.py --device cuda
+
 # Summary
 echo ""
 echo "============================================================"
