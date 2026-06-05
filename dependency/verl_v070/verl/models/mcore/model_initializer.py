@@ -307,15 +307,21 @@ class Qwen3_6HybridModel(BaseModelInitializer):
         # Replace linear attention layers with GatedDeltaNetAttention
         from .gated_delta_net import GatedDeltaNetAttention
 
+        # Get the SelfAttentionSubmodules from the block spec
+        vp_stage = kwargs.get("vp_stage", None)
+        block_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
+        sa_modspec = block_spec.layer_specs[0].submodules.self_attention
+        sa_submodules = sa_modspec.submodules
+
         for i, layer in enumerate(model.decoder.layers):
             if i % full_attention_interval != 0:
                 # This is a linear attention layer — replace SelfAttention
                 old_attn = layer.self_attention
 
-                # Create GatedDeltaNetAttention with same submodules
+                # Create GatedDeltaNetAttention with correct submodules
                 new_attn = GatedDeltaNetAttention(
                     config=self.tfconfig,
-                    submodules=old_attn.submodules if hasattr(old_attn, 'submodules') else type(old_attn).SelfAttentionSubmodules(),
+                    submodules=sa_submodules,
                     layer_number=old_attn.layer_number,
                     attn_mask_type=old_attn.attn_mask_type,
                     partial_rotary_factor=partial_rotary_factor,
