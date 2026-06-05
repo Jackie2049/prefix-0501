@@ -7,6 +7,7 @@ from prefix_sharing.integrations.context import (
     prefix_sharing_runtime_context,
 )
 from prefix_sharing.integrations.patch_manager import PatchHandle, PatchManager
+from prefix_sharing.integrations.parallel_info import MegatronParallelInfo, get_megatron_parallel_info
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.integrations.verl_mcore import (
     PrefixSharingRuntimeState,
@@ -24,6 +25,7 @@ __all__ = [
     "PatchManager",
     "PackedBatchLayout",
     "PackedPrefixLastRestoreIndex",
+    "MegatronParallelInfo",
     "PrefixSharingRuntimeContext",
     "PrefixSharingRuntimeState",
     "VerlMCoreBatchAdapter",
@@ -35,4 +37,5 @@ __all__ = [
     "prefix_sharing_enabled",
     "build_prefix_sharing_micro_batch",
     "restore_suffix_first_log_probs_from_prefix",
+    "get_megatron_parallel_info",
 ]

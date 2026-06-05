@@ -62,13 +62,30 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
     
     class "verl_mcore.py\nPrefixSharingRuntimeState" as RuntimeState #FFCC80 {
         运行时状态容器
-        封装执行计划、backend实例、packed runtime layout等运行时数据
+        封装执行计划、backend实例、packed runtime layout和Megatron并行信息
         +prefix_sharing_plan: PrefixSharingPlan
         .. 执行计划，包含 reuse_specs、裁剪范围、restore specs 等 ..
         +backend: Any
         .. attention backend 实例，如 TorchReferenceBackend ..
         +packed_batch_layout: PackedBatchLayout
         .. 当前 forward 的真实 packed batch 布局，用于 RoPE、KV split 和 restore index ..
+        +parallel_info: MegatronParallelInfo
+        .. 当前并行信息；Megatron 场景中为 Megatron TP/CP/PP rank-size 快照 ..
+    }
+
+    class "parallel_info.py\nMegatronParallelInfo" as ParallelInfo #FFCC80 {
+        Megatron并行信息
+        从 Megatron parallel_state 读取当前rank的TP/CP/PP语义
+        +global_rank: int | str
+        +tp_rank: int
+        +tp_size: int
+        +cp_rank: int
+        +cp_size: int
+        +pp_rank: int
+        +pp_size: int
+        +is_pipeline_first_stage: bool
+        +is_pipeline_last_stage: bool
+        +virtual_pp_size: int | None
     }
 
     class "context.py\nPackedPrefixLastRestoreIndex" as PackedRestoreIndex #FFCC80 {
@@ -113,7 +130,6 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         +min_prefix_len: int
         +min_group_size: int
         +boundary_strategy: str = "prefix_last_restore"
-        +supported_pp_size: int = 1
         +supported_cp_size: int = 1
         +supported_rope_fusion: bool = False
         +supported_fused_qkv_rope: bool = False
@@ -457,9 +473,11 @@ note bottom of Context
   **PrefixSharingRuntimeContext:**
   - prefix_sharing_plan: PrefixSharingPlan
   - packed_batch_layout: PackedBatchLayout
+  - parallel_info: MegatronParallelInfo
   - store: PrefixAttentionStore
   - backend: Any
   - prefix_last_restore_indices: packed 读写索引
+  - Prefix-Last Restore 只在 last PP stage 执行
   
   主入口是 prefix_sharing_runtime_context()
 endnote
