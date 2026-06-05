@@ -36,6 +36,11 @@ _MODELS = {
         "apertus",
         ("ParallelApertusForCausalLMRmPadPP", "ParallelApertusForValueRmPadPP", "ParallelApertusForCausalLMRmPad"),
     ),
+    # Qwen3.6 HybridAttention: 16 full attention + 48 GatedDeltaNet linear attention
+    "Qwen3ForCausalLM": (
+        "qwen3_6",
+        ("ParallelQwen3_6ForCausalLMRmPadPP", "ParallelQwen3_6ForValueRmPadPP", "ParallelQwen3_6ForCausalLMRmPad"),
+    ),
 }
 
 
