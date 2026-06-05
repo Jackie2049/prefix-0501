@@ -133,17 +133,6 @@ class GatedDeltaNetAttention(SelfAttention):
 
         Returns (output, bias) like SelfAttention.
         """
-        # Check prefix-sharing context first
-        from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_deltanet
-        result = maybe_run_prefix_sharing_deltanet(
-            attention_module=self,
-            state_update=None,  # Will be computed inside
-            packed_seq_params=packed_seq_params,
-        )
-        if result is not None:
-            return result, None
-
-        # Standard path: compute GatedDeltaNet linear attention
         # hidden_states: [sq, b, h]
 
         # QKV projection using inherited linear_qkv
@@ -183,8 +172,19 @@ class GatedDeltaNetAttention(SelfAttention):
         kv = torch.einsum('thd,the->thde', k_flat, v_flat)
         update = beta_flat.unsqueeze(-1) * kv  # [t, h, d, d]
 
-        # Cumsum over sequence
-        trajectory = torch.cumsum(update, dim=0)
+        # Try prefix-sharing trajectory first (needs the actual state_update)
+        from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_deltanet
+        ps_trajectory = maybe_run_prefix_sharing_deltanet(
+            attention_module=self,
+            state_update=update,
+            packed_seq_params=packed_seq_params,
+        )
+
+        if ps_trajectory is not None:
+            trajectory = ps_trajectory
+        else:
+            # Standard cumsum over sequence
+            trajectory = torch.cumsum(update, dim=0)
 
         # Query the state
         y = torch.einsum('thd,thde->the', q_flat, trajectory)
