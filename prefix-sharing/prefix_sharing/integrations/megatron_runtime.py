@@ -21,6 +21,8 @@ def maybe_run_prefix_sharing_attention(
     packed_seq_params: Any,
     rotary_pos_cos: Any | None = None,
     rotary_pos_sin: Any | None = None,
+    mscale: Any = None,
+    **kwargs,
 ) -> tuple[Any, Any] | None:
     """Run prefix-sharing attention when a runtime context is active.
 
