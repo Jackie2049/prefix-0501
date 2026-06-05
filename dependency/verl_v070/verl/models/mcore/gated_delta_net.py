@@ -109,7 +109,7 @@ class GatedDeltaNetAttention(SelfAttention):
                 self.config.hidden_size,
                 config=self.config,
                 init_method=self.config.init_method,
-                gather_output=False,
+                gather_output=True,  # Must gather to match linear_proj output shape
                 bias=False,
                 skip_bias_add=False,
                 is_expert=False,

@@ -808,7 +808,7 @@ class Attention(MegatronModule, ABC):
 
         try:
 
-            prefix_log.warning("\n\n\nprefix hook try to run\n\n\n")
+            prefix_log.debug("prefix hook try to run")
 
             from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_attention
 
@@ -824,16 +824,16 @@ class Attention(MegatronModule, ABC):
             )
         except ModuleNotFoundError:
 
-            prefix_log.warning("\n\n\nprefix hook fail to import module\n\n\n")
+            prefix_log.debug("prefix hook fail to import module")
 
             prefix_sharing_output = None
         if prefix_sharing_output is not None:
 
-            prefix_log.warning("\n\n\nprefix hook success, begin to return\n\n\n")
+            prefix_log.debug("prefix hook success, begin to return")
 
             return prefix_sharing_output
-        
-        prefix_log.warning("\n\n\nprefix hook failed\n\n\n")
+
+        prefix_log.debug("prefix hook: no sharing, falling through")
         ######### prefix-sharing #########
 
         # ================================================
