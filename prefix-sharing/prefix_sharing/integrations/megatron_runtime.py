@@ -137,27 +137,36 @@ def _apply_positioned_rope(
     # RoPE is linear: freqs[p] = p * inv_freq.  The step (inv_freq) can be
     # recovered from the pos_emb itself as pos_emb[1] - pos_emb[0].
     if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
-        dim_half = q_pos_emb.shape[-1] // 2
-        step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
-        n_extra = max_needed - q_pos_emb.shape[0]
-        extra_positions = torch.arange(
-            q_pos_emb.shape[0], max_needed,
-            device=q_pos_emb.device, dtype=q_pos_emb.dtype,
-        )
-        extra_angles = extra_positions[:, None, None, None] * step
-        extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
-        q_pos_emb = torch.cat([q_pos_emb, extra_emb], dim=0)
+        if q_pos_emb.shape[0] < 2:
+            # Can't recover RoPE frequency step from a single position.
+            # Fall through: apply_rotary_pos_emb will use the available
+            # positions and might truncate — rare edge case.
+            pass
+        else:
+            dim_half = q_pos_emb.shape[-1] // 2
+            step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
+            n_extra = max_needed - q_pos_emb.shape[0]
+            extra_positions = torch.arange(
+                q_pos_emb.shape[0], max_needed,
+                device=q_pos_emb.device, dtype=q_pos_emb.dtype,
+            )
+            extra_angles = extra_positions[:, None, None, None] * step
+            extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
+            q_pos_emb = torch.cat([q_pos_emb, extra_emb], dim=0)
     if k_pos_emb is not None and max_needed > k_pos_emb.shape[0]:
-        dim_half = k_pos_emb.shape[-1] // 2
-        step = k_pos_emb[1:2, :, :, :dim_half] - k_pos_emb[0:1, :, :, :dim_half]
-        n_extra = max_needed - k_pos_emb.shape[0]
-        extra_positions = torch.arange(
-            k_pos_emb.shape[0], max_needed,
-            device=k_pos_emb.device, dtype=k_pos_emb.dtype,
-        )
-        extra_angles = extra_positions[:, None, None, None] * step
-        extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
-        k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
+        if k_pos_emb.shape[0] < 2:
+            pass
+        else:
+            dim_half = k_pos_emb.shape[-1] // 2
+            step = k_pos_emb[1:2, :, :, :dim_half] - k_pos_emb[0:1, :, :, :dim_half]
+            n_extra = max_needed - k_pos_emb.shape[0]
+            extra_positions = torch.arange(
+                k_pos_emb.shape[0], max_needed,
+                device=k_pos_emb.device, dtype=k_pos_emb.dtype,
+            )
+            extra_angles = extra_positions[:, None, None, None] * step
+            extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
+            k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
 
     if q_pos_emb is not None:
         q_freqs = q_pos_emb.index_select(0, positions)
