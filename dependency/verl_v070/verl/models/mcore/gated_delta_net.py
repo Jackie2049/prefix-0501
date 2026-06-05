@@ -151,11 +151,7 @@ class GatedDeltaNetAttention(SelfAttention):
         query, key, value = self.get_query_key_value_tensors(hidden_states, None, True)
         sq, b, _ = hidden_states.size()
 
-        # Apply QK layernorm if configured
-        if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
-        if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
+        # Note: QK layernorm is already applied by get_query_key_value_tensors()
 
         # Apply RoPE using parent class method
         if rotary_pos_emb is not None:
