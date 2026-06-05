@@ -66,7 +66,8 @@ def maybe_run_prefix_sharing_attention(
         )
     backend = ctx.backend or TorchReferenceBackend()
     global_rank, tp_rank, tp_size = _read_parallel_rank_info()
-    layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
+    # Megatron layer_number is 1-indexed; convert to 0-indexed for ModelSpec
+    layer_id = int(getattr(attention_module, "layer_number", 0) or 0) - 1
 
     # Determine layer type for HybridAttention models (e.g., Qwen3.6-27B)
     model_spec = ctx.model_spec
@@ -274,7 +275,8 @@ def maybe_run_prefix_sharing_deltanet(
 
     backend = ctx.backend or TorchReferenceBackend()
     _, tp_rank, _ = _read_parallel_rank_info()
-    layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
+    # Megatron layer_number is 1-indexed; convert to 0-indexed for ModelSpec
+    layer_id = int(getattr(attention_module, "layer_number", 0) or 0) - 1
 
     # Only process linear attention layers
     model_spec = ctx.model_spec
