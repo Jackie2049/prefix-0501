@@ -17,7 +17,8 @@ def get_backend_instance(
     """Return an explicit ``backend`` if given, otherwise build from ``config``.
 
     Supported values for ``config.backend``:
-    * ``"torch_ref"``      -> :class:`~prefix_sharing.backends.torch_ref.TorchReferenceBackend`
+    * ``"auto"``            -> tries flash_atten_gpu, falls back to torch_ref
+    * ``"torch_ref"``       -> :class:`~prefix_sharing.backends.torch_ref.TorchReferenceBackend`
     * ``"flash_atten_gpu"`` -> :class:`~prefix_sharing.backends.flash_atten_gpu.GpuFlashAttentionBackend`
     * ``"flash_atten_npu"`` -> :class:`~prefix_sharing.backends.flash_atten_npu.NpuFlashAttentionBackend`
 
@@ -26,6 +27,20 @@ def get_backend_instance(
     """
     if backend is not None:
         return backend
+
+    if config.backend in ("auto", "flash_atten_gpu"):
+        try:
+            from prefix_sharing.backends.flash_atten_gpu import GpuFlashAttentionBackend
+            return GpuFlashAttentionBackend()
+        except (ImportError, ModuleNotFoundError) as exc:
+            if config.backend == "flash_atten_gpu":
+                logger.warning(
+                    "flash_atten_gpu backend unavailable (%s), falling back to torch_ref. "
+                    "Install flash-attn for optimal performance.",
+                    exc,
+                )
+            from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+            return TorchReferenceBackend()
 
     if config.backend == "torch_ref":
         from prefix_sharing.backends.torch_ref import TorchReferenceBackend
