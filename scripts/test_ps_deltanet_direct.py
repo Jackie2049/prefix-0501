@@ -164,11 +164,13 @@ conv_overlap = deltanet.conv_kernel_size - 1  # 3
 # Build extended suffix hidden_states: [overlap_prefix, suffix]
 # Include last conv_overlap prefix tokens for conv1d context
 overlap_hiddens = prefix_hidden[:, -conv_overlap:, :]  # (1, conv_overlap, hidden_size)
-# Each sequence gets: [overlap_prefix, suffix_i]
-extended_suffix = torch.cat([
-    torch.cat([overlap_hiddens.expand(N_SEQUENCES, -1, -1), suffix_hiddens[i]], dim=1)
-    for i in range(N_SEQUENCES)
-], dim=0)  # (N, conv_overlap + SUFFIX_LEN, hidden_size)
+# Build per-sequence: [overlap, suffix_i] then stack into batch
+extended_suffix_seqs = []
+for i in range(N_SEQUENCES):
+    # Each sequence: (1, conv_overlap + SUFFIX_LEN, hidden_size)
+    seq_extended = torch.cat([overlap_hiddens, suffix_hiddens[i]], dim=1)
+    extended_suffix_seqs.append(seq_extended)
+extended_suffix = torch.cat(extended_suffix_seqs, dim=0)  # (N, conv_overlap + SUFFIX_LEN, hidden_size)
 
 torch.cuda.synchronize()
 t2 = time.time()
