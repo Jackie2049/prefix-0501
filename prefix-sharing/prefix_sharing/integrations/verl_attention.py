@@ -190,6 +190,13 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         ).cumsum(0)
         max_seqlen_expanded = max(ctx.prefix_sharing_plan.expanded_lengths_kv)
 
+        logger.debug(
+            "[PS][verl-attn][layer=%s] expanded_cu_seqlens dtype=%s, values=%s, "
+            "cu_seqlens_q dtype=%s, values=%s",
+            layer_id, expanded_cu_seqlens.dtype, expanded_cu_seqlens.tolist(),
+            cu_seqlens.dtype, cu_seqlens.tolist(),
+        )
+
         # Cast if needed (fp32 → fp16 for flash_attn)
         input_dtype = query_states.dtype
         if input_dtype == torch.float32:
