@@ -126,7 +126,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
 
         # Partial RoPE AFTER q_norm/k_norm
         cos, sin = attn_module.rotary_emb(value_states, seq_len=sequence_length)
-        cos, sin = cos[:, :cos.shape[1] // 2], sin[:, sin.shape[1] // 2]
+        cos, sin = cos[:, :cos.shape[1] // 2], sin[:, :sin.shape[1] // 2]
 
         if attn_module.rope_dim == attn_module.head_dim:
             from flash_attn.layers.rotary import apply_rotary_emb
