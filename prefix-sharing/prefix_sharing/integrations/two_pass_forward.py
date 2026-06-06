@@ -148,26 +148,29 @@ def run_two_pass_prefix_sharing_forward(
                     query_4d = torch.cat([q_rot, q_pass], dim=-1)
                     key_4d = torch.cat([k_rot, k_pass], dim=-1)
 
-                # Reshape back to 3D for flash_attn_varlen_func
-                query_states = query_4d.view(bsz * seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
-                key_states = key_4d.view(bsz * seq_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
-
-                # GQA expand
+                # GQA expand in 4D
                 num_key_value_groups = attn_module.num_key_value_groups
                 if num_key_value_groups > 1:
-                    key_states = key_states.unsqueeze(2).expand(-1, -1, num_key_value_groups, -1).reshape(
-                        bsz * seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
-                    value_states = value_states.unsqueeze(2).expand(-1, -1, num_key_value_groups, -1).reshape(
-                        bsz * seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                    key_states_4d = key_4d.repeat_interleave(num_key_value_groups, dim=2)
+                    value_states_4d = value_states.view(bsz, seq_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+                    value_states_4d = value_states_4d.repeat_interleave(num_key_value_groups, dim=2)
+                else:
+                    key_states_4d = key_4d
+                    value_states_4d = value_states.view(bsz, seq_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
 
-                # Store prefix KV (expanded to N sequences)
-                prefix_kv_states[layer_idx] = (key_states, value_states)
+                # Store prefix KV in 4D format (1, prefix_len, heads, head_dim) for easy expand in suffix pass
+                prefix_kv_states[layer_idx] = (key_states_4d, value_states_4d)
+
+                # Reshape to 3D for flash_attn_varlen_func
+                query_flat = query_4d.view(bsz * seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                key_flat = key_states_4d.view(bsz * seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                value_flat = value_states_4d.view(bsz * seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
 
                 # Run full attention for prefix (to get output for residual)
-                cu_seqlens_prefix = torch.tensor([0, seq_len], dtype=torch.int32, device=query_states.device)
+                cu_seqlens_prefix = torch.tensor([0, seq_len], dtype=torch.int32, device=query_flat.device)
 
                 attn_output = flash_attn_varlen_func(
-                    query_states, key_states, value_states,
+                    query_flat, key_flat, value_flat,
                     cu_seqlens_q=cu_seqlens_prefix, cu_seqlens_k=cu_seqlens_prefix,
                     max_seqlen_q=seq_len, max_seqlen_k=seq_len,
                     dropout_p=0.0, softmax_scale=attn_module.scaling, causal=True,
@@ -258,42 +261,37 @@ def run_two_pass_prefix_sharing_forward(
                     query_states = torch.cat([q_rot, q_pass], dim=-1)
                     key_states = torch.cat([k_rot, k_pass], dim=-1)
 
-                # Reshape back to 3D for flash_attn and GQA
-                query_states = query_states.view(N * suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim)
-                key_states = key_states.view(N * suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
-                value_states = value_states.view(N * suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
-
-                # GQA expand
+                # GQA expand in 4D
                 num_key_value_groups = attn_module.num_key_value_groups
                 if num_key_value_groups > 1:
-                    key_states = key_states.unsqueeze(2).expand(-1, -1, num_key_value_groups, -1).reshape(
-                        N * suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim)
-                    value_states = value_states.unsqueeze(2).expand(-1, -1, num_key_value_groups, -1).reshape(
-                        N * suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                    key_states = key_states.repeat_interleave(num_key_value_groups, dim=2)
+                    value_states = value_states.repeat_interleave(num_key_value_groups, dim=2)
 
-                # KV expansion: concatenate prefix KV + suffix KV
+                # KV expansion in 4D: expand prefix KV (1, prefix_len, heads, head_dim) → (N, prefix_len, heads, head_dim)
                 prefix_key, prefix_value = prefix_kv_states[layer_idx]
-                expanded_key = torch.cat([
-                    prefix_key.expand(N * prefix_len, -1, -1),
-                    key_states,
-                ], dim=0)
-                expanded_value = torch.cat([
-                    prefix_value.expand(N * prefix_len, -1, -1),
-                    value_states,
-                ], dim=0)
+                expanded_prefix_key = prefix_key.expand(N, -1, -1, -1).contiguous()
+                expanded_prefix_value = prefix_value.expand(N, -1, -1, -1).contiguous()
+
+                # Concatenate prefix KV + suffix KV in 4D
+                expanded_key = torch.cat([expanded_prefix_key, key_states], dim=1)   # (N, prefix_len+suffix_len, heads, head_dim)
+                expanded_value = torch.cat([expanded_prefix_value, value_states], dim=1)
 
                 # Build cu_seqlens for flash_attn_varlen_func
                 cu_seqlens_q = torch.tensor(
                     [0] + [suffix_len] * N, dtype=torch.int32, device=query_states.device
                 ).cumsum(0).to(torch.int32)
-                expanded_lengths = [prefix_len + suffix_len] * N
                 cu_seqlens_k = torch.tensor(
-                    [0] + expanded_lengths, dtype=torch.int32, device=query_states.device
+                    [0] + [prefix_len + suffix_len] * N, dtype=torch.int32, device=query_states.device
                 ).cumsum(0).to(torch.int32)
+
+                # Reshape to 3D (total_nnz, heads, head_dim) for flash_attn_varlen_func
+                query_flat = query_states.reshape(N * suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                expanded_key_flat = expanded_key.reshape(N * (prefix_len + suffix_len), attn_module.num_heads_per_tp, attn_module.head_dim)
+                expanded_value_flat = expanded_value.reshape(N * (prefix_len + suffix_len), attn_module.num_heads_per_tp, attn_module.head_dim)
 
                 # flash_attn with expanded KV
                 attn_output = flash_attn_varlen_func(
-                    query_states, expanded_key, expanded_value,
+                    query_flat, expanded_key_flat, expanded_value_flat,
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k,
                     max_seqlen_q=suffix_len,
