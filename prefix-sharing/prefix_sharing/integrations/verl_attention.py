@@ -2,8 +2,7 @@
 
 When verl uses its own model classes (ParallelQwen3_6AttentionRmPad,
 ParallelQwen3_6GatedDeltaNetRmPad), this module provides prefix-sharing
-hooks that intercept the attention forward pass to expand KV with
-prefix-sharing data.
+hooks that intercept the attention forward pass.
 
 For full attention layers (16 out of 64 in Qwen3.6-27B):
 - Intercept after q/k/v projection and before flash_attn
@@ -13,12 +12,14 @@ For full attention layers (16 out of 64 in Qwen3.6-27B):
 - Apply output gate (attn_output * sigmoid(gate))
 - Run o_proj (RowParallelLinear)
 
-For DeltaNet layers (48 out of 64):
-- These use recurrent state (GatedDeltaNet), not KV-based attention
-- Prefix-sharing for DeltaNet would require state injection, which
-  is more complex. For now, we skip PS for DeltaNet layers.
-- DeltaNet layers don't have traditional KV cache, so the main
-  prefix-sharing benefit is from the 16 full attention layers.
+For DeltaNet layers (48 out of 64) — two-pass state injection:
+- Prefix pass: process provider's prefix tokens with output_final_state=True,
+  extract conv1d overlap context from the last (kernel_size-1) layernorm
+  outputs, and store recurrent state + conv overlap in deltanet_store.
+- Suffix pass: load stored state, inject as initial_state + conv_overlap_hidden
+  into the DeltaNet forward for state injection.
+- This achieves precision alignment (cos_sim > 0.999) as validated in the
+  two-pass E2E test (scripts/run_ps_e2e_twopass_v2.py).
 """
 
 from __future__ import annotations
@@ -252,13 +253,27 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
 def _make_verl_deltanet_patch(original_forward: Any) -> Any:
     """Create a patched forward for verl's ParallelQwen3_6GatedDeltaNetRmPad.
 
-    DeltaNet layers use recurrent state (GatedDeltaNet), not KV-based attention.
-    Prefix-sharing for DeltaNet would require injecting accumulated state from
-    the prefix computation into the suffix computation.
+    Supports two-pass prefix-sharing for DeltaNet (GatedDeltaNet) layers:
 
-    For now, we pass through to the original forward when prefix-sharing is
-    active for DeltaNet layers, since the main benefit of prefix-sharing comes
-    from the 16 full attention layers which DO have KV cache.
+    **Prefix pass** (deltanet_store has no state for this layer):
+      - Run DeltaNet forward with output_final_state=True to capture the
+        accumulated recurrent state after processing prefix tokens.
+      - Extract conv1d overlap context: the last (conv_kernel_size-1) tokens
+        of the layernorm output (hidden_states input to DeltaNet). These
+        provide causal context for the conv1d at the prefix/suffix boundary.
+      - Store recurrent_state + conv_state in deltanet_store for the suffix
+        pass to inject.
+
+    **Suffix pass** (deltanet_store has state for this layer):
+      - Load stored recurrent_state and conv_state (conv1d overlap).
+      - Pass them as initial_state and conv_overlap_hidden to the DeltaNet
+        forward, enabling state injection so suffix tokens start from the
+        prefix-accumulated recurrent state instead of zero initial state.
+      - All sequences share the same prefix state (expanded by DeltaNet's
+        padded forward when conv_overlap_hidden has bsz=1).
+
+    This two-pass approach achieves cos_sim > 0.999 precision alignment
+    as validated in scripts/run_ps_e2e_twopass_v2.py.
     """
 
     def patched_forward(
@@ -271,18 +286,153 @@ def _make_verl_deltanet_patch(original_forward: Any) -> Any:
         max_seqlen_in_batch=None,
         **kwargs,
     ):
-        # DeltaNet prefix-sharing is not implemented yet
-        # Just run the original forward
-        return original_forward(
-            deltanet_module,
-            hidden_states,
-            position_ids=position_ids,
-            sequence_length=sequence_length,
-            indices=indices,
-            cu_seqlens=cu_seqlens,
-            max_seqlen_in_batch=max_seqlen_in_batch,
-            **kwargs,
+        from prefix_sharing.integrations.context import current_prefix_sharing_context
+        from prefix_sharing.core.model_spec import AttentionLayerType
+        from prefix_sharing.core.prefix_store import (
+            PrefixActivationSlotId, PREFIX_STATE_TYPE_DELTANET_STATE,
         )
+        from prefix_sharing.integrations.megatron_runtime import _read_parallel_rank_info
+
+        ctx = current_prefix_sharing_context()
+        if ctx is None or not ctx.prefix_sharing_plan.has_sharing:
+            return original_forward(
+                deltanet_module,
+                hidden_states,
+                position_ids=position_ids,
+                sequence_length=sequence_length,
+                indices=indices,
+                cu_seqlens=cu_seqlens,
+                max_seqlen_in_batch=max_seqlen_in_batch,
+                **kwargs,
+            )
+
+        # Check if this is a DeltaNet (linear attention) layer
+        layer_id = int(getattr(deltanet_module, "layer_idx", 0) or 0)
+        model_spec = ctx.model_spec
+        if model_spec is not None and model_spec.layer_type(layer_id) == AttentionLayerType.FULL_ATTENTION:
+            # Full attention layer — skip, handled by attention patch
+            return original_forward(
+                deltanet_module, hidden_states, position_ids=position_ids,
+                sequence_length=sequence_length, indices=indices,
+                cu_seqlens=cu_seqlens, max_seqlen_in_batch=max_seqlen_in_batch,
+                **kwargs,
+            )
+
+        # Build slot ID for this layer's DeltaNet state
+        _, tp_rank, _ = _read_parallel_rank_info()
+        slot_id = PrefixActivationSlotId(
+            forward_id=ctx.prefix_sharing_plan.forward_id,
+            micro_batch_id=ctx.prefix_sharing_plan.micro_batch_id,
+            layer_id=layer_id,
+            sample_idx_in_batch=0,  # provider's state (shared by all reusers)
+            prefix_state_type=PREFIX_STATE_TYPE_DELTANET_STATE,
+            tp_rank=tp_rank,
+        )
+
+        if ctx.deltanet_store.contains(slot_id):
+            # === Suffix pass: inject stored DeltaNet state ===
+            stored_state = ctx.deltanet_store.load(slot_id)
+            initial_state = stored_state.recurrent_state
+            conv_overlap_hidden = stored_state.conv_state
+
+            logger.debug(
+                "[PS][deltanet-inject][layer=%s] Injecting state: "
+                "initial_state=%s, conv_overlap=%s",
+                layer_id,
+                tuple(initial_state.shape) if initial_state is not None else None,
+                tuple(conv_overlap_hidden.shape) if conv_overlap_hidden is not None else None,
+            )
+
+            return original_forward(
+                deltanet_module,
+                hidden_states,
+                position_ids=position_ids,
+                sequence_length=sequence_length,
+                indices=indices,
+                cu_seqlens=cu_seqlens,
+                max_seqlen_in_batch=max_seqlen_in_batch,
+                initial_state=initial_state,
+                output_final_state=False,
+                conv_overlap_hidden=conv_overlap_hidden,
+                **kwargs,
+            )
+        else:
+            # === Prefix pass: capture and store DeltaNet state ===
+            import torch
+            from flash_attn.bert_padding import pad_input as _pad_input
+
+            # Run DeltaNet forward with output_final_state=True to capture
+            # the accumulated recurrent state after processing prefix tokens.
+            result = original_forward(
+                deltanet_module,
+                hidden_states,
+                position_ids=position_ids,
+                sequence_length=sequence_length,
+                indices=indices,
+                cu_seqlens=cu_seqlens,
+                max_seqlen_in_batch=max_seqlen_in_batch,
+                initial_state=None,
+                output_final_state=True,
+                **kwargs,
+            )
+
+            # original_forward returns (output, final_state) when output_final_state=True
+            output, final_state = result
+
+            if final_state is not None:
+                # Extract conv1d overlap context from hidden_states.
+                # hidden_states is the layernorm output (input to DeltaNet).
+                # The last (conv_kernel_size-1) tokens provide causal context
+                # for the conv1d at the prefix/suffix boundary.
+                conv_overlap = deltanet_module.conv_kernel_size - 1  # 3
+                hidden_size = deltanet_module.hidden_size
+
+                # hidden_states is in RmPad format: (total_nnz, 1, hidden_size)
+                total_nnz = hidden_states.shape[0]
+
+                if deltanet_module.megatron_config.sequence_parallel:
+                    from megatron.core import parallel_state as mpu
+                    total_nnz = total_nnz * mpu.get_tensor_model_parallel_world_size()
+
+                # Unpack to padded format to extract last tokens
+                hidden_flat = hidden_states.reshape(total_nnz, hidden_size)
+
+                if indices is not None and cu_seqlens is not None:
+                    batch_size = len(cu_seqlens) - 1
+                    hidden_padded = _pad_input(hidden_flat, indices, batch_size, sequence_length)
+                else:
+                    # Already padded: (bsz, seq_len, hidden_size) with dim-1=1 removed
+                    hidden_padded = hidden_flat.unsqueeze(0) if hidden_flat.dim() == 2 else hidden_flat
+
+                # Extract last conv_overlap tokens as conv1d context.
+                # Shape: (1, conv_overlap, hidden_size) — provider's overlap only,
+                # will be expanded to all sequences by DeltaNet padded forward.
+                conv_overlap_hidden = hidden_padded[:1, -conv_overlap:, :].contiguous()
+
+                # Determine prefix_len from the plan or from actual input length.
+                # In prefix pass, we're processing only the provider's prefix tokens,
+                # so the total sequence length equals the prefix length.
+                prefix_len = sequence_length if sequence_length is not None else 0
+
+                # Store in deltanet_store for suffix pass injection
+                ctx.deltanet_store.store(
+                    slot_id,
+                    recurrent_state=final_state,
+                    prefix_len=prefix_len,
+                    conv_state=conv_overlap_hidden,
+                )
+
+                logger.debug(
+                    "[PS][deltanet-store][layer=%s] Stored state: "
+                    "recurrent_state=%s, conv_overlap=%s, prefix_len=%s",
+                    layer_id,
+                    tuple(final_state.shape),
+                    tuple(conv_overlap_hidden.shape),
+                    prefix_len,
+                )
+
+            # Return only the output (not the tuple)
+            return output
 
     return patched_forward
 
@@ -319,7 +469,7 @@ class VerlQwen3_6Integration:
             original_deltanet_forward = ParallelQwen3_6GatedDeltaNetRmPad.forward
             patched_deltanet = _make_verl_deltanet_patch(original_deltanet_forward)
             mgr.patch_attr(ParallelQwen3_6GatedDeltaNetRmPad, "forward", patched_deltanet)
-            logger.info("Patched ParallelQwen3_6GatedDeltaNetRmPad.forward (passthrough)")
+            logger.info("Patched ParallelQwen3_6GatedDeltaNetRmPad.forward for two-pass PS state injection")
         except ImportError:
             logger.warning("Could not import ParallelQwen3_6GatedDeltaNetRmPad, skipping")
 
