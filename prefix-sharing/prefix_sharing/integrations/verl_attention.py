@@ -161,10 +161,10 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         num_key_value_groups = attn_module.num_key_value_groups
         if num_key_value_groups > 1:
             key_states = key_states.unsqueeze(2).expand(
-                -1, -1, num_key_value_groups, -1, -1
+                -1, -1, num_key_value_groups, -1
             ).reshape(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
             value_states = value_states.unsqueeze(2).expand(
-                -1, -1, num_key_value_groups, -1, -1
+                -1, -1, num_key_value_groups, -1
             ).reshape(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
 
         # === Prefix-sharing KV expansion ===
