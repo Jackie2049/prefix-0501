@@ -39,19 +39,24 @@ logger = logging.getLogger(__name__)
 def _make_verl_attention_patch(original_forward: Any) -> Any:
     """Create a patched forward for verl's ParallelQwen3_6AttentionRmPad.
 
-    Two-pass prefix-sharing for full attention layers:
+    Two-pass prefix-sharing for full attention layers.
+
+    Works in RmPad (3D flat) format like the original forward, using
+    apply_rotary_emb with cu_seqlens for RoPE.
 
     **Prefix pass** (store has no KV for this layer):
-      - Compute QKV projections + QK norm + partial RoPE
-      - Store prefix KV in ctx.store for suffix pass expansion
-      - Run flash_attn on prefix tokens to get output for residual
+      - Compute QKV + QK norm + partial RoPE (in 3D flat format)
+      - Store prefix KV (after GQA expand) in 4D format for easy suffix expansion
+      - Run flash_attn_varlen_func on prefix tokens (normal RmPad path)
       - Apply output gate + o_proj
 
     **Suffix pass** (store has KV for this layer):
-      - Compute QKV projections + QK norm + partial RoPE (suffix tokens)
-      - Load stored prefix KV from ctx.store
-      - Expand KV: concat prefix KV + suffix KV
-      - Run flash_attn_varlen_func with expanded KV
+      - Compute QKV + QK norm (in 3D flat format)
+      - Generate cos/sin for positions 0..prefix_len+suffix_len, slice for suffix
+      - Apply partial RoPE to suffix tokens (in 3D flat format with cu_seqlens)
+      - Load stored prefix KV, expand to N sequences, concat with suffix KV
+      - Build custom cu_seqlens for flash_attn_varlen_func (Q=suffix, KV=prefix+suffix)
+      - Run flash_attn_varlen_func
       - Apply output gate + o_proj
     """
 
@@ -101,7 +106,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         import torch
         from flash_attn import flash_attn_varlen_func
         from flash_attn.layers.rotary import apply_rotary_emb
-        from flash_attn.bert_padding import pad_input as _pad_input, unpad_input as _unpad_input
+        from flash_attn.bert_padding import pad_input as _pad_input
         from prefix_sharing.integrations.megatron_runtime import _read_parallel_rank_info
         from prefix_sharing.core.prefix_store import (
             PrefixActivationSlotId,
@@ -120,7 +125,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
 
         batch_size = len(cu_seqlens) - 1 if cu_seqlens is not None else 1
 
-        # QKV projections
+        # QKV projections (same as original RmPad forward)
         q_full = attn_module.q_proj(hidden_states)[0]
         key_raw = attn_module.k_proj(hidden_states)[0]
         value_raw = attn_module.v_proj(hidden_states)[0]
@@ -132,7 +137,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
             key_raw = key_raw[:total_nnz]
             value_raw = value_raw[:total_nnz]
 
-        # Chunk q_proj into query and gate
+        # Chunk q_proj into query and gate (same as original)
         q_shape = (total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim * 2)
         query_states, gate = torch.chunk(q_full.view(*q_shape), 2, dim=-1)
         gate = gate.reshape(total_nnz, attn_module.num_heads_per_tp * attn_module.head_dim)
@@ -141,27 +146,9 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         key_states = key_raw.view(total_nnz, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
         value_states = value_raw.view(total_nnz, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
 
-        # QK normalization
+        # QK normalization (same as original)
         query_states = attn_module.q_norm(query_states)
         key_states = attn_module.k_norm(key_states)
-
-        # Unpack to padded format for RoPE (apply_rotary_emb needs 4D without cu_seqlens)
-        hidden_flat = query_states.reshape(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
-        if indices is not None and cu_seqlens is not None and sequence_length is not None:
-            query_4d = _pad_input(hidden_flat, indices, batch_size, sequence_length)
-            key_flat = key_states.reshape(total_nnz, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
-            key_4d = _pad_input(key_flat, indices, batch_size, sequence_length)
-            value_flat = value_states.reshape(total_nnz, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
-            value_4d = _pad_input(value_flat, indices, batch_size, sequence_length)
-        else:
-            # Already padded format
-            query_4d = query_states.unsqueeze(0) if query_states.dim() == 2 else query_states
-            key_4d = key_states.unsqueeze(0) if key_states.dim() == 2 else key_states
-            value_4d = value_states.unsqueeze(0) if value_states.dim() == 2 else value_states
-
-        # Partial RoPE
-        cos, sin = attn_module.rotary_emb(value_4d, seq_len=sequence_length)
-        cos, sin = cos[:, :cos.shape[1] // 2], sin[:, :sin.shape[1] // 2]
 
         # Build slot ID for this layer's attention KV
         slot_id = PrefixActivationSlotId(
@@ -176,75 +163,108 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         if ctx.store.contains(slot_id):
             # === Suffix pass: load stored prefix KV and expand ===
             stored_kv = ctx.store.load(slot_id)
-            prefix_key_4d = stored_kv.key_tensor   # (1, prefix_len, num_heads_per_tp, head_dim)
-            prefix_value_4d = stored_kv.value_tensor  # (1, prefix_len, num_heads_per_tp, head_dim)
-
-            # Slice cos/sin for suffix positions only
+            prefix_key_4d = stored_kv.key_tensor   # (1, prefix_len, num_heads_per_tp, head_dim) after GQA expand
+            prefix_value_4d = stored_kv.value_tensor  # (1, prefix_len, num_heads_per_tp, head_dim) after GQA expand
             prefix_len = prefix_key_4d.shape[1]
             suffix_len = sequence_length  # In suffix pass, all tokens are suffix
-            cos_suffix = cos[prefix_len:prefix_len + suffix_len]
-            sin_suffix = sin[prefix_len:prefix_len + suffix_len]
 
-            # Apply partial RoPE to suffix tokens (4D, no cu_seqlens)
+            # Generate cos/sin for positions 0..prefix_len+suffix_len-1, slice for suffix
+            # Use a dummy tensor just for device/dtype, then slice for suffix positions
+            cos_full, sin_full = attn_module.rotary_emb(
+                value_states, seq_len=prefix_len + suffix_len
+            )
+            # Halve dimensions for partial RoPE
+            cos_full = cos_full[:, :cos_full.shape[1] // 2]
+            sin_full = sin_full[:, :sin_full.shape[1] // 2]
+            # Slice for suffix positions only
+            cos_suffix = cos_full[prefix_len:prefix_len + suffix_len]
+            sin_suffix = sin_full[prefix_len:prefix_len + suffix_len]
+
+            # Apply partial RoPE in 3D flat format (RmPad mode with cu_seqlens)
             if attn_module.rope_dim == attn_module.head_dim:
-                query_4d = apply_rotary_emb(query_4d, cos_suffix, sin_suffix, interleaved=False, inplace=False)
-                key_4d = apply_rotary_emb(key_4d, cos_suffix, sin_suffix, interleaved=False, inplace=False)
+                query_states = apply_rotary_emb(
+                    query_states, cos_suffix, sin_suffix,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
+                key_states = apply_rotary_emb(
+                    key_states, cos_suffix, sin_suffix,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
             else:
-                q_rot = query_4d[:, :, :, :attn_module.rope_dim]
-                q_pass = query_4d[:, :, :, attn_module.rope_dim:]
-                k_rot = key_4d[:, :, :, :attn_module.rope_dim]
-                k_pass = key_4d[:, :, :, attn_module.rope_dim:]
-                q_rot = apply_rotary_emb(q_rot, cos_suffix, sin_suffix, interleaved=False, inplace=False)
-                k_rot = apply_rotary_emb(k_rot, cos_suffix, sin_suffix, interleaved=False, inplace=False)
-                query_4d = torch.cat([q_rot, q_pass], dim=-1)
-                key_4d = torch.cat([k_rot, k_pass], dim=-1)
+                # Partial RoPE: only apply to the first rope_dim dimensions
+                q_rot = query_states[:, :, :attn_module.rope_dim]
+                q_pass = query_states[:, :, attn_module.rope_dim:]
+                k_rot = key_states[:, :, :attn_module.rope_dim]
+                k_pass = key_states[:, :, attn_module.rope_dim:]
+                q_rot = apply_rotary_emb(
+                    q_rot, cos_suffix, sin_suffix,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
+                k_rot = apply_rotary_emb(
+                    k_rot, cos_suffix, sin_suffix,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
+                query_states = torch.cat([q_rot, q_pass], dim=-1)
+                key_states = torch.cat([k_rot, k_pass], dim=-1)
 
-            # GQA expand in 4D
+            # GQA expand for suffix KV (in 3D flat format)
             num_key_value_groups = attn_module.num_key_value_groups
             if num_key_value_groups > 1:
-                key_4d = key_4d.repeat_interleave(num_key_value_groups, dim=2)
-                value_4d = value_4d.repeat_interleave(num_key_value_groups, dim=2)
+                key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
+                value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
 
-            # KV expansion: expand prefix KV to N sequences and concat with suffix KV
-            expanded_prefix_key = prefix_key_4d.expand(batch_size, -1, -1, -1).contiguous()
-            expanded_prefix_value = prefix_value_4d.expand(batch_size, -1, -1, -1).contiguous()
-            expanded_key_4d = torch.cat([expanded_prefix_key, key_4d], dim=1)
-            expanded_value_4d = torch.cat([expanded_prefix_value, value_4d], dim=1)
+            # KV expansion: need to interleave prefix KV with suffix KV per sequence
+            # prefix_key_4d is (1, prefix_len, num_heads_per_tp, head_dim) — already GQA expanded
+            # We need flat format: each sequence gets prefix_len + suffix_len KV tokens
+            # Approach: pad suffix KV to 4D, concat with expanded prefix KV, reshape to flat
+            # First, pad suffix KV from flat to (N, suffix_len, num_heads_per_tp, head_dim)
+            key_4d_suffix = _pad_input(key_states, indices, batch_size, sequence_length)
+            value_4d_suffix = _pad_input(value_states, indices, batch_size, sequence_length)
 
-            # Reshape to 3D for flash_attn_varlen_func
+            # Expand prefix KV from (1, prefix_len, ...) to (N, prefix_len, ...)
+            prefix_key_expanded = prefix_key_4d.expand(batch_size, -1, -1, -1).contiguous()
+            prefix_value_expanded = prefix_value_4d.expand(batch_size, -1, -1, -1).contiguous()
+
+            # Concat prefix + suffix KV along sequence dimension
+            expanded_key_4d = torch.cat([prefix_key_expanded, key_4d_suffix], dim=1)
+            expanded_value_4d = torch.cat([prefix_value_expanded, value_4d_suffix], dim=1)
+
+            # Reshape to flat for flash_attn_varlen_func
             N = batch_size
-            total_suffix = N * suffix_len
             total_kv = N * (prefix_len + suffix_len)
-            query_flat = query_4d.reshape(total_suffix, attn_module.num_heads_per_tp, attn_module.head_dim)
             expanded_key_flat = expanded_key_4d.reshape(total_kv, attn_module.num_heads_per_tp, attn_module.head_dim)
             expanded_value_flat = expanded_value_4d.reshape(total_kv, attn_module.num_heads_per_tp, attn_module.head_dim)
 
-            # Build cu_seqlens
-            cu_seqlens_q = torch.tensor(
-                [0] + [suffix_len] * N, device=hidden_states.device, dtype=torch.int32,
-            ).cumsum(0).to(torch.int32)
+            # Build cu_seqlens for flash_attn_varlen_func
+            # Q: each sequence has suffix_len tokens
+            # K/V: each sequence has prefix_len + suffix_len tokens
+            cu_seqlens_q = cu_seqlens  # Same as original — suffix tokens only
             cu_seqlens_k = torch.tensor(
-                [0] + [prefix_len + suffix_len] * N, device=hidden_states.device, dtype=torch.int32,
-            ).cumsum(0).to(torch.int32)
+                [0] + [prefix_len + suffix_len] * N,
+                device=hidden_states.device, dtype=torch.int32,
+            ).cumsum(0)
 
-            input_dtype = query_flat.dtype
+            input_dtype = query_states.dtype
             if input_dtype == torch.float32:
-                query_flat = query_flat.to(torch.float16)
+                query_states = query_states.to(torch.float16)
                 expanded_key_flat = expanded_key_flat.to(torch.float16)
                 expanded_value_flat = expanded_value_flat.to(torch.float16)
 
             # flash_attn with expanded KV
             attn_output = flash_attn_varlen_func(
-                query_flat, expanded_key_flat, expanded_value_flat,
+                query_states, expanded_key_flat, expanded_value_flat,
                 cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=suffix_len, max_seqlen_k=prefix_len + suffix_len,
+                max_seqlen_q=max_seqlen_in_batch, max_seqlen_k=prefix_len + suffix_len,
                 dropout_p=0.0, softmax_scale=attn_module.scaling, causal=True,
             )
             attn_output = attn_output.to(input_dtype)
 
-            # Pack back to RmPad format
-            attn_output = _unpad_input(attn_output, indices, batch_size, sequence_length)
-
+            # Output is in flat format (total_nnz, num_heads, head_dim) —
+            # same as original RmPad forward, no _unpad_input needed
             attn_output = attn_output.reshape(total_nnz, attn_module.q_output_size_per_tp)
 
             # Apply output gate
@@ -252,7 +272,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
                 gate = gate[:total_nnz]
                 attn_output = attn_output * torch.sigmoid(gate)
 
-            # Reshape for o_proj and handle SP padding
+            # Reshape for o_proj (same as original)
             attn_output = attn_output.reshape(total_nnz, 1, attn_module.q_output_size_per_tp).contiguous()
 
             if attn_module.megatron_config.sequence_parallel:
@@ -270,27 +290,56 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
 
         else:
             # === Prefix pass: compute KV, store it, run flash_attn ===
-            # Apply RoPE to prefix tokens (4D, positions 0..prefix_len-1)
-            if attn_module.rope_dim == attn_module.head_dim:
-                query_4d = apply_rotary_emb(query_4d, cos, sin, interleaved=False, inplace=False)
-                key_4d = apply_rotary_emb(key_4d, cos, sin, interleaved=False, inplace=False)
-            else:
-                q_rot = query_4d[:, :, :, :attn_module.rope_dim]
-                q_pass = query_4d[:, :, :, attn_module.rope_dim:]
-                k_rot = key_4d[:, :, :, :attn_module.rope_dim]
-                k_pass = key_4d[:, :, :, attn_module.rope_dim:]
-                q_rot = apply_rotary_emb(q_rot, cos, sin, interleaved=False, inplace=False)
-                k_rot = apply_rotary_emb(k_rot, cos, sin, interleaved=False, inplace=False)
-                query_4d = torch.cat([q_rot, q_pass], dim=-1)
-                key_4d = torch.cat([k_rot, k_pass], dim=-1)
+            # Same as original RmPad forward, but store KV before flash_attn
 
-            # GQA expand in 4D
+            # Generate cos/sin for prefix positions (0..prefix_len-1)
+            cos, sin = attn_module.rotary_emb(value_states, seq_len=sequence_length)
+            cos, sin = cos[:, :cos.shape[1] // 2], sin[:, :sin.shape[1] // 2]
+
+            # Apply partial RoPE in 3D flat format (RmPad mode)
+            if attn_module.rope_dim == attn_module.head_dim:
+                query_states = apply_rotary_emb(
+                    query_states, cos, sin,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
+                key_states = apply_rotary_emb(
+                    key_states, cos, sin,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
+            else:
+                q_rot = query_states[:, :, :attn_module.rope_dim]
+                q_pass = query_states[:, :, attn_module.rope_dim:]
+                k_rot = key_states[:, :, :attn_module.rope_dim]
+                k_pass = key_states[:, :, attn_module.rope_dim:]
+                q_rot = apply_rotary_emb(
+                    q_rot, cos, sin,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
+                k_rot = apply_rotary_emb(
+                    k_rot, cos, sin,
+                    interleaved=False, inplace=False,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+                )
+                query_states = torch.cat([q_rot, q_pass], dim=-1)
+                key_states = torch.cat([k_rot, k_pass], dim=-1)
+
+            # GQA expand in 3D flat format (same as original)
             num_key_value_groups = attn_module.num_key_value_groups
             if num_key_value_groups > 1:
-                key_4d = key_4d.repeat_interleave(num_key_value_groups, dim=2)
-                value_4d = value_4d.repeat_interleave(num_key_value_groups, dim=2)
+                key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
+                value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
 
             # Store prefix KV in 4D format for easy expand in suffix pass
+            # Convert flat to (1, prefix_len, num_heads_per_tp, head_dim)
+            # Prefix pass has only 1 batch (provider), so this is straightforward
+            key_4d = _pad_input(key_states, indices, batch_size, sequence_length)
+            value_4d = _pad_input(value_states, indices, batch_size, sequence_length)
+
+            # For prefix pass, batch_size might be 1 (only provider's prefix tokens)
+            # Store the entire batch's KV — in prefix pass with batch=1, shape is (1, prefix_len, ...)
             ctx.store.store(
                 slot_id,
                 key_tensor=key_4d.contiguous(),
@@ -303,33 +352,26 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
                 layer_id, tuple(key_4d.shape), tuple(value_4d.shape),
             )
 
-            # Reshape to 3D for flash_attn
-            seq_len_prefix = sequence_length
-            query_flat = query_4d.reshape(batch_size * seq_len_prefix, attn_module.num_heads_per_tp, attn_module.head_dim)
-            key_flat = key_4d.reshape(batch_size * seq_len_prefix, attn_module.num_heads_per_tp, attn_module.head_dim)
-            value_flat = value_4d.reshape(batch_size * seq_len_prefix, attn_module.num_heads_per_tp, attn_module.head_dim)
+            # Convert back to flat for flash_attn (undo the _pad_input)
+            key_flat = key_4d.reshape(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
+            value_flat = value_4d.reshape(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
 
-            cu_seqlens_prefix = torch.tensor(
-                [0] + [seq_len_prefix] * batch_size, device=hidden_states.device, dtype=torch.int32,
-            ).cumsum(0).to(torch.int32)
-
-            input_dtype = query_flat.dtype
+            input_dtype = query_states.dtype
             if input_dtype == torch.float32:
-                query_flat = query_flat.to(torch.float16)
+                query_states = query_states.to(torch.float16)
                 key_flat = key_flat.to(torch.float16)
                 value_flat = value_flat.to(torch.float16)
 
+            # flash_attn on prefix tokens (same cu_seqlens as original)
             attn_output = flash_attn_varlen_func(
-                query_flat, key_flat, value_flat,
-                cu_seqlens_q=cu_seqlens_prefix, cu_seqlens_k=cu_seqlens_prefix,
-                max_seqlen_q=seq_len_prefix, max_seqlen_k=seq_len_prefix,
+                query_states, key_flat, value_flat,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen_in_batch, max_seqlen_k=max_seqlen_in_batch,
                 dropout_p=0.0, softmax_scale=attn_module.scaling, causal=True,
             )
             attn_output = attn_output.to(input_dtype)
 
-            # Pack back to RmPad format
-            attn_output = _unpad_input(attn_output, indices, batch_size, sequence_length)
-
+            # Output in flat format — same as original RmPad forward
             attn_output = attn_output.reshape(total_nnz, attn_module.q_output_size_per_tp)
 
             # Apply output gate
@@ -337,7 +379,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
                 gate = gate[:total_nnz]
                 attn_output = attn_output * torch.sigmoid(gate)
 
-            # Reshape for o_proj and handle SP padding
+            # Reshape for o_proj (same as original)
             attn_output = attn_output.reshape(total_nnz, 1, attn_module.q_output_size_per_tp).contiguous()
 
             if attn_module.megatron_config.sequence_parallel:
@@ -354,7 +396,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
 def _make_verl_deltanet_patch(original_forward: Any) -> Any:
     """Create a patched forward for verl's ParallelQwen3_6GatedDeltaNetRmPad.
 
-    Supports two-pass prefix-sharing for DeltaNet (GatedDeltaNet) layers:
+    Supports two-pass prefix-sharing for DeltaNet (GatedDeltaNet) layers.
 
     **Prefix pass** (deltanet_store has no state for this layer):
       - Run DeltaNet forward with output_final_state=True to capture the
