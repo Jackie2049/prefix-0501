@@ -244,7 +244,20 @@ patch_handle = ps_integration.install(model_config=config)
 
 # Build runtime state
 backend = get_backend_instance(ps_config)
-packed_batch_layout = PackedBatchLayout.from_valid_lengths(kept_lengths, align_size=int(align_size))
+
+# Build packed_batch_layout from kept position rows with TP alignment
+# Build position rows for each sequence (only suffix tokens for reusers)
+kept_position_rows = []
+for i in range(N_SEQUENCES):
+    offset = prefix_sharing_plan.q_position_offsets[i]
+    kept_len = kept_lengths[i]
+    row = torch.arange(offset, offset + kept_len, dtype=torch.long, device=device)
+    kept_position_rows.append(row)
+
+packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
+    kept_position_rows,
+    align_size=int(align_size),
+)
 
 # Add layer_idx to the attention module (needed by PS patch)
 attn.layer_idx = LAYER_IDX
