@@ -183,17 +183,13 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         )
 
         # Build expanded cu_seqlens for flash_attn (must be int32)
+        # cumsum() can upcast int32 to int64, so force int32 after cumsum
         expanded_cu_seqlens = torch.tensor(
             [0] + list(ctx.prefix_sharing_plan.expanded_lengths_kv),
             device=cu_seqlens.device,
             dtype=torch.int32,
-        ).cumsum(0)
+        ).cumsum(0).to(torch.int32)
         max_seqlen_expanded = max(ctx.prefix_sharing_plan.expanded_lengths_kv)
-
-        print(f"[PS][verl-attn][layer={layer_id}] expanded_cu_seqlens dtype={expanded_cu_seqlens.dtype}, "
-              f"values={expanded_cu_seqlens.tolist()}, "
-              f"cu_seqlens_q dtype={cu_seqlens.dtype}, values={cu_seqlens.tolist()}, "
-              f"q shape={query_states.shape}, ek shape={expanded_key.shape}, ev shape={expanded_value.shape}")
 
         # Cast if needed (fp32 → fp16 for flash_attn)
         input_dtype = query_states.dtype
