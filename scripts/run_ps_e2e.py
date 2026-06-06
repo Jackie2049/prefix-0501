@@ -27,8 +27,10 @@ import time
 import json
 
 verl_path = os.path.expanduser("~/rollout-prefix/prefix-0501/dependency/verl_v070")
+prefix_sharing_path = os.path.expanduser("~/rollout-prefix/prefix-0501/prefix-sharing")
 prefix_path = os.path.expanduser("~/rollout-prefix/prefix-0501")
 sys.path.insert(0, verl_path)
+sys.path.insert(0, prefix_sharing_path)
 sys.path.insert(0, prefix_path)
 
 import torch
