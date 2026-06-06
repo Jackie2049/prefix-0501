@@ -107,11 +107,14 @@ prefix_hidden = torch.randn(1, PREFIX_LEN, hidden_size, dtype=torch.bfloat16, de
 suffix_hiddens = [torch.randn(1, SUFFIX_LEN, hidden_size, dtype=torch.bfloat16, device=device)
                   for _ in range(N_SEQUENCES)]
 
-# Build full hidden_states: [prefix, suffix_0], [prefix, suffix_1], ...
-hidden_full = torch.cat([
-    torch.cat([prefix_hidden.expand(N_SEQUENCES, -1, -1), suffix_hiddens[i]], dim=1)
-    for i in range(N_SEQUENCES)
-], dim=0)
+# Build full hidden_states: for each sequence, [prefix, suffix_i]
+full_sequences = []
+for i in range(N_SEQUENCES):
+    # Each sequence: (1, total_len, hidden_size)
+    seq_hidden = torch.cat([prefix_hidden, suffix_hiddens[i]], dim=1)
+    full_sequences.append(seq_hidden)
+# Stack into batch: (N, total_len, hidden_size)
+hidden_full = torch.cat(full_sequences, dim=0)
 
 # ===== Step 1: Normal forward (full sequences) =====
 print(f"[Rank {local_rank}] === Step 1: Normal forward ===")
