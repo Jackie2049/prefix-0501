@@ -69,61 +69,44 @@ megatron_config = ModelParallelConfig(
     params_dtype=torch.bfloat16,
 )
 
-# Instantiate model
+# Instantiate model with small random weights
+# (Focus on testing the two_pass_forward helper mechanism, not pretrained accuracy)
 model = ParallelQwen3_6ForCausalLM(config, megatron_config)
 model = model.to(device)
 
-# Load pretrained weights
-from scripts.load_weights_qwen36 import load_qwen36_weights
-load_qwen36_weights(model, HF_MODEL_PATH, device, tp_rank=tp_rank)
+for name, param in model.named_parameters():
+    if param.dtype == torch.bfloat16:
+        param.data.normal_(0, 0.01)
+    elif param.dtype == torch.float32:
+        param.data.normal_(0, 0.01)
 
 if local_rank == 0:
-    print("Model loaded with pretrained weights")
+    print("Model instantiated with random weights")
 
 # ===== Create test token sequences =====
-# For this test, we use actual token IDs to test the full pipeline
+# Use random token IDs (vocab_size from config) to test the full pipeline
 # (embed_tokens → layers → norm → lm_head)
 
-from transformers import AutoTokenizer
-tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, trust_remote_code=True)
+torch.manual_seed(SEED + 500)
+vocab_size = config.vocab_size  # 248320
 
-# Create test prompts
-prompt_text = "The quick brown fox jumps over the lazy dog. This is a test prompt for prefix-sharing."
-suffix_texts = [
-    " Response one: The fox was very agile.",
-    " Response two: The dog was sleeping peacefully.",
-    " Response three: They met in the forest.",
-    " Response four: Both animals were friendly.",
-]
+# Random prefix tokens (shared across all sequences)
+prefix_tokens = torch.randint(0, vocab_size, (PREFIX_LEN,), dtype=torch.long, device=device)
 
-# Tokenize
-prefix_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
-suffix_tokens_list = [tokenizer.encode(s, add_special_tokens=False) for s in suffix_texts]
-
-# Adjust lengths to match PREFIX_LEN and SUFFIX_LEN
-# Trim or pad prefix
-if len(prefix_tokens) > PREFIX_LEN:
-    prefix_tokens = prefix_tokens[:PREFIX_LEN]
-else:
-    prefix_tokens = prefix_tokens + [tokenizer.pad_token_id or 0] * (PREFIX_LEN - len(prefix_tokens))
-
-# Trim or pad suffixes
-for i in range(len(suffix_tokens_list)):
-    if len(suffix_tokens_list[i]) > SUFFIX_LEN:
-        suffix_tokens_list[i] = suffix_tokens_list[i][:SUFFIX_LEN]
-    else:
-        suffix_tokens_list[i] = suffix_tokens_list[i] + [tokenizer.pad_token_id or 0] * (SUFFIX_LEN - len(suffix_tokens_list[i]))
+# Random suffix tokens (different per sequence)
+suffix_tokens_list = [torch.randint(0, vocab_size, (SUFFIX_LEN,), dtype=torch.long, device=device)
+                      for _ in range(N_SEQUENCES)]
 
 # Build full sequences (prefix + suffix_i)
 full_sequences = []
 for suffix in suffix_tokens_list:
-    full_seq = prefix_tokens + suffix
+    full_seq = torch.cat([prefix_tokens, suffix])
     full_sequences.append(full_seq)
 
 # Convert to tensors
-full_input_ids = torch.tensor(full_sequences, dtype=torch.long, device=device)
-suffix_input_ids = torch.tensor(suffix_tokens_list, dtype=torch.long, device=device)
-prefix_input_ids = torch.tensor([prefix_tokens], dtype=torch.long, device=device)
+full_input_ids = torch.stack(full_sequences)  # (N, PREFIX_LEN + SUFFIX_LEN)
+suffix_input_ids = torch.stack(suffix_tokens_list)  # (N, SUFFIX_LEN)
+prefix_input_ids = prefix_tokens.unsqueeze(0)  # (1, PREFIX_LEN)
 
 # Attention masks (all tokens are valid in this test)
 full_attention_mask = torch.ones_like(full_input_ids, dtype=torch.bool, device=device)
@@ -133,6 +116,7 @@ prefix_attention_mask = torch.ones_like(prefix_input_ids, dtype=torch.bool, devi
 # Position IDs
 prefix_position_ids = torch.arange(PREFIX_LEN, dtype=torch.long, device=device).unsqueeze(0)
 suffix_position_ids = torch.arange(PREFIX_LEN, PREFIX_LEN + SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(N_SEQUENCES, -1)
+full_position_ids = torch.arange(PREFIX_LEN + SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(N_SEQUENCES, -1)
 
 # ===== Step 1: Normal forward (reference) =====
 if local_rank == 0:
