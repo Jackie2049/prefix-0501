@@ -545,17 +545,24 @@ with torch.no_grad():
                 [0] + [PREFIX_LEN + SUFFIX_LEN] * N_SEQUENCES, device=device, dtype=torch.int32
             ).cumsum(0).to(torch.int32)
 
-            input_dtype = query_states.dtype
+            # Reshape to 3D (total_nnz, heads, head_dim) for flash_attn_varlen_func
+            # Q: total = N * SUFFIX_LEN tokens
+            # K/V: total = N * (PREFIX_LEN + SUFFIX_LEN) tokens
+            query_flat = query_states.reshape(N_SEQUENCES * SUFFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
+            expanded_key_flat = expanded_key.reshape(N_SEQUENCES * (PREFIX_LEN + SUFFIX_LEN), attn_module.num_heads_per_tp, attn_module.head_dim)
+            expanded_value_flat = expanded_value.reshape(N_SEQUENCES * (PREFIX_LEN + SUFFIX_LEN), attn_module.num_heads_per_tp, attn_module.head_dim)
+
+            input_dtype = query_flat.dtype
             if input_dtype == torch.float32:
-                query_states = query_states.to(torch.float16)
-                expanded_key = expanded_key.to(torch.float16)
-                expanded_value = expanded_value.to(torch.float16)
+                query_flat = query_flat.to(torch.float16)
+                expanded_key_flat = expanded_key_flat.to(torch.float16)
+                expanded_value_flat = expanded_value_flat.to(torch.float16)
 
             from flash_attn import flash_attn_varlen_func
             attn_output = flash_attn_varlen_func(
-                query_states,
-                expanded_key,
-                expanded_value,
+                query_flat,
+                expanded_key_flat,
+                expanded_value_flat,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_kv,
                 max_seqlen_q=SUFFIX_LEN,
