@@ -486,12 +486,8 @@ class ParallelQwen3_6GatedDeltaNetRmPad(ParallelQwen3_6GatedDeltaNet):
         # output_3d: (batch_size, seq_len, hidden_size)
 
         # Pack back: (batch_size, seq_len, hidden_size) → (total_nnz, 1, hidden_size)
+        # Use indices to select only the non-padding tokens
         output_flat = output_3d.reshape(batch_size * sequence_length, self.hidden_size)
-        output_unpad, _ = unpad_input(output_3d, None)  # Use indices to unpad
-
-        # Actually, we need to use indices to unpad properly
-        output_flat = output_3d.reshape(batch_size * sequence_length, self.hidden_size)
-        # Select only the non-padding tokens using indices
         output_selected = output_flat[indices]
 
         # Handle SP padding
