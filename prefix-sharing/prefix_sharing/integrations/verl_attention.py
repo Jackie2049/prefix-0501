@@ -182,11 +182,11 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
             tp_rank=tp_rank,
         )
 
-        # Build expanded cu_seqlens for flash_attn
+        # Build expanded cu_seqlens for flash_attn (must be int32)
         expanded_cu_seqlens = torch.tensor(
             [0] + list(ctx.prefix_sharing_plan.expanded_lengths_kv),
             device=cu_seqlens.device,
-            dtype=cu_seqlens.dtype,
+            dtype=torch.int32,
         ).cumsum(0)
         max_seqlen_expanded = max(ctx.prefix_sharing_plan.expanded_lengths_kv)
 
