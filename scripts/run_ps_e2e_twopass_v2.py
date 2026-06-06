@@ -573,15 +573,18 @@ with torch.no_grad():
             )
 
             attn_output = attn_output.to(input_dtype)
-            attn_output = attn_output.reshape(N_SEQUENCES, SUFFIX_LEN, attn_module.q_output_size_per_tp)
+            # flash_attn returns (total_nnz, num_heads, head_dim) → reshape to (N, SUFFIX_LEN, heads*head_dim)
+            attn_output = attn_output.reshape(N_SEQUENCES, SUFFIX_LEN, attn_module.num_heads_per_tp * attn_module.head_dim)
 
             # Apply output gate BEFORE o_proj
             if attn_module.attn_output_gate:
+                gate = gate.reshape(N_SEQUENCES, SUFFIX_LEN, attn_module.num_heads_per_tp * attn_module.head_dim)
                 attn_output = attn_output * torch.sigmoid(gate)
 
-            # o_proj
-            attn_output = attn_output.reshape(N_SEQUENCES, SUFFIX_LEN, 1, attn_module.q_output_size_per_tp).contiguous()
+            # Reshape for o_proj: (N, SUFFIX_LEN, 1, q_output_size_per_tp) or (total_nnz, 1, q_output_size_per_tp)
+            attn_output = attn_output.reshape(N_SEQUENCES * SUFFIX_LEN, 1, attn_module.q_output_size_per_tp).contiguous()
             attn_output = attn_module.o_proj(attn_output)[0]
+            attn_output = attn_output.reshape(N_SEQUENCES, SUFFIX_LEN, hidden_size)
 
         hidden_suffix = residual + attn_output
 
