@@ -28,7 +28,12 @@ sys.path.insert(0, prefix_path)
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from transformers import AutoConfig
+from verl.models.qwen3_6.megatron.layers.parallel_deltanet import (
+    ParallelQwen3_6GatedDeltaNet,
+    torch_chunk_gated_delta_rule,
+)
 
 # ===== Configuration =====
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only")
@@ -157,37 +162,123 @@ print(f"[Rank {local_rank}] === Step 3: Suffix-only forward with injected state 
 
 # CRITICAL: conv1d context — the causal conv1d (kernel_size=4) needs the
 # last kernel_size-1=3 prefix tokens as context for the first suffix tokens.
-# Without these overlap tokens, the first few suffix tokens get incorrect
-# conv1d output (zero padding instead of actual prefix context).
+# But the overlap tokens must NOT be included in the chunk_gated_delta_rule
+# computation, because they're already accounted for in the prefix recurrent
+# state. Including them in the chunk computation would misalign chunk boundaries.
+#
+# Solution: Separate conv1d context injection from chunk computation.
+# 1. Compute QKV projections for suffix AND overlap prefix tokens
+# 2. Apply conv1d with proper causal context (overlap provides prefix context)
+# 3. After conv1d: extract only the suffix portion (skip overlap tokens)
+# 4. Pass suffix-only (conv1d-processed) QKV to chunk computation with initial_state
 conv_overlap = deltanet.conv_kernel_size - 1  # 3
 
-# Build extended suffix hidden_states: [overlap_prefix, suffix]
-# Include last conv_overlap prefix tokens for conv1d context
-overlap_hiddens = prefix_hidden[:, -conv_overlap:, :]  # (1, conv_overlap, hidden_size)
-# Build per-sequence: [overlap, suffix_i] then stack into batch
-extended_suffix_seqs = []
-for i in range(N_SEQUENCES):
-    # Each sequence: (1, conv_overlap + SUFFIX_LEN, hidden_size)
-    seq_extended = torch.cat([overlap_hiddens, suffix_hiddens[i]], dim=1)
-    extended_suffix_seqs.append(seq_extended)
-extended_suffix = torch.cat(extended_suffix_seqs, dim=0)  # (N, conv_overlap + SUFFIX_LEN, hidden_size)
+# 3a. Compute prefix QKV for conv1d context
+with torch.no_grad():
+    prefix_q = deltanet.in_proj_q(prefix_hidden)[0]  # (1, PREFIX_LEN, key_dim_per_tp)
+    prefix_k = deltanet.in_proj_k(prefix_hidden)[0]
+    prefix_v = deltanet.in_proj_v(prefix_hidden)[0]
 
+# Extract last conv_overlap prefix QKV values for conv1d context
+prefix_qkv_tail = torch.cat([
+    prefix_q[:, -conv_overlap:, :],   # (1, 3, key_dim_per_tp)
+    prefix_k[:, -conv_overlap:, :],   # (1, 3, key_dim_per_tp)
+    prefix_v[:, -conv_overlap:, :],   # (1, 3, value_dim_per_tp)
+], dim=-1)  # (1, 3, conv_dim_per_tp)
+
+# 3b. Compute suffix QKV
+suffix_batch = torch.cat(suffix_hiddens, dim=0)  # (N, SUFFIX_LEN, hidden_size)
+
+with torch.no_grad():
+    suffix_q = deltanet.in_proj_q(suffix_batch)[0]  # (N, SUFFIX_LEN, key_dim_per_tp)
+    suffix_k = deltanet.in_proj_k(suffix_batch)[0]
+    suffix_v = deltanet.in_proj_v(suffix_batch)[0]
+
+# Concatenate suffix QKV for conv1d
+suffix_mixed_qkv = torch.cat([suffix_q, suffix_k, suffix_v], dim=-1)  # (N, SUFFIX_LEN, conv_dim_per_tp)
+
+# 3c. Apply conv1d with prefix context
+# Prepend prefix QKV tail to suffix QKV for conv1d context
+# Each sequence gets: [prefix_qkv_tail, suffix_mixed_qkv] → (1, 3+SUFFIX_LEN, conv_dim_per_tp)
+extended_qkv_seqs = []
+for i in range(N_SEQUENCES):
+    seq_qkv = torch.cat([prefix_qkv_tail, suffix_mixed_qkv[i:i+1]], dim=1)  # (1, 3+64, conv_dim_per_tp)
+    extended_qkv_seqs.append(seq_qkv)
+extended_qkv = torch.cat(extended_qkv_seqs, dim=0)  # (N, 3+64, conv_dim_per_tp)
+
+# Apply conv1d on extended QKV (with prefix context)
+extended_qkv_t = extended_qkv.transpose(1, 2)  # (N, conv_dim_per_tp, 3+64)
+conv1d_weight = deltanet.conv1d.weight.to(extended_qkv_t.dtype)
+extended_qkv_conv = F.conv1d(
+    extended_qkv_t, conv1d_weight, None,
+    stride=1, padding=deltanet.conv_kernel_size - 1,
+    groups=deltanet.conv_dim_per_tp,
+)
+total_qkv_len = conv_overlap + SUFFIX_LEN
+extended_qkv_conv = extended_qkv_conv[:, :, :total_qkv_len]  # trim causal padding
+extended_qkv_conv = F.silu(extended_qkv_conv)
+extended_qkv_conv = extended_qkv_conv.transpose(1, 2)  # back to (N, 3+64, conv_dim_per_tp)
+
+# Extract only the suffix portion (skip overlap tokens)
+suffix_qkv_conv = extended_qkv_conv[:, conv_overlap:, :]  # (N, 64, conv_dim_per_tp)
+
+# Split back into query, key, value (suffix only, with correct conv1d context)
+query_conv, key_conv, value_conv = torch.split(
+    suffix_qkv_conv,
+    [deltanet.key_dim_per_tp, deltanet.key_dim_per_tp, deltanet.value_dim_per_tp],
+    dim=-1,
+)
+
+# Reshape to per-head format
+query_conv = query_conv.reshape(N_SEQUENCES, SUFFIX_LEN, deltanet.num_k_heads_per_tp, deltanet.head_k_dim)
+key_conv = key_conv.reshape(N_SEQUENCES, SUFFIX_LEN, deltanet.num_k_heads_per_tp, deltanet.head_k_dim)
+value_conv = value_conv.reshape(N_SEQUENCES, SUFFIX_LEN, deltanet.num_v_heads_per_tp, deltanet.head_v_dim)
+
+# 3d. Compute beta, g, z from suffix hidden_states only
+with torch.no_grad():
+    b_suffix = deltanet.in_proj_b(suffix_batch)[0]  # (N, SUFFIX_LEN, num_v_heads_per_tp)
+    a_suffix = deltanet.in_proj_a(suffix_batch)[0]
+    z_suffix = deltanet.in_proj_z(suffix_batch)[0]  # (N, SUFFIX_LEN, value_dim_per_tp)
+
+beta_suffix = b_suffix.sigmoid()  # (N, SUFFIX_LEN, num_v_heads_per_tp)
+g_suffix = -deltanet.A_log.float().exp() * F.softplus(a_suffix.float() + deltanet.dt_bias)
+g_suffix = g_suffix.to(suffix_batch.dtype)
+
+# GQA expansion
+if deltanet.num_v_per_k > 1:
+    query_conv = query_conv.repeat_interleave(deltanet.num_v_per_k, dim=2)
+    key_conv = key_conv.repeat_interleave(deltanet.num_v_per_k, dim=2)
+
+# Reshape z
+z_suffix = z_suffix.reshape(N_SEQUENCES, SUFFIX_LEN, deltanet.num_v_heads_per_tp, deltanet.head_v_dim)
+
+# Transpose to (N, heads, seq, dim) for chunk computation
+query_t = query_conv.transpose(1, 2)  # (N, v_heads_per_tp, seq, head_k_dim)
+key_t = key_conv.transpose(1, 2)
+value_t = value_conv.transpose(1, 2)
+beta_t = beta_suffix.transpose(1, 2)
+g_t = g_suffix.transpose(1, 2)
+
+# 3e. Run chunk computation with injected prefix state
 torch.cuda.synchronize()
 t2 = time.time()
 with torch.no_grad():
-    output_ps_extended = deltanet(
-        extended_suffix,  # (N, conv_overlap + SUFFIX_LEN, hidden_size)
+    core_attn_out, _ = torch_chunk_gated_delta_rule(
+        query_t, key_t, value_t, g_t, beta_t,
+        chunk_size=64,
         initial_state=prefix_state_expanded,
         output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
     )
 torch.cuda.synchronize()
 t_suffix = time.time() - t2
 
-# Extract only the suffix portion (skip overlap tokens)
-output_ps = output_ps_extended[:, conv_overlap:, :]  # (N, SUFFIX_LEN, hidden_size)
+# 3f. Apply RMSNormGated + out_proj
+core_attn_out = deltanet.norm(core_attn_out, z_suffix)
+core_attn_out = core_attn_out.reshape(N_SEQUENCES, SUFFIX_LEN, deltanet.value_dim_per_tp)
+output_ps = deltanet.out_proj(core_attn_out)[0]  # (N, SUFFIX_LEN, hidden_size)
 
-print(f"[Rank {local_rank}] Extended PS output shape: {output_ps_extended.shape}")
-print(f"[Rank {local_rank}] Trimmed PS output shape: {output_ps.shape}, time={t_suffix:.3f}s")
+print(f"[Rank {local_rank}] PS output shape: {output_ps.shape}, time={t_suffix:.3f}s")
 
 # ===== Step 4: Compare outputs =====
 print(f"[Rank {local_rank}] === Step 4: Precision alignment ===")
