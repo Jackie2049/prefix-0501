@@ -1,43 +1,46 @@
-"""Prefix-sharing integration for verl's own attention classes (legacy path).
+"""Prefix-sharing integration for verl's Qwen3.6 model classes.
 
-When verl runs with `use_mbridge: False`, it uses its own model classes
-(e.g. ParallelQwen3_6AttentionRmPad) instead of Megatron's SelfAttention.
-This module provides the integration hooks for that path.
+When verl uses its own model classes (ParallelQwen3_6AttentionRmPad,
+ParallelQwen3_6GatedDeltaNetRmPad), this module provides prefix-sharing
+hooks that intercept the attention forward pass to expand KV with
+prefix-sharing data.
 
-For the mcore path (use_mbridge: True), see megatron_attention.py instead.
+For full attention layers (16 out of 64 in Qwen3.6-27B):
+- Intercept after q/k/v projection and before flash_attn
+- Apply q_norm/k_norm (per-head RMSNorm) and partial RoPE
+- Expand KV with prefix-sharing data
+- Run flash_attn_varlen_func with expanded KV
+- Apply output gate (attn_output * sigmoid(gate))
+- Run o_proj (RowParallelLinear)
+
+For DeltaNet layers (48 out of 64):
+- These use recurrent state (GatedDeltaNet), not KV-based attention
+- Prefix-sharing for DeltaNet would require state injection, which
+  is more complex. For now, we skip PS for DeltaNet layers.
+- DeltaNet layers don't have traditional KV cache, so the main
+  prefix-sharing benefit is from the 16 full attention layers.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.model_spec import AttentionLayerType, ModelSpec
-from prefix_sharing.core.planner import PrefixSharingPlan
-from prefix_sharing.integrations.context import (
-    PrefixSharingRuntimeContext,
-    current_prefix_sharing_context,
-)
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable
-from prefix_sharing.integrations.megatron_runtime import (
-    _read_parallel_rank_info,
-    maybe_run_prefix_sharing_attention,
-    maybe_run_prefix_sharing_deltanet,
-)
-from prefix_sharing.integrations.patch_manager import PatchHandle, PatchManager
+from prefix_sharing.integrations.megatron_runtime import _read_parallel_rank_info
+from prefix_sharing.integrations.patch_manager import PatchManager
 
 import logging
 logger = logging.getLogger(__name__)
 
 
-def _make_verl_attention_patch(original_forward: Any, layer_type_check: Any | None = None) -> Any:
+def _make_verl_attention_patch(original_forward: Any) -> Any:
     """Create a patched forward for verl's ParallelQwen3_6AttentionRmPad.
 
-    The patch intercepts after QKV projection and before flash_attn,
-    expanding KV with prefix-sharing data when a context is active.
+    The patch intercepts after QKV projection, applies QK normalization
+    and partial RoPE, expands KV with prefix-sharing data, then runs
+    flash_attn_varlen_func with expanded KV.
     """
 
     def patched_forward(
@@ -50,8 +53,11 @@ def _make_verl_attention_patch(original_forward: Any, layer_type_check: Any | No
         max_seqlen_in_batch=None,
         **kwargs,
     ):
+        from prefix_sharing.integrations.context import current_prefix_sharing_context
+        from prefix_sharing.core.model_spec import AttentionLayerType
+
         ctx = current_prefix_sharing_context()
-        if ctx is None:
+        if ctx is None or not ctx.prefix_sharing_plan.has_sharing:
             return original_forward(
                 self_attention_module,
                 hidden_states,
@@ -63,56 +69,105 @@ def _make_verl_attention_patch(original_forward: Any, layer_type_check: Any | No
                 **kwargs,
             )
 
-        # Prefix-sharing path: delegate to the runtime hook
+        # Check if this layer should use prefix-sharing
+        layer_id = int(getattr(self_attention_module, "layer_idx", 0) or 0)
+        model_spec = ctx.model_spec
+        if model_spec is not None and model_spec.layer_type(layer_id) != AttentionLayerType.FULL_ATTENTION:
+            # Not a full attention layer, skip prefix-sharing
+            return original_forward(
+                self_attention_module,
+                hidden_states,
+                position_ids=position_ids,
+                sequence_length=sequence_length,
+                indices=indices,
+                cu_seqlens=cu_seqlens,
+                max_seqlen_in_batch=max_seqlen_in_batch,
+                **kwargs,
+            )
+
+        # === Prefix-sharing path for full attention ===
         import torch
+        from flash_attn import flash_attn_varlen_func
+        from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 
-        # Get QKV from the module's projections
-        qkv = self_attention_module.qkv_proj(hidden_states)[0]
-        query_states, key_states, value_states = qkv.split(
-            [self_attention_module.q_size, self_attention_module.k_size, self_attention_module.v_size],
-            dim=-1,
-        )
+        attn_module = self_attention_module
+        total_nnz, _, _ = hidden_states.size()
 
-        total_nnz = query_states.shape[0]
-        if self_attention_module.megatron_config.sequence_parallel:
+        if attn_module.megatron_config.sequence_parallel:
             from megatron.core import parallel_state as mpu
             tp_size = mpu.get_tensor_model_parallel_world_size()
             total_nnz = total_nnz * tp_size
 
-        if self_attention_module.megatron_config.sequence_parallel:
+        # QKV projections (same as original forward)
+        q_full = attn_module.q_proj(hidden_states)[0]
+        key_states = attn_module.k_proj(hidden_states)[0]
+        value_states = attn_module.v_proj(hidden_states)[0]
+
+        if attn_module.megatron_config.sequence_parallel:
             sp_pad = total_nnz - cu_seqlens[-1]
             total_nnz = cu_seqlens[-1]
-            query_states = query_states[:total_nnz]
+            q_full = q_full[:total_nnz]
             key_states = key_states[:total_nnz]
             value_states = value_states[:total_nnz]
 
-        query_states = query_states.view(total_nnz, self_attention_module.num_heads_per_tp, self_attention_module.head_dim)
-        key_states = key_states.view(total_nnz, self_attention_module.num_key_value_heads_per_tp, self_attention_module.head_dim)
-        value_states = value_states.view(total_nnz, self_attention_module.num_key_value_heads_per_tp, self_attention_module.head_dim)
+        # Chunk q_proj into query and gate
+        hidden_shape = (total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim * 2)
+        query_states, gate = torch.chunk(q_full.view(*hidden_shape), 2, dim=-1)
+        gate = gate.reshape(total_nnz, attn_module.num_heads_per_tp * attn_module.head_dim)
 
-        # Check model_spec for layer type routing
-        layer_id = int(getattr(self_attention_module, "layer_number", 0)
-                       or getattr(self_attention_module, "layer_idx", 0) or 0)
-        model_spec = ctx.model_spec
+        # Reshape
+        query_states = query_states.view(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
+        key_states = key_states.view(total_nnz, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+        value_states = value_states.view(total_nnz, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
 
-        if model_spec is not None and model_spec.layer_type(layer_id) == AttentionLayerType.LINEAR_ATTENTION:
-            # Linear attention layers should not be handled here
-            return original_forward(
-                self_attention_module,
-                hidden_states,
-                position_ids=position_ids,
-                sequence_length=sequence_length,
-                indices=indices,
-                cu_seqlens=cu_seqlens,
-                max_seqlen_in_batch=max_seqlen_in_batch,
-                **kwargs,
+        # QK normalization (per-head RMSNorm BEFORE RoPE)
+        query_states = attn_module.q_norm(query_states)
+        key_states = attn_module.k_norm(key_states)
+
+        # Partial RoPE AFTER q_norm/k_norm
+        cos, sin = attn_module.rotary_emb(value_states, seq_len=sequence_length)
+        cos, sin = cos[:, :cos.shape[1] // 2], sin[:, sin.shape[1] // 2]
+
+        if attn_module.rope_dim == attn_module.head_dim:
+            from flash_attn.layers.rotary import apply_rotary_emb
+            query_states = apply_rotary_emb(
+                query_states, cos, sin, interleaved=False, inplace=False,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
             )
+            key_states = apply_rotary_emb(
+                key_states, cos, sin, interleaved=False, inplace=False,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+            )
+        else:
+            # Partial RoPE: only rotate first rope_dim dims
+            q_rot = query_states[:, :, :attn_module.rope_dim]
+            q_pass = query_states[:, :, attn_module.rope_dim:]
+            k_rot = key_states[:, :, :attn_module.rope_dim]
+            k_pass = key_states[:, :, attn_module.rope_dim:]
 
-        # Full attention: build expanded KV and run attention
-        import torch.nn.functional as F
-        from flash_attn import flash_attn_varlen_func
-        from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+            from flash_attn.layers.rotary import apply_rotary_emb
+            q_rot = apply_rotary_emb(
+                q_rot, cos, sin, interleaved=False, inplace=False,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+            )
+            k_rot = apply_rotary_emb(
+                k_rot, cos, sin, interleaved=False, inplace=False,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch,
+            )
+            query_states = torch.cat([q_rot, q_pass], dim=-1)
+            key_states = torch.cat([k_rot, k_pass], dim=-1)
 
+        # GQA: repeat KV heads to match query heads
+        num_key_value_groups = attn_module.num_key_value_groups
+        if num_key_value_groups > 1:
+            key_states = key_states.unsqueeze(2).expand(
+                -1, -1, num_key_value_groups, -1, -1
+            ).reshape(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
+            value_states = value_states.unsqueeze(2).expand(
+                -1, -1, num_key_value_groups, -1, -1
+            ).reshape(total_nnz, attn_module.num_heads_per_tp, attn_module.head_dim)
+
+        # === Prefix-sharing KV expansion ===
         backend = ctx.backend or TorchReferenceBackend()
         _, tp_rank, tp_size = _read_parallel_rank_info()
 
@@ -135,12 +190,14 @@ def _make_verl_attention_patch(original_forward: Any, layer_type_check: Any | No
         ).cumsum(0)
         max_seqlen_expanded = max(ctx.prefix_sharing_plan.expanded_lengths_kv)
 
+        # Cast if needed (fp32 → fp16 for flash_attn)
         input_dtype = query_states.dtype
         if input_dtype == torch.float32:
             query_states = query_states.to(torch.float16)
             expanded_key = expanded_key.to(torch.float16)
             expanded_value = expanded_value.to(torch.float16)
 
+        # Run flash_attn with expanded KV
         attn_output = flash_attn_varlen_func(
             query_states,
             expanded_key,
@@ -150,23 +207,32 @@ def _make_verl_attention_patch(original_forward: Any, layer_type_check: Any | No
             max_seqlen_q=max_seqlen_in_batch,
             max_seqlen_k=max_seqlen_expanded,
             dropout_p=0.0,
-            softmax_scale=None,
+            softmax_scale=attn_module.scaling,
             causal=True,
         )
 
         attn_output = attn_output.to(input_dtype)
-        attn_output = attn_output.reshape(total_nnz, 1, self_attention_module.hidden_size_per_tp).contiguous()
+        attn_output = attn_output.reshape(total_nnz, attn_module.q_output_size_per_tp)
 
-        if self_attention_module.megatron_config.sequence_parallel:
+        # Apply output gate BEFORE o_proj
+        if attn_module.attn_output_gate:
+            gate = gate[:total_nnz]
+            attn_output = attn_output * torch.sigmoid(gate)
+
+        # Reshape for o_proj and handle SP padding
+        attn_output = attn_output.reshape(total_nnz, 1, attn_module.q_output_size_per_tp).contiguous()
+
+        if attn_module.megatron_config.sequence_parallel:
+            import torch.nn.functional as F
             attn_output = F.pad(attn_output, pad=(0, 0, 0, 0, 0, sp_pad))
 
-        attn_output = self_attention_module.o_proj(attn_output)[0]
+        attn_output = attn_module.o_proj(attn_output)[0]
 
-        # Apply output gate if present
-        if getattr(self_attention_module, "attn_output_gate", False) and hasattr(self_attention_module, "gate_proj"):
-            gate = torch.sigmoid(self_attention_module.gate_proj(hidden_states)[0])
-            gate = gate[:attn_output.shape[0]]
-            attn_output = attn_output * gate
+        logger.debug(
+            "[PS][verl-attn][layer=%s] query=%s expanded_kv=%s output=%s",
+            layer_id, tuple(query_states.shape),
+            tuple(expanded_key.shape), tuple(attn_output.shape),
+        )
 
         return attn_output
 
@@ -176,7 +242,13 @@ def _make_verl_attention_patch(original_forward: Any, layer_type_check: Any | No
 def _make_verl_deltanet_patch(original_forward: Any) -> Any:
     """Create a patched forward for verl's ParallelQwen3_6GatedDeltaNetRmPad.
 
-    The patch intercepts the cumsum computation to inject prefix-sharing state.
+    DeltaNet layers use recurrent state (GatedDeltaNet), not KV-based attention.
+    Prefix-sharing for DeltaNet would require injecting accumulated state from
+    the prefix computation into the suffix computation.
+
+    For now, we pass through to the original forward when prefix-sharing is
+    active for DeltaNet layers, since the main benefit of prefix-sharing comes
+    from the 16 full attention layers which DO have KV cache.
     """
 
     def patched_forward(
@@ -189,52 +261,8 @@ def _make_verl_deltanet_patch(original_forward: Any) -> Any:
         max_seqlen_in_batch=None,
         **kwargs,
     ):
-        ctx = current_prefix_sharing_context()
-        if ctx is None:
-            return original_forward(
-                deltanet_module,
-                hidden_states,
-                position_ids=position_ids,
-                sequence_length=sequence_length,
-                indices=indices,
-                cu_seqlens=cu_seqlens,
-                max_seqlen_in_batch=max_seqlen_in_batch,
-                **kwargs,
-            )
-
-        if not ctx.prefix_sharing_plan.has_sharing:
-            return original_forward(
-                deltanet_module,
-                hidden_states,
-                position_ids=position_ids,
-                sequence_length=sequence_length,
-                indices=indices,
-                cu_seqlens=cu_seqlens,
-                max_seqlen_in_batch=max_seqlen_in_batch,
-                **kwargs,
-            )
-
-        # Prefix-sharing for DeltaNet: delegate to runtime hook
-        import torch
-
-        layer_id = int(getattr(deltanet_module, "layer_idx", 0) or 0)
-        model_spec = ctx.model_spec
-
-        if model_spec is not None and model_spec.layer_type(layer_id) != AttentionLayerType.LINEAR_ATTENTION:
-            # Not a linear attention layer, skip
-            return original_forward(
-                deltanet_module,
-                hidden_states,
-                position_ids=position_ids,
-                sequence_length=sequence_length,
-                indices=indices,
-                cu_seqlens=cu_seqlens,
-                max_seqlen_in_batch=max_seqlen_in_batch,
-                **kwargs,
-            )
-
-        # Run the original forward but with state injection
-        # For DeltaNet, we hook into the cumsum step
+        # DeltaNet prefix-sharing is not implemented yet
+        # Just run the original forward
         return original_forward(
             deltanet_module,
             hidden_states,
@@ -251,12 +279,12 @@ def _make_verl_deltanet_patch(original_forward: Any) -> Any:
 
 @dataclass
 class VerlQwen3_6Integration:
-    """Prefix-sharing integration for verl's Qwen3.6 model (legacy path)."""
+    """Prefix-sharing integration for verl's Qwen3.6 model."""
 
     config: PrefixSharingConfig
     backend: Any = None
 
-    def install(self, model_config: Any | None = None) -> PatchHandle:
+    def install(self, model_config: Any | None = None):
         """Patch verl's Qwen3.6 attention classes."""
         self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
         self._ensure_verl_importable()
@@ -270,8 +298,9 @@ class VerlQwen3_6Integration:
             original_attn_forward = ParallelQwen3_6AttentionRmPad.forward
             patched_attn = _make_verl_attention_patch(original_attn_forward)
             mgr.patch_attr(ParallelQwen3_6AttentionRmPad, "forward", patched_attn)
+            logger.info("Patched ParallelQwen3_6AttentionRmPad.forward for prefix-sharing")
         except ImportError:
-            pass
+            logger.warning("Could not import ParallelQwen3_6AttentionRmPad, skipping")
 
         try:
             from verl.models.qwen3_6.megatron.layers.parallel_deltanet import (
@@ -280,8 +309,9 @@ class VerlQwen3_6Integration:
             original_deltanet_forward = ParallelQwen3_6GatedDeltaNetRmPad.forward
             patched_deltanet = _make_verl_deltanet_patch(original_deltanet_forward)
             mgr.patch_attr(ParallelQwen3_6GatedDeltaNetRmPad, "forward", patched_deltanet)
+            logger.info("Patched ParallelQwen3_6GatedDeltaNetRmPad.forward (passthrough)")
         except ImportError:
-            pass
+            logger.warning("Could not import ParallelQwen3_6GatedDeltaNetRmPad, skipping")
 
         return mgr.handle()
 

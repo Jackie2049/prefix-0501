@@ -34,6 +34,7 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.patch_manager import PatchHandle
+from prefix_sharing.integrations.verl_attention import VerlQwen3_6Integration
 
 import logging
 logger = logging.getLogger(__name__)
