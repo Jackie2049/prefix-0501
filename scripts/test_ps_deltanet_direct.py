@@ -33,8 +33,8 @@ from transformers import AutoConfig
 # ===== Configuration =====
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only")
 TP_SIZE = 4
-PREFIX_LEN = 16      # Short prefix for faster testing
-SUFFIX_LEN = 32      # Short suffix
+PREFIX_LEN = 64      # Must be >= chunk_size (64) for proper chunk boundary alignment
+SUFFIX_LEN = 64      # Suffix length (same size as prefix for balanced test)
 N_SEQUENCES = 4      # n=4 for GRPO
 SEED = 42
 LAYER_IDX = 0        # First DeltaNet layer (idx 0,1,2,...)
