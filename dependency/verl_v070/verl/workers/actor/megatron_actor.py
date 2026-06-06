@@ -694,10 +694,39 @@ class MegatronPPOActor(BasePPOActor):
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
                 ######### prefix-sharing #########
-                # 通过 context manager 在 Megatron attention 注入运行时状态，
-                # 使 attention 层能识别 prefix-sharing 模式并执行 KV 激活值复用
+                # Two-pass prefix-sharing for Qwen3.6-27B hybrid attention:
+                # Pass 1 (prefix): Process provider's prefix tokens only →
+                #   DeltaNet patches capture recurrent state + conv overlap
+                #   Attention patches capture prefix KV
+                # Pass 2 (suffix): Process all sequences' suffix tokens →
+                #   DeltaNet patches inject stored state
+                #   Attention patches expand KV with stored prefix KV
                 prefix_context = prefix_sharing_runtime_context or nullcontext
-                with prefix_context(prefix_sharing_runtime_state):
+                with prefix_context(prefix_sharing_runtime_state) as ps_ctx:
+                    # Two-pass: if prefix_input_ids is available, run prefix forward first
+                    if ps_ctx is not None and hasattr(prefix_sharing_runtime_state, 'prefix_input_ids') \
+                            and prefix_sharing_runtime_state.prefix_input_ids is not None:
+                        # Prefix pass: forward with provider's prefix tokens only
+                        # This populates the deltanet_store and attention KV store
+                        _prefix_ids = prefix_sharing_runtime_state.prefix_input_ids
+                        _prefix_mask = prefix_sharing_runtime_state.prefix_attention_mask
+                        _prefix_pos = prefix_sharing_runtime_state.prefix_position_ids
+                        with torch.no_grad():
+                            _prefix_output = forward_fn(
+                                model=model,
+                                input_ids=_prefix_ids,
+                                attention_mask=_prefix_mask,
+                                position_ids=_prefix_pos,
+                                multi_modal_inputs={},
+                                logits_processor=None,
+                                logits_processor_args={},
+                                data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
+                            )
+                        # Discard prefix logits (not needed for training)
+                        del _prefix_output
+
+                    # Suffix pass: forward with all sequences' suffix tokens
+                    # DeltaNet patches inject stored state, Attention patches expand KV
                     output = forward_fn(
                         model=model,
                         input_ids=input_ids,

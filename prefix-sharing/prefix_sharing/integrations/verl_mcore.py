@@ -36,6 +36,7 @@ from prefix_sharing.integrations.megatron_attention import IntegrationUnavailabl
 from prefix_sharing.integrations.patch_manager import PatchHandle
 from prefix_sharing.integrations.verl_attention import VerlQwen3_6Integration
 
+import torch
 import logging
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,10 @@ class PrefixSharingRuntimeState:
     backend: Any
     packed_batch_layout: PackedBatchLayout
     model_spec: ModelSpec | None = None
+    # Two-pass PS: prefix tokens for the provider sequence
+    prefix_input_ids: Any | None = None
+    prefix_attention_mask: Any | None = None
+    prefix_position_ids: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -283,7 +288,36 @@ def build_prefix_sharing_micro_batch(
         return batch, None
 
     # --- Path 6: sharing found, trim the original micro-batch ---
-    logger.debug(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
+    logger.debug(f"[PS][prepare] PATH 6: sharing detected, preparing two-pass trimmed batch...")
+
+    # Extract provider's prefix tokens for the prefix pass (two-pass PS)
+    # Find the provider index (the sequence that provides prefix KV/DeltaNet state)
+    provider_idx = None
+    for i, is_prov in enumerate(prefix_sharing_plan.is_provider):
+        if is_prov:
+            provider_idx = i
+            break
+    if provider_idx is None:
+        logger.warning("[PS][prepare] No provider found in prefix sharing plan, falling back to single-pass")
+        return batch, None
+
+    provider_indices = valid_indices[provider_idx]
+    provider_prefix_len = prefix_sharing_plan.prefix_lens[provider_idx]
+
+    # Provider's prefix tokens: positions 0..prefix_len-1 (before suffix)
+    prefix_token_indices = provider_indices[:provider_prefix_len]
+    prefix_input_ids = input_ids[provider_idx, prefix_token_indices].unsqueeze(0)  # (1, prefix_len)
+    prefix_attention_mask = torch.ones(1, provider_prefix_len, dtype=bool, device=input_ids.device)
+    prefix_position_ids = position_ids[provider_idx, prefix_token_indices].unsqueeze(0)  # (1, prefix_len)
+
+    logger.debug(
+        f"[PS][prepare] Two-pass prefix tokens: provider_idx={provider_idx}, "
+        f"prefix_len={provider_prefix_len}, prefix_input_ids shape={prefix_input_ids.shape}"
+    )
+
+    # Trim all sequences to suffix-only (including provider)
+    # This is the key change for two-pass: provider also becomes suffix-only,
+    # so DeltaNet state injection works for ALL sequences in the suffix pass.
     trimmed_micro_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
     new_attention_mask[:] = False
@@ -292,8 +326,18 @@ def build_prefix_sharing_micro_batch(
     kept_position_rows = []
 
     for row, indices in enumerate(valid_indices):
-        keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
-        kept_indices = indices[keep_start:keep_end]
+        # For two-pass, all sequences keep only suffix tokens
+        # Provider: suffix starts at prefix_len
+        # Reuser: suffix starts at their keep_start
+        if row == provider_idx:
+            # Provider keeps suffix portion (after prefix_len)
+            suffix_start = provider_prefix_len
+            suffix_end = len(indices)
+            kept_indices = indices[suffix_start:suffix_end]
+        else:
+            # Reuser keeps their suffix portion (as planned)
+            keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
+            kept_indices = indices[keep_start:keep_end]
         new_attention_mask[row, kept_indices] = True
         kept_position_rows.append(position_ids[row, kept_indices])
 
@@ -328,6 +372,9 @@ def build_prefix_sharing_micro_batch(
         backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
         model_spec=model_spec or ModelSpec.from_hf_config(model_config),
+        prefix_input_ids=prefix_input_ids,
+        prefix_attention_mask=prefix_attention_mask,
+        prefix_position_ids=prefix_position_ids,
     )
     logger.debug(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
