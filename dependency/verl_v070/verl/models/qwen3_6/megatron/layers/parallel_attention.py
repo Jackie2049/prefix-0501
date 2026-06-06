@@ -125,7 +125,7 @@ class RMSNormPerHead(nn.Module):
     def forward(self, x):
         input_dtype = x.dtype
         output = self._norm(x.float()).to(input_dtype)
-        return output * self.weight
+        return output * self.weight.to(input_dtype)
 
 
 class ParallelQwen3_6Attention(nn.Module):
