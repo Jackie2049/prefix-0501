@@ -65,7 +65,7 @@ class PrefixSharingStats:
             for index in range(prefix_sharing_plan.batch_size)
             if prefix_sharing_plan.is_reuser(index)
         ]
-        sharing_group_ids = {spec.group_id for spec in prefix_sharing_plan.reuse_specs}
+        sharing_group_ids = set(prefix_sharing_plan.group_ids)
         return cls(
             forward_id=prefix_sharing_plan.forward_id,
             micro_batch_id=prefix_sharing_plan.micro_batch_id,
