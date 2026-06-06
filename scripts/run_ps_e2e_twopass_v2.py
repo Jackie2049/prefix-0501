@@ -522,12 +522,10 @@ with torch.no_grad():
             # GQA: repeat KV heads to match query heads
             num_key_value_groups = attn_module.num_key_value_groups
             if num_key_value_groups > 1:
-                key_states = key_states.unsqueeze(2).expand(
-                    -1, -1, num_key_value_groups, -1
-                ).reshape(N_SEQUENCES, SUFFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
-                v_states = v_states.unsqueeze(2).expand(
-                    -1, -1, num_key_value_groups, -1
-                ).reshape(N_SEQUENCES, SUFFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
+                # key_states: (N, SUFFIX_LEN, kv_heads_per_tp, head_dim)
+                # Expand kv_heads to query heads via repeat_interleave along dim=2
+                key_states = key_states.repeat_interleave(num_key_value_groups, dim=2)
+                v_states = v_states.repeat_interleave(num_key_value_groups, dim=2)
 
             # Expand prefix KV to all N sequences
             expanded_prefix_key = prefix_key.expand(N_SEQUENCES, -1, -1, -1).contiguous()
