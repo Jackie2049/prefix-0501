@@ -374,7 +374,14 @@ class ParallelQwen3_6GatedDeltaNet(nn.Module):
         mixed_qkv = mixed_qkv.transpose(1, 2)      # (bsz, conv_dim_per_tp, seq) for Conv1d
 
         # Apply causal conv1d + SiLU activation (PyTorch fallback)
-        mixed_qkv = self.conv1d(mixed_qkv)
+        # Cast conv1d weight to input dtype (conv1d initializes as float32, but input is bf16)
+        conv1d_weight = self.conv1d.weight.to(mixed_qkv.dtype)
+        conv1d_bias = self.conv1d.bias.to(mixed_qkv.dtype) if self.conv1d.bias is not None else None
+        mixed_qkv = F.conv1d(
+            mixed_qkv, conv1d_weight, conv1d_bias,
+            stride=1, padding=self.conv_kernel_size - 1,
+            groups=self.conv_dim_per_tp,
+        )
         mixed_qkv = mixed_qkv[:, :, :seq_len]      # trim causal padding
         mixed_qkv = F.silu(mixed_qkv)
 
