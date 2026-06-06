@@ -9,6 +9,7 @@
 **问题**：当前 PP 支持只覆盖单 micro-batch 内 prefix-sharing。`PrefixAttentionStore` / `PrefixDeltanetStore` 仍绑定在单次 `PrefixSharingRuntimeContext` 生命周期内，PP 下也保持 stage-local，不跨 micro-batch、不跨 PP stage 传递 prefix activation。后续若支持 inter micro-batch sharing，需要重新定义缓存生命周期、复用边界和清理策略。
 
 **方案**：后续单独设计 inter micro-batch sharing：引入跨 micro-batch 的稳定 key，明确 forward/backward 生命周期与梯度保留策略，补充 PP rank/stage 隔离和过期清理机制；如果需要跨进程或跨 stage 共享，再单独设计通信/分布式 store，不能复用当前 context-local store 假设。
+
 ### 2026-05-30：接入支持 Qwen3.5/Qwen3.6 HybridAttention 的训练引擎
 
 **问题**：当前 `dependency/` 中的 verl / Megatron 快照尚未支持 Qwen3.5/Qwen3.6 的 HybridAttention 训练主路径。prefix-sharing 本轮只在 `prefix-sharing` 侧准备 full gated attention KV 复用和 gated delta net activation state 复用的框架无关抽象，暂不做训练引擎侵入式接入。

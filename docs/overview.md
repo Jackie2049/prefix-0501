@@ -572,14 +572,14 @@ _current_context: ContextVar[PrefixSharingRuntimeContext | None] = ContextVar(
 class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan   # 执行计划
     packed_batch_layout: PackedBatchLayout    # packed runtime 坐标
-parallel_info: MegatronParallelInfo
+    parallel_info: MegatronParallelInfo
     store: PrefixAttentionStore              # 每层 attention KV 缓存
     backend: Any | None = None                # 后端实现
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
 
 @contextmanager
 def prefix_sharing_runtime_context(runtime_state):
-store = PrefixAttentionStore()
+    store = PrefixAttentionStore()
     ctx = PrefixSharingRuntimeContext(runtime_state, store)
     token = _current_context.set(ctx)  # 设置 thread-local
     try:
