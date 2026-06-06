@@ -356,10 +356,18 @@ class ParallelQwen3_6GatedDeltaNet(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         initial_state: Optional[torch.Tensor] = None,
         output_final_state: bool = False,
+        conv_overlap_hidden: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Standard (padded) forward for DeltaNet.
 
         No RoPE is applied — position encoding is handled by causal conv1d.
+
+        Args:
+            conv_overlap_hidden: Last (conv_kernel_size-1) prefix tokens' hidden_states
+                (after layernorm), used to provide causal conv1d overlap context
+                for suffix-only processing with prefix state injection.
+                Shape: (1 or bsz, conv_overlap, hidden_size). When prefix is shared
+                across all sequences, use bsz=1 and it will be expanded automatically.
         """
         bsz, seq_len, _ = hidden_states.size()
 
@@ -373,7 +381,24 @@ class ParallelQwen3_6GatedDeltaNet(nn.Module):
 
         # Concatenate for causal conv1d (depthwise)
         mixed_qkv = torch.cat([q, k, v], dim=-1)  # (bsz, seq, conv_dim_per_tp)
-        mixed_qkv = mixed_qkv.transpose(1, 2)      # (bsz, conv_dim_per_tp, seq) for Conv1d
+
+        # Handle conv1d overlap context for prefix-sharing state injection
+        conv_overlap = 0
+        if conv_overlap_hidden is not None:
+            conv_overlap = self.conv_kernel_size - 1  # 3
+            # Compute QKV for overlap prefix tokens
+            overlap_q = self.in_proj_q(conv_overlap_hidden)[0]
+            overlap_k = self.in_proj_k(conv_overlap_hidden)[0]
+            overlap_v = self.in_proj_v(conv_overlap_hidden)[0]
+            overlap_qkv = torch.cat([overlap_q, overlap_k, overlap_v], dim=-1)
+            # Expand overlap to all sequences if prefix is shared (bsz=1)
+            if overlap_qkv.shape[0] == 1 and bsz > 1:
+                overlap_qkv = overlap_qkv.expand(bsz, -1, -1).contiguous()
+            # Prepend overlap for conv1d context
+            mixed_qkv = torch.cat([overlap_qkv, mixed_qkv], dim=1)
+
+        total_qkv_len = conv_overlap + seq_len
+        mixed_qkv = mixed_qkv.transpose(1, 2)      # (bsz, conv_dim_per_tp, total_qkv_len) for Conv1d
 
         # Apply causal conv1d + SiLU activation (PyTorch fallback)
         # Cast conv1d weight to input dtype (conv1d initializes as float32, but input is bf16)
@@ -384,10 +409,14 @@ class ParallelQwen3_6GatedDeltaNet(nn.Module):
             stride=1, padding=self.conv_kernel_size - 1,
             groups=self.conv_dim_per_tp,
         )
-        mixed_qkv = mixed_qkv[:, :, :seq_len]      # trim causal padding
+        mixed_qkv = mixed_qkv[:, :, :total_qkv_len]  # trim causal padding
         mixed_qkv = F.silu(mixed_qkv)
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)      # back to (bsz, seq, conv_dim_per_tp)
+        mixed_qkv = mixed_qkv.transpose(1, 2)      # back to (bsz, total_qkv_len, conv_dim_per_tp)
+
+        # Extract suffix portion (skip overlap tokens) after conv1d processing
+        if conv_overlap_hidden is not None:
+            mixed_qkv = mixed_qkv[:, conv_overlap:, :]  # (bsz, seq, conv_dim_per_tp)
 
         # Split back into query, key, value
         query, key, value = torch.split(
@@ -469,6 +498,7 @@ class ParallelQwen3_6GatedDeltaNetRmPad(ParallelQwen3_6GatedDeltaNet):
         max_seqlen_in_batch=None,
         initial_state=None,
         output_final_state=False,
+        conv_overlap_hidden=None,
     ):
         total_nnz, _, _ = hidden_states.size()
 
@@ -490,6 +520,7 @@ class ParallelQwen3_6GatedDeltaNetRmPad(ParallelQwen3_6GatedDeltaNet):
             position_ids=position_ids,
             initial_state=initial_state,
             output_final_state=output_final_state,
+            conv_overlap_hidden=conv_overlap_hidden,
         )
         if output_final_state:
             output_3d, final_state = result
