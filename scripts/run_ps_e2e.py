@@ -367,11 +367,18 @@ align_size = TP_SIZE
 #   seq 1-7 (reusers): suffix_len non-zero positions → suffix_len tokens in packed
 # Total packed length = total_len + 7 * suffix_len
 
-# The model will compute its own cu_seqlens from unpad_input.
-# We need packed_batch_layout to match that format.
-# PackedBatchLayout.from_valid_lengths will compute padded lengths with alignment
+# Build packed_batch_layout from kept position rows with TP alignment
+kept_position_rows = []
+for i in range(N_SEQUENCES):
+    offset = prefix_sharing_plan.q_position_offsets[i]
+    kept_len = kept_lengths[i]
+    row = torch.arange(offset, offset + kept_len, dtype=torch.long, device=device)
+    kept_position_rows.append(row)
 
-packed_batch_layout = PackedBatchLayout.from_valid_lengths(kept_lengths, align_size=int(align_size))
+packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
+    kept_position_rows,
+    align_size=int(align_size),
+)
 
 print(f"[Rank {local_rank}] PackedBatchLayout: valid_lengths={packed_batch_layout.valid_lengths}, "
       f"padded_lengths={packed_batch_layout.padded_lengths}, "
