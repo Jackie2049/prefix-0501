@@ -21,7 +21,7 @@ sys.path.insert(0, prefix_path)
 import torch
 import torch.nn.functional as F
 from transformers import AutoConfig
-from safetensors import load_file
+from safetensors.torch import load_file
 
 # ===== Configuration =====
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only")
