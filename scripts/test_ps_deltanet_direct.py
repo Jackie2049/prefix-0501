@@ -155,21 +155,37 @@ prefix_state_expanded = prefix_state.expand(N_SEQUENCES, -1, -1, -1)  # (N, v_he
 # ===== Step 3: Suffix-only forward with injected prefix state =====
 print(f"[Rank {local_rank}] === Step 3: Suffix-only forward with injected state ===")
 
-# Build suffix-only hidden_states for all sequences
-suffix_batch = torch.cat(suffix_hiddens, dim=0)  # (N, SUFFIX_LEN, hidden_size)
+# CRITICAL: conv1d context — the causal conv1d (kernel_size=4) needs the
+# last kernel_size-1=3 prefix tokens as context for the first suffix tokens.
+# Without these overlap tokens, the first few suffix tokens get incorrect
+# conv1d output (zero padding instead of actual prefix context).
+conv_overlap = deltanet.conv_kernel_size - 1  # 3
+
+# Build extended suffix hidden_states: [overlap_prefix, suffix]
+# Include last conv_overlap prefix tokens for conv1d context
+overlap_hiddens = prefix_hidden[:, -conv_overlap:, :]  # (1, conv_overlap, hidden_size)
+# Each sequence gets: [overlap_prefix, suffix_i]
+extended_suffix = torch.cat([
+    torch.cat([overlap_hiddens.expand(N_SEQUENCES, -1, -1), suffix_hiddens[i]], dim=1)
+    for i in range(N_SEQUENCES)
+], dim=0)  # (N, conv_overlap + SUFFIX_LEN, hidden_size)
 
 torch.cuda.synchronize()
 t2 = time.time()
 with torch.no_grad():
-    output_ps = deltanet(
-        suffix_batch,  # (N, SUFFIX_LEN, hidden_size)
+    output_ps_extended = deltanet(
+        extended_suffix,  # (N, conv_overlap + SUFFIX_LEN, hidden_size)
         initial_state=prefix_state_expanded,
         output_final_state=False,
     )
 torch.cuda.synchronize()
 t_suffix = time.time() - t2
 
-print(f"[Rank {local_rank}] PS output shape: {output_ps.shape}, time={t_suffix:.3f}s")
+# Extract only the suffix portion (skip overlap tokens)
+output_ps = output_ps_extended[:, conv_overlap:, :]  # (N, SUFFIX_LEN, hidden_size)
+
+print(f"[Rank {local_rank}] Extended PS output shape: {output_ps_extended.shape}")
+print(f"[Rank {local_rank}] Trimmed PS output shape: {output_ps.shape}, time={t_suffix:.3f}s")
 
 # ===== Step 4: Compare outputs =====
 print(f"[Rank {local_rank}] === Step 4: Precision alignment ===")
@@ -184,10 +200,12 @@ all_cos_sims = []
 all_max_diffs = []
 
 for i in range(N_SEQUENCES):
-    cos_sim = torch.nn.functional.cosine_similarity(
+    # Per-position cos_sim
+    per_pos_cos = torch.nn.functional.cosine_similarity(
         ps_suffix[i].float(), normal_suffix[i].float(), dim=-1
-    ).mean().item()
+    )  # (SUFFIX_LEN,)
 
+    cos_sim = per_pos_cos.mean().item()
     max_diff = (ps_suffix[i].float() - normal_suffix[i].float()).abs().max().item()
     mean_diff = (ps_suffix[i].float() - normal_suffix[i].float()).abs().mean().item()
 
@@ -197,6 +215,10 @@ for i in range(N_SEQUENCES):
     if local_rank == 0:
         print(f"[Rank 0] Seq {i}: cos_sim={cos_sim:.6f}, max_diff={max_diff:.6f}, "
               f"mean_diff={mean_diff:.6f}")
+        # Print per-position cos_sim for first 10 and last 5 positions
+        first_10 = [f"{v:.4f}" for v in per_pos_cos[:10].tolist()]
+        last_5 = [f"{v:.4f}" for v in per_pos_cos[-5:].tolist()]
+        print(f"  Per-pos cos_sim: first10={first_10}, last5={last_5}")
 
     results[i] = {"cos_sim": cos_sim, "max_diff": max_diff, "mean_diff": mean_diff}
 
