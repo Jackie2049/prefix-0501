@@ -171,13 +171,21 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         backend = ctx.backend or TorchReferenceBackend()
         _, tp_rank, tp_size = _read_parallel_rank_info()
 
-        packed_batch_layout = ctx.packed_batch_layout
+        # Compute actual per-sequence lengths from cu_seqlens (not from packed_batch_layout)
+        # The model's unpad_input produces cu_seqlens that reflect the actual non-zero tokens.
+        # Each sequence's length = cu_seqlens[i+1] - cu_seqlens[i]
+        actual_lengths = [cu_seqlens[i+1].item() - cu_seqlens[i].item()
+                          for i in range(len(cu_seqlens) - 1)]
+
+        # Build a PackedBatchLayout from actual_lengths for build_kv splitting
+        kv_layout = PackedBatchLayout.from_valid_lengths(actual_lengths)
+
         expanded_key, expanded_value = backend.build_kv(
             key_states,
             value_states,
             ctx.store,
             ctx.prefix_sharing_plan,
-            packed_batch_layout=packed_batch_layout,
+            packed_batch_layout=kv_layout,
             layer_id=layer_id,
             tp_rank=tp_rank,
         )
