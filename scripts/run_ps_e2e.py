@@ -41,9 +41,9 @@ from safetensors.torch import load_file
 # ===== Configuration =====
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only")
 TP_SIZE = 4
-PREFIX_LEN = 32      # Length of shared prefix (prompt)
-SUFFIX_LEN = 64      # Length of each suffix (response)
-N_SEQUENCES = 8      # Number of sequences (GRPO n=8 pattern)
+PREFIX_LEN = 16      # Length of shared prefix (prompt) - shorter for memory
+SUFFIX_LEN = 32      # Length of each suffix (response) - shorter for memory
+N_SEQUENCES = 4      # Number of sequences (GRPO n=4 pattern)
 SEED = 42
 
 # ===== Initialize distributed =====
@@ -244,6 +244,7 @@ if lm_key in hf_keys_filtered:
 # Free HF state_dict
 hf_state_dict.clear()
 hf_keys_filtered.clear()
+torch.cuda.empty_cache()
 
 print(f"[Rank {local_rank}] Loaded {loaded_count} weights, GPU {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
