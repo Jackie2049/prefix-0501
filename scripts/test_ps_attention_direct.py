@@ -161,6 +161,7 @@ ps_config = PrefixSharingConfig(
     min_prefix_len=1,
     min_group_size=2,
     boundary_strategy="prefix_last_restore",
+    model_type="qwen3",  # Match HF config's model_type
 )
 
 # Create sequences for planning (same prefix, different suffixes)
