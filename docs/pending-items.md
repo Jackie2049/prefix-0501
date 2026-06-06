@@ -4,6 +4,14 @@
 
 ## 当前事项
 
+### 2026-06-06：补充 Qwen3.5 NPU 非 packed 路径的 DenseBatchLayout 支持
+
+**问题**：当前 prefix-sharing 主路径假设 Megatron actor 使用 packed / THD token layout：`PrefixSharingPlan`、`PackedBatchLayout`、RoPE、KV split / store / load、prefix-last restore 都围绕 packed 1D 坐标设计。但官方 Qwen3.5 NPU recipe 中 Gated DeltaNet 当前不支持 packed sequence，训练配置需要保持 `use_remove_padding=False` / `use_dynamic_bsz=False`。这意味着 Qwen3.5 NPU 落地时可能走 dense BSHD layout，现有 packed-only runtime 坐标无法直接复用。
+
+**方案**：后续接入 Qwen3.5/Qwen3.6 NPU 训练引擎时，先明确检测 `use_remove_padding=False` 场景并避免静默错跑；再设计 dense runtime layout 支持。建议引入 `DenseBatchLayout`，并在更上层以 `BatchRuntimeLayout` 或等价协议统一 packed / dense 两类真实 tensor 坐标：`PackedBatchLayout` 继续服务 THD packed 路径，`DenseBatchLayout` 表达 dense BSHD 下的 batch / seq 坐标、valid token mask、position ids 和 prefix-last restore dense index。`PrefixSharingPlan` 仍只保存 prefix-sharing 逻辑语义，不混入具体 packed / dense runtime layout 字段。
+
+第一版 dense path 应优先验证精度一致性，覆盖 full gated attention KV 复用和 GatedDeltaNet state 复用在 `use_remove_padding=False` 下的 logprob / loss / gradient 对齐；性能优化和重新启用 packed GatedDeltaNet 可以作为后续事项。
+
 ### 2026-06-02：设计 inter micro-batch sharing 的 store 生命周期与 PP 隔离
 
 **问题**：当前 PP 支持只覆盖单 micro-batch 内 prefix-sharing。`PrefixAttentionStore` / `PrefixDeltanetStore` 仍绑定在单次 `PrefixSharingRuntimeContext` 生命周期内，PP 下也保持 stage-local，不跨 micro-batch、不跨 PP stage 传递 prefix activation。后续若支持 inter micro-batch sharing，需要重新定义缓存生命周期、复用边界和清理策略。
