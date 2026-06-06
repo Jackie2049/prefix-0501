@@ -112,7 +112,8 @@ class ParallelQwen3_6Attention(nn.Module):
         self.megatron_config = megatron_config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        # Use explicit head_dim from config if available (Qwen3.6 uses head_dim=256, not hidden_size/num_heads)
+        self.head_dim = getattr(config, "head_dim", None) or self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
@@ -131,9 +132,11 @@ class ParallelQwen3_6Attention(nn.Module):
 
         self.num_heads_per_tp = self.num_heads // tp_size
         self.num_key_value_heads_per_tp = self.num_key_value_heads // tp_size
-        self.hidden_size_per_tp = self.hidden_size // tp_size
+        # With explicit head_dim, Q output size != hidden_size per TP shard
+        self.q_output_size_per_tp = self.num_heads_per_tp * self.head_dim
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        config_head_dim = getattr(config, "head_dim", None)
+        if config_head_dim is None and (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size} and "
                 f"`num_heads`: {self.num_heads})."
@@ -173,12 +176,13 @@ class ParallelQwen3_6Attention(nn.Module):
         )
 
         # Output gate projection (ColumnParallelLinear, hidden -> hidden)
+        # Must gather_output since o_proj (RowParallelLinear) produces full output
         if self.attn_output_gate:
             self.gate_proj = tensor_parallel.ColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_size=self.hidden_size,
                 bias=False,
-                gather_output=False,
+                gather_output=True,
                 skip_bias_add=False,
                 **column_kwargs,
             )
@@ -244,7 +248,7 @@ class ParallelQwen3_6Attention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size_per_tp)
+        attn_output = attn_output.reshape(bsz, q_len, self.q_output_size_per_tp)
         attn_output = self.o_proj(attn_output)[0]
 
         # Apply output gate
@@ -335,7 +339,7 @@ class ParallelQwen3_6AttentionRmPad(ParallelQwen3_6Attention):
         )
 
         attn_output_unpad = attn_output_unpad.to(input_dtype)
-        attn_output_unpad = attn_output_unpad.reshape(total_nnz, 1, self.hidden_size_per_tp).contiguous()
+        attn_output_unpad = attn_output_unpad.reshape(total_nnz, 1, self.q_output_size_per_tp).contiguous()
 
         if self.megatron_config.sequence_parallel:
             attn_output_unpad = F.pad(attn_output_unpad, pad=(0, 0, 0, 0, 0, sequence_parallel_pad))

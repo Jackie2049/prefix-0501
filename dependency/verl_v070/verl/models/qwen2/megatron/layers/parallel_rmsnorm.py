@@ -12,15 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import numbers
 
 import torch
-from apex.normalization.fused_layer_norm import fused_rms_norm_affine
 from megatron.core import ModelParallelConfig
 from torch import nn
 from transformers import Qwen2Config
 
 from verl.utils.megatron import sequence_parallel as sp_utils
+
+try:
+    from apex.normalization.fused_layer_norm import fused_rms_norm_affine
+    _HAS_APEX = True
+except ImportError:
+    _HAS_APEX = False
+
+# Further check: apex may be importable but CUDA kernel not available
+if _HAS_APEX:
+    try:
+        importlib.import_module("fused_layer_norm_cuda")
+    except (ImportError, ModuleNotFoundError):
+        _HAS_APEX = False
 
 
 class ParallelQwen2RMSNorm(nn.Module):
@@ -39,10 +52,17 @@ class ParallelQwen2RMSNorm(nn.Module):
             sp_utils.mark_parameter_as_sequence_parallel(self.weight)
 
     def forward(self, hidden_states):
-        return fused_rms_norm_affine(
-            input=hidden_states,
-            weight=self.weight,
-            normalized_shape=self.normalized_shape,
-            eps=self.variance_epsilon,
-            memory_efficient=True,
-        )
+        if _HAS_APEX:
+            return fused_rms_norm_affine(
+                input=hidden_states,
+                weight=self.weight,
+                normalized_shape=self.normalized_shape,
+                eps=self.variance_epsilon,
+                memory_efficient=True,
+            )
+        else:
+            # Pure PyTorch fallback: RMSNorm = x * rsqrt(mean(x^2) + eps) * weight
+            input_dtype = hidden_states.dtype
+            variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states.to(torch.float32) * torch.rsqrt(variance + self.variance_epsilon)
+            return (self.weight * hidden_states).to(input_dtype)
