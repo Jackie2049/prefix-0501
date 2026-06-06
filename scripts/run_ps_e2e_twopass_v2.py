@@ -343,10 +343,10 @@ with torch.no_grad():
             query_states, gate = torch.chunk(q_full.view(*q_shape), 2, dim=-1)
             gate = gate.reshape(PREFIX_LEN, attn_module.num_heads_per_tp * attn_module.head_dim)
 
-            # Reshape
-            query_states = query_states.view(PREFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
-            k_states = k_states.view(PREFIX_LEN, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
-            v_states = v_states.view(PREFIX_LEN, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+            # Reshape: flash_attn apply_rotary_emb expects (batch, seq, heads, head_dim)
+            query_states = query_states.view(1, PREFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
+            k_states = k_states.view(1, PREFIX_LEN, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+            v_states = v_states.view(1, PREFIX_LEN, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
 
             # QK normalization (per-head RMSNorm BEFORE RoPE)
             query_states = attn_module.q_norm(query_states)
@@ -356,17 +356,16 @@ with torch.no_grad():
             cos, sin = attn_module.rotary_emb(v_states, seq_len=PREFIX_LEN)
             cos, sin = cos[:, :cos.shape[1] // 2], sin[:, :sin.shape[1] // 2]
 
+            from flash_attn.layers.rotary import apply_rotary_emb
             if attn_module.rope_dim == attn_module.head_dim:
-                from flash_attn.layers.rotary import apply_rotary_emb
                 query_states = apply_rotary_emb(query_states, cos, sin, interleaved=False, inplace=False)
                 key_states = apply_rotary_emb(key_states, cos, sin, interleaved=False, inplace=False)
             else:
                 # Partial RoPE: only rotate first rope_dim dims
-                q_rot = query_states[:, :, :attn_module.rope_dim]
-                q_pass = query_states[:, :, attn_module.rope_dim:]
-                k_rot = key_states[:, :, :attn_module.rope_dim]
-                k_pass = key_states[:, :, attn_module.rope_dim:]
-                from flash_attn.layers.rotary import apply_rotary_emb
+                q_rot = query_states[:, :, :, :attn_module.rope_dim]
+                q_pass = query_states[:, :, :, attn_module.rope_dim:]
+                k_rot = key_states[:, :, :, :attn_module.rope_dim]
+                k_pass = key_states[:, :, :, attn_module.rope_dim:]
                 q_rot = apply_rotary_emb(q_rot, cos, sin, interleaved=False, inplace=False)
                 k_rot = apply_rotary_emb(k_rot, cos, sin, interleaved=False, inplace=False)
                 query_states = torch.cat([q_rot, q_pass], dim=-1)
@@ -375,15 +374,15 @@ with torch.no_grad():
             # GQA: repeat KV heads to match query heads
             num_key_value_groups = attn_module.num_key_value_groups
             if num_key_value_groups > 1:
-                key_states = key_states.unsqueeze(2).expand(
-                    -1, -1, num_key_value_groups, -1
-                ).reshape(PREFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
-                v_states = v_states.unsqueeze(2).expand(
-                    -1, -1, num_key_value_groups, -1
-                ).reshape(PREFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
+                key_states = key_states.unsqueeze(3).expand(
+                    -1, -1, -1, num_key_value_groups, -1
+                ).reshape(1, PREFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
+                v_states = v_states.unsqueeze(3).expand(
+                    -1, -1, -1, num_key_value_groups, -1
+                ).reshape(1, PREFIX_LEN, attn_module.num_heads_per_tp, attn_module.head_dim)
 
             # Store prefix KV (in per-head format for flash_attn)
-            prefix_kv_store[layer_idx] = (key_states.unsqueeze(0), v_states.unsqueeze(0))
+            prefix_kv_store[layer_idx] = (key_states, v_states)
             # key: (1, PREFIX_LEN, num_heads_per_tp, head_dim)
             # value: (1, PREFIX_LEN, num_heads_per_tp, head_dim)
 
@@ -510,10 +509,10 @@ with torch.no_grad():
                 query_states = apply_rotary_emb(query_states, cos_suffix, sin_suffix, interleaved=False, inplace=False)
                 key_states = apply_rotary_emb(key_states, cos_suffix, sin_suffix, interleaved=False, inplace=False)
             else:
-                q_rot = query_states[:, :, :attn_module.rope_dim]
-                q_pass = query_states[:, :, attn_module.rope_dim:]
-                k_rot = key_states[:, :, :attn_module.rope_dim]
-                k_pass = key_states[:, :, attn_module.rope_dim:]
+                q_rot = query_states[:, :, :, :attn_module.rope_dim]
+                q_pass = query_states[:, :, :, attn_module.rope_dim:]
+                k_rot = key_states[:, :, :, :attn_module.rope_dim]
+                k_pass = key_states[:, :, :, attn_module.rope_dim:]
                 from flash_attn.layers.rotary import apply_rotary_emb
                 q_rot = apply_rotary_emb(q_rot, cos_suffix, sin_suffix, interleaved=False, inplace=False)
                 k_rot = apply_rotary_emb(k_rot, cos_suffix, sin_suffix, interleaved=False, inplace=False)
