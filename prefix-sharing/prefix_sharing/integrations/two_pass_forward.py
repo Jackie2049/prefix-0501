@@ -126,23 +126,31 @@ def run_two_pass_prefix_sharing_forward(
                 query_states = attn_module.q_norm(query_states)
                 key_states = attn_module.k_norm(key_states)
 
-                # Partial RoPE
+                # Partial RoPE — apply_rotary_emb needs 4D (batch, seqlen, nheads, headdim) without cu_seqlens
                 cos, sin = attn_module.rotary_emb(value_states, seq_len=seq_len)
                 cos = cos[:, :cos.shape[1] // 2]
                 sin = sin[:, :sin.shape[1] // 2]
 
+                # Reshape to 4D for apply_rotary_emb (no cu_seqlens → needs 4D)
+                query_4d = query_states.view(bsz, seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                key_4d = key_states.view(bsz, seq_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+
                 if attn_module.rope_dim == attn_module.head_dim:
-                    query_states = apply_rotary_emb(query_states, cos, sin, interleaved=False, inplace=False)
-                    key_states = apply_rotary_emb(key_states, cos, sin, interleaved=False, inplace=False)
+                    query_4d = apply_rotary_emb(query_4d, cos, sin, interleaved=False, inplace=False)
+                    key_4d = apply_rotary_emb(key_4d, cos, sin, interleaved=False, inplace=False)
                 else:
-                    q_rot = query_states[:, :, :attn_module.rope_dim]
-                    q_pass = query_states[:, :, attn_module.rope_dim:]
-                    k_rot = key_states[:, :, :attn_module.rope_dim]
-                    k_pass = key_states[:, :, attn_module.rope_dim:]
+                    q_rot = query_4d[:, :, :, :attn_module.rope_dim]
+                    q_pass = query_4d[:, :, :, attn_module.rope_dim:]
+                    k_rot = key_4d[:, :, :, :attn_module.rope_dim]
+                    k_pass = key_4d[:, :, :, attn_module.rope_dim:]
                     q_rot = apply_rotary_emb(q_rot, cos, sin, interleaved=False, inplace=False)
                     k_rot = apply_rotary_emb(k_rot, cos, sin, interleaved=False, inplace=False)
-                    query_states = torch.cat([q_rot, q_pass], dim=-1)
-                    key_states = torch.cat([k_rot, k_pass], dim=-1)
+                    query_4d = torch.cat([q_rot, q_pass], dim=-1)
+                    key_4d = torch.cat([k_rot, k_pass], dim=-1)
+
+                # Reshape back to 3D for flash_attn_varlen_func
+                query_states = query_4d.view(bsz * seq_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                key_states = key_4d.view(bsz * seq_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
 
                 # GQA expand
                 num_key_value_groups = attn_module.num_key_value_groups
@@ -223,44 +231,37 @@ def run_two_pass_prefix_sharing_forward(
                 q_shape = (N * suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim * 2)
                 query_states, gate = torch.chunk(q_full.view(*q_shape), 2, dim=-1)
 
-                query_states = query_states.view(N * suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim)
-                key_states = key_raw.view(N * suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
-                value_states = value_raw.view(N * suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+                # Reshape to 4D for QK norm and RoPE (same pattern as working E2E test)
+                query_states = query_states.view(N, suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                key_states = key_raw.view(N, suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+                value_states = value_raw.view(N, suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
 
-                # QK normalization
+                # QK normalization (per-head RMSNorm)
                 query_states = attn_module.q_norm(query_states)
                 key_states = attn_module.k_norm(key_states)
 
-                # Partial RoPE with suffix positions
+                # Partial RoPE — slice cos/sin for suffix positions only
                 cos, sin = attn_module.rotary_emb(value_states, seq_len=prefix_len + suffix_len)
-                cos = cos[:, :cos.shape[1] // 2]
-                sin = sin[:, :sin.shape[1] // 2]
-
-                # Build cu_seqlens for suffix-only positions
-                cu_seqlens_suffix = torch.tensor(
-                    [0] + [suffix_len] * N, dtype=torch.int32, device=query_states.device
-                ).cumsum(0).to(torch.int32)
+                cos_suffix = cos[prefix_len:prefix_len + suffix_len, :cos.shape[1] // 2]
+                sin_suffix = sin[prefix_len:prefix_len + suffix_len, :sin.shape[1] // 2]
 
                 if attn_module.rope_dim == attn_module.head_dim:
-                    query_states = apply_rotary_emb(
-                        query_states, cos, sin, interleaved=False, inplace=False,
-                        cu_seqlens=cu_seqlens_suffix, max_seqlen=suffix_len,
-                    )
-                    key_states = apply_rotary_emb(
-                        key_states, cos, sin, interleaved=False, inplace=False,
-                        cu_seqlens=cu_seqlens_suffix, max_seqlen=suffix_len,
-                    )
+                    query_states = apply_rotary_emb(query_states, cos_suffix, sin_suffix, interleaved=False, inplace=False)
+                    key_states = apply_rotary_emb(key_states, cos_suffix, sin_suffix, interleaved=False, inplace=False)
                 else:
-                    q_rot = query_states[:, :, :attn_module.rope_dim]
-                    q_pass = query_states[:, :, attn_module.rope_dim:]
-                    k_rot = key_states[:, :, :attn_module.rope_dim]
-                    k_pass = key_states[:, :, attn_module.rope_dim:]
-                    q_rot = apply_rotary_emb(q_rot, cos, sin, interleaved=False, inplace=False,
-                                             cu_seqlens=cu_seqlens_suffix, max_seqlen=suffix_len)
-                    k_rot = apply_rotary_emb(k_rot, cos, sin, interleaved=False, inplace=False,
-                                             cu_seqlens=cu_seqlens_suffix, max_seqlen=suffix_len)
+                    q_rot = query_states[:, :, :, :attn_module.rope_dim]
+                    q_pass = query_states[:, :, :, attn_module.rope_dim:]
+                    k_rot = key_states[:, :, :, :attn_module.rope_dim]
+                    k_pass = key_states[:, :, :, attn_module.rope_dim:]
+                    q_rot = apply_rotary_emb(q_rot, cos_suffix, sin_suffix, interleaved=False, inplace=False)
+                    k_rot = apply_rotary_emb(k_rot, cos_suffix, sin_suffix, interleaved=False, inplace=False)
                     query_states = torch.cat([q_rot, q_pass], dim=-1)
                     key_states = torch.cat([k_rot, k_pass], dim=-1)
+
+                # Reshape back to 3D for flash_attn and GQA
+                query_states = query_states.view(N * suffix_len, attn_module.num_heads_per_tp, attn_module.head_dim)
+                key_states = key_states.view(N * suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
+                value_states = value_states.view(N * suffix_len, attn_module.num_key_value_heads_per_tp, attn_module.head_dim)
 
                 # GQA expand
                 num_key_value_groups = attn_module.num_key_value_groups
@@ -281,17 +282,20 @@ def run_two_pass_prefix_sharing_forward(
                     value_states,
                 ], dim=0)
 
-                # Build expanded cu_seqlens
+                # Build cu_seqlens for flash_attn_varlen_func
+                cu_seqlens_q = torch.tensor(
+                    [0] + [suffix_len] * N, dtype=torch.int32, device=query_states.device
+                ).cumsum(0).to(torch.int32)
                 expanded_lengths = [prefix_len + suffix_len] * N
-                expanded_cu_seqlens = torch.tensor(
+                cu_seqlens_k = torch.tensor(
                     [0] + expanded_lengths, dtype=torch.int32, device=query_states.device
                 ).cumsum(0).to(torch.int32)
 
                 # flash_attn with expanded KV
                 attn_output = flash_attn_varlen_func(
                     query_states, expanded_key, expanded_value,
-                    cu_seqlens_q=cu_seqlens_suffix,
-                    cu_seqlens_k=expanded_cu_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
                     max_seqlen_q=suffix_len,
                     max_seqlen_k=prefix_len + suffix_len,
                     dropout_p=0.0,
