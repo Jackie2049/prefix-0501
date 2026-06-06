@@ -13,16 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.6 full attention layer with partial RoPE and output gate.
+"""Qwen3.6 full attention layer with QK normalization, partial RoPE, and fused output gate.
 
-Key differences from Qwen2:
-- Partial RoPE: only apply RoPE to the first `rope_dim` dimensions (64/256)
-- Output gate: output = o_proj(attn_output) * sigmoid(gate_proj(hidden_states))
+Key differences from our initial design and Qwen2:
+- q_proj output = num_heads * head_dim * 2 (fused query + output gate via chunk)
+- q_norm and k_norm (per-head RMSNorm before attention, matching Qwen3_5 reference)
+- RoPE applied AFTER q_norm/k_norm (not before)
+- Partial RoPE: only apply RoPE to the first rope_dim (64/256) dimensions
+- Output gate: attn_output * sigmoid(gate) where gate = chunk(q_proj, 2)[1]
+  (NOT separate gate_proj(hidden_states) * sigmoid)
+- No bias on projections (matching reference, config.attention_bias=False)
 """
 
 import math
 from typing import Optional
 
+import torch
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.utils import is_flash_attn_2_available
@@ -36,9 +42,7 @@ from flash_attn.layers.rotary import apply_rotary_emb
 from megatron.core import ModelParallelConfig, tensor_parallel
 from megatron.core import parallel_state as mpu
 from torch import nn
-from transformers import AutoConfig
 
-from verl.models.qwen3_6.megatron.layers.parallel_linear import QKVParallelLinear
 from verl.utils.megatron import tensor_parallel as tp_utils
 
 
@@ -103,8 +107,37 @@ def apply_rotary_pos_emb_rmpad_flash(q, k, cos, sin, cu_seqlens, max_seqlen):
     return q_embed, k_embed
 
 
+class RMSNormPerHead(nn.Module):
+    """Per-head RMSNorm for Qwen3.5's QK normalization.
+
+    Unlike the full RMSNorm (which operates on hidden_size),
+    this operates on head_dim for each attention head independently.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        input_dtype = x.dtype
+        output = self._norm(x.float()).to(input_dtype)
+        return output * self.weight
+
+
 class ParallelQwen3_6Attention(nn.Module):
-    """Qwen3.6 full attention with partial RoPE and output gate."""
+    """Qwen3.6 full attention matching official Qwen3_5 reference.
+
+    Key architectural changes:
+    - q_proj outputs num_heads * head_dim * 2 (fused query + gate)
+    - After chunk, query_states and gate are separated
+    - q_norm and k_norm applied per-head BEFORE RoPE and attention
+    - Output gate: attn_output * sigmoid(gate) from q_proj chunk
+    - No bias on projections (config.attention_bias=False)
+    """
 
     def __init__(self, config, megatron_config: ModelParallelConfig):
         super().__init__()
@@ -112,19 +145,22 @@ class ParallelQwen3_6Attention(nn.Module):
         self.megatron_config = megatron_config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        # Use explicit head_dim from config if available (Qwen3.6 uses head_dim=256, not hidden_size/num_heads)
         self.head_dim = getattr(config, "head_dim", None) or self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = getattr(config, "rope_theta", 10000.0)
+        self.scaling = self.head_dim ** -0.5
 
         # Partial RoPE dimension
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rope_dim = int(self.head_dim * self.partial_rotary_factor)
 
-        # Output gate
+        # Output gate (from chunk of q_proj, not separate gate_proj)
         self.attn_output_gate = getattr(config, "attn_output_gate", False)
+
+        # Has QK normalization (Qwen3.5 uses per-head RMSNorm)
+        self.use_qk_norm = True  # Qwen3.5 always has q_norm and k_norm
 
         tp_size = mpu.get_tensor_model_parallel_world_size()
         assert self.num_heads % tp_size == 0
@@ -132,8 +168,11 @@ class ParallelQwen3_6Attention(nn.Module):
 
         self.num_heads_per_tp = self.num_heads // tp_size
         self.num_key_value_heads_per_tp = self.num_key_value_heads // tp_size
-        # With explicit head_dim, Q output size != hidden_size per TP shard
-        self.q_output_size_per_tp = self.num_heads_per_tp * self.head_dim
+
+        # q_proj outputs num_heads * head_dim * 2 (fused query + gate)
+        # Per TP shard: num_heads_per_tp * head_dim * 2
+        self.q_output_size_per_tp = self.num_heads_per_tp * self.head_dim  # without gate
+        self.q_gate_output_size_per_tp = self.num_heads_per_tp * self.head_dim  # gate portion
 
         config_head_dim = getattr(config, "head_dim", None)
         if config_head_dim is None and (self.head_dim * self.num_heads) != self.hidden_size:
@@ -146,67 +185,64 @@ class ParallelQwen3_6Attention(nn.Module):
         row_kwargs = tp_utils.get_default_kwargs_for_row_parallel_linear()
 
         if megatron_config is not None:
-            assert column_kwargs.get("config", False), "must have ModelParallelConfig"
-            assert row_kwargs.get("config", False), "must have ModelParallelConfig"
             tp_utils.update_kwargs_with_config(column_kwargs, megatron_config)
             tp_utils.update_kwargs_with_config(row_kwargs, megatron_config)
 
-        self.qkv_proj = QKVParallelLinear(
+        # Separate q/k/v projections (no bias, matching reference)
+        # q_proj: hidden_size → num_heads * head_dim * 2 (fused query + gate)
+        self.q_proj = tensor_parallel.ColumnParallelLinear(
             input_size=self.hidden_size,
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            bias=True,
+            output_size=self.num_heads * self.head_dim * 2,  # 12288 (6144 query + 6144 gate)
+            bias=False,  # No bias (config.attention_bias=False)
+            gather_output=False,
+            skip_bias_add=False,
+            **column_kwargs,
+        )
+        self.k_proj = tensor_parallel.ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.num_key_value_heads * self.head_dim,  # 1024 (GQA: 4 KV heads)
+            bias=False,
+            gather_output=False,
+            skip_bias_add=False,
+            **column_kwargs,
+        )
+        self.v_proj = tensor_parallel.ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.num_key_value_heads * self.head_dim,  # 1024
+            bias=False,
             gather_output=False,
             skip_bias_add=False,
             **column_kwargs,
         )
 
-        self.q_size = self.num_heads_per_tp * self.head_dim
-        self.k_size = self.num_key_value_heads_per_tp * self.head_dim
-        self.v_size = self.num_key_value_heads_per_tp * self.head_dim
+        # Per-head RMSNorm for query and key (QK normalization)
+        self.q_norm = RMSNormPerHead(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNormPerHead(self.head_dim, eps=config.rms_norm_eps)
 
+        # Output projection
         self.o_proj = tensor_parallel.RowParallelLinear(
-            input_size=self.num_heads * self.head_dim,
-            output_size=self.hidden_size,
+            input_size=self.num_heads * self.head_dim,  # 6144
+            output_size=self.hidden_size,  # 5120
             bias=False,
             input_is_parallel=True,
             skip_bias_add=False,
             **row_kwargs,
         )
 
-        # Output gate projection (ColumnParallelLinear, hidden -> hidden)
-        # Must gather_output since o_proj (RowParallelLinear) produces full output
-        if self.attn_output_gate:
-            self.gate_proj = tensor_parallel.ColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_size=self.hidden_size,
-                bias=False,
-                gather_output=True,
-                skip_bias_add=False,
-                **column_kwargs,
-            )
-
         self._init_rope()
 
     def _init_rope(self):
-        # RoPE only applied to the first rope_dim dimensions
         self.rotary_emb = Qwen3_6RotaryEmbedding(
             self.rope_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
     def _apply_partial_rope(self, query_states, key_states, cos, sin, position_ids):
-        """Apply partial RoPE: only rotate the first rope_dim dims, pass through the rest."""
+        """Apply partial RoPE: only rotate the first rope_dim dims."""
         if self.rope_dim == self.head_dim:
-            # Full RoPE (same as Qwen2)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         else:
-            # Partial RoPE
             q_rot = query_states[..., :self.rope_dim]
             q_pass = query_states[..., self.rope_dim:]
             k_rot = key_states[..., :self.rope_dim]
@@ -215,7 +251,6 @@ class ParallelQwen3_6Attention(nn.Module):
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, position_ids)
             query_states = torch.cat([q_rot, q_pass], dim=-1)
             key_states = torch.cat([k_rot, k_pass], dim=-1)
-
         return query_states, key_states
 
     def forward(
@@ -225,21 +260,47 @@ class ParallelQwen3_6Attention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
-        qkv = self.qkv_proj(hidden_states)[0]
-        query_states, key_states, value_states = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads_per_tp, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads_per_tp, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads_per_tp, self.head_dim).transpose(1, 2)
+        # q_proj: hidden → num_heads * head_dim * 2 (per shard: num_heads_per_tp * head_dim * 2)
+        q_full = self.q_proj(hidden_states)[0]  # (bsz, q_len, num_heads_per_tp * head_dim * 2)
 
+        # Chunk into query and gate (matching reference)
+        # q_full: (bsz, q_len, num_heads_per_tp * head_dim * 2)
+        # After reshape to per-head with head_dim*2, chunk on last dim
+        hidden_shape = (bsz, q_len, self.num_heads_per_tp, self.head_dim * 2)
+        query_states, gate = torch.chunk(
+            q_full.view(*hidden_shape), 2, dim=-1
+        )
+        # query_states: (bsz, q_len, num_heads_per_tp, head_dim)
+        # gate: (bsz, q_len, num_heads_per_tp, head_dim)
+
+        # Reshape gate for later use (flatten heads)
+        gate = gate.reshape(bsz, q_len, self.num_heads_per_tp * self.head_dim)
+
+        # k_proj and v_proj (per shard)
+        key_states = self.k_proj(hidden_states)[0].view(bsz, q_len, self.num_key_value_heads_per_tp, self.head_dim)
+        value_states = self.v_proj(hidden_states)[0].view(bsz, q_len, self.num_key_value_heads_per_tp, self.head_dim)
+
+        # QK normalization (per-head RMSNorm BEFORE RoPE)
+        query_states = self.q_norm(query_states)  # (bsz, q_len, heads_per_tp, head_dim)
+        key_states = self.k_norm(key_states)
+
+        # Transpose for RoPE and attention: (bsz, heads, seq, dim)
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # Apply partial RoPE AFTER q_norm/k_norm
         kv_seq_len = key_states.shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = self._apply_partial_rope(query_states, key_states, cos, sin, position_ids)
 
+        # GQA: repeat KV heads to match query heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # Standard attention computation
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
 
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
@@ -247,16 +308,19 @@ class ParallelQwen3_6Attention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
 
+        # Reshape attention output
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.q_output_size_per_tp)
-        attn_output = self.o_proj(attn_output)[0]
 
-        # Apply output gate
+        # Apply output gate BEFORE o_proj (matching reference)
+        # gate: (bsz, q_len, num_heads_per_tp * head_dim) — per-shard, matches attn_output shape
         if self.attn_output_gate:
-            gate = torch.sigmoid(self.gate_proj(hidden_states)[0])
-            attn_output = attn_output * gate
+            attn_output = attn_output * torch.sigmoid(gate)
 
-        return attn_output
+        # Output projection (RowParallelLinear, AllReduce across TP)
+        output = self.o_proj(attn_output)[0]
+
+        return output
 
 
 class ParallelQwen3_6AttentionRmPad(ParallelQwen3_6Attention):
@@ -276,13 +340,19 @@ class ParallelQwen3_6AttentionRmPad(ParallelQwen3_6Attention):
         if self.megatron_config.sequence_parallel:
             total_nnz = total_nnz * mpu.get_tensor_model_parallel_world_size()
 
-        # Save hidden_states for gate_proj before QKV projection
-        residual_hidden = hidden_states if self.attn_output_gate else None
+        # q_proj: hidden → num_heads * head_dim * 2 (per shard)
+        q_full = self.q_proj(hidden_states)[0]
 
-        qkv = self.qkv_proj(hidden_states)[0]
-        query_states, key_states, value_states = qkv.split(
-            [self.q_size, self.k_size, self.v_size], dim=-1
+        # Chunk into query and gate
+        hidden_shape = (total_nnz, self.num_heads_per_tp, self.head_dim * 2)
+        query_states, gate = torch.chunk(
+            q_full.view(*hidden_shape), 2, dim=-1
         )
+        # gate: (total_nnz, num_heads_per_tp, head_dim) → flatten for later
+        gate = gate.reshape(total_nnz, self.num_heads_per_tp * self.head_dim)
+
+        key_states = self.k_proj(hidden_states)[0]
+        value_states = self.v_proj(hidden_states)[0]
 
         if self.megatron_config.sequence_parallel:
             sequence_parallel_pad = total_nnz - cu_seqlens[-1]
@@ -290,22 +360,25 @@ class ParallelQwen3_6AttentionRmPad(ParallelQwen3_6Attention):
             query_states = query_states[:total_nnz]
             key_states = key_states[:total_nnz]
             value_states = value_states[:total_nnz]
+            gate = gate[:total_nnz]
 
         query_states = query_states.view(total_nnz, self.num_heads_per_tp, self.head_dim)
         key_states = key_states.view(total_nnz, self.num_key_value_heads_per_tp, self.head_dim)
         value_states = value_states.view(total_nnz, self.num_key_value_heads_per_tp, self.head_dim)
 
-        # Partial RoPE using flash_attn's apply_rotary_emb
+        # QK normalization (per-head RMSNorm)
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+
+        # Partial RoPE using flash_attn's apply_rotary_emb (AFTER q_norm/k_norm)
         cos, sin = self.rotary_emb(value_states, seq_len=sequence_length)
         cos, sin = cos[:, : cos.shape[1] // 2], sin[:, : sin.shape[1] // 2]
 
         if self.rope_dim == self.head_dim:
-            # Full RoPE
             query_states, key_states = apply_rotary_pos_emb_rmpad_flash(
                 query_states, key_states, cos, sin, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen_in_batch
             )
         else:
-            # Partial RoPE: rotate only first rope_dim dims
             q_rot = query_states[:, :, :self.rope_dim]
             q_pass = query_states[:, :, self.rope_dim:]
             k_rot = key_states[:, :, :self.rope_dim]
@@ -334,31 +407,23 @@ class ParallelQwen3_6AttentionRmPad(ParallelQwen3_6Attention):
             max_seqlen_q=max_seqlen_in_batch,
             max_seqlen_k=max_seqlen_in_batch,
             dropout_p=dropout_rate,
-            softmax_scale=None,
+            softmax_scale=self.scaling,
             causal=True,
         )
 
         attn_output_unpad = attn_output_unpad.to(input_dtype)
+        attn_output_unpad = attn_output_unpad.reshape(total_nnz, self.num_heads_per_tp * self.head_dim)
+
+        # Apply output gate BEFORE o_proj
+        if self.attn_output_gate:
+            attn_output_unpad = attn_output_unpad * torch.sigmoid(gate)
+
+        # Reshape for o_proj
         attn_output_unpad = attn_output_unpad.reshape(total_nnz, 1, self.q_output_size_per_tp).contiguous()
 
         if self.megatron_config.sequence_parallel:
             attn_output_unpad = F.pad(attn_output_unpad, pad=(0, 0, 0, 0, 0, sequence_parallel_pad))
 
         attn_output_unpad = self.o_proj(attn_output_unpad)[0]
-
-        # Apply output gate
-        if self.attn_output_gate:
-            if self.megatron_config.sequence_parallel:
-                gate_hidden = residual_hidden[:total_nnz] if residual_hidden is not None else hidden_states[:total_nnz]
-            else:
-                gate_hidden = residual_hidden if residual_hidden is not None else hidden_states
-            gate_hidden = gate_hidden.reshape(total_nnz, 1, self.hidden_size)
-            # gate_proj needs SP padding too
-            if self.megatron_config.sequence_parallel and residual_hidden is not None:
-                gate_hidden = residual_hidden  # Use original padded hidden for gate_proj
-            gate = torch.sigmoid(self.gate_proj(gate_hidden)[0])
-            # Trim gate to match attn_output_unpad shape
-            gate = gate[:attn_output_unpad.shape[0]]
-            attn_output_unpad = attn_output_unpad * gate
 
         return attn_output_unpad
