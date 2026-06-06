@@ -354,7 +354,9 @@ class ParallelQwen3_6GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
+        initial_state: Optional[torch.Tensor] = None,
+        output_final_state: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Standard (padded) forward for DeltaNet.
 
         No RoPE is applied — position encoding is handled by causal conv1d.
@@ -429,11 +431,11 @@ class ParallelQwen3_6GatedDeltaNet(nn.Module):
         g = g.transpose(1, 2)          # (bsz, v_heads_per_tp, seq)
 
         # Core computation: chunk_gated_delta_rule (pure PyTorch fallback)
-        core_attn_out, _ = torch_chunk_gated_delta_rule(
+        core_attn_out, final_state = torch_chunk_gated_delta_rule(
             query, key, value, g, beta,
             chunk_size=64,
-            initial_state=None,
-            output_final_state=False,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=True,
         )
         # core_attn_out: (bsz, seq, num_v_heads_per_tp, head_v_dim)
@@ -445,6 +447,8 @@ class ParallelQwen3_6GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(bsz, seq_len, self.value_dim_per_tp)
         output = self.out_proj(core_attn_out)[0]
 
+        if output_final_state:
+            return output, final_state
         return output
 
 
@@ -463,6 +467,8 @@ class ParallelQwen3_6GatedDeltaNetRmPad(ParallelQwen3_6GatedDeltaNet):
         indices=None,
         cu_seqlens=None,
         max_seqlen_in_batch=None,
+        initial_state=None,
+        output_final_state=False,
     ):
         total_nnz, _, _ = hidden_states.size()
 
@@ -477,12 +483,19 @@ class ParallelQwen3_6GatedDeltaNetRmPad(ParallelQwen3_6GatedDeltaNet):
         hidden_states_3d = pad_input(hidden_states_3d, indices, batch_size, sequence_length)
 
         # Run the padded forward
-        output_3d = ParallelQwen3_6GatedDeltaNet.forward(
+        result = ParallelQwen3_6GatedDeltaNet.forward(
             self,
             hidden_states=hidden_states_3d,
             attention_mask=None,
             position_ids=position_ids,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
         )
+        if output_final_state:
+            output_3d, final_state = result
+        else:
+            output_3d = result
+            final_state = None
         # output_3d: (batch_size, seq_len, hidden_size)
 
         # Pack back: (batch_size, seq_len, hidden_size) → (total_nnz, 1, hidden_size)
@@ -500,4 +513,6 @@ class ParallelQwen3_6GatedDeltaNetRmPad(ParallelQwen3_6GatedDeltaNet):
         else:
             output_selected = output_selected.reshape(-1, 1, self.hidden_size)
 
+        if output_final_state:
+            return output_selected, final_state
         return output_selected
