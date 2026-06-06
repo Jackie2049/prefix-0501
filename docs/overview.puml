@@ -473,7 +473,7 @@ note bottom of Context
   **PrefixSharingRuntimeContext:**
   - prefix_sharing_plan: PrefixSharingPlan
   - packed_batch_layout: PackedBatchLayout
-  - parallel_info: MegatronParallelInfo
+- parallel_info: MegatronParallelInfo
   - store: PrefixAttentionStore
   - backend: Any
   - prefix_last_restore_indices: packed 读写索引

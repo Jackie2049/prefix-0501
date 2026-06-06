@@ -37,7 +37,7 @@ def test_enabled_config_accepts_physical_pipeline_parallel_sizes(pp_size):
 def test_env_var_can_enable_prefix_sharing(monkeypatch, value):
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", value)
 
-    config = PrefixSharingConfig()
+    config = PrefixSharingConfig.from_raw(None)
 
     assert config.enable_prefix_sharing is True
 
@@ -46,7 +46,7 @@ def test_env_var_can_enable_prefix_sharing(monkeypatch, value):
 def test_env_var_false_values_do_not_enable_prefix_sharing(monkeypatch, value):
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", value)
 
-    config = PrefixSharingConfig()
+    config = PrefixSharingConfig.from_raw(None)
 
     assert config.enable_prefix_sharing is False
 
@@ -55,7 +55,7 @@ def test_env_var_rejects_invalid_prefix_sharing_value(monkeypatch):
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", "maybe")
 
     with pytest.raises(PrefixSharingConfigError, match="ENABLE_PREFIX_SHARING"):
-        PrefixSharingConfig()
+        PrefixSharingConfig.from_raw(None)
 
 
 @pytest.mark.parametrize(

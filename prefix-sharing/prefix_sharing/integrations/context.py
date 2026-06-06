@@ -31,7 +31,7 @@ class PackedPrefixLastRestoreIndex:
 class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan
     packed_batch_layout: PackedBatchLayout
-    parallel_info: MegatronParallelInfo
+parallel_info: MegatronParallelInfo
     store: PrefixAttentionStore
     backend: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
@@ -85,7 +85,7 @@ def prefix_sharing_runtime_context(
         yield None
         return
 
-    store = PrefixAttentionStore()
+store = PrefixAttentionStore()
     ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
     token = _current_context.set(ctx)
     try:

@@ -162,6 +162,10 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    ######## prefix sharing ########
+    # Prefix sharing configuration
+    prefix_sharing_config: dict[str, Any] = field(default_factory=dict)
+    ######## Prefix sharing ########
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
