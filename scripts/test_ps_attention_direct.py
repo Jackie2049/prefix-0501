@@ -98,12 +98,21 @@ hidden_size = config.hidden_size  # 5120
 
 # Create hidden_states for n=4 sequences, each of total_len
 # Format: (total_nnz, 1, hidden_size) — THD packed format
-# But we'll first test the full (padded) format, then the trimmed format
+# CRITICAL: prefix hidden_states must be identical across all sequences
+# for prefix-sharing to work correctly (same tokens → same embeddings)
 
-# Full sequences: each has prefix_len + suffix_len tokens
 torch.manual_seed(SEED + 100)
-hidden_full = torch.randn(N_SEQUENCES * total_len, 1, hidden_size,
-                          dtype=torch.bfloat16, device=device)
+# Generate prefix hidden_states (shared across all sequences)
+prefix_hidden = torch.randn(PREFIX_LEN, 1, hidden_size, dtype=torch.bfloat16, device=device)
+# Generate suffix hidden_states (different per sequence)
+suffix_hiddens = [torch.randn(SUFFIX_LEN, 1, hidden_size, dtype=torch.bfloat16, device=device)
+                  for _ in range(N_SEQUENCES)]
+
+# Build full hidden_states: [prefix, suffix_0], [prefix, suffix_1], ...
+hidden_full = torch.cat([
+    torch.cat([prefix_hidden, suffix_hiddens[i]], dim=0)
+    for i in range(N_SEQUENCES)
+], dim=0)
 
 # Build cu_seqlens for full sequences
 cu_seqlens_full = torch.tensor(
