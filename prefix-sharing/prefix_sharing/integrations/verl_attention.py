@@ -89,6 +89,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
         import torch
         from flash_attn import flash_attn_varlen_func
         from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+        from prefix_sharing.backends.packed_layout import PackedBatchLayout
 
         attn_module = self_attention_module
         total_nnz, _, _ = hidden_states.size()
