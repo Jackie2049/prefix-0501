@@ -35,9 +35,18 @@ from .parallel_rmsnorm import ParallelQwen2RMSNorm
 
 
 def _is_full_attention_layer(config, layer_idx: int) -> bool:
-    """Check if a layer should use full attention vs GatedDeltaNet."""
+    """Check if a layer should use full attention vs GatedDeltaNet.
+
+    Uses the config's layer_types list (if available) for accurate routing.
+    Falls back to positional heuristic: full attention at layers where
+    (layer_idx + 1) % full_attention_interval == 0, meaning the last layer
+    in each interval group gets full attention (e.g., layers 3,7,11,...).
+    """
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None and layer_idx < len(layer_types):
+        return layer_types[layer_idx] == "full_attention"
     full_attention_interval = getattr(config, "full_attention_interval", 1)
-    return layer_idx % full_attention_interval == 0
+    return (layer_idx + 1) % full_attention_interval == 0
 
 
 class ParallelQwen3_6DecoderLayer(nn.Module):
