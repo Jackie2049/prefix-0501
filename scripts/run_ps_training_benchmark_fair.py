@@ -141,7 +141,7 @@ for layer_idx in range(num_layers):
     dec = model.model.layers[layer_idx]
     attn = dec.self_attn
     mlp = dec.mlp
-    pfx = f"model.language_chain.layers.{layer_idx}"
+    pfx = f"model.language_model.layers.{layer_idx}"
 
     if is_dn:
         dn_pfx = f"{pfx}.linear_attn"
@@ -208,12 +208,12 @@ for layer_idx in range(num_layers):
             getattr(dec, ln).weight.data.copy_(hf_state_dict[key].to(torch.bfloat16))
             loaded_count += 1
 
-embed_key = "model.language_chain.embed_tokens.weight"
+embed_key = "model.language_model.embed_tokens.weight"
 if embed_key in hf_state_dict:
     model.model.embed_tokens.weight.data.copy_(
         shard_tensor(hf_state_dict[embed_key], 0, TP_SIZE, tp_rank).to(torch.bfloat16))
     loaded_count += 1
-norm_key = "model.language_chain.norm.weight"
+norm_key = "model.language_model.norm.weight"
 if norm_key in hf_state_dict:
     model.model.norm.weight.data.copy_(hf_state_dict[norm_key].to(torch.bfloat16))
     loaded_count += 1
@@ -424,8 +424,8 @@ def manual_forward_on(prefix_ids_list, suffix_ids_lists):
             exp_key = torch.cat([pk_exp, key], dim=1)
             exp_value = torch.cat([pv_exp, v], dim=1)
 
-            cu_q = torch.tensor([0] + [SUFFIX_LEN] * N, device=device, dtype=torch.int32).cumsum(0)
-            cu_k = torch.tensor([0] + [PREFIX_LEN + SUFFIX_LEN] * N, device=device, dtype=torch.int32).cumsum(0)
+            cu_q = torch.tensor([0] + [SUFFIX_LEN] * N, device=device).cumsum(0).to(torch.int32)
+            cu_k = torch.tensor([0] + [PREFIX_LEN + SUFFIX_LEN] * N, device=device).cumsum(0).to(torch.int32)
 
             q_flat = query.reshape(N * SUFFIX_LEN, attn.num_heads_per_tp, attn.head_dim)
             k_flat = exp_key.reshape(N * (PREFIX_LEN + SUFFIX_LEN), attn.num_heads_per_tp, attn.head_dim)
