@@ -24,6 +24,7 @@ from typing import Any, Optional
 import psutil
 import torch
 import torch.distributed
+import torch.nn.functional as F
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf
 
@@ -829,7 +830,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+            if getattr(self, '_is_native_rollout', False):
+                # Native rollout: generate directly using actor's model
+                output = self._native_generate_sequences(prompts)
+            else:
+                output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:
             if getattr(self, '_is_native_rollout', False):
@@ -860,6 +865,166 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # clear kv cache
         aggressive_empty_cache(force_sync=True)
         return output
+
+    def _native_generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Generate sequences directly using the actor's Megatron model.
+
+        Token-by-token autoregressive generation, same format as HFRollout output.
+        Uses the Megatron forward function already set up in the worker.
+        """
+        rollout_config = self.config.rollout
+
+        # Sampling parameters from meta_info or config
+        do_sample = prompts.meta_info.get("do_sample", rollout_config.do_sample)
+        temperature = prompts.meta_info.get("temperature", rollout_config.temperature)
+        response_length = prompts.meta_info.get("response_length", rollout_config.response_length)
+        top_p = prompts.meta_info.get("top_p", rollout_config.get("top_p", 1.0))
+
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        pad_token_id = prompts.meta_info["pad_token_id"]
+
+        # Extract input_ids from DataProto - handle both .batch and .non_tensor_batch
+        if prompts.batch is not None:
+            input_ids = prompts.batch["input_ids"]  # (bs, prompt_length)
+            attention_mask = prompts.batch["attention_mask"]
+            position_ids = prompts.batch.get("position_ids", None)
+        else:
+            # Data may be in non_tensor_batch (rare but possible after TP dispatch)
+            input_ids = prompts.non_tensor_batch["input_ids"]
+            attention_mask = prompts.non_tensor_batch["attention_mask"]
+            position_ids = prompts.non_tensor_batch.get("position_ids", None)
+
+        # If position_ids not provided, create them from attention_mask
+        if position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+
+        device = get_torch_device()
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        position_ids = position_ids.to(device)
+
+        batch_size = input_ids.size(0)
+        prompt_length = input_ids.size(1)
+
+        # Get the Megatron forward function
+        from verl.models.mcore import get_mcore_forward_fn
+        forward_fn = get_mcore_forward_fn(self.hf_config)
+
+        # Token-by-token generation
+        current_ids = input_ids.clone()
+        current_mask = attention_mask.clone()
+        current_pos = position_ids.clone()
+
+        generated_tokens = []
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for step in range(response_length):
+            # Forward pass through the Megatron model
+            logits = self._forward_for_logits_native(
+                forward_fn, current_ids, current_mask, current_pos
+            )
+
+            # Get logits at the last non-padding position for each sequence
+            last_logits = logits[:, -1, :]  # (bs, vocab_size)
+
+            # Sample or greedy
+            if do_sample and temperature > 0:
+                last_logits = last_logits / temperature
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(last_logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = False
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    last_logits[indices_to_remove] = float("-inf")
+
+                probs = F.softmax(last_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                next_tokens = torch.argmax(last_logits, dim=-1)
+
+            # Replace next tokens for finished sequences with pad_token
+            next_tokens = next_tokens.masked_fill(finished, pad_token_id)
+
+            # Check for EOS
+            just_finished = (next_tokens == eos_token_id) & ~finished
+            finished = finished | just_finished
+
+            # Append generated token
+            generated_tokens.append(next_tokens)
+
+            # Update current_ids for next step
+            current_ids = torch.cat([current_ids, next_tokens.unsqueeze(-1)], dim=-1)
+            current_mask = torch.cat([current_mask, (~finished).long().unsqueeze(-1)], dim=-1)
+            # Extend position_ids
+            last_pos = current_pos[:, -1:] + 1
+            current_pos = torch.cat([current_pos, last_pos], dim=-1)
+
+            # If all sequences finished, stop early
+            if finished.all():
+                break
+
+        # Build response tensor
+        if len(generated_tokens) > 0:
+            responses = torch.stack(generated_tokens, dim=1)  # (bs, response_length_actual)
+        else:
+            responses = torch.full((batch_size, 1), pad_token_id, dtype=input_ids.dtype, device=device)
+
+        # Pad responses to target response_length
+        actual_response_len = responses.size(1)
+        if actual_response_len < response_length:
+            padding = torch.full(
+                (batch_size, response_length - actual_response_len),
+                pad_token_id, dtype=input_ids.dtype, device=device
+            )
+            responses = torch.cat([responses, padding], dim=1)
+
+        # Build response_mask: 1 for real tokens, 0 for padding/eos
+        response_mask = (responses != pad_token_id).long()
+        for i in range(batch_size):
+            eos_positions = (responses[i] == eos_token_id).nonzero()
+            if len(eos_positions) > 0:
+                response_mask[i, eos_positions[0].item() + 1:] = 0
+
+        # Build full input_ids (prompt + response)
+        full_input_ids = torch.cat([input_ids, responses], dim=1)
+
+        # Return in same format as HFRollout
+        output = DataProto.from_dict(tensors={
+            "input_ids": full_input_ids.cpu(),
+            "responses": responses.cpu(),
+            "response_mask": response_mask.cpu(),
+        })
+        output.meta_info = {
+            "eos_token_id": eos_token_id,
+            "pad_token_id": pad_token_id,
+            "prompt_length": prompt_length,
+            "response_length": response_length,
+        }
+
+        return output
+
+    def _forward_for_logits_native(self, forward_fn, input_ids, attention_mask, position_ids):
+        """Do a forward pass through the Megatron model to get logits.
+
+        For native rollout (PP=1), we call the model directly.
+        """
+        from verl.utils.megatron_utils import unwrap_model
+
+        model = unwrap_model(self.actor_module)
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            output = forward_fn(
+                model=model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
+        logits = output["logits"]
+        return logits
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
