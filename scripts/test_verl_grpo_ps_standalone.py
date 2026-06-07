@@ -337,7 +337,7 @@ for step in range(N_STEPS):
 
     all_results.append((step, policy_loss.item(), cos_sim, t_total, mem_peak))
 
-    del output, suffix_logits_ps, new_log_prob, old_log_prob, old_log_prob_gpu
+    del suffix_output, suffix_logits_ps, new_log_prob, old_log_prob, old_log_prob_gpu
     del batch, input_ids, attention_mask, position_ids
     torch.cuda.empty_cache()
 
