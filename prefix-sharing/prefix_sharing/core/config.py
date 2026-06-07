@@ -172,9 +172,12 @@ class PrefixSharingConfig:
                 f"Phase 1 要求关闭 fused QKV rope (fused_single_qkv_rope=False)，"
                 f"请修改配置或禁用 prefix sharing。"
             )
-        if self.model_type == "text_only_causal_lm" and model_type != "text_only_causal_lm":
+        if self.model_type == "text_only_causal_lm" and model_type not in (
+            "text_only_causal_lm", "qwen3", "qwen3_5", "qwen2", "qwen2_5",
+            "llama", "mistral", "gpt2", "gpt_neo", "gptj", "opt",
+        ):
             raise PrefixSharingConfigError(
                 f"[Config Error] 当前模型类型 '{model_type}' 不支持当前阶段。"
-                f"Phase 1 仅支持 model_type='text_only_causal_lm' (纯文本因果语言模型)，"
+                f"Phase 1 仅支持纯文本因果语言模型 (如 qwen3, qwen2, llama 等)，"
                 f"请使用支持的模型类型或禁用 prefix sharing。"
             )
