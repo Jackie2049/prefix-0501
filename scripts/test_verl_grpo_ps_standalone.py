@@ -208,8 +208,6 @@ actor_config = {
     "clip_ratio": clip_ratio,
 }
 
-forward_fn = get_mcore_forward_fn(config)
-
 if local_rank == 0:
     mem = torch.cuda.memory_allocated() / 1024**3
     print(f"Loaded {loaded_count} weights, GPU {mem:.2f} GB")
