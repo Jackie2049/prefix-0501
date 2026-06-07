@@ -810,6 +810,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             "pad_token_id": self.generation_config.pad_token_id
             if self.generation_config is not None
             else self.tokenizer.pad_token_id,
+            "max_prompt_length": self.config.rollout.get("max_prompt_length", None) or self.config.data.get("max_prompt_length", 1024),
         }
         prompts.meta_info.update(meta_info)
         if self._is_offload_optimizer:
@@ -870,7 +871,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         """Generate sequences directly using the actor's Megatron model.
 
         Token-by-token autoregressive generation, same format as HFRollout output.
-        Uses the Megatron forward function already set up in the worker.
+        Handles tokenization from raw_prompt (chat messages) since the dataloader
+        returns raw text, not tokenized ids.
         """
         rollout_config = self.config.rollout
 
@@ -879,44 +881,63 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         temperature = prompts.meta_info.get("temperature", rollout_config.temperature)
         response_length = prompts.meta_info.get("response_length", rollout_config.response_length)
         top_p = prompts.meta_info.get("top_p", rollout_config.get("top_p", 1.0))
+        max_prompt_length = prompts.meta_info.get("max_prompt_length", rollout_config.get("max_prompt_length", 1024))
 
         eos_token_id = prompts.meta_info["eos_token_id"]
         pad_token_id = prompts.meta_info["pad_token_id"]
 
-        # Extract input_ids from DataProto - handle both .batch and .non_tensor_batch
-        # Debug: write DataProto structure to file for analysis
-        with open(f"/tmp/native_rollout_debug_rank{torch.distributed.get_rank()}.txt", "w") as f:
-            f.write(f"prompts type={type(prompts)}\n")
-            f.write(f"batch is not None = {prompts.batch is not None}\n")
-            if prompts.batch is not None:
-                f.write(f"batch keys={list(prompts.batch.keys())}\n")
-                f.write(f"batch_size={prompts.batch.batch_size}\n")
-                for key in prompts.batch.keys():
-                    f.write(f"  {key}: shape={prompts.batch[key].shape}, dtype={prompts.batch[key].dtype}\n")
-            f.write(f"non_tensor_batch keys={list(prompts.non_tensor_batch.keys()) if prompts.non_tensor_batch else 'None'}\n")
-            if prompts.non_tensor_batch:
-                for key in prompts.non_tensor_batch.keys():
-                    val = prompts.non_tensor_batch[key]
-                    f.write(f"  {key}: type={type(val)}\n")
-            f.write(f"meta_info keys={list(prompts.meta_info.keys())}\n")
-            for key in prompts.meta_info.keys():
-                f.write(f"  {key}: {prompts.meta_info[key]}\n")
-        if prompts.batch is not None:
-            input_ids = prompts.batch["input_ids"]  # (bs, prompt_length)
-            attention_mask = prompts.batch["attention_mask"]
-            position_ids = prompts.batch.get("position_ids", None)
-        else:
-            # Data may be in non_tensor_batch (rare but possible after TP dispatch)
-            input_ids = prompts.non_tensor_batch["input_ids"]
-            attention_mask = prompts.non_tensor_batch["attention_mask"]
-            position_ids = prompts.non_tensor_batch.get("position_ids", None)
+        # Tokenize raw_prompt from non_tensor_batch
+        # The dataloader returns raw_prompt (chat messages), not input_ids
+        raw_prompts = prompts.non_tensor_batch.get("raw_prompt", None)
 
-        # If position_ids not provided, create them from attention_mask
-        if position_ids is None:
+        if raw_prompts is not None:
+            # Tokenize each prompt using the tokenizer's chat template
+            prompt_ids_list = []
+            for i in range(len(raw_prompts)):
+                messages = raw_prompts[i]
+                if isinstance(messages, list):
+                    # Chat template format: list of message dicts
+                    ids = self.tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True, tokenize=True
+                    )
+                elif isinstance(messages, str):
+                    # Plain string: tokenize directly
+                    ids = self.tokenizer.encode(messages, add_special_tokens=True)
+                else:
+                    raise ValueError(f"Unexpected raw_prompt type: {type(messages)}")
+                # Truncate to max_prompt_length
+                if len(ids) > max_prompt_length:
+                    ids = ids[:max_prompt_length]
+                prompt_ids_list.append(ids)
+
+            # Pad to same length
+            max_len = max(len(ids) for ids in prompt_ids_list)
+            batch_size = len(prompt_ids_list)
+            input_ids = torch.full(
+                (batch_size, max_len), pad_token_id, dtype=torch.long
+            )
+            attention_mask = torch.zeros(batch_size, max_len, dtype=torch.long)
+            for i, ids in enumerate(prompt_ids_list):
+                input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+                attention_mask[i, :len(ids)] = 1
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
+        elif prompts.batch is not None and "input_ids" in prompts.batch.keys():
+            # Already tokenized (legacy path)
+            input_ids = prompts.batch["input_ids"]
+            attention_mask = prompts.batch["attention_mask"]
+            position_ids = prompts.batch.get("position_ids", None)
+            if position_ids is None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 0)
+        else:
+            raise ValueError(
+                f"No raw_prompt or input_ids found in DataProto. "
+                f"batch keys: {list(prompts.batch.keys()) if prompts.batch else 'None'}, "
+                f"non_tensor_batch keys: {list(prompts.non_tensor_batch.keys()) if prompts.non_tensor_batch else 'None'}"
+            )
 
-        device = get_torch_device()
+        device = torch.device(f"cuda:{get_device_id()}")
         input_ids = input_ids.to(device)
         attention_mask = attention_mask.to(device)
         position_ids = position_ids.to(device)
@@ -1010,11 +1031,25 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # Build full input_ids (prompt + response)
         full_input_ids = torch.cat([input_ids, responses], dim=1)
 
+        # Build full attention_mask (prompt_mask + response_mask)
+        prompt_mask = attention_mask.clone()
+        full_attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
+
+        # Build full position_ids
+        # For padded tokens, position_ids should also be 0
+        full_position_ids = torch.cat([
+            position_ids,
+            position_ids[:, -1:] + torch.arange(1, response_length + 1, device=device).unsqueeze(0)
+        ], dim=1)
+        full_position_ids = full_attention_mask * full_position_ids  # zero out padded positions
+
         # Return in same format as HFRollout
         output = DataProto.from_dict(tensors={
             "input_ids": full_input_ids.cpu(),
             "responses": responses.cpu(),
             "response_mask": response_mask.cpu(),
+            "attention_mask": full_attention_mask.cpu(),
+            "position_ids": full_position_ids.cpu(),
         })
         output.meta_info = {
             "eos_token_id": eos_token_id,
@@ -1033,15 +1068,24 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         from verl.utils.megatron_utils import unwrap_model
 
         model = unwrap_model(self.actor_module)
+        # Determine data_format based on use_remove_padding config
+        use_rmpad = getattr(unwrap_model(model).config, 'use_remove_padding', False)
+        data_format = "thd" if use_rmpad else "bshd"
+        # Convert attention_mask to bool for the forward function
+        attn_mask_bool = attention_mask.bool()
+
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             output = forward_fn(
                 model=model,
                 input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=attn_mask_bool,
                 position_ids=position_ids,
+                multi_modal_inputs={},
+                logits_processor=None,
+                logits_processor_args={},
+                data_format=data_format,
             )
-        logits = output["logits"]
-        return logits
+        return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)

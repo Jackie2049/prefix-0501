@@ -44,6 +44,7 @@ print(f"Using device: {device}")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
     torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
     device_map=device,
     local_files_only=True,
 )
