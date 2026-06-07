@@ -59,6 +59,7 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     ++actor_rollout_ref.actor.megatron.use_distributed_optimizer=False \
     actor_rollout_ref.actor.clip_ratio=0.2 \
     actor_rollout_ref.rollout.name=hf \
+    actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
