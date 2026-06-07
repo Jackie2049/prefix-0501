@@ -4,6 +4,12 @@
 
 ## 当前事项
 
+### 2026-06-07：对齐官方 verl + Megatron 的 Qwen3.5/Qwen3.6-27B 依赖版本
+
+**问题**：当前 `dependency/` 里的 verl / Megatron 快照还停留在旧版本，不能作为 Qwen3.5/Qwen3.6-27B RL 训练的可靠基线。后续如果要基于官方 `verl + Megatron + vLLM` 技术路线接入 prefix-sharing，需要先升级并锁定一套能跑通 Qwen3.5/Qwen3.6-27B baseline 的配套依赖，包括 verl、Megatron-LM / Megatron-Core、Megatron-Bridge 或 mbridge、MindSpeed、MindSpeed-MM、vLLM / vLLM-Ascend、CANN / CUDA 等。
+
+**方案**：后续先以官方 Qwen3.5 NPU Megatron recipe 和官方 Qwen3.5/Qwen3.6 Megatron-Bridge 支持为基准，建立无 prefix-sharing baseline；确认 Qwen3.5/Qwen3.6-27B 在 CUDA 和 CANN 环境下的可运行依赖矩阵后，再迁移 prefix-sharing 的 thin integration / patch。升级过程中必须保持 `prefix-sharing` 核心逻辑在本模块内沉淀，`dependency/` 只保留必要使能入口和训练引擎 hook。
+
 ### 2026-06-06：补充 Qwen3.5 NPU 非 packed 路径的 DenseBatchLayout 支持
 
 **问题**：当前 prefix-sharing 主路径假设 Megatron actor 使用 packed / THD token layout：`PrefixSharingPlan`、`PackedBatchLayout`、RoPE、KV split / store / load、prefix-last restore 都围绕 packed 1D 坐标设计。但官方 Qwen3.5 NPU recipe 中 Gated DeltaNet 当前不支持 packed sequence，训练配置需要保持 `use_remove_padding=False` / `use_dynamic_bsz=False`。这意味着 Qwen3.5 NPU 落地时可能走 dense BSHD layout，现有 packed-only runtime 坐标无法直接复用。
