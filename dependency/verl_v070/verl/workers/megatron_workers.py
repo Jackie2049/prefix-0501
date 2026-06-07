@@ -884,12 +884,23 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         pad_token_id = prompts.meta_info["pad_token_id"]
 
         # Extract input_ids from DataProto - handle both .batch and .non_tensor_batch
-        # Debug: print the DataProto structure to understand format
-        print(f"[native_rollout] prompts type: {type(prompts)}, batch={prompts.batch is not None}, "
-              f"non_tensor_batch keys={list(prompts.non_tensor_batch.keys()) if prompts.non_tensor_batch else 'None'}, "
-              f"meta_info keys={list(prompts.meta_info.keys())}")
-        if prompts.batch is not None:
-            print(f"[native_rollout] batch keys={list(prompts.batch.keys())}, batch_size={prompts.batch.batch_size}")
+        # Debug: write DataProto structure to file for analysis
+        with open(f"/tmp/native_rollout_debug_rank{torch.distributed.get_rank()}.txt", "w") as f:
+            f.write(f"prompts type={type(prompts)}\n")
+            f.write(f"batch is not None = {prompts.batch is not None}\n")
+            if prompts.batch is not None:
+                f.write(f"batch keys={list(prompts.batch.keys())}\n")
+                f.write(f"batch_size={prompts.batch.batch_size}\n")
+                for key in prompts.batch.keys():
+                    f.write(f"  {key}: shape={prompts.batch[key].shape}, dtype={prompts.batch[key].dtype}\n")
+            f.write(f"non_tensor_batch keys={list(prompts.non_tensor_batch.keys()) if prompts.non_tensor_batch else 'None'}\n")
+            if prompts.non_tensor_batch:
+                for key in prompts.non_tensor_batch.keys():
+                    val = prompts.non_tensor_batch[key]
+                    f.write(f"  {key}: type={type(val)}\n")
+            f.write(f"meta_info keys={list(prompts.meta_info.keys())}\n")
+            for key in prompts.meta_info.keys():
+                f.write(f"  {key}: {prompts.meta_info[key]}\n")
         if prompts.batch is not None:
             input_ids = prompts.batch["input_ids"]  # (bs, prompt_length)
             attention_mask = prompts.batch["attention_mask"]
