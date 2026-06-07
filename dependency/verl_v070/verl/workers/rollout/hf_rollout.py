@@ -53,10 +53,17 @@ class HFRollout(BaseRollout):
                 self.module = AutoModelForCausalLM.from_pretrained(
                     model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
                 )
-            # Materialize any remaining meta tensors to CPU
+            # Materialize any remaining meta tensors to CPU with random data
+            # Use torch.empty to create real tensors (not meta), preserving
+            # shape and dtype of each meta parameter.
             for name, param in self.module.named_parameters():
                 if param.is_meta:
-                    param.data = torch.empty_like(param.data, device="cpu")
+                    # torch.empty_like preserves dtype but we need to
+                    # explicitly specify device="cpu" and avoid meta
+                    new_param = torch.empty(
+                        param.shape, dtype=param.dtype, device="cpu"
+                    ).normal_()
+                    param.data = new_param
             # Move to current GPU
             device = get_device_name()  # returns "cuda" (device string)
             self.module = self.module.to(device)
