@@ -1,5 +1,5 @@
 # Qwen3.6-27B (16-layer reduced) GRPO training config with prefix-sharing
-# For 8×RTX 4090 (24GB each), TP=4
+# For 8×RTX 4090 (24GB each), TP=4, 4 GPUs
 # Usage: bash scripts/run_grpo_ps.sh
 
 hydra:
@@ -36,11 +36,17 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 2
     ppo_mini_batch_size: 8
     use_kl_loss: False
+    megatron:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 1
+      use_remove_padding: True
 
   ref:
     strategy: megatron
     log_prob_micro_batch_size_per_gpu: 2
-    fsdp_size: -1
+    megatron:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 1
 
   rollout:
     name: hf
@@ -50,6 +56,8 @@ actor_rollout_ref:
     response_length: 128
     temperature: 0.7
     max_num_startups: 1
+    do_sample: True
+    load_format: dummy
 
 algorithm:
   adv_estimator: grpo
@@ -60,10 +68,16 @@ algorithm:
     type: fixed
     kl_coef: 0.001
 
-reward_manager:
-  enable: True
-  reward_type: rule
-  rule_reward_fn_path: ~/rollout-prefix/prefix-0501/scripts/rule_reward.py
+reward_model:
+  enable: False
+
+custom_reward_function:
+  path: ~/rollout-prefix/prefix-0501/scripts/rule_reward.py
+  name: compute_score
+
+critic:
+  enable: False
+  strategy: megatron
 
 trainer:
   total_epochs: 1
