@@ -233,6 +233,11 @@ class ParallelQwen3_6ForCausalLMRmPad(nn.Module):
         input_ids_rmpad, indices, cu_seqlens, max_seqlen_in_batch, *_ = unpad_input(
             input_ids.unsqueeze(dim=-1), attention_mask
         )
+        import os; _lr = int(os.environ.get('LOCAL_RANK', 0))
+        if _lr == 0:
+            print(f"  [DEBUG-RMPAD] input_ids={input_ids.shape} attn_mask={attention_mask.shape} dtype={attention_mask.dtype}")
+            print(f"  [DEBUG-RMPAD] rmpad={input_ids_rmpad.shape} indices={indices.shape} cu_seqlens={cu_seqlens} max_seqlen={max_seqlen_in_batch}")
+            print(f"  [DEBUG-RMPAD] batch={batch_size} seq_len={sequence_length}")
         if self.megatron_config.sequence_parallel:
             input_ids_rmpad = sp_utils.pad_to_sequence_parallel(input_ids_rmpad)
 
