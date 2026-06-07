@@ -296,7 +296,12 @@ class Qwen3_6HybridModel(BaseModelInitializer):
             use_te = True
         except ImportError:
             use_te = False
-        return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=use_te, **extra_kwargs)
+        # Qwen3.6 uses RMSNorm; must pass normalization explicitly so
+        # get_gpt_layer_local_spec switches LNImpl from FusedLayerNorm
+        # to WrappedTorchNorm (FusedLayerNorm does not support RMSNorm)
+        return get_gpt_decoder_block_spec(
+            self.tfconfig, use_transformer_engine=use_te,
+            normalization=self.tfconfig.normalization, **extra_kwargs)
 
     def initialize(self, **kwargs):
         model = super().initialize(**kwargs)
