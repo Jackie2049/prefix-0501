@@ -421,9 +421,12 @@ def _load_hf_model(config, model_config, is_value_model):
         local_model_path = config.model.path
         print(f"load from local dir {local_model_path}")
 
-    src_rank = _megatron_calc_global_rank(tp_rank=0, dp_rank=0, pp_rank=0, cp_rank=mpu.get_context_parallel_rank())
+    # Always load on CPU (not meta device) to avoid meta tensor errors in
+    # the weight loader when TP>1 and src_rank doesn't match local ranks.
+    # init_empty_weights() creates meta tensors which cause
+    # "Cannot copy out of meta tensor; no data!" in _broadcast_tp_shard_tensor_vocab.
     cpu_init_weights = lambda: torch.device("cpu")
-    init_context = init_empty_weights if torch.distributed.get_rank() != src_rank else cpu_init_weights
+    init_context = cpu_init_weights
     with init_context(), warnings.catch_warnings():
         warnings.simplefilter("ignore")
         # TODO: to find a better way to load mistral7b-rm lm_head
