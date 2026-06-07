@@ -271,8 +271,13 @@ if local_rank == 0:
 
 # Install PS patches
 from prefix_sharing.integrations.verl_attention import VerlQwen3_6Integration
-integration = VerlQwen3_6Integration()
-integration.install()
+from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.core.planner import PrefixSharingPlanner
+
+# PS config (used for both integration and planner)
+ps_config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=PREFIX_LEN, min_group_size=N_SEQUENCES)
+integration = VerlQwen3_6Integration(config=ps_config)
+integration.install(model_config=config)
 
 if local_rank == 0:
     print("PS patches installed")
@@ -281,10 +286,8 @@ if local_rank == 0:
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
 from prefix_sharing.core.model_spec import ModelSpec
-from prefix_sharing.core.planner import PrefixSharingPlanner, PrefixSharingConfig
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 
-ps_config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=PREFIX_LEN, min_group_size=N_SEQUENCES)
 sequences_list = [seq.tolist() for seq in full_input_ids]
 ps_plan = PrefixSharingPlanner(ps_config).plan(sequences_list)
 
