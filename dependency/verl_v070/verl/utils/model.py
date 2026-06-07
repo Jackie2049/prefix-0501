@@ -454,6 +454,20 @@ def _load_hf_model(config, model_config, is_value_model):
             )
             state_dict = model.state_dict()
 
+    # Materialize any meta tensors in the state_dict to CPU.
+    # This happens when the HF checkpoint has missing keys (e.g. Qwen3.6
+    # HybridAttention DeltaNet layers whose self_attn weights don't exist
+    # in the checkpoint). Meta tensors cause "Cannot copy out of meta
+    # tensor" in _broadcast_tp_shard_tensor_vocab during TP weight loading.
+    for key in state_dict:
+        if state_dict[key].is_meta:
+            # Create a real CPU tensor with the same shape and dtype
+            state_dict[key] = torch.empty(
+                state_dict[key].shape,
+                dtype=state_dict[key].dtype,
+                device="cpu",
+            )
+
     return architectures, model, state_dict, is_value_model
 
 
