@@ -246,17 +246,20 @@ pos_1_64 = torch.arange(PREFIX_LEN, dtype=torch.long, device=device).unsqueeze(0
 avg_prefix = measure(lambda: model(ids_1_64, attention_mask=mask_1_64, position_ids=pos_1_64))
 
 # --- D: Suffix pass (4 seqs, 64 tokens) ---
-# position_ids use global positions (PREFIX_LEN to PREFIX_LEN+SUFFIX_LEN)
-# because the suffix tokens are at positions 64..127 in the original sequence
+# NOTE: For suffix-only model.forward(), position_ids start from 0.
+# In the real PS monkey-patch, the suffix tokens are at global positions
+# 64..127, but the suffix-only forward treats them as positions 0..63
+# and the monkey-patch adjusts the RoPE positions inside attention.
+# For this timing estimate, we use pos 0..63 (same seq_len, different positions).
 ids_4_64 = torch.randint(0, vocab_size, (4, SUFFIX_LEN), device=device)
 mask_4_64 = torch.ones(4, SUFFIX_LEN, dtype=torch.long, device=device)
-pos_4_64 = torch.arange(PREFIX_LEN, PREFIX_LEN + SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(4, -1)
+pos_4_64 = torch.arange(SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(4, -1)
 avg_suffix_4 = measure(lambda: model(ids_4_64, attention_mask=mask_4_64, position_ids=pos_4_64))
 
 # --- E: Suffix pass n=2 (2 seqs, 64 tokens) ---
 ids_2_64 = torch.randint(0, vocab_size, (2, SUFFIX_LEN), device=device)
 mask_2_64 = torch.ones(2, SUFFIX_LEN, dtype=torch.long, device=device)
-pos_2_64 = torch.arange(PREFIX_LEN, PREFIX_LEN + SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(2, -1)
+pos_2_64 = torch.arange(SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(2, -1)
 avg_suffix_2 = measure(lambda: model(ids_2_64, attention_mask=mask_2_64, position_ids=pos_2_64))
 
 # ===== Results =====
