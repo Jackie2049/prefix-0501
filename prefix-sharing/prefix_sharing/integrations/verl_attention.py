@@ -246,7 +246,7 @@ def _make_verl_attention_patch(original_forward: Any) -> Any:
             cu_seqlens_k = torch.tensor(
                 [0] + [prefix_len + suffix_len] * N,
                 device=hidden_states.device, dtype=torch.int32,
-            ).cumsum(0)
+            ).cumsum(0).to(torch.int32)
 
             input_dtype = query_states.dtype
             if input_dtype == torch.float32:
