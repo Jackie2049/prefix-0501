@@ -36,8 +36,8 @@ from safetensors.torch import load_file
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only")
 TP_SIZE = 4
 PREFIX_LEN = 64    # Must be multiple of DeltaNet chunk_size (64) for bf16 precision
-SUFFIX_LEN = 64    # Short response
-N_SEQUENCES = 4    # Fit in 24GB GPU (8 would OOM with 27B vocab)
+SUFFIX_LEN = 32    # Short response
+N_SEQUENCES = 8    # GRPO n=8 scenario (reduced suffix to fit in 24GB)
 SEED = 42
 N_WARMUP = 2       # Warmup iterations
 N_MEASURE = 5      # Measurement iterations
