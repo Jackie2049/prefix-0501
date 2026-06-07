@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Quick timing of model.forward() for prefix and suffix passes.
 
-This gives us the monkey-patch PS ON estimated timing:
-- Prefix pass: model.forward(1, prefix_len) — no_grad, captures KV/DeltaNet
-- Suffix pass: model.forward(N, suffix_len) — with_grad + state injection
-
-The monkey-patch overhead (KV expansion, DeltaNet state injection) is minimal
-because it happens inside the attention.forward() call.
+Measures inference-only model.forward() timings to estimate the monkey-patch
+PS ON timing. Both PS OFF and PS ON use model.forward() (fused kernels),
+so this gives the upper bound for PS speedup.
 
 Usage: torchrun --nproc_per_node=4 scripts/quick_model_forward_timing.py
 """
@@ -23,6 +20,7 @@ sys.path.insert(0, prefix_path)
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig
+from safetensors.torch import load_file
 
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only-16layers")
 TP_SIZE = 4
@@ -46,6 +44,7 @@ parallel_state.initialize_model_parallel(
     tensor_model_parallel_size=TP_SIZE, pipeline_model_parallel_size=1,
     context_parallel_size=1, expert_model_parallel_size=1,
 )
+tp_rank = parallel_state.get_tensor_model_parallel_rank()
 device = torch.device(f"cuda:{local_rank}")
 
 # ===== Load config and model =====
@@ -54,7 +53,6 @@ vocab_size = config.vocab_size
 
 from verl.models.qwen3_6.megatron.modeling_qwen3_6_megatron import ParallelQwen3_6ForCausalLM
 from megatron.core import ModelParallelConfig
-from safetensors.torch import load_file
 
 megatron_config = ModelParallelConfig(
     tensor_model_parallel_size=TP_SIZE, pipeline_model_parallel_size=1,
@@ -65,8 +63,6 @@ model = ParallelQwen3_6ForCausalLM(config=config, megatron_config=megatron_confi
 # ===== Load weights (same as other benchmarks) =====
 def shard_tensor(tensor, dim, tp_size, tp_rank):
     return torch.chunk(tensor, tp_size, dim=dim)[tp_rank].contiguous()
-
-tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
 hf_state_dict = {}
 for fname in os.listdir(HF_MODEL_PATH):
@@ -211,7 +207,9 @@ if local_rank == 0:
 
 torch.manual_seed(42)
 
-# --- A: PS OFF n=4 (4 seqs, 128 tokens) ---
+# CRITICAL: Run longest sequence first to set rotary_emb cos/sin cache
+# (max_seq_len_cached must be >= PREFIX_LEN + SUFFIX_LEN = 128)
+# This warmup call sets the cache.
 ids_4_128 = torch.randint(0, vocab_size, (4, total_len), device=device)
 mask_4_128 = torch.ones(4, total_len, dtype=torch.long, device=device)
 pos_4_128 = torch.arange(total_len, dtype=torch.long, device=device).unsqueeze(0).expand(4, -1)
@@ -220,124 +218,71 @@ with torch.no_grad():
     model(ids_4_128, attention_mask=mask_4_128, position_ids=pos_4_128)
 torch.cuda.synchronize()
 
-times_off = []
-for i in range(10):
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with torch.no_grad():
-        model(ids_4_128, attention_mask=mask_4_128, position_ids=pos_4_128)
-    torch.cuda.synchronize()
-    t1 = time.time()
-    times_off.append(t1 - t0)
+def measure(fn, n_runs=10):
+    """Measure average time over n_runs."""
+    times = []
+    for i in range(n_runs):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        fn()
+        torch.cuda.synchronize()
+        t1 = time.time()
+        times.append(t1 - t0)
+    return sum(times) / len(times)
 
-avg_off_4 = sum(times_off) / len(times_off)
+# --- A: PS OFF n=4 (4 seqs, 128 tokens) ---
+avg_off_4 = measure(lambda: model(ids_4_128, attention_mask=mask_4_128, position_ids=pos_4_128))
 
-# --- B: Prefix pass (1 seq, 64 tokens) ---
-ids_1_64 = torch.randint(0, vocab_size, (1, PREFIX_LEN), device=device)
-mask_1_64 = torch.ones(1, PREFIX_LEN, dtype=torch.long, device=device)
-pos_1_64 = torch.arange(PREFIX_LEN, dtype=torch.long, device=device).unsqueeze(0)
-
-with torch.no_grad():
-    model(ids_1_64, attention_mask=mask_1_64, position_ids=pos_1_64)
-torch.cuda.synchronize()
-
-times_prefix = []
-for i in range(10):
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with torch.no_grad():
-        model(ids_1_64, attention_mask=mask_1_64, position_ids=pos_1_64)
-    torch.cuda.synchronize()
-    t1 = time.time()
-    times_prefix.append(t1 - t0)
-
-avg_prefix = sum(times_prefix) / len(times_prefix)
-
-# --- C: Suffix pass (4 seqs, 64 tokens) ---
-ids_4_64 = torch.randint(0, vocab_size, (4, SUFFIX_LEN), device=device)
-mask_4_64 = torch.ones(4, SUFFIX_LEN, dtype=torch.long, device=device)
-pos_4_64 = torch.arange(PREFIX_LEN, PREFIX_LEN + SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(4, -1)
-
-with torch.no_grad():
-    model(ids_4_64, attention_mask=mask_4_64, position_ids=pos_4_64)
-torch.cuda.synchronize()
-
-times_suffix = []
-for i in range(10):
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with torch.no_grad():
-        model(ids_4_64, attention_mask=mask_4_64, position_ids=pos_4_64)
-    torch.cuda.synchronize()
-    t1 = time.time()
-    times_suffix.append(t1 - t0)
-
-avg_suffix_4 = sum(times_suffix) / len(times_suffix)
-
-# --- D: n=2 PS OFF (2 seqs, 128 tokens) ---
+# --- B: PS OFF n=2 (2 seqs, 128 tokens) ---
 ids_2_128 = torch.randint(0, vocab_size, (2, total_len), device=device)
 mask_2_128 = torch.ones(2, total_len, dtype=torch.long, device=device)
 pos_2_128 = torch.arange(total_len, dtype=torch.long, device=device).unsqueeze(0).expand(2, -1)
+avg_off_2 = measure(lambda: model(ids_2_128, attention_mask=mask_2_128, position_ids=pos_2_128))
 
-with torch.no_grad():
-    model(ids_2_128, attention_mask=mask_2_128, position_ids=pos_2_128)
-torch.cuda.synchronize()
+# --- C: Prefix pass (1 seq, 64 tokens) ---
+ids_1_64 = torch.randint(0, vocab_size, (1, PREFIX_LEN), device=device)
+mask_1_64 = torch.ones(1, PREFIX_LEN, dtype=torch.long, device=device)
+pos_1_64 = torch.arange(PREFIX_LEN, dtype=torch.long, device=device).unsqueeze(0)
+avg_prefix = measure(lambda: model(ids_1_64, attention_mask=mask_1_64, position_ids=pos_1_64))
 
-times_off_2 = []
-for i in range(10):
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with torch.no_grad():
-        model(ids_2_128, attention_mask=mask_2_128, position_ids=pos_2_128)
-    torch.cuda.synchronize()
-    t1 = time.time()
-    times_off_2.append(t1 - t0)
-
-avg_off_2 = sum(times_off_2) / len(times_off)
+# --- D: Suffix pass (4 seqs, 64 tokens) ---
+# position_ids use global positions (PREFIX_LEN to PREFIX_LEN+SUFFIX_LEN)
+# because the suffix tokens are at positions 64..127 in the original sequence
+ids_4_64 = torch.randint(0, vocab_size, (4, SUFFIX_LEN), device=device)
+mask_4_64 = torch.ones(4, SUFFIX_LEN, dtype=torch.long, device=device)
+pos_4_64 = torch.arange(PREFIX_LEN, PREFIX_LEN + SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(4, -1)
+avg_suffix_4 = measure(lambda: model(ids_4_64, attention_mask=mask_4_64, position_ids=pos_4_64))
 
 # --- E: Suffix pass n=2 (2 seqs, 64 tokens) ---
 ids_2_64 = torch.randint(0, vocab_size, (2, SUFFIX_LEN), device=device)
 mask_2_64 = torch.ones(2, SUFFIX_LEN, dtype=torch.long, device=device)
 pos_2_64 = torch.arange(PREFIX_LEN, PREFIX_LEN + SUFFIX_LEN, dtype=torch.long, device=device).unsqueeze(0).expand(2, -1)
-
-with torch.no_grad():
-    model(ids_2_64, attention_mask=mask_2_64, position_ids=pos_2_64)
-torch.cuda.synchronize()
-
-times_suffix_2 = []
-for i in range(10):
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with torch.no_grad():
-        model(ids_2_64, attention_mask=mask_2_64, position_ids=pos_2_64)
-    torch.cuda.synchronize()
-    t1 = time.time()
-    times_suffix_2.append(t1 - t0)
-
-avg_suffix_2 = sum(times_suffix_2) / len(times_suffix_2)
+avg_suffix_2 = measure(lambda: model(ids_2_64, attention_mask=mask_2_64, position_ids=pos_2_64))
 
 # ===== Results =====
 if local_rank == 0:
     print(f"\n{'='*60}")
     print("RESULTS: model.forward() timing (no_grad, inference)")
     print(f"{'='*60}")
-    print(f"PS OFF n=2 (2×128): {avg_off_2*1000:.1f}ms")
-    print(f"PS OFF n=4 (4×128): {avg_off_4*1000:.1f}ms")
-    print(f"Prefix pass (1×64): {avg_prefix*1000:.1f}ms")
-    print(f"Suffix pass n=2 (2×64): {avg_suffix_2*1000:.1f}ms")
-    print(f"Suffix pass n=4 (4×64): {avg_suffix_4*1000:.1f}ms")
+    print(f"PS OFF n=2 (2x128):  {avg_off_2*1000:.1f}ms")
+    print(f"PS OFF n=4 (4x128):  {avg_off_4*1000:.1f}ms")
+    print(f"Prefix pass (1x64):  {avg_prefix*1000:.1f}ms")
+    print(f"Suffix pass n=2 (2x64): {avg_suffix_2*1000:.1f}ms")
+    print(f"Suffix pass n=4 (4x64): {avg_suffix_4*1000:.1f}ms")
     print(f"{'='*60}")
-    print(f"Estimated monkey-patch PS ON (n=2): prefix={avg_prefix*1000:.0f}ms + suffix={avg_suffix_2*1000:.0f}ms = {(avg_prefix+avg_suffix_2)*1000:.0f}ms")
-    print(f"Estimated monkey-patch PS ON (n=4): prefix={avg_prefix*1000:.0f}ms + suffix={avg_suffix_4*1000:.0f}ms = {(avg_prefix+avg_suffix_4)*1000:.0f}ms")
+    ps_on_2 = avg_prefix + avg_suffix_2
+    ps_on_4 = avg_prefix + avg_suffix_4
+    print(f"Estimated monkey-patch PS ON (n=2): {ps_on_2*1000:.0f}ms")
+    print(f"Estimated monkey-patch PS ON (n=4): {ps_on_4*1000:.0f}ms")
     print(f"{'='*60}")
-    speedup_2 = avg_off_2 / (avg_prefix + avg_suffix_2)
-    speedup_4 = avg_off_4 / (avg_prefix + avg_suffix_4)
+    speedup_2 = avg_off_2 / ps_on_2
+    speedup_4 = avg_off_4 / ps_on_4
     print(f"Estimated speedup n=2: {speedup_2:.2f}x (theoretical: 1.33x)")
     print(f"Estimated speedup n=4: {speedup_4:.2f}x (theoretical: 1.60x)")
     print(f"{'='*60}")
-    print(f"NOTE: These are inference-only timings (no_grad). Training")
-    print(f"timings include backward + optimizer, which have different ratios.")
-    print(f"But the forward speedup should translate proportionally.")
+    print(f"NOTE: These are forward-only (inference) timings.")
+    print(f"Training includes backward + optimizer (~2-3x forward cost),")
+    print(f"but forward speedup translates to overall training speedup")
 
 parallel_state.destroy_model_parallel()
 dist.destroy_process_group()
