@@ -2,6 +2,9 @@
 # verl GRPO + PS training test on 8×RTX 4090
 # Uses 16-layer reduced Qwen3.6-27B model with prefix-sharing enabled
 # Settings: n=4, TP=4, disable mbridge (no transformer_engine on RTX 4090)
+#
+# Rollout uses MegatronNativeRollout (same model as actor, no separate model)
+# This avoids OOM on RTX 4090 (24GB) by not loading a second model.
 
 set -e
 
@@ -25,6 +28,8 @@ ray start --head --port=6379 --num-gpus=8 2>/dev/null || true
 # Key config notes:
 # - use_mbridge=False: skip mbridge (no transformer_engine on RTX 4090)
 # - TP=4 for both actor.megatron and rollout
+# - rollout.name=hf, rollout.mode=sync: uses MegatronNativeRollout
+#   (colocated with actor, no separate model loaded, avoids OOM)
 # - train_batch_size=8, n=4 → real_batch=32, minimal_bsz=2*4=8 (divisible)
 # - ppo_micro_batch_size_per_gpu=2 to keep memory safe
 # - use_distributed_optimizer=False: apex FusedAdam not compiled on RTX 4090,

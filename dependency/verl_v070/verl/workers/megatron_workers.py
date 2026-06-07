@@ -527,14 +527,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         if rollout_config.name == "hf" and rollout_config.mode == "sync":
-            # For HF sync rollout, load a separate HF model for generation.
-            # This avoids the need for vLLM/SGLang server.
-            from verl.workers.rollout.hf_rollout import HFRollout
-            self.rollout = HFRollout(config=rollout_config, model_config=model_config, device_mesh=None)
+            # MegatronNativeRollout: uses the same Megatron model as the actor.
+            # No separate model is loaded, avoiding OOM on limited-memory GPUs.
+            # Actor_module reference will be set after init_model completes.
+            from verl.workers.rollout.megatron_native_rollout import MegatronNativeRollout
+            self.rollout = MegatronNativeRollout(
+                config=rollout_config, model_config=model_config,
+                device_mesh=None, actor_module=None,
+            )
+            self._is_native_rollout = True
         else:
             self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
             )
+            self._is_native_rollout = False
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # 5. switch to trainer mode
@@ -610,6 +616,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_rollout:
             with use_original_torch_compile():
                 self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            # For native rollout, set actor_module reference after actor init
+            if getattr(self, '_is_native_rollout', False) and self._is_actor:
+                self.rollout.set_actor_module(
+                    self.actor_module, self.hf_config, self.tf_config
+                )
             log_gpu_memory_usage("After rollout init", logger=logger)
 
         if self._is_ref:
@@ -672,6 +683,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         set_expandable_segments(False)
 
+        # For native rollout (same model as actor), skip weight export/offload
+        if getattr(self, '_is_native_rollout', False):
+            # Just put the model in eval mode for generation
+            await self.rollout.resume(tags=["weights"])
+            # Set random states for reproducible generation across TP ranks
+            self.torch_random_states = get_torch_device().get_rng_state()
+            get_torch_device().set_rng_state(self.gen_random_states)
+            return
+
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
@@ -705,6 +725,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
+        # For native rollout, just put model back in train mode
+        if getattr(self, '_is_native_rollout', False):
+            await self.rollout.release()
+            # Restore random states
+            self.gen_random_states = get_torch_device().get_rng_state()
+            get_torch_device().set_rng_state(self.torch_random_states)
+            return
+
         if self.config.rollout.free_cache_engine:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
             await self.rollout.release()
