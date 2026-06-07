@@ -42,6 +42,20 @@ class HFRollout(BaseRollout):
         self.config = config
         self.module = module
 
+    # Stub implementations for abstract methods from BaseRollout
+    # (async server-mode methods not needed for HF sync rollout)
+    async def resume(self, tags: list[str]):
+        """Not needed for HF sync rollout."""
+        pass
+
+    async def update_weights(self, weights, **kwargs):
+        """Not needed for HF sync rollout - weights are always in memory."""
+        pass
+
+    async def release(self):
+        """Not needed for HF sync rollout."""
+        pass
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
         num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
