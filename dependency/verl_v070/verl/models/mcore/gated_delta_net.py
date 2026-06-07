@@ -31,7 +31,6 @@ from megatron.core import tensor_parallel
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.process_groups_config import ProcessGroupCollection
 
 
 class GatedDeltaNetAttention(SelfAttention):
@@ -54,7 +53,6 @@ class GatedDeltaNetAttention(SelfAttention):
         layer_number: int,
         attn_mask_type=AttnMaskType.causal,
         cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
         partial_rotary_factor: float = 1.0,
         attn_output_gate: bool = False,
     ):
@@ -64,7 +62,6 @@ class GatedDeltaNetAttention(SelfAttention):
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             cp_comm_type=cp_comm_type,
-            pg_collection=pg_collection,
         )
 
         self.partial_rotary_factor = partial_rotary_factor
