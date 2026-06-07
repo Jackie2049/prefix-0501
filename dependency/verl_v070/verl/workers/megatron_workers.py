@@ -884,6 +884,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         pad_token_id = prompts.meta_info["pad_token_id"]
 
         # Extract input_ids from DataProto - handle both .batch and .non_tensor_batch
+        # Debug: print the DataProto structure to understand format
+        print(f"[native_rollout] prompts type: {type(prompts)}, batch={prompts.batch is not None}, "
+              f"non_tensor_batch keys={list(prompts.non_tensor_batch.keys()) if prompts.non_tensor_batch else 'None'}, "
+              f"meta_info keys={list(prompts.meta_info.keys())}")
+        if prompts.batch is not None:
+            print(f"[native_rollout] batch keys={list(prompts.batch.keys())}, batch_size={prompts.batch.batch_size}")
         if prompts.batch is not None:
             input_ids = prompts.batch["input_ids"]  # (bs, prompt_length)
             attention_mask = prompts.batch["attention_mask"]
