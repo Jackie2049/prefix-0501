@@ -816,15 +816,30 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
+            if getattr(self, '_is_native_rollout', False):
+                # Native rollout: sync context switch (no async needed)
+                # Just put model in eval mode for generation
+                for module in self.actor_module:
+                    module.eval()
+                self.torch_random_states = get_torch_device().get_rng_state()
+                get_torch_device().set_rng_state(self.gen_random_states)
+            else:
+                loop = get_event_loop()
+                loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
+            if getattr(self, '_is_native_rollout', False):
+                # Native rollout: sync context switch back to train mode
+                for module in self.actor_module:
+                    module.train()
+                self.gen_random_states = get_torch_device().get_rng_state()
+                get_torch_device().set_rng_state(self.torch_random_states)
+            else:
+                loop.run_until_complete(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks
