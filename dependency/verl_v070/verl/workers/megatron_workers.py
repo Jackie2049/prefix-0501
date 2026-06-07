@@ -526,9 +526,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        if rollout_config.name == "hf" and rollout_config.mode == "sync":
+            # For HF sync rollout, load the full HF model directly.
+            # No device_mesh or TP needed - HF models don't support TP.
+            from transformers import AutoModelForCausalLM
+            from verl.workers.rollout.hf_rollout import HFRollout
+            self.rollout = HFRollout(config=rollout_config, model_config=model_config, device_mesh=None)
+        else:
+            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+            )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # 5. switch to trainer mode

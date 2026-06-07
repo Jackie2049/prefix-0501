@@ -37,10 +37,32 @@ __all__ = ["HFRollout"]
 
 
 class HFRollout(BaseRollout):
-    def __init__(self, module: nn.Module, config):
-        super().__init__()
-        self.config = config
-        self.module = module
+    def __init__(self, config, model_config=None, device_mesh=None):
+        if model_config is not None:
+            # New init path: load HF model from model_config.path
+            # device_mesh may be None for sync mode (no TP needed)
+            from transformers import AutoModelForCausalLM
+            model_path = model_config.path
+            print(f"HFRollout: loading model from {model_path}")
+            # For sync mode, load on current GPU only (no TP)
+            device = get_torch_device()
+            self.module = AutoModelForCausalLM.from_pretrained(
+                model_path, torch_dtype=torch.bfloat16
+            ).to(device)
+            # Use omega_conf_to_dataclass for config (RolloutConfig fields)
+            from verl.utils.config import omega_conf_to_dataclass
+            from verl.workers.config import RolloutConfig
+            if hasattr(config, '__class__') and config.__class__.__name__ != 'RolloutConfig':
+                self.config = omega_conf_to_dataclass(config, dataclass_type=RolloutConfig)
+            else:
+                self.config = config
+            self.device_mesh = device_mesh
+            self.model_config = model_config
+        else:
+            # Legacy init path (module-based, no model loading)
+            self.config = config
+            self.module = None
+            self.device_mesh = None
 
     # Stub implementations for abstract methods from BaseRollout
     # (async server-mode methods not needed for HF sync rollout)
