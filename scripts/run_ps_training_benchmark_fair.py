@@ -552,11 +552,16 @@ for step in range(NUM_WARMUP + NUM_STEPS):
 
 avg_off_model = sum(times_off_model) / len(times_off_model)
 
+# Free memory before next section
+del optimizer
+torch.cuda.empty_cache()
+gc.collect()
+
 # --- B: PS OFF manual forward (fair baseline) ---
 if local_rank == 0:
     print("\n[B] PS OFF manual forward — fair baseline (same overhead as PS ON)")
 model.train()
-optimizer.zero_grad()
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.999), weight_decay=0.01)
 
 times_off_manual = []
 for step in range(NUM_WARMUP + NUM_STEPS):
@@ -584,10 +589,16 @@ for step in range(NUM_WARMUP + NUM_STEPS):
 
 avg_off_manual = sum(times_off_manual) / len(times_off_manual)
 
+# Free memory before next section
+del optimizer
+torch.cuda.empty_cache()
+gc.collect()
+
 # --- C: PS ON manual two-pass forward ---
 if local_rank == 0:
     print("\n[C] PS ON manual two-pass — PS optimization (same overhead as PS OFF manual)")
 model.train()
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.999), weight_decay=0.01)
 optimizer.zero_grad()
 
 times_on_manual = []
