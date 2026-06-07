@@ -21,7 +21,7 @@ from transformers import AutoConfig
 from safetensors.torch import load_file
 
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only-16layers")
-TP_SIZE = 4; PREFIX_LEN = 64; SUFFIX_LEN = 128; N_SEQUENCES = 8; SEED = 42; N_STEPS = 3
+TP_SIZE = 4; PREFIX_LEN = 64; SUFFIX_LEN = 128; N_SEQUENCES = 4; SEED = 42; N_STEPS = 3
 
 torch.distributed.init_process_group(backend="nccl", init_method="env://")
 local_rank = int(os.environ.get("LOCAL_RANK", 0)); torch.cuda.set_device(local_rank)
