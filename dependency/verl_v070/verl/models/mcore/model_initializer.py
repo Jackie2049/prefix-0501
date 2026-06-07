@@ -296,9 +296,18 @@ class Qwen3_6HybridModel(BaseModelInitializer):
             use_te = True
         except ImportError:
             use_te = False
-        # Qwen3.6 uses RMSNorm; must pass normalization explicitly so
-        # get_gpt_layer_local_spec switches LNImpl from FusedLayerNorm
-        # to WrappedTorchNorm (FusedLayerNorm does not support RMSNorm)
+
+        # Qwen3.6 uses RMSNorm; must ensure LNImpl is WrappedTorchNorm BEFORE
+        # calling get_gpt_decoder_block_spec, because it captures the global LNImpl
+        # for block-level final_layernorm at line 340 BEFORE calling
+        # get_gpt_layer_local_spec which later changes LNImpl. FusedLayerNorm
+        # (the default LNImpl when apex is partially importable) does NOT support
+        # RMSNorm, causing an AssertionError at TransformerBlock._build_layers().
+        if not use_te and self.tfconfig.normalization == "RMSNorm":
+            import megatron.core.models.gpt.gpt_layer_specs as specs_module
+            from megatron.core.transformer.torch_norm import WrappedTorchNorm
+            specs_module.LNImpl = WrappedTorchNorm
+
         return get_gpt_decoder_block_spec(
             self.tfconfig, use_transformer_engine=use_te,
             normalization=self.tfconfig.normalization, **extra_kwargs)
