@@ -290,7 +290,13 @@ class Qwen3_6HybridModel(BaseModelInitializer):
     def get_transformer_layer_spec(self, vp_stage=None):
         assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
-        return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+        # Check if Transformer Engine is available at runtime
+        try:
+            from megatron.core.extensions.transformer_engine import TENorm  # noqa: F401
+            use_te = True
+        except ImportError:
+            use_te = False
+        return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=use_te, **extra_kwargs)
 
     def initialize(self, **kwargs):
         model = super().initialize(**kwargs)

@@ -60,6 +60,7 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     ++actor_rollout_ref.ref.megatron.use_mbridge=False \
     ++actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4 \
+    ++actor_rollout_ref.ref.megatron.sequence_parallel=False \
     trainer.total_epochs=1 \
     trainer.total_training_steps=3 \
     trainer.project_name=prefix_sharing_qwen3_6 \
