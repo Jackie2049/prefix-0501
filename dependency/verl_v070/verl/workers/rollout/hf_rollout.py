@@ -47,7 +47,7 @@ class HFRollout(BaseRollout):
             # For sync mode, load on current GPU only (no TP)
             device = get_device_name()  # returns "cuda" (device string)
             self.module = AutoModelForCausalLM.from_pretrained(
-                model_path, torch_dtype=torch.bfloat16
+                model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
             )
             self.module = self.module.to(device)
             # Use omega_conf_to_dataclass for config (RolloutConfig fields)
