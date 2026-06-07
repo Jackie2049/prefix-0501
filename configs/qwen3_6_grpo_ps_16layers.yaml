@@ -1,8 +1,6 @@
 # Qwen3.6-27B (16-layer reduced) GRPO training config with prefix-sharing
 # For 8×RTX 4090 (24GB each), TP=4
-# Usage: python -m verl.trainer.main_ppo \
-#   actor_rollout_ref.model.path=~/rollout-prefix/models/Qwen3-27B-text-only-16layers \
-#   +trainer/config/qwen3_6_grpo_ps_16layers
+# Usage: bash scripts/run_grpo_ps.sh
 
 hydra:
   searchpath:
@@ -13,10 +11,14 @@ defaults:
   - _self_
 
 data:
+  train_files: ~/rollout-prefix/prefix-0501/data/gsm8k_train.parquet
+  val_files: ~/rollout-prefix/prefix-0501/data/gsm8k_test.parquet
   max_prompt_length: 64
   max_response_length: 128
-  train_batch_size: 8  # GRPO n=8 sequences per prompt
+  train_batch_size: 8
   return_raw_chat: True
+  prompt_key: prompt
+  reward_fn_key: data_source
 
 actor_rollout_ref:
   hybrid_engine: True
@@ -26,23 +28,28 @@ actor_rollout_ref:
     override_config:
       model_config: {}
     use_fused_kernels: False
-    use_remove_padding: True  # Required for prefix-sharing
+    use_remove_padding: True
+    external_lib: null
 
   actor:
     strategy: megatron
-    ppo_micro_batch_size_per_gpu: 8
+    ppo_micro_batch_size_per_gpu: 2
     ppo_mini_batch_size: 8
-    ppo_micro_batch_size: 8
-    prefix_sharing_config:
-      enable_prefix_sharing: True
-      min_prefix_len: 64
-      min_group_size: 8
+    use_kl_loss: False
+
+  ref:
+    strategy: megatron
+    log_prob_micro_batch_size_per_gpu: 2
+    fsdp_size: -1
 
   rollout:
     name: hf
-    mode: sync  # Required for native rollout without vLLM
+    mode: sync
     tensor_model_parallel_size: 4
-    n: 8  # GRPO: generate 8 responses per prompt
+    n: 8
+    response_length: 128
+    temperature: 0.7
+    max_num_startups: 1
 
 algorithm:
   adv_estimator: grpo
@@ -53,13 +60,18 @@ algorithm:
     type: fixed
     kl_coef: 0.001
 
+reward_manager:
+  enable: True
+  reward_type: rule
+  rule_reward_fn_path: ~/rollout-prefix/prefix-0501/scripts/rule_reward.py
+
 trainer:
-  total_epochs: 3
-  total_training_steps: 100
+  total_epochs: 1
+  total_training_steps: 5
   project_name: prefix_sharing_qwen3_6
   experiment_name: grpo_ps_16layers
   logger: ["console"]
   nnodes: 1
-  n_gpus_per_node: 8
+  n_gpus_per_node: 4
   save_freq: -1
   val_before_train: False
