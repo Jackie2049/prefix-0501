@@ -293,12 +293,6 @@ for step in range(N_STEPS):
             _prefix_mask = ps_runtime_state.prefix_attention_mask
             _prefix_pos = ps_runtime_state.prefix_position_ids
 
-            if local_rank == 0:
-                print(f"  [DEBUG] prefix pass shapes: ids={_prefix_ids.shape} mask={_prefix_mask.shape} dtype={_prefix_mask.dtype} pos={_prefix_pos.shape}")
-                print(f"  [DEBUG] prefix mask values: all_true={_prefix_mask.all().item()}, sum={_prefix_mask.sum().item()}")
-                print(f"  [DEBUG] suffix batch shapes: ids={input_ids.shape} mask={attention_mask.shape} dtype={attention_mask.dtype} pos={position_ids.shape}")
-                print(f"  [DEBUG] suffix mask: true_count={attention_mask.sum().item()}, total={attention_mask.numel()}")
-
             with torch.no_grad():
                 prefix_output = model(input_ids=_prefix_ids,
                                      attention_mask=_prefix_mask,

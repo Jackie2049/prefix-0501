@@ -301,8 +301,18 @@ def build_prefix_sharing_micro_batch(
         logger.warning("[PS][prepare] No provider found in prefix sharing plan, falling back to single-pass")
         return batch, None
 
+    # IMPORTANT: provider's own prefix_lens[provider_idx] is 0 (providers don't reuse).
+    # The actual shared prefix length comes from the reuse_specs — the maximum prefix_len
+    # among all reusers that reference this provider.
+    provider_prefix_len = 0
+    for spec in prefix_sharing_plan.reuse_specs:
+        if spec.provider_idx_in_batch == provider_idx:
+            provider_prefix_len = max(provider_prefix_len, spec.prefix_len)
+    if provider_prefix_len == 0:
+        logger.warning("[PS][prepare] No reuse specs with prefix_len>0 for provider %s, falling back", provider_idx)
+        return batch, None
+
     provider_indices = valid_indices[provider_idx]
-    provider_prefix_len = prefix_sharing_plan.prefix_lens[provider_idx]
 
     # Provider's prefix tokens: positions 0..prefix_len-1 (before suffix)
     prefix_token_indices = provider_indices[:provider_prefix_len]
