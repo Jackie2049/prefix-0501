@@ -14,9 +14,12 @@ except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
         from apex.optimizers import FusedSGD as SGD
-    except ImportError:
+    except (ImportError, RuntimeError):
+        # RuntimeError occurs when apex is installed but CUDA extensions
+        # are not compiled (e.g. apex.optimizers.FusedAdam on RTX 4090
+        # without compiled extensions). Fall back to torch.optim.AdamW.
         warnings.warn(
-            f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
+            f'Transformer Engine and Apex are not available. Falling back to Torch optimizers.'
         )
 
         # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
@@ -349,7 +352,23 @@ def _get_megatron_optimizer_based_on_param_groups(
                 if is_te_min_version("2.1.0.dev0"):
                     kwargs.update({"store_param_remainders": True})
 
-            optimizer = Adam(**kwargs)
+            try:
+                optimizer = Adam(**kwargs)
+            except RuntimeError:
+                # apex FusedAdam may import successfully but fail at
+                # instantiation if CUDA extensions are not compiled.
+                # Fall back to torch.optim.AdamW, filtering out TE/apex-
+                # specific kwargs that AdamW doesn't accept.
+                from torch.optim import AdamW as TorchAdamW
+                warnings.warn(
+                    'Apex/TE FusedAdam failed to instantiate. '
+                    'Falling back to torch.optim.AdamW.'
+                )
+                adamw_kwargs = {
+                    k: v for k, v in kwargs.items()
+                    if k in ('params', 'lr', 'weight_decay', 'betas', 'eps')
+                }
+                optimizer = TorchAdamW(**adamw_kwargs)
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:
