@@ -45,10 +45,11 @@ class HFRollout(BaseRollout):
             model_path = model_config.path
             print(f"HFRollout: loading model from {model_path}")
             # For sync mode, load on current GPU only (no TP)
-            device = get_torch_device()
+            device = get_device_name()  # returns "cuda" (device string)
             self.module = AutoModelForCausalLM.from_pretrained(
                 model_path, torch_dtype=torch.bfloat16
-            ).to(device)
+            )
+            self.module = self.module.to(device)
             # Use omega_conf_to_dataclass for config (RolloutConfig fields)
             from verl.utils.config import omega_conf_to_dataclass
             from verl.workers.config import RolloutConfig
