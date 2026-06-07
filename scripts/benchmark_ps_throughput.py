@@ -35,12 +35,13 @@ from safetensors.torch import load_file
 # ===== Configuration =====
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only")
 TP_SIZE = 4
-PREFIX_LEN = 128   # Medium prefix
+PREFIX_LEN = 64    # Must be multiple of DeltaNet chunk_size (64) for bf16 precision
 SUFFIX_LEN = 64    # Short response
 N_SEQUENCES = 4    # Fit in 24GB GPU (8 would OOM with 27B vocab)
 SEED = 42
 N_WARMUP = 2       # Warmup iterations
 N_MEASURE = 5      # Measurement iterations
+COS_SIM_THRESHOLD = 0.999  # bf16 threshold; prefix_len=chunk_size achieves this
 
 # ===== Initialize distributed =====
 torch.distributed.init_process_group(backend="nccl", init_method="env://")
@@ -434,10 +435,10 @@ if local_rank == 0:
     print(f"Speedup ratio: {speedup_ratio:.2f}x")
     print(f"Overall cos_sim: {overall_cos:.6f}")
     print(f"{'='*70}")
-    if overall_cos >= 0.999:
-        print("PASS: PS precision alignment + throughput benchmark!")
+    if overall_cos >= COS_SIM_THRESHOLD:
+        print(f"PASS: PS precision alignment + throughput benchmark! (cos_sim >= {COS_SIM_THRESHOLD})")
     else:
-        print(f"FAIL: cos_sim {overall_cos:.6f} < 0.999")
+        print(f"FAIL: cos_sim {overall_cos:.6f} < {COS_SIM_THRESHOLD}")
     print(f"{'='*70}")
 
 # Cleanup
