@@ -527,9 +527,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         if rollout_config.name == "hf" and rollout_config.mode == "sync":
-            # For HF sync rollout, load the full HF model directly.
-            # No device_mesh or TP needed - HF models don't support TP.
-            from transformers import AutoModelForCausalLM
+            # For HF sync rollout, load a separate HF model for generation.
+            # This avoids the need for vLLM/SGLang server.
             from verl.workers.rollout.hf_rollout import HFRollout
             self.rollout = HFRollout(config=rollout_config, model_config=model_config, device_mesh=None)
         else:

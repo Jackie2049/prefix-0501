@@ -42,13 +42,23 @@ class HFRollout(BaseRollout):
             # New init path: load HF model from model_config.path
             # device_mesh may be None for sync mode (no TP needed)
             from transformers import AutoModelForCausalLM
+            import warnings
             model_path = model_config.path
             print(f"HFRollout: loading model from {model_path}")
-            # For sync mode, load on current GPU only (no TP)
+            # Load on CPU first, then move to GPU. Use torch.device("cpu")
+            # context to avoid meta tensors (some HF model classes create
+            # meta tensors for missing weights in distributed settings).
+            with torch.device("cpu"), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.module = AutoModelForCausalLM.from_pretrained(
+                    model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
+                )
+            # Materialize any remaining meta tensors to CPU
+            for name, param in self.module.named_parameters():
+                if param.is_meta:
+                    param.data = torch.empty_like(param.data, device="cpu")
+            # Move to current GPU
             device = get_device_name()  # returns "cuda" (device string)
-            self.module = AutoModelForCausalLM.from_pretrained(
-                model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
-            )
             self.module = self.module.to(device)
             # Use omega_conf_to_dataclass for config (RolloutConfig fields)
             from verl.utils.config import omega_conf_to_dataclass
