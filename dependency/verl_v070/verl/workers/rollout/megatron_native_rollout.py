@@ -65,6 +65,17 @@ class MegatronNativeRollout(BaseRollout):
         self.device_mesh = device_mesh
         self.actor_module = actor_module  # nn.ModuleList from MegatronPPOActor
 
+    def set_actor_module(self, actor_module, hf_config, tf_config):
+        """Set actor module reference after actor init completes.
+
+        In colocated mode, the rollout shares the actor's model weights.
+        This method is called after the actor model is initialized to set
+        the reference and configs needed for generation.
+        """
+        self.actor_module = actor_module  # nn.ModuleList from MegatronPPOActor
+        self.hf_config = hf_config
+        self.tf_config = tf_config
+
     async def resume(self, tags: list[str]):
         """No separate model - just put actor in eval mode."""
         for module in self.actor_module:
