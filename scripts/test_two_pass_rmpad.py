@@ -277,7 +277,7 @@ from prefix_sharing.core.planner import PrefixSharingPlanner
 # PS config (used for both integration and planner)
 ps_config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=PREFIX_LEN, min_group_size=N_SEQUENCES)
 integration = VerlQwen3_6Integration(config=ps_config)
-integration.install(model_config=config)
+patch_handle = integration.install(model_config=config)
 
 if local_rank == 0:
     print("PS patches installed")
@@ -349,7 +349,7 @@ if local_rank == 0:
     print(f"PS logits shape: {logits_ps.shape}, time={t_ps:.3f}s")
 
 # Uninstall patches
-integration.uninstall()
+patch_handle.disable()
 
 # ===== Step 3: Compare logits =====
 if local_rank == 0:

@@ -62,6 +62,7 @@ class ParallelQwen3_6DecoderLayer(nn.Module):
             self.self_attn = ParallelQwen3_6Attention(config=config, megatron_config=megatron_config)
         else:
             self.self_attn = ParallelQwen3_6GatedDeltaNet(config=config, megatron_config=megatron_config)
+        self.self_attn.layer_idx = layer_idx
 
         self.mlp = ParallelQwen2MLP(config, megatron_config=megatron_config)
         self.input_layernorm = ParallelQwen2RMSNorm(config, megatron_config)
@@ -103,6 +104,7 @@ class ParallelQwen3_6DecoderLayerRmPad(nn.Module):
             self.self_attn = ParallelQwen3_6AttentionRmPad(config=config, megatron_config=megatron_config)
         else:
             self.self_attn = ParallelQwen3_6GatedDeltaNetRmPad(config=config, megatron_config=megatron_config)
+        self.self_attn.layer_idx = layer_idx
 
         self.mlp = ParallelQwen2MLP(config, megatron_config=megatron_config)
         self.input_layernorm = ParallelQwen2RMSNorm(config, megatron_config)
