@@ -210,8 +210,7 @@ if local_rank == 0:
 
 
 def run_normal_training(n_seqs, n_steps, step_seed_offset=0):
-    """Run Normal mode GRPO training, return list of (loss, time, mem_peak)."""
-    patch_handle.disable()
+    """Run Normal mode GRPO training (no PS context → patches fall through)."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
     results = []
 
@@ -277,10 +276,7 @@ def run_normal_training(n_seqs, n_steps, step_seed_offset=0):
 
 
 def run_ps_training(n_seqs, n_steps, step_seed_offset=0):
-    """Run PS mode GRPO training, return list of (loss, cos_sim, time, mem_peak)."""
-    patch_handle.enable()
-    # Update ps_config for the right min_group_size
-    ps_config_local = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=PREFIX_LEN, min_group_size=n_seqs)
+    """Run PS mode GRPO training (use prefix_sharing_runtime_context to activate patches)."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
     results = []
 
@@ -310,6 +306,7 @@ def run_ps_training(n_seqs, n_steps, step_seed_offset=0):
         torch.cuda.empty_cache()
 
         # PS two-pass forward (with grad)
+        ps_config_local = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=PREFIX_LEN, min_group_size=n_seqs)
         sequences_list = [seq.tolist() for seq in full_input_ids]
         ps_plan = PrefixSharingPlanner(ps_config_local).plan(sequences_list)
 
@@ -409,8 +406,6 @@ ps_n8_results = run_ps_training(n_seqs=8, n_steps=N_STEPS, step_seed_offset=N_ST
 for step, (loss, cos, t, mem) in enumerate(ps_n8_results):
     if local_rank == 0:
         print(f"{step:>4} {'PS_N8':>8} {loss:>8.4f} {cos:>10.6f} {t:>8.3f}s {mem:>8.2f}GB")
-
-patch_handle.disable()
 
 if local_rank == 0:
     # Compute throughput for each mode
