@@ -48,6 +48,14 @@ def get_ppo_ray_runtime_env():
         "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
         **({"working_dir": None} if working_dir is None else {}),
     }
+    # Propagate PYTHONPATH to Ray workers so they can find our dependency modules
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    if pythonpath:
+        runtime_env["env_vars"]["PYTHONPATH"] = pythonpath
+    # Propagate PYTORCH_ALLOC_CONF for memory allocation
+    pytorch_alloc = os.environ.get("PYTORCH_ALLOC_CONF", "")
+    if pytorch_alloc:
+        runtime_env["env_vars"]["PYTORCH_ALLOC_CONF"] = pytorch_alloc
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
