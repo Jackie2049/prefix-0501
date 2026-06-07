@@ -45,18 +45,26 @@ class HFRollout(BaseRollout):
             import warnings
             model_path = model_config.path
             print(f"HFRollout: loading model from {model_path}")
-            # Load on CPU without meta tensors. from_pretrained() with
-            # low_cpu_mem_usage=False creates all params on CPU with real data.
-            # Missing keys (e.g. Qwen3.6 HybridAttention DeltaNet params) are
-            # randomly initialized.
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 self.module = AutoModelForCausalLM.from_pretrained(
                     model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
                 )
-            # Move to current GPU
+            # Move to GPU. If any meta tensors remain (e.g. missing keys from
+            # checkpoint), use to_empty() which handles meta -> real conversion.
             device = get_device_name()  # returns "cuda" (device string)
-            self.module = self.module.to(device)
+            try:
+                self.module = self.module.to(device)
+            except NotImplementedError:
+                # Some parameters are on meta device (missing from checkpoint).
+                # Use to_empty() to create empty real tensors on GPU, then
+                # materialize any remaining CPU tensors.
+                self.module = self.module.to_empty(device=device)
+                # Initialize parameters that have no data (from meta device)
+                for name, param in self.module.named_parameters():
+                    if param.data_ptr() == 0 or param.numel() == 0:
+                        # Initialize with small random values
+                        torch.nn.init.normal_(param, std=0.02)
             # Use omega_conf_to_dataclass for config (RolloutConfig fields)
             from verl.utils.config import omega_conf_to_dataclass
             from verl.workers.config import RolloutConfig
