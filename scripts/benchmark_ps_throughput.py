@@ -35,9 +35,9 @@ from safetensors.torch import load_file
 # ===== Configuration =====
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only")
 TP_SIZE = 4
-PREFIX_LEN = 256   # Longer prefix (common prompt length)
-SUFFIX_LEN = 64    # Short response (typical GRPO)
-N_SEQUENCES = 8    # GRPO n=8
+PREFIX_LEN = 128   # Medium prefix
+SUFFIX_LEN = 64    # Short response
+N_SEQUENCES = 4    # Fit in 24GB GPU (8 would OOM with 27B vocab)
 SEED = 42
 N_WARMUP = 2       # Warmup iterations
 N_MEASURE = 5      # Measurement iterations
