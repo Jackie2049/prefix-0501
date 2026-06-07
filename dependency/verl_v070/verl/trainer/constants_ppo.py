@@ -56,7 +56,9 @@ def get_ppo_ray_runtime_env():
     pytorch_alloc = os.environ.get("PYTORCH_ALLOC_CONF", "")
     if pytorch_alloc:
         runtime_env["env_vars"]["PYTORCH_ALLOC_CONF"] = pytorch_alloc
+    # Keys that must propagate to workers even if already set on the driver
+    ALWAYS_PROPAGATE = {"PYTHONPATH", "PYTORCH_ALLOC_CONF"}
     for key in list(runtime_env["env_vars"].keys()):
-        if os.environ.get(key) is not None:
+        if key not in ALWAYS_PROPAGATE and os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
     return runtime_env
