@@ -402,8 +402,20 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             gpt_model_module = _get_gpt_model(models[dst_virtual_pp_rank])
             sync_layer = gpt_model_module.decoder.layers[dst_layer_idx]
 
+            # input_layernorm.weight: when qk_layernorm=True it's a separate
+            # module at layer level; when qk_layernorm=False it's fused into
+            # linear_qkv as layer_norm_weight.
+            if dst_pp_rank == pp_rank:
+                if hasattr(sync_layer.self_attention.linear_qkv, 'layer_norm_weight'):
+                    ln_weight = sync_layer.self_attention.linear_qkv.layer_norm_weight
+                elif hasattr(sync_layer, 'input_layernorm') and hasattr(sync_layer.input_layernorm, 'weight'):
+                    ln_weight = sync_layer.input_layernorm.weight
+                else:
+                    ln_weight = None
+            else:
+                ln_weight = None
             _broadcast_tensor(
-                sync_layer.self_attention.linear_qkv.layer_norm_weight if dst_pp_rank == pp_rank else None,
+                ln_weight,
                 f"{layer_name}.input_layernorm.weight",
             )
 
@@ -491,8 +503,20 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                     chunk_dim=0,
                 )
 
+            # post_attention_layernorm.weight: when fused it's on
+            # mlp.linear_fc1.layer_norm_weight; when separate it's on
+            # pre_mlp_layernorm.weight.
+            if dst_pp_rank == pp_rank:
+                if hasattr(sync_layer.mlp.linear_fc1, 'layer_norm_weight'):
+                    post_attn_ln_weight = sync_layer.mlp.linear_fc1.layer_norm_weight
+                elif hasattr(sync_layer, 'pre_mlp_layernorm') and hasattr(sync_layer.pre_mlp_layernorm, 'weight'):
+                    post_attn_ln_weight = sync_layer.pre_mlp_layernorm.weight
+                else:
+                    post_attn_ln_weight = None
+            else:
+                post_attn_ln_weight = None
             _broadcast_tensor(
-                sync_layer.mlp.linear_fc1.layer_norm_weight if dst_pp_rank == pp_rank else None,
+                post_attn_ln_weight,
                 f"{layer_name}.post_attention_layernorm.weight",
             )
 
