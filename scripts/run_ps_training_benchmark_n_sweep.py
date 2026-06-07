@@ -37,7 +37,7 @@ SEED = 42
 NUM_WARMUP = 1
 NUM_STEPS = 5
 LR = 1e-5
-N_VALUES = [2, 4, 8]
+N_VALUES = [2, 4]
 
 # ===== Initialize distributed =====
 torch.distributed.init_process_group(backend="nccl", init_method="env://")
