@@ -191,8 +191,6 @@ patch_handle = integration.install(model_config=config)
 
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 
-from verl.models.mcore import get_mcore_forward_fn
-
 clip_ratio = 0.2
 total_len = PREFIX_LEN + SUFFIX_LEN
 response_len = SUFFIX_LEN - 1
@@ -285,9 +283,6 @@ for step in range(N_STEPS):
     attention_mask = batch["attention_mask"].to(bool)
     position_ids = batch["position_ids"]
 
-    label = position_ids.clone()
-    label_mask = attention_mask.clone()
-
     from contextlib import nullcontext
     prefix_context = prefix_sharing_runtime_context or nullcontext
 
@@ -301,39 +296,16 @@ for step in range(N_STEPS):
             _prefix_pos = ps_runtime_state.prefix_position_ids
 
             with torch.no_grad():
-                prefix_output = forward_fn(
-                    model=model,
-                    input_ids=_prefix_ids,
-                    attention_mask=_prefix_mask,
-                    position_ids=_prefix_pos,
-                    multi_modal_inputs={},
-                    logits_processor=None,
-                    logits_processor_args={},
-                    data_format="thd",
-                )
+                prefix_output = model(input_ids=_prefix_ids,
+                                     attention_mask=_prefix_mask,
+                                     position_ids=_prefix_pos)
             del prefix_output
 
         # Suffix pass (with grad)
-        def logits_processor(logits, label, label_mask):
-            # Extract suffix logits for loss computation
-            return logits
-
-        output = forward_fn(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            multi_modal_inputs={},
-            logits_processor=logits_processor,
-            logits_processor_args={"label": label, "label_mask": label_mask},
-            data_format="thd",
-        )
-
-    # output contains logits for suffix positions
-    # Compute log_probs for suffix
-    suffix_logits_ps = output  # forward_fn returns logits directly when logits_processor is used
-    if hasattr(output, 'logits'):
-        suffix_logits_ps = output.logits
+        suffix_output = model(input_ids=input_ids,
+                             attention_mask=attention_mask,
+                             position_ids=position_ids)
+        suffix_logits_ps = suffix_output.logits
 
     # Determine how many suffix positions we have
     suffix_log_probs = F.log_softmax(suffix_logits_ps.float(), dim=-1)
