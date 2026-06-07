@@ -27,6 +27,9 @@ ray start --head --port=6379 --num-gpus=8 2>/dev/null || true
 # - TP=4 for both actor.megatron and rollout
 # - train_batch_size=8, n=4 → real_batch=32, minimal_bsz=2*4=8 (divisible)
 # - ppo_micro_batch_size_per_gpu=2 to keep memory safe
+# - use_distributed_optimizer=False: apex FusedAdam not compiled on RTX 4090,
+#   DistributedOptimizer requires FusedAdam, so we disable it and use
+#   torch.optim.AdamW with standard Float16Optimizer
 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml' \
     algorithm.adv_estimator=grpo \
@@ -53,6 +56,7 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     +actor_rollout_ref.actor.prefix_sharing_config.min_prefix_len=64 \
     +actor_rollout_ref.actor.prefix_sharing_config.min_group_size=4 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
+    ++actor_rollout_ref.actor.optim.use_distributed_optimizer=False \
     actor_rollout_ref.actor.clip_ratio=0.2 \
     actor_rollout_ref.rollout.name=hf \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
