@@ -67,6 +67,23 @@ def _build_prefix_last_restore_indices(
     return indices
 
 
+def _safe_build_prefix_last_restore_indices(
+    prefix_sharing_plan: PrefixSharingPlan,
+    packed_batch_layout: PackedBatchLayout,
+) -> list[PackedPrefixLastRestoreIndex]:
+    """Try to build prefix-last restore indices; return empty list on failure.
+
+    In two-pass PS the packed_batch_layout contains suffix-only lengths,
+    so offset computation referencing prefix positions may raise IndexError.
+    Prefix-last restore is not needed for two-pass PS, so returning an
+    empty list is safe.
+    """
+    try:
+        return _build_prefix_last_restore_indices(prefix_sharing_plan, packed_batch_layout)
+    except (IndexError, KeyError):
+        return []
+
+
 @contextmanager
 def prefix_sharing_runtime_context(
     prefix_sharing_runtime_state: Any | None,
@@ -81,7 +98,7 @@ def prefix_sharing_runtime_context(
         store=PrefixAttentionStore(),
         deltanet_store=PrefixDeltanetStore(),
         backend=prefix_sharing_runtime_state.backend,
-        prefix_last_restore_indices=_build_prefix_last_restore_indices(
+        prefix_last_restore_indices=_safe_build_prefix_last_restore_indices(
             prefix_sharing_runtime_state.prefix_sharing_plan,
             prefix_sharing_runtime_state.packed_batch_layout,
         ),
