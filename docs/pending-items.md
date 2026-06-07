@@ -17,6 +17,11 @@
 **方案**：后续待 verl + MindSpeed + MindSpeed-MM 的 Qwen3.5/Qwen3.6 模型仓和 RL 适配代码进入 `dependency/` 后，补充 thin integration / patch：full attention 接 `PrefixAttentionStore` 的 KV injection，gated delta net 接 `PrefixDeltanetStore` 或等价 cache-param 复用入口，并补齐真实引擎下的精度一致性测试。
 
 当前 `PrefixSharingRuntimeContext` 仍只持有 `PrefixAttentionStore`，这是因为现有 runtime context 只服务 Megatron attention hook。后续接入真实 HybridAttention 训练引擎时，需要扩展 runtime context / runtime state，使其能同时承载 attention KV store 和 GatedDeltaNet state store，并明确两类 store 的生命周期、layer 维度隔离、TP rank 隔离和 context 清理逻辑。
+### 2026-06-04：prefix-sharing 可观测性日志分级与耗时拆分
+
+**问题**：当前 profiler 分支先补充 expected/actual 复用统计，用于定位“理论应复用”和“运行时真实复用”是否一致；但还没有完整日志分级，也没有拆分 `plan_ms`、`build_kv_ms`、`attention_ms`、`restore_ms` 等耗时指标。若 expected/actual 已匹配但性能仍未提升，需要进一步定位慢点是复用比例不足、backend/kernel 路径低效，还是 Python `split/cat/store/load` 开销抵消收益。
+
+**方案**：后续增加类似 `PREFIX_SHARING_OBSERVE=off|summary|layer|profile|debug` 的观测级别控制，并在 profile 级别补充阶段耗时。summary/layer 级别用于常驻问题定位，profile/debug 级别只在专项排查时打开，避免训练日志过量。
 
 ### 2026-05-30：补充 `use_fp8_padding=True` 的 packed layout 对齐与测试
 

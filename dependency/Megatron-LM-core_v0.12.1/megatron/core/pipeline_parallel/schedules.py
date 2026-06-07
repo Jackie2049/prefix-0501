@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+from contextvars import ContextVar
 from typing import Iterator, List, Union
 
 import torch
@@ -22,6 +23,11 @@ from megatron.core.utils import (
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+######### profiling #########
+# ContextVar for passing profile stopwatch across call boundaries without parameter modification.
+_profile_stopwatch_var: ContextVar = ContextVar('profile_stopwatch', default=None)
+######### profiling #########
 
 
 def get_forward_backward_func():
@@ -472,11 +478,22 @@ def forward_backward_no_pipelining(
 
     model_type = get_model_type(model)
 
+######### profiling #########
+    _profile_stopwatch = _profile_stopwatch_var.get()
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+
+    if _profile_stopwatch is not None:
+        _profile_stopwatch.start("minibatch_fwd_bwd")
+######### profiling #########
+
     with no_sync_func():
         for i in range(num_microbatches - 1):
+            ######### profiling #########
+            if _profile_stopwatch is not None:
+                _profile_stopwatch.start("microbatch_fwd")
+            ######### profiling #########
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -489,12 +506,28 @@ def forward_backward_no_pipelining(
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                 current_microbatch=i,
             )
+            ######### profiling #########
+            if _profile_stopwatch is not None:
+                _profile_stopwatch.stop("microbatch_fwd")
+            ######### profiling #########
             total_num_tokens += num_tokens
             if not forward_only:
+                ######### profiling #########
+                if _profile_stopwatch is not None:
+                    _profile_stopwatch.start("microbatch_bwd")
+                ######### profiling #########
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                ######### profiling #########
+                if _profile_stopwatch is not None:
+                    _profile_stopwatch.stop("microbatch_bwd")
+                ######### profiling #########
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
+    ######### profiling #########
+    if _profile_stopwatch is not None:
+        _profile_stopwatch.start("microbatch_fwd")
+    ######### profiling #########
     output_tensor, num_tokens = forward_step(
         forward_step_func,
         data_iterator,
@@ -509,10 +542,27 @@ def forward_backward_no_pipelining(
         ),
         current_microbatch=num_microbatches - 1,
     )
+    ######### profiling #########
+    if _profile_stopwatch is not None:
+        _profile_stopwatch.stop("microbatch_fwd")
+    ######### profiling #########
     total_num_tokens += num_tokens
 
     if not forward_only:
+        ######### profiling #########
+        if _profile_stopwatch is not None:
+            _profile_stopwatch.start("microbatch_bwd")
+        ######### profiling #########
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        ######### profiling #########
+        if _profile_stopwatch is not None:
+            _profile_stopwatch.stop("microbatch_bwd")
+        ######### profiling #########
+
+    ######### profiling #########
+    if _profile_stopwatch is not None:
+        _profile_stopwatch.stop("minibatch_fwd_bwd")
+    ######### profiling #########
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for

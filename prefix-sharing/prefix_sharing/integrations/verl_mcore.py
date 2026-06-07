@@ -387,6 +387,8 @@ def restore_suffix_first_log_probs_from_prefix(
         log_probs.shape[1],
         ctx.packed_batch_layout.total_padded_length,
     )
+    if ctx.stats is not None:
+        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
     restored = log_probs.clone()
     for index in ctx.prefix_last_restore_indices:
         provider_logits = logits[

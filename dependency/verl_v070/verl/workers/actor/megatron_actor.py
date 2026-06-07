@@ -795,9 +795,31 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
+
+        ######### profiling #########
+        # Profiling setup: triggered by PROFILE_OUTPUT_DIR env variable
+        profile_output_dir = os.environ.get("PROFILE_OUTPUT_DIR", None)
+        _profile_ctx_var = None
+        if profile_output_dir:
+            from prefix_sharing.tools.training_monitor import MemoryMonitor, Stopwatch
+            from megatron.core.pipeline_parallel.schedules import _profile_stopwatch_var
+
+            _profile_ctx_var = _profile_stopwatch_var
+            self._profile_sw = Stopwatch()
+            self._profile_mon = MemoryMonitor(interval=0.1)
+            self._profile_mon.start()
+            _train_step = 0
+        ######### profiling #########
+
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
         for data in dataloader:
+            ######### profiling #########
+            if profile_output_dir:
+                self._profile_sw.set_step_context(_train_step)
+                _profile_ctx_var.set(self._profile_sw)
+            ######### profiling #########
+
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             self.actor_optimizer.zero_grad()
@@ -827,7 +849,20 @@ class MegatronPPOActor(BasePPOActor):
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
+            ######### profiling #########
+            if profile_output_dir:
+                _profile_ctx_var.set(None)
+                self._profile_sw.start("update")
+            ######### profiling #########
+
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+
+            ######### profiling #########
+            if profile_output_dir:
+                self._profile_sw.stop("update")
+                _train_step += 1
+            ######### profiling #########
+
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
 
@@ -842,6 +877,19 @@ class MegatronPPOActor(BasePPOActor):
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
+
+        ######### profiling #########
+        # Save profiling traces to CSV files under PROFILE_OUTPUT_DIR
+        if profile_output_dir:
+            _profile_ctx_var.set(None)
+            self._profile_mon.stop()
+            os.makedirs(profile_output_dir, exist_ok=True)
+            rank = torch.distributed.get_rank()
+            self._profile_mon.save_to_csv(os.path.join(profile_output_dir, f"memory_trace_rank{rank}.csv"))
+            self._profile_sw.save_to_csv(os.path.join(profile_output_dir, f"timing_trace_rank{rank}.csv"))
+            self._profile_sw = None
+            self._profile_mon = None
+        ######### profiling #########
 
         # add empty cache after each compute
         if self.use_torch_profiler and self.prof and self.prof.enable:

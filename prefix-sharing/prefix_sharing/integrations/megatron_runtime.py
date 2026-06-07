@@ -97,6 +97,7 @@ def maybe_run_prefix_sharing_attention(
         packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=parallel_info.tp_rank,
+        stats=ctx.stats,
     )
     prefix_log.warning(
         "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
