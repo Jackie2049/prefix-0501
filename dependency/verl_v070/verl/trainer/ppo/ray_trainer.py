@@ -914,26 +914,36 @@ class RayPPOTrainer:
             self.ref_policy_wg = self.actor_rollout_wg
 
         # create async rollout manager and request scheduler
-        # Note: mode is always "async" since sync mode is deprecated
-        self.async_rollout_mode = True
-
-        # Support custom AgentLoopManager via config
-        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
-        if manager_class_fqn:
-            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        # For sync/hf rollout mode (MegatronNativeRollout), use sync path
+        # For async/vllm/sglang mode, use AgentLoopManager
+        rollout_name = self.config.actor_rollout_ref.rollout.name
+        rollout_mode = self.config.actor_rollout_ref.rollout.mode
+        if rollout_name == "hf" or rollout_mode == "sync":
+            # Sync rollout: use worker_group.generate_sequences() directly
+            # MegatronNativeRollout shares actor model, no separate server needed
+            self.async_rollout_mode = False
+            self.async_rollout_manager = None
         else:
-            from verl.experimental.agent_loop import AgentLoopManager
+            # Async rollout: use AgentLoopManager (vLLM/SGLang HTTP servers)
+            self.async_rollout_mode = True
 
-        if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
-            rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-        else:
-            rm_resource_pool = None
+            # Support custom AgentLoopManager via config
+            manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+            if manager_class_fqn:
+                AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+            else:
+                from verl.experimental.agent_loop import AgentLoopManager
 
-        self.async_rollout_manager = AgentLoopManager(
-            config=self.config,
-            worker_group=self.actor_rollout_wg,
-            rm_resource_pool=rm_resource_pool,
-        )
+            if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
+                rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            else:
+                rm_resource_pool = None
+
+            self.async_rollout_manager = AgentLoopManager(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rm_resource_pool=rm_resource_pool,
+            )
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
