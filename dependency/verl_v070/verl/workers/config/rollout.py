@@ -221,16 +221,17 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
-        # Deprecation warning for mode field - only async mode is supported
-        if self.mode == "sync":
+        # Allow sync mode for HF rollout (native HuggingFace generation),
+        # async mode for vLLM/SGLang server-based rollout
+        if self.mode == "sync" and self.name != "hf":
             raise ValueError(
-                "Rollout mode 'sync' has been removed. Please set "
-                "`actor_rollout_ref.rollout.mode=async` or remove the mode setting entirely."
+                "Rollout mode 'sync' is only supported with 'hf' rollout backend. "
+                "For vLLM/SGLang, please set `actor_rollout_ref.rollout.mode=async`."
             )
-        if self.mode != "async":
+        if self.mode not in ("async", "sync"):
             warnings.warn(
-                f"Unknown rollout mode '{self.mode}'. Only 'async' mode is supported. "
-                "The 'mode' field is deprecated and will be removed in a future version.",
+                f"Unknown rollout mode '{self.mode}'. Supported modes: 'async' (vLLM/SGLang), 'sync' (HF). "
+                "The 'mode' field is deprecated for vLLM/SGLang backends.",
                 DeprecationWarning,
                 stacklevel=2,
             )
