@@ -7,14 +7,27 @@
 在已有前置环境（Python、PyTorch、CUDA/Ascend 等）的基础上，进入各依赖目录执行安装：
 
 ```bash
-# 按顺序安装
+# Qwen2.5 旧配套（v0.12.1 系列）
 cd dependency/mbridge-main && pip install --no-deps -v -e . && cd ../..
 cd dependency/Megatron-LM-core_v0.12.1 && pip install --no-deps -v -e . && cd ../..
 cd dependency/MindSpeed-v2.2.0_core_r0.12.1 && pip install --no-deps -v -e . && cd ../..
 cd dependency/verl_v070 && pip install --no-deps -v -e . && cd ../..
+
+# Qwen3.5 新配套（v0.16.1 系列）
+cd dependency/Megatron-Bridge_de93536e && pip install --no-deps -v -e . && cd ../..
+cd dependency/Megatron-LM-core_v0.16.1 && pip install --no-deps -v -e . && cd ../..
+cd dependency/MindSpeed_core_r0.16.0 && pip install --no-deps -v -e . && cd ../..
+cd dependency/verl_cdd9014f && pip install --no-deps -v -e . && cd ../..
 ```
 
 使用 `--no-deps` 避免依赖冲突，各包的运行时依赖需由前置环境提供。
+
+> **版本配套说明**
+>
+> - **Qwen2.5 系列**：verl_v070 + Megatron-LM core_v0.12.1 + MindSpeed core_r0.12.1 + mbridge-main
+> - **Qwen3.5 系列**：verl_cdd9014f + Megatron-LM core_v0.16.1 + MindSpeed core_r0.16.0 + Megatron-Bridge de93536e
+>
+> Qwen3.5 配套版本严格遵循 [verl Qwen3.5 NPU 教程](https://verl.readthedocs.io/en/latest/ascend_tutorial/model_support/examples/qwen3_5_122b_npu.html) 的版本要求。两组配套不能混用。
 
 ## 2. 启动训练
 
@@ -103,8 +116,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 
 ### Phase 1 约束
 
-- 仅支持 TP（tensor parallel），不支持 PP（pipeline parallel）和 CP（context parallel）
-- 必须开启 `use_remove_padding=True`
+- 支持 TP、物理 PP、Megatron TP-bound SP；不支持 CP、virtual PP
+- Qwen2.5 必须开启 `use_remove_padding=True`；Qwen3.5 GDN linear attention 当前不支持 packed THD 格式，需设置 `use_remove_padding=False`（bshd 格式）
 - 必须关闭 `use_fused_kernels=False`
 - NPU 需设置 `VLLM_ASCEND_ENABLE_NZ=0` 并通过 `override_transformer_config.use_flash_attn=True` 启用 flash attention
 
@@ -215,7 +228,24 @@ SP 支持范围为 Megatron `sequence_parallel=True` 且 prefix-sharing attentio
 
 ## 4. 前置环境安装
 
-### verl 依赖
+### Qwen3.5 配套（推荐）
+
+参照 [verl Qwen3.5 NPU 教程](https://verl.readthedocs.io/en/latest/ascend_tutorial/model_support/examples/qwen3_5_122b_npu.html)，推荐使用官方 Docker 镜像：
+
+```bash
+# NPU 推荐镜像（包含 CANN 8.5.2、Python 3.11 等）
+docker pull quay.io/ascend/verl:verl-8.5.2-a3-ubuntu22.04-py3.11-qwen3-5
+```
+
+镜像内可能缺少部分依赖，在容器内补充安装：
+
+```bash
+pip install viztracer flash-linear-attention nvidia-modelopt nvidia-ml-py nvidia-resiliency-ext megatron-energon
+```
+
+然后在第 1 节中安装 Qwen3.5 配套的 verl、Megatron-LM、MindSpeed、Megatron-Bridge 即可。
+
+### Qwen2.5 配套（旧版）
 
 参照 [verl 官方安装文档](https://verl.org.cn/en/latest/start/install.html#install-from-custom-environment)，使用 verl 提供的脚本安装推理框架和基础依赖：
 
@@ -224,7 +254,7 @@ cd dependency/verl_v070
 bash scripts/install_vllm_sglang_mcore.sh
 ```
 
-该脚本会安装 vLLM、SGLang、FlashAttention、TransformerEngine 等依赖。注意脚本中默认安装的 Megatron-LM 版本与本项目不同，本项目使用 `dependency/Megatron-LM-core_v0.12.1` 的快照版本，需在第 1 步单独安装覆盖。
+该脚本会安装 vLLM、SGLang、FlashAttention、TransformerEngine 等依赖。注意脚本中默认安装的 Megatron-LM 版本与本项目不同，本项目使用 `dependency/Megatron-LM-core_v0.12.1` 的快照版本，需在第 1 节单独安装覆盖。
 
 ### MindSpeed（NPU）
 
