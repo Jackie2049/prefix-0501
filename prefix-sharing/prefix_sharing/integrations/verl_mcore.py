@@ -345,9 +345,11 @@ def build_prefix_sharing_micro_batch(
             suffix_end = len(indices)
             kept_indices = indices[suffix_start:suffix_end]
         else:
-            # Reuser keeps their suffix portion (as planned)
-            keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
-            kept_indices = indices[keep_start:keep_end]
+            # Two-pass: ALL sequences (including non-group rows) trimmed to suffix-only
+            # for maximum token savings. PS hooks inject prefix state for all rows.
+            suffix_start = provider_prefix_len
+            suffix_end = len(indices)
+            kept_indices = indices[suffix_start:suffix_end]
         new_attention_mask[row, kept_indices] = True
         kept_position_rows.append(position_ids[row, kept_indices])
 
