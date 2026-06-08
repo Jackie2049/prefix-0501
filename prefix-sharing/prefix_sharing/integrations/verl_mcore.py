@@ -429,6 +429,12 @@ def _take_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: 
         if keep_vocab_dim:
             return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1, :]
         return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1]
+    if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
+        flat_pos = valid_offset * layout.batch_size + token_index.row
+        return tensor[:, flat_pos : flat_pos + 1, :] if keep_vocab_dim else tensor[:, flat_pos : flat_pos + 1]
+    if _is_flattened_full_bshd_tensor(tensor, layout):
+        flat_pos = token_index.row * layout.max_seqlen + token_index.seq_pos
+        return tensor[:, flat_pos : flat_pos + 1, :] if keep_vocab_dim else tensor[:, flat_pos : flat_pos + 1]
     if keep_vocab_dim:
         return tensor[token_index.row : token_index.row + 1, token_index.seq_pos : token_index.seq_pos + 1, :]
     return tensor[token_index.row : token_index.row + 1, token_index.seq_pos : token_index.seq_pos + 1]
@@ -442,6 +448,14 @@ def _write_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index:
         return
     if _is_kept_padded_sbh_tensor(tensor, layout):
         tensor[valid_offset, token_index.row] = value
+        return
+    if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
+        flat_pos = valid_offset * layout.batch_size + token_index.row
+        tensor[:, flat_pos] = value
+        return
+    if _is_flattened_full_bshd_tensor(tensor, layout):
+        flat_pos = token_index.row * layout.max_seqlen + token_index.seq_pos
+        tensor[:, flat_pos] = value
         return
     tensor[token_index.row, token_index.seq_pos] = value
 
@@ -464,6 +478,18 @@ def _is_kept_padded_sbh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
         and int(tensor.shape[0]) == max(layout.valid_lengths, default=0)
         and int(tensor.shape[1]) == layout.batch_size
     )
+
+
+def _is_flattened_kept_padded_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    return (
+        tensor.dim() >= 2
+        and int(tensor.shape[0]) == 1
+        and int(tensor.shape[1]) == max(layout.valid_lengths, default=0) * layout.batch_size
+    )
+
+
+def _is_flattened_full_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    return tensor.dim() >= 2 and int(tensor.shape[0]) == 1 and int(tensor.shape[1]) == layout.batch_size * layout.max_seqlen
 
 
 def _clone_batch(batch: Any) -> Any:
