@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Benchmark PS ON vs PS OFF: measure time, memory, and precision.
 
-Uses verl's ParallelQwen3_6ForCausalLMRmPad model with PS patches installed.
+Uses verl's ParallelQwen3_6ForCausalLMRmPad model with real weights loaded
+from safetensors. PS patches installed for both attention types.
 - PS OFF: N full sequences (prefix+suffix) through normal forward (no PS context)
 - PS ON: prefix pass + suffix pass with PS context (build_prefix_sharing_micro_batch)
-
-Uses CPU Adam optimizer to avoid OOM on 24GB GPUs (same approach as GRPO E2E).
+CPU AdamW optimizer keeps optimizer state on CPU to avoid OOM on 24GB GPUs.
 
 Usage: torchrun --nproc_per_node=4 scripts/benchmark_ps_on_vs_off.py
 """
@@ -19,6 +19,7 @@ sys.path.insert(0, verl_path); sys.path.insert(0, prefix_sharing_path); sys.path
 import torch
 import torch.nn.functional as F
 from transformers import AutoConfig
+from safetensors.torch import load_file
 from contextlib import nullcontext
 
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only-16layers")
@@ -50,6 +51,7 @@ config = AutoConfig.from_pretrained(HF_MODEL_PATH)
 vocab_size = config.vocab_size
 total_len = PREFIX_LEN + SUFFIX_LEN
 response_len = SUFFIX_LEN - 1
+layer_types = config.layer_types; num_layers = config.num_hidden_layers
 
 from megatron.core import ModelParallelConfig
 from verl.models.qwen3_6.megatron.modeling_qwen3_6_megatron import ParallelQwen3_6ForCausalLMRmPad
@@ -59,6 +61,135 @@ megatron_config = ModelParallelConfig(
     sequence_parallel=False, bf16=True, params_dtype=torch.bfloat16,
 )
 model = ParallelQwen3_6ForCausalLMRmPad(config, megatron_config).to(device)
+
+# === Load real weights from safetensors ===
+if local_rank == 0:
+    print("Loading weights from safetensors...")
+
+hf_state_dict = {}
+for i in range(1, 12):
+    shard_path = os.path.join(HF_MODEL_PATH, f"model.safetensors-{i:05d}-of-00011.safetensors")
+    shard_dict = load_file(shard_path); hf_state_dict.update(shard_dict)
+
+hf_keys_filtered = {k: v for k, v in hf_state_dict.items()
+                    if k.startswith("model.language_model.") or k.startswith("lm_head.")}
+
+def shard_tensor(t, dim, tp_size, tp_rank):
+    return torch.chunk(t, tp_size, dim=dim)[tp_rank].contiguous()
+
+def split_deltanet_qkv(w, config, tp_size, tp_rank):
+    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+    return (shard_tensor(w[:key_dim], 0, tp_size, tp_rank),
+            shard_tensor(w[key_dim:key_dim*2], 0, tp_size, tp_rank),
+            shard_tensor(w[key_dim*2:], 0, tp_size, tp_rank))
+
+def shard_conv1d_weight(w, config, tp_size, tp_rank):
+    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+    return torch.cat([
+        shard_tensor(w[:key_dim], 0, tp_size, tp_rank),
+        shard_tensor(w[key_dim:key_dim*2], 0, tp_size, tp_rank),
+        shard_tensor(w[key_dim*2:], 0, tp_size, tp_rank),
+    ], dim=0).contiguous()
+
+loaded_count = 0
+for layer_idx in range(num_layers):
+    is_deltanet = (layer_types[layer_idx] == "linear_attention")
+    decoder_layer = model.model.layers[layer_idx]
+    attn_module = decoder_layer.self_attn; mlp_module = decoder_layer.mlp
+    hf_layer_prefix = f"model.language_model.layers.{layer_idx}"
+    gate_key = f"{hf_layer_prefix}.mlp.gate_proj.weight"
+    up_key = f"{hf_layer_prefix}.mlp.up_proj.weight"
+    if gate_key in hf_keys_filtered and up_key in hf_keys_filtered:
+        gate_up_shard = torch.cat([
+            shard_tensor(hf_keys_filtered[gate_key], 0, TP_SIZE, tp_rank),
+            shard_tensor(hf_keys_filtered[up_key], 0, TP_SIZE, tp_rank),
+        ], dim=0).contiguous()
+        mlp_module.gate_up_proj.weight.data.copy_(gate_up_shard.to(torch.bfloat16))
+        loaded_count += 2
+    down_key = f"{hf_layer_prefix}.mlp.down_proj.weight"
+    if down_key in hf_keys_filtered:
+        mlp_module.down_proj.weight.data.copy_(
+            shard_tensor(hf_keys_filtered[down_key], 1, TP_SIZE, tp_rank).to(torch.bfloat16))
+        loaded_count += 1
+    if is_deltanet:
+        hf_prefix = f"{hf_layer_prefix}.linear_attn"
+        key = f"{hf_prefix}.in_proj_qkv.weight"
+        if key in hf_keys_filtered:
+            q_s, k_s, v_s = split_deltanet_qkv(hf_keys_filtered[key], config, TP_SIZE, tp_rank)
+            attn_module.in_proj_q.weight.data.copy_(q_s.to(torch.bfloat16))
+            attn_module.in_proj_k.weight.data.copy_(k_s.to(torch.bfloat16))
+            attn_module.in_proj_v.weight.data.copy_(v_s.to(torch.bfloat16))
+            loaded_count += 3
+        key = f"{hf_prefix}.conv1d.weight"
+        if key in hf_keys_filtered:
+            attn_module.conv1d.weight.data.copy_(
+                shard_conv1d_weight(hf_keys_filtered[key], config, TP_SIZE, tp_rank).to(torch.bfloat16))
+            loaded_count += 1
+        for proj_name in ["in_proj_z", "in_proj_b", "in_proj_a"]:
+            key = f"{hf_prefix}.{proj_name}.weight"
+            if key in hf_keys_filtered:
+                getattr(attn_module, proj_name).weight.data.copy_(
+                    shard_tensor(hf_keys_filtered[key], 0, TP_SIZE, tp_rank).to(torch.bfloat16))
+                loaded_count += 1
+        key = f"{hf_prefix}.A_log"
+        if key in hf_keys_filtered:
+            attn_module.A_log.data.copy_(
+                shard_tensor(hf_keys_filtered[key], 0, TP_SIZE, tp_rank).to(torch.float32))
+            loaded_count += 1
+        key = f"{hf_prefix}.dt_bias"
+        if key in hf_keys_filtered:
+            attn_module.dt_bias.data.copy_(
+                shard_tensor(hf_keys_filtered[key], 0, TP_SIZE, tp_rank).to(torch.bfloat16))
+            loaded_count += 1
+        key = f"{hf_prefix}.norm.weight"
+        if key in hf_keys_filtered:
+            attn_module.norm.weight.data.copy_(hf_keys_filtered[key].to(torch.bfloat16))
+            loaded_count += 1
+        key = f"{hf_prefix}.out_proj.weight"
+        if key in hf_keys_filtered:
+            attn_module.out_proj.weight.data.copy_(
+                shard_tensor(hf_keys_filtered[key], 1, TP_SIZE, tp_rank).to(torch.bfloat16))
+            loaded_count += 1
+    else:
+        hf_prefix = f"{hf_layer_prefix}.self_attn"
+        for proj_name in ["q_proj", "k_proj", "v_proj"]:
+            key = f"{hf_prefix}.{proj_name}.weight"
+            if key in hf_keys_filtered:
+                getattr(attn_module, proj_name).weight.data.copy_(
+                    shard_tensor(hf_keys_filtered[key], 0, TP_SIZE, tp_rank).to(torch.bfloat16))
+                loaded_count += 1
+        key = f"{hf_prefix}.o_proj.weight"
+        if key in hf_keys_filtered:
+            attn_module.o_proj.weight.data.copy_(
+                shard_tensor(hf_keys_filtered[key], 1, TP_SIZE, tp_rank).to(torch.bfloat16))
+            loaded_count += 1
+        for norm_name in ["q_norm", "k_norm"]:
+            key = f"{hf_prefix}.{norm_name}.weight"
+            if key in hf_keys_filtered:
+                getattr(attn_module, norm_name).weight.data.copy_(hf_keys_filtered[key].to(torch.bfloat16))
+                loaded_count += 1
+    for ln_name in ["input_layernorm", "post_attention_layernorm"]:
+        key = f"{hf_layer_prefix}.{ln_name}.weight"
+        if key in hf_keys_filtered:
+            getattr(decoder_layer, ln_name).weight.data.copy_(hf_keys_filtered[key].to(torch.bfloat16))
+            loaded_count += 1
+
+embed_key = "model.language_model.embed_tokens.weight"
+if embed_key in hf_keys_filtered:
+    model.model.embed_tokens.weight.data.copy_(
+        shard_tensor(hf_keys_filtered[embed_key], 0, TP_SIZE, tp_rank).to(torch.bfloat16))
+    loaded_count += 1
+norm_key = "model.language_model.norm.weight"
+if norm_key in hf_keys_filtered:
+    model.model.norm.weight.data.copy_(hf_keys_filtered[norm_key].to(torch.bfloat16))
+    loaded_count += 1
+lm_key = "lm_head.weight"
+if lm_key in hf_keys_filtered:
+    model.lm_head.weight.data.copy_(
+        shard_tensor(hf_keys_filtered[lm_key], 0, TP_SIZE, tp_rank).to(torch.bfloat16))
+    loaded_count += 1
+
+hf_state_dict.clear(); hf_keys_filtered.clear(); torch.cuda.empty_cache()
 
 # Install PS patches
 from prefix_sharing.integrations.verl_attention import VerlQwen3_6Integration
@@ -90,10 +221,10 @@ class CPUAdamW:
         self.eps = eps
         self.weight_decay = weight_decay
         self.step_count = 0
-        # FP32 main params + optimizer state on CPU
-        self.main_params = [p.data.detach().float().cpu().pin_memory() for p in self.params]
-        self.exp_avg = [torch.zeros_like(mp).pin_memory() for mp in self.main_params]
-        self.exp_avg_sq = [torch.zeros_like(mp).pin_memory() for mp in self.main_params]
+        # FP32 main params + optimizer state on CPU (no pin_memory to avoid CUDA errors)
+        self.main_params = [p.data.detach().float().cpu() for p in self.params]
+        self.exp_avg = [torch.zeros_like(mp) for mp in self.main_params]
+        self.exp_avg_sq = [torch.zeros_like(mp) for mp in self.main_params]
 
     def step(self):
         self.step_count += 1
@@ -102,7 +233,6 @@ class CPUAdamW:
         step_size = self.lr / bias_correction1
 
         for mp, ea, eas, p in zip(self.main_params, self.exp_avg, self.exp_avg_sq, self.params):
-            # Copy GPU bf16 grad → CPU fp32
             if p.grad is not None:
                 grad_cpu = p.grad.detach().float().cpu()
             else:
@@ -132,12 +262,12 @@ if local_rank == 0:
     mem = torch.cuda.memory_allocated() / 1024**3
     print(f"\n{'='*70}")
     print(f"PS ON vs PS OFF BENCHMARK")
-    print(f"Model: 16-layer ~7B, TP={TP_SIZE}, P={PREFIX_LEN}, S={SUFFIX_LEN}, N={N_SEQUENCES}")
+    print(f"Model: 16-layer ~7B (real weights), TP={TP_SIZE}, P={PREFIX_LEN}, S={SUFFIX_LEN}, N={N_SEQUENCES}")
     print(f"PS OFF: N full sequences ({N_SEQUENCES*total_len} tokens)")
     print(f"PS ON:  P prefix + N suffix ({PREFIX_LEN+N_SEQUENCES*SUFFIX_LEN} tokens)")
     print(f"Token savings: {(1 - (PREFIX_LEN+N_SEQUENCES*SUFFIX_LEN)/(N_SEQUENCES*total_len))*100:.1f}%")
     print(f"Optimizer: CPU AdamW (optimizer state on CPU, bf16 params on GPU)")
-    print(f"Model memory: {mem:.2f}GB")
+    print(f"Loaded {loaded_count} weight tensors, GPU {mem:.2f}GB")
     print(f"{'='*70}")
 
 # === Phase 0: Precision validation (no_grad, same weights, same input) ===
@@ -158,11 +288,7 @@ with torch.no_grad():
 
     output_off = model(input_ids=full_input_ids, attention_mask=attention_mask, position_ids=position_ids)
     logits_off = output_off.logits.float()
-    has_nan_off = logits_off.isnan().any().item()
-    if local_rank == 0:
-        print(f"  PS OFF logits NaN: {has_nan_off}")
-
-    suffix_logits_off = logits_off[:, PREFIX_LEN:-1, :]  # (N, response_len, vocab)
+    suffix_logits_off = logits_off[:, PREFIX_LEN:-1, :]
     log_probs_off = F.log_softmax(suffix_logits_off, dim=-1)
     selected_lp_off = log_probs_off.gather(-1, suffix_labels.unsqueeze(-1)).squeeze(-1)
 
@@ -198,22 +324,20 @@ with torch.no_grad():
     else:
         logits_on = logits_off.clone()
 
-    has_nan_on = logits_on.isnan().any().item()
-    if local_rank == 0:
-        print(f"  PS ON logits NaN: {has_nan_on}")
-
-    suffix_logits_on = logits_on[:, :-1, :]  # (N, response_len, vocab)
+    suffix_logits_on = logits_on[:, :-1, :]
     log_probs_on = F.log_softmax(suffix_logits_on, dim=-1)
     selected_lp_on = log_probs_on.gather(-1, suffix_labels.unsqueeze(-1)).squeeze(-1)
 
 if local_rank == 0:
+    has_nan_off = selected_lp_off.isnan().any().item()
+    has_nan_on = selected_lp_on.isnan().any().item()
     if not has_nan_off and not has_nan_on:
         cos_sim = F.cosine_similarity(selected_lp_off.flatten().unsqueeze(0),
                                        selected_lp_on.flatten().unsqueeze(0)).item()
         max_diff = (selected_lp_off - selected_lp_on).abs().max().item()
         print(f"  Precision: cos_sim={cos_sim:.6f}, max_diff={max_diff:.6f}")
     else:
-        print(f"  Precision: SKIPPED (NaN in logits — random DeltaNet weights)")
+        print(f"  Precision: NaN detected (OFF={has_nan_off}, ON={has_nan_on}) — SKIPPED")
 
 del output_off, logits_off, suffix_logits_off, log_probs_off, selected_lp_off
 del output_on, logits_on, suffix_logits_on, log_probs_on, selected_lp_on
