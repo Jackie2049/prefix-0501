@@ -260,6 +260,17 @@ if local_rank == 0:
 old_aligned = selected_normal[:, 1:].to(device=device, dtype=torch.float32)
 new_aligned = selected_ps.to(device=device, dtype=torch.float32)
 
+if local_rank == 0:
+    # Per-position max_diff to identify where errors concentrate
+    per_pos_diff = (new_aligned - old_aligned).abs().max(dim=0).values.cpu()
+    per_pos_mean_diff = (new_aligned - old_aligned).abs().mean(dim=0).cpu()
+    print(f"  Per-position max_diff (seq 0): top-5 positions:")
+    top5_idx = per_pos_diff.topk(5).indices.tolist()
+    for idx in top5_idx:
+        print(f"    pos {idx}: max_diff={per_pos_diff[idx]:.4f}, mean_diff={per_pos_mean_diff[idx]:.4f}")
+    print(f"  First position (boundary) diff: max={per_pos_diff[0]:.4f}, mean={per_pos_mean_diff[0]:.4f}")
+    print(f"  Last position diff: max={per_pos_diff[-1]:.4f}, mean={per_pos_mean_diff[-1]:.4f}")
+
 all_cos_sims = []
 for i in range(N_SEQUENCES):
     cos_sim = F.cosine_similarity(
