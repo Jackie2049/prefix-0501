@@ -34,8 +34,6 @@ cov.json
 # Data
 # data/
 outputs/
-data/
-# models/  # 注意：models 目录现已纳入版本控制
 log/
 
 # Backup git directories
