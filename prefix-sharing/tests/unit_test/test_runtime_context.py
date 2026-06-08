@@ -2,7 +2,6 @@ from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
-from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
 
 
@@ -17,7 +16,6 @@ def _prefix_sharing_runtime_state():
         prefix_sharing_plan=prefix_sharing_plan,
         backend=None,
         packed_batch_layout=PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q),
-        parallel_info=MegatronParallelInfo(pp_rank=1, pp_size=2, is_pipeline_first_stage=False),
     )
 
 
@@ -27,9 +25,6 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.prefix_sharing_plan is prefix_sharing_runtime_state.prefix_sharing_plan
-        assert ctx.parallel_info is prefix_sharing_runtime_state.parallel_info
-        assert ctx.parallel_info.pp_rank == 1
-        assert ctx.parallel_info.pp_size == 2
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
         assert not ctx.store.closed
@@ -53,7 +48,6 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
             cu_seqlens=[0, 6, 8],
             max_seqlen=6,
         ),
-        parallel_info=MegatronParallelInfo(),
     )
 
     with prefix_sharing_runtime_context(runtime_state) as ctx:
