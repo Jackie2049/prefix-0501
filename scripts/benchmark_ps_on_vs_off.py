@@ -28,7 +28,7 @@ PREFIX_LEN = int(os.environ.get("PREFIX_LEN", 64))
 SUFFIX_LEN = int(os.environ.get("SUFFIX_LEN", 128))
 N_SEQUENCES = int(os.environ.get("N_SEQUENCES", 4))
 SEED = 42
-N_STEPS = 5
+N_STEPS = int(os.environ.get("N_STEPS", 5))
 
 torch.distributed.init_process_group(backend="nccl", init_method="env://")
 local_rank = int(os.environ.get("LOCAL_RANK", 0)); torch.cuda.set_device(local_rank)
@@ -304,6 +304,13 @@ with torch.no_grad():
         batch, actor_config, config, model_spec=ModelSpec.from_hf_config(config),
     )
 
+    if local_rank == 0 and ps_runtime_state is not None:
+        plan = ps_runtime_state.prefix_sharing_plan
+        print(f"  PS plan: is_provider={plan.is_provider}, provider_idx={plan.provider_index}, "
+              f"prefix_lens={plan.prefix_lens}, input_keep_ranges={plan.input_keep_ranges}")
+        valid_per_row = [batch["attention_mask"][row].to(bool).sum().item() for row in range(N_SEQUENCES)]
+        print(f"  Suffix batch valid tokens per row: {valid_per_row} (total={sum(valid_per_row)})")
+
     if ps_runtime_state is not None:
         prefix_context = prefix_sharing_runtime_context or nullcontext
         with prefix_context(ps_runtime_state) as ps_ctx:
@@ -417,6 +424,13 @@ for step in range(N_STEPS):
         batch, actor_config, config, model_spec=ModelSpec.from_hf_config(config),
     )
 
+    if local_rank == 0 and ps_runtime_state is not None:
+        plan = ps_runtime_state.prefix_sharing_plan
+        print(f"  PS plan: is_provider={plan.is_provider}, provider_idx={plan.provider_index}, "
+              f"prefix_lens={plan.prefix_lens}, input_keep_ranges={plan.input_keep_ranges}")
+        valid_per_row = [batch["attention_mask"][row].to(bool).sum().item() for row in range(N_SEQUENCES)]
+        print(f"  Suffix batch valid tokens per row: {valid_per_row} (total={sum(valid_per_row)})")
+
     if ps_runtime_state is not None:
         prefix_context = prefix_sharing_runtime_context or nullcontext
         with prefix_context(ps_runtime_state) as ps_ctx:
@@ -439,7 +453,9 @@ for step in range(N_STEPS):
         output = model(input_ids=full_input_ids, attention_mask=attention_mask, position_ids=position_ids)
         logits = output.logits.float()
 
-    suffix_logits = logits[:, :-1, :]
+    # Use PREFIX_LEN:-1 to select only suffix positions (same as PS OFF)
+    # This ensures backward only propagates through suffix, not padded prefix
+    suffix_logits = logits[:, PREFIX_LEN:-1, :]
     log_probs = F.log_softmax(suffix_logits, dim=-1)
     selected_lp = log_probs.gather(-1, suffix_labels.unsqueeze(-1)).squeeze(-1)
 
