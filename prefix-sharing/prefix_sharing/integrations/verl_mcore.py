@@ -409,20 +409,61 @@ def restore_suffix_first_log_probs_from_prefix(
             reuse_pos = index.reuse_token_index
             if not isinstance(provider_pos, BshdTokenIndex) or not isinstance(reuse_pos, BshdTokenIndex):
                 raise TypeError("BSHD prefix-last restore requires BshdTokenIndex values")
-            provider_logits = logits[
-                provider_pos.row : provider_pos.row + 1,
-                provider_pos.seq_pos : provider_pos.seq_pos + 1,
-                :,
-            ].clone()
-            reuse_label = labels[
-                reuse_pos.row : reuse_pos.row + 1,
-                reuse_pos.seq_pos : reuse_pos.seq_pos + 1,
-            ]
+            provider_logits = _take_bshd_restore_token(logits, layout, provider_pos, keep_vocab_dim=True).clone()
+            reuse_label = _take_bshd_restore_token(labels, layout, reuse_pos, keep_vocab_dim=False)
             restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-            restored[reuse_pos.row, reuse_pos.seq_pos] = restored_value.reshape(())
+            _write_bshd_restore_token(restored, layout, reuse_pos, restored_value.reshape(()))
             continue
         raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
     return restored
+
+
+def _take_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: BshdTokenIndex, *, keep_vocab_dim: bool) -> Any:
+    valid_offset = _bshd_valid_offset(layout, token_index)
+    if _is_compact_bshd_tensor(tensor, layout):
+        compact_pos = sum(layout.valid_lengths[: token_index.row]) + valid_offset
+        if keep_vocab_dim:
+            return tensor[compact_pos : compact_pos + 1].unsqueeze(0)
+        return tensor[compact_pos : compact_pos + 1].unsqueeze(0)
+    if _is_kept_padded_sbh_tensor(tensor, layout):
+        if keep_vocab_dim:
+            return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1, :]
+        return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1]
+    if keep_vocab_dim:
+        return tensor[token_index.row : token_index.row + 1, token_index.seq_pos : token_index.seq_pos + 1, :]
+    return tensor[token_index.row : token_index.row + 1, token_index.seq_pos : token_index.seq_pos + 1]
+
+
+def _write_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: BshdTokenIndex, value: Any) -> None:
+    valid_offset = _bshd_valid_offset(layout, token_index)
+    if _is_compact_bshd_tensor(tensor, layout):
+        compact_pos = sum(layout.valid_lengths[: token_index.row]) + valid_offset
+        tensor[compact_pos] = value
+        return
+    if _is_kept_padded_sbh_tensor(tensor, layout):
+        tensor[valid_offset, token_index.row] = value
+        return
+    tensor[token_index.row, token_index.seq_pos] = value
+
+
+def _bshd_valid_offset(layout: BshdBatchLayout, token_index: BshdTokenIndex) -> int:
+    row_mask = layout.valid_token_mask[token_index.row]
+    preceding = row_mask[: token_index.seq_pos].sum()
+    if not bool(row_mask[token_index.seq_pos]):
+        raise IndexError("BshdTokenIndex points to a non-valid token")
+    return int(preceding.detach().cpu().item())
+
+
+def _is_compact_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    return tensor.dim() >= 1 and int(tensor.shape[0]) == layout.total_valid_length
+
+
+def _is_kept_padded_sbh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    return (
+        tensor.dim() >= 2
+        and int(tensor.shape[0]) == max(layout.valid_lengths, default=0)
+        and int(tensor.shape[1]) == layout.batch_size
+    )
 
 
 def _clone_batch(batch: Any) -> Any:

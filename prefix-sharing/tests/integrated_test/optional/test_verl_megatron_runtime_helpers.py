@@ -343,6 +343,54 @@ def test_restore_suffix_first_log_probs_from_prefix_supports_bshd_dense_indices(
     assert logits.grad[0, 2].abs().sum() > 0
 
 
+def test_restore_suffix_first_log_probs_from_prefix_supports_bshd_kept_padded_sbh_indices():
+    logits = torch.randn(5, 2, 8, requires_grad=True)
+    labels = torch.tensor(
+        [
+            [0, 3],
+            [0, 4],
+            [0, 0],
+            [10, 0],
+            [11, 0],
+        ]
+    )
+    log_probs = torch.zeros(5, 2, requires_grad=True)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": False},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+
+    def gather_fn(provider_logits, reuse_label):
+        assert provider_logits.shape == (1, 1, 8)
+        assert reuse_label.shape == (1, 1)
+        return torch.gather(
+            torch.log_softmax(provider_logits, dim=-1),
+            dim=-1,
+            index=reuse_label.unsqueeze(-1),
+        ).squeeze(-1)
+
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
+        restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
+
+    restored[0, 1].backward()
+    assert logits.grad is not None
+    assert logits.grad[2, 0].abs().sum() > 0
+
+
 def test_restore_suffix_first_log_probs_from_prefix_noops_on_non_last_pp_stage(monkeypatch):
     _install_megatron_parallel_state(monkeypatch, pp_size=2, pp_rank=0)
     logits = torch.randn(1, 7, 8, requires_grad=True)
