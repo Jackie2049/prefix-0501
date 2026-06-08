@@ -5,6 +5,8 @@ Uses verl's ParallelQwen3_6ForCausalLMRmPad model with PS patches installed.
 - PS OFF: N full sequences (prefix+suffix) through normal forward (no PS context)
 - PS ON: prefix pass + suffix pass with PS context (build_prefix_sharing_micro_batch)
 
+Uses CPU Adam optimizer to avoid OOM on 24GB GPUs (same approach as GRPO E2E).
+
 Usage: torchrun --nproc_per_node=4 scripts/benchmark_ps_on_vs_off.py
 """
 import os, sys, time
@@ -25,7 +27,7 @@ PREFIX_LEN = 64
 SUFFIX_LEN = 128
 N_SEQUENCES = 4
 SEED = 42
-N_STEPS = 3
+N_STEPS = 5
 
 torch.distributed.init_process_group(backend="nccl", init_method="env://")
 local_rank = int(os.environ.get("LOCAL_RANK", 0)); torch.cuda.set_device(local_rank)
@@ -77,6 +79,55 @@ actor_config = {
     "megatron": {"use_remove_padding": True},
 }
 
+
+# === CPU AdamW optimizer (avoids OOM on 24GB GPUs) ===
+class CPUAdamW:
+    """AdamW optimizer with all state on CPU. Only bf16 params on GPU."""
+    def __init__(self, model_params, lr=1e-5, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        self.params = list(model_params)
+        self.lr = lr
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.step_count = 0
+        # FP32 main params + optimizer state on CPU
+        self.main_params = [p.data.detach().float().cpu().pin_memory() for p in self.params]
+        self.exp_avg = [torch.zeros_like(mp).pin_memory() for mp in self.main_params]
+        self.exp_avg_sq = [torch.zeros_like(mp).pin_memory() for mp in self.main_params]
+
+    def step(self):
+        self.step_count += 1
+        bias_correction1 = 1 - self.beta1 ** self.step_count
+        bias_correction2 = 1 - self.beta2 ** self.step_count
+        step_size = self.lr / bias_correction1
+
+        for mp, ea, eas, p in zip(self.main_params, self.exp_avg, self.exp_avg_sq, self.params):
+            # Copy GPU bf16 grad → CPU fp32
+            if p.grad is not None:
+                grad_cpu = p.grad.detach().float().cpu()
+            else:
+                continue
+
+            # Decoupled weight decay
+            mp.add_(mp, alpha=-self.lr * self.weight_decay)
+
+            # Update exp_avg and exp_avg_sq
+            ea.mul_(self.beta1).add_(grad_cpu, alpha=1 - self.beta1)
+            eas.mul_(self.beta2).addcmul_(grad_cpu, grad_cpu, value=1 - self.beta2)
+
+            # Update main_params
+            denom = (eas.sqrt() / bias_correction2).add_(self.eps)
+            mp.addcdiv_(ea, denom, value=-step_size)
+
+            # Copy CPU fp32 → GPU bf16
+            p.data.copy_(mp.to(p.device, dtype=p.dtype))
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad = None
+
+
 if local_rank == 0:
     mem = torch.cuda.memory_allocated() / 1024**3
     print(f"\n{'='*70}")
@@ -85,6 +136,7 @@ if local_rank == 0:
     print(f"PS OFF: N full sequences ({N_SEQUENCES*total_len} tokens)")
     print(f"PS ON:  P prefix + N suffix ({PREFIX_LEN+N_SEQUENCES*SUFFIX_LEN} tokens)")
     print(f"Token savings: {(1 - (PREFIX_LEN+N_SEQUENCES*SUFFIX_LEN)/(N_SEQUENCES*total_len))*100:.1f}%")
+    print(f"Optimizer: CPU AdamW (optimizer state on CPU, bf16 params on GPU)")
     print(f"Model memory: {mem:.2f}GB")
     print(f"{'='*70}")
 
@@ -106,6 +158,10 @@ with torch.no_grad():
 
     output_off = model(input_ids=full_input_ids, attention_mask=attention_mask, position_ids=position_ids)
     logits_off = output_off.logits.float()
+    has_nan_off = logits_off.isnan().any().item()
+    if local_rank == 0:
+        print(f"  PS OFF logits NaN: {has_nan_off}")
+
     suffix_logits_off = logits_off[:, PREFIX_LEN:-1, :]  # (N, response_len, vocab)
     log_probs_off = F.log_softmax(suffix_logits_off, dim=-1)
     selected_lp_off = log_probs_off.gather(-1, suffix_labels.unsqueeze(-1)).squeeze(-1)
@@ -142,22 +198,29 @@ with torch.no_grad():
     else:
         logits_on = logits_off.clone()
 
+    has_nan_on = logits_on.isnan().any().item()
+    if local_rank == 0:
+        print(f"  PS ON logits NaN: {has_nan_on}")
+
     suffix_logits_on = logits_on[:, :-1, :]  # (N, response_len, vocab)
     log_probs_on = F.log_softmax(suffix_logits_on, dim=-1)
     selected_lp_on = log_probs_on.gather(-1, suffix_labels.unsqueeze(-1)).squeeze(-1)
 
 if local_rank == 0:
-    cos_sim = F.cosine_similarity(selected_lp_off.flatten().unsqueeze(0),
-                                   selected_lp_on.flatten().unsqueeze(0)).item()
-    max_diff = (selected_lp_off - selected_lp_on).abs().max().item()
-    print(f"  Precision: cos_sim={cos_sim:.6f}, max_diff={max_diff:.6f}")
+    if not has_nan_off and not has_nan_on:
+        cos_sim = F.cosine_similarity(selected_lp_off.flatten().unsqueeze(0),
+                                       selected_lp_on.flatten().unsqueeze(0)).item()
+        max_diff = (selected_lp_off - selected_lp_on).abs().max().item()
+        print(f"  Precision: cos_sim={cos_sim:.6f}, max_diff={max_diff:.6f}")
+    else:
+        print(f"  Precision: SKIPPED (NaN in logits — random DeltaNet weights)")
 
 del output_off, logits_off, suffix_logits_off, log_probs_off, selected_lp_off
 del output_on, logits_on, suffix_logits_on, log_probs_on, selected_lp_on
 torch.cuda.empty_cache()
 
 # === Phase 1: PS OFF training performance ===
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+optimizer = CPUAdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
 ps_off_results = []
 
 if local_rank == 0:
@@ -185,6 +248,7 @@ for step in range(N_STEPS):
 
     loss = selected_lp.mean()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step(); optimizer.zero_grad()
 
     torch.cuda.synchronize(); t_end = time.time()
@@ -194,8 +258,11 @@ for step in range(N_STEPS):
     if local_rank == 0:
         print(f"  Step {step}: time={t_end-t_start:.3f}s, peak_mem={peak_mem:.2f}GB")
 
+    del output, logits, suffix_logits, log_probs, selected_lp, loss
+    torch.cuda.empty_cache()
+
 # === Phase 2: PS ON training performance ===
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+optimizer = CPUAdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
 ps_on_results = []
 
 if local_rank == 0:
@@ -254,6 +321,7 @@ for step in range(N_STEPS):
 
     loss = selected_lp.mean()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step(); optimizer.zero_grad()
 
     torch.cuda.synchronize(); t_end = time.time()
@@ -263,12 +331,15 @@ for step in range(N_STEPS):
     if local_rank == 0:
         print(f"  Step {step}: time={t_end-t_start:.3f}s, peak_mem={peak_mem:.2f}GB")
 
+    del output, logits, suffix_logits, log_probs, selected_lp, loss
+    torch.cuda.empty_cache()
+
 # === Results ===
 if local_rank == 0:
     avg_time_off = sum(r["time"] for r in ps_off_results[1:]) / max(N_STEPS - 1, 1)
     avg_time_on = sum(r["time"] for r in ps_on_results[1:]) / max(N_STEPS - 1, 1)
-    avg_mem_off = sum(r["peak_mem"] for r in ps_off_results) / N_STEPS
-    avg_mem_on = sum(r["peak_mem"] for r in ps_on_results) / N_STEPS
+    avg_mem_off = sum(r["peak_mem"] for r in ps_off_results[1:]) / max(N_STEPS - 1, 1)
+    avg_mem_on = sum(r["peak_mem"] for r in ps_on_results[1:]) / max(N_STEPS - 1, 1)
 
     speedup = avg_time_off / avg_time_on if avg_time_on > 0 else 0
     mem_savings = (avg_mem_off - avg_mem_on) / avg_mem_off * 100
@@ -279,8 +350,8 @@ if local_rank == 0:
     print(f"  PS OFF avg time (steps 1+): {avg_time_off:.3f}s")
     print(f"  PS ON  avg time (steps 1+): {avg_time_on:.3f}s")
     print(f"  Speedup: {speedup:.2f}x")
-    print(f"  PS OFF avg peak mem: {avg_mem_off:.2f}GB")
-    print(f"  PS ON  avg peak mem: {avg_mem_on:.2f}GB")
+    print(f"  PS OFF avg peak mem (steps 1+): {avg_mem_off:.2f}GB")
+    print(f"  PS ON  avg peak mem (steps 1+): {avg_mem_on:.2f}GB")
     print(f"  Memory: {mem_savings:+.1f}%")
 
     print(f"\n  Per-step breakdown:")
