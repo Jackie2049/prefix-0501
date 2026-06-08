@@ -220,8 +220,8 @@ with prefix_sharing_runtime_context(ps_runtime_state) as ctx:
 
     if local_rank == 0:
         print(f"  Prefix pass done, GPU {torch.cuda.memory_allocated()/1024**3:.2f} GiB")
-        kv_count = len(ctx.store._slots)
-        dn_count = len(ctx.deltanet_store._slots)
+        kv_count = len(ctx.store._entries)
+        dn_count = len(ctx.deltanet_store._entries)
         print(f"  Store: KV slots={kv_count}, DeltaNet slots={dn_count}")
 
     # Suffix pass (with gradients)
