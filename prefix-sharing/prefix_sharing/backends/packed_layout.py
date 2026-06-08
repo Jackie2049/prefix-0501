@@ -155,11 +155,11 @@ class PackedBatchLayout:
             if valid_len == padded_len:
                 repadded.append(row)
                 continue
-            padded = torch.zeros(
-                padded_len, *row.shape[1:], dtype=row.dtype, device=row.device,
+            pad_len = padded_len - valid_len
+            pad_tensor = torch.zeros(
+                pad_len, *row.shape[1:], dtype=row.dtype, device=row.device,
             )
-            padded[:valid_len] = row
-            repadded.append(padded)
+            repadded.append(torch.cat([row, pad_tensor], dim=0))
         return torch.cat(repadded, dim=0)
 
 
