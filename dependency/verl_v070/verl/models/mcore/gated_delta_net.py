@@ -139,10 +139,57 @@ class GatedDeltaNetAttention(SelfAttention):
 
         # Note: QK layernorm is already applied by get_query_key_value_tensors()
 
+        # --- Prefix-sharing: detect context early (needed for RoPE correction) ---
+        ps_slot_id = None
+        ps_ctx = None
+        ps_is_suffix_pass = False
+        try:
+            from prefix_sharing.integrations.context import current_prefix_sharing_context
+            from prefix_sharing.core.model_spec import AttentionLayerType
+            from prefix_sharing.core.prefix_store import PrefixActivationSlotId, PREFIX_STATE_TYPE_DELTANET_STATE
+            from prefix_sharing.integrations.megatron_runtime import _read_parallel_rank_info, _normalize_layer_number
+            ps_ctx = current_prefix_sharing_context()
+        except ImportError:
+            ps_ctx = None
+
+        if ps_ctx is not None and ps_ctx.prefix_sharing_plan.has_sharing:
+            ps_layer_id = _normalize_layer_number(self)
+            ps_model_spec = ps_ctx.model_spec
+            if ps_layer_id >= 0 and ps_model_spec is not None and \
+                    ps_model_spec.layer_type(ps_layer_id) == AttentionLayerType.LINEAR_ATTENTION:
+                _, ps_tp_rank, _ = _read_parallel_rank_info()
+                ps_slot_id = PrefixActivationSlotId(
+                    forward_id=ps_ctx.prefix_sharing_plan.forward_id,
+                    micro_batch_id=ps_ctx.prefix_sharing_plan.micro_batch_id,
+                    layer_id=ps_layer_id,
+                    sample_idx_in_batch=0,
+                    prefix_state_type=PREFIX_STATE_TYPE_DELTANET_STATE,
+                    tp_rank=ps_tp_rank,
+                )
+                ps_is_suffix_pass = ps_ctx.deltanet_store.contains(ps_slot_id)
+
         # Apply RoPE - same pattern as SelfAttention.forward
         # For self attention, duplicate rotary_pos_emb if not already a tuple
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        # Prefix-sharing: correct RoPE positions for suffix pass
+        # In suffix pass, rotary_pos_emb covers positions 0..suffix_len-1,
+        # but suffix tokens need absolute positions PREFIX_LEN..total_len-1.
+        # We extend and slice to the correct absolute positions.
+        if ps_is_suffix_pass and rotary_pos_emb is not None:
+            from prefix_sharing.integrations.megatron_runtime import _extend_rope_pos_emb
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            stored_state = ps_ctx.deltanet_store.load(ps_slot_id)
+            prefix_len_actual = stored_state.prefix_len
+            suffix_len = sq
+            total_len_needed = prefix_len_actual + suffix_len
+            q_pos_emb_ext = _extend_rope_pos_emb(q_pos_emb, total_len_needed)
+            k_pos_emb_ext = _extend_rope_pos_emb(k_pos_emb, total_len_needed)
+            suffix_positions = torch.arange(prefix_len_actual, total_len_needed, device=query.device)
+            q_pos_emb_suffix = q_pos_emb_ext.index_select(0, suffix_positions)
+            k_pos_emb_suffix = k_pos_emb_ext.index_select(0, suffix_positions)
+            rotary_pos_emb = (q_pos_emb_suffix, k_pos_emb_suffix)
 
         if rotary_pos_emb is not None:
             from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
@@ -182,38 +229,11 @@ class GatedDeltaNetAttention(SelfAttention):
         beta_flat = beta.reshape(sq, bh, 1)
         decay_flat = decay.reshape(sq, bh, 1)
 
-        # --- Prefix-sharing: carry state injection for two-pass DeltaNet ---
-        ps_slot_id = None
-        ps_ctx = None
-        try:
-            from prefix_sharing.integrations.context import current_prefix_sharing_context
-            from prefix_sharing.core.model_spec import AttentionLayerType
-            from prefix_sharing.core.prefix_store import PrefixActivationSlotId, PREFIX_STATE_TYPE_DELTANET_STATE
-            from prefix_sharing.integrations.megatron_runtime import _read_parallel_rank_info, _normalize_layer_number
-            ps_ctx = current_prefix_sharing_context()
-        except ImportError:
-            ps_ctx = None
-
-        if ps_ctx is not None and ps_ctx.prefix_sharing_plan.has_sharing:
-            ps_layer_id = _normalize_layer_number(self)
-            ps_model_spec = ps_ctx.model_spec
-            if ps_layer_id >= 0 and ps_model_spec is not None and \
-                    ps_model_spec.layer_type(ps_layer_id) == AttentionLayerType.LINEAR_ATTENTION:
-                _, ps_tp_rank, _ = _read_parallel_rank_info()
-                ps_slot_id = PrefixActivationSlotId(
-                    forward_id=ps_ctx.prefix_sharing_plan.forward_id,
-                    micro_batch_id=ps_ctx.prefix_sharing_plan.micro_batch_id,
-                    layer_id=ps_layer_id,
-                    sample_idx_in_batch=0,
-                    prefix_state_type=PREFIX_STATE_TYPE_DELTANET_STATE,
-                    tp_rank=ps_tp_rank,
-                )
-
         # Initialize carry state
         carry = torch.zeros(bh, d, d, dtype=query.dtype, device=query.device)
 
         # Suffix pass: inject stored prefix carry state
-        if ps_slot_id is not None and ps_ctx.deltanet_store.contains(ps_slot_id):
+        if ps_is_suffix_pass:
             stored_state = ps_ctx.deltanet_store.load(ps_slot_id)
             prefix_carry = stored_state.recurrent_state  # (prefix_bh, d, d)
             # Expand from prefix batch (1*h) to current batch (N*h)
@@ -264,7 +284,7 @@ class GatedDeltaNetAttention(SelfAttention):
         y = y.reshape(sq, b, h * d)
 
         # --- Prefix-sharing: store carry state for prefix pass ---
-        if ps_slot_id is not None and not ps_ctx.deltanet_store.contains(ps_slot_id):
+        if ps_slot_id is not None and not ps_is_suffix_pass:
             ps_ctx.deltanet_store.store(
                 ps_slot_id,
                 recurrent_state=carry.contiguous(),
