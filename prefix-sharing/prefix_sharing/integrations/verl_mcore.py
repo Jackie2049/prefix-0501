@@ -268,12 +268,22 @@ def build_prefix_sharing_micro_batch(
         raise RuntimeError("prefix sharing phase 1 expects 2D input_ids/attention_mask/position_ids")
 
     # --- Planning ---
+    # Override min_group_size to 2 because TriePrefixDetector is online/incremental:
+    # it cannot see future sequences not yet inserted. min_group_size=N means only
+    # the last sequence (Nth) can pass the group_size check, since earlier sequences
+    # see fewer nodes in the trie. min_group_size=2 allows any sequence that shares
+    # a prefix ≥ min_prefix_len with any earlier sequence to become a reuser.
+    plan_config = PrefixSharingConfig(
+        enable_prefix_sharing=True,
+        min_prefix_len=config.min_prefix_len,
+        min_group_size=2,
+    )
     valid_indices = [attention_mask[row].nonzero(as_tuple=False).flatten() for row in range(input_ids.shape[0])]
     sequences = [input_ids[row, indices].detach().cpu().tolist() for row, indices in enumerate(valid_indices)]
     seq_lens = [len(s) for s in sequences]
     logger.debug(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
 
-    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
+    prefix_sharing_plan = PrefixSharingPlanner(plan_config).plan(sequences)
     logger.debug(
         f"[PS][prepare] prefix_sharing_plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
