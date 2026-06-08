@@ -53,10 +53,10 @@ def _add_output_gate_to_self_attention(attn_module):
     )
 
     def _output_gate_hook(module, input, output):
-        """Apply sigmoid gate after linear_proj output."""
+        """Apply swish gate after linear_proj output (Qwen3.6 output_gate_type="swish")."""
         if isinstance(output, tuple) and len(output) >= 2:
             hidden_states = input[0]
-            gate = torch.sigmoid(module.gate_proj(hidden_states)[0])
+            gate = torch.nn.functional.silu(module.gate_proj(hidden_states)[0])
             gated_output = output[0] * gate
             return (gated_output, output[1])
         return output

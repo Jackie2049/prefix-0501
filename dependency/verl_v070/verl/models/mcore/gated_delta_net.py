@@ -24,6 +24,7 @@ so it can be dropped into existing TransformerLayer specs.
 """
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Tuple, Union
 
@@ -295,9 +296,9 @@ class GatedDeltaNetAttention(SelfAttention):
         # Output projection
         output, bias = self.linear_proj(y)
 
-        # Output gate
+        # Output gate (swish: x * sigmoid(x), matching Qwen3.6 output_gate_type="swish")
         if self.attn_output_gate:
-            gate = torch.sigmoid(self.gate_proj(hidden_states)[0])
+            gate = F.silu(self.gate_proj(hidden_states)[0])
             output = output * gate
 
         return output, bias
