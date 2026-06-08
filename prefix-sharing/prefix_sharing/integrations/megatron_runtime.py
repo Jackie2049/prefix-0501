@@ -172,6 +172,17 @@ def _run_bshd_prefix_sharing_attention(
         logger.debug("[PS][bshd] skipping: no rotary_pos_emb for RoPE")
         return None
 
+    # Build slot_id early (needed for contains check and both prefix/suffix passes)
+    _, tp_rank, _ = _read_parallel_rank_info()
+    slot_id = PrefixActivationSlotId(
+        forward_id=ctx.prefix_sharing_plan.forward_id,
+        micro_batch_id=ctx.prefix_sharing_plan.micro_batch_id,
+        layer_id=layer_id,
+        sample_idx_in_batch=0,
+        prefix_state_type=PREFIX_STATE_TYPE_ATTENTION_KV,
+        tp_rank=tp_rank,
+    )
+
     # Check whether we're in suffix pass (prefix KV already stored) or prefix pass
     is_suffix_pass = ctx.store.contains(slot_id)
 
@@ -200,17 +211,7 @@ def _run_bshd_prefix_sharing_attention(
         query = apply_rotary_pos_emb(query, q_pos_emb, config=attention_module.config)
         key = apply_rotary_pos_emb(key, k_pos_emb, config=attention_module.config)
 
-    _, tp_rank, _ = _read_parallel_rank_info()
-
-    slot_id = PrefixActivationSlotId(
-        forward_id=ctx.prefix_sharing_plan.forward_id,
-        micro_batch_id=ctx.prefix_sharing_plan.micro_batch_id,
-        layer_id=layer_id,
-        sample_idx_in_batch=0,
-        prefix_state_type=PREFIX_STATE_TYPE_ATTENTION_KV,
-        tp_rank=tp_rank,
-    )
-
+    
     num_heads = attention_module.num_attention_heads_per_partition
     kv_heads = attention_module.num_query_groups_per_partition
     head_dim = attention_module.hidden_size_per_attention_head
