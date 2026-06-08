@@ -134,17 +134,27 @@ class GatedDeltaNetAttention(SelfAttention):
 
         # QKV projection using inherited linear_qkv
         # Use parent's get_query_key_value_tensors for correct GQA interleaved split
-        query, key, value = self.get_query_key_value_tensors(hidden_states, None, True)
+        query, key, value = self.get_query_key_value_tensors(hidden_states, None)
         sq, b, _ = hidden_states.size()
 
         # Note: QK layernorm is already applied by get_query_key_value_tensors()
 
-        # Apply RoPE using parent class method
+        # Apply RoPE - same pattern as SelfAttention.forward
+        # For self attention, duplicate rotary_pos_emb if not already a tuple
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+
         if rotary_pos_emb is not None:
+            from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query, key = self._apply_rotary_emb(query, key, q_pos_emb, k_pos_emb)
+            if q_pos_emb is not None:
+                query = apply_rotary_pos_emb(query, q_pos_emb, config=self.config)
+            if k_pos_emb is not None:
+                key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config)
         elif rotary_pos_cos is not None and rotary_pos_sin is not None:
-            query, key = self._apply_fused_rotary_emb(query, key, rotary_pos_cos, rotary_pos_sin)
+            from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb_with_cos_sin
+            key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos, rotary_pos_sin)
+            query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos, rotary_pos_sin)
 
         # Beta and decay
         beta = torch.sigmoid(self.beta_proj(hidden_states)[0])  # [sq, b, heads_per_tp]
@@ -157,37 +167,67 @@ class GatedDeltaNetAttention(SelfAttention):
             key = key.repeat_interleave(self.kv_groups, dim=2)
             value = value.repeat_interleave(self.kv_groups, dim=2)
 
-        # GatedDeltaNet cumsum attention
-        # k, v, query: [sq, b, heads, head_dim]
-        # Reshape to [sq * b, heads, head_dim] for cumsum
-        q_flat = query.reshape(sq * b, self.num_heads_per_tp, self.hidden_size_per_attention_head)
-        k_flat = key.reshape(sq * b, self.num_heads_per_tp, self.hidden_size_per_attention_head)
-        v_flat = value.reshape(sq * b, self.num_heads_per_tp, self.hidden_size_per_attention_head)
-        beta_flat = beta.reshape(sq * b, self.num_heads_per_tp, 1)
 
-        # kv outer product: [t, h, d, d]
-        kv = torch.einsum('thd,the->thde', k_flat, v_flat)
-        update = beta_flat.unsqueeze(-1) * kv  # [t, h, d, d]
+        # GatedDeltaNet chunked cumsum attention (vectorized + memory-efficient)
+        # Uses vectorized cumsum in chunks to avoid Python for-loop overhead
+        # and avoid O(sq * b * h * d^2) full-sequence tensor
+        d = self.hidden_size_per_attention_head
+        h = self.num_heads_per_tp
+        bh = b * h
 
-        # Try prefix-sharing trajectory first (needs the actual state_update)
-        from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_deltanet
-        ps_trajectory = maybe_run_prefix_sharing_deltanet(
-            attention_module=self,
-            state_update=update,
-            packed_seq_params=packed_seq_params,
-        )
+        # Reshape: [sq, b, heads, head_dim] -> [sq, b*heads, head_dim]
+        q_flat = query.reshape(sq, bh, d)
+        k_flat = key.reshape(sq, bh, d)
+        v_flat = value.reshape(sq, bh, d)
+        beta_flat = beta.reshape(sq, bh, 1)
+        decay_flat = decay.reshape(sq, bh, 1)
 
-        if ps_trajectory is not None:
-            trajectory = ps_trajectory
-        else:
-            # Standard cumsum over sequence
-            trajectory = torch.cumsum(update, dim=0)
+        # Chunked cumsum: process in chunks of CHUNK_SIZE tokens
+        # Each chunk: vectorized cumsum -> state trajectory -> query output
+        # Carry state forward between chunks
+        CHUNK_SIZE = 8
+        y = torch.zeros(sq, bh, d, dtype=query.dtype, device=query.device)
+        carry = torch.zeros(bh, d, d, dtype=query.dtype, device=query.device)
 
-        # Query the state
-        y = torch.einsum('thd,thde->the', q_flat, trajectory)
+        num_chunks = (sq + CHUNK_SIZE - 1) // CHUNK_SIZE
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * CHUNK_SIZE
+            end = min(start + CHUNK_SIZE, sq)
+            cs = end - start  # chunk size
 
-        # Reshape back: [sq, b, hidden_per_tp]
-        y = y.reshape(sq, b, self.num_heads_per_tp * self.hidden_size_per_attention_head)
+            q_c = q_flat[start:end]
+            k_c = k_flat[start:end]
+            v_c = v_flat[start:end]
+            beta_c = beta_flat[start:end]
+            decay_c = decay_flat[start:end]
+
+            # kv outer products: [cs, b*h, d, d]
+            kv = torch.einsum("thd,the->thde", k_c, v_c)
+            # beta-weighted update: [cs, b*h, d, d]
+            update = beta_c.unsqueeze(-1) * kv
+
+            # Cumulative decay product: [cs, b*h, 1]
+            log_decay = torch.log(decay_c.clamp(min=1e-7))
+            decay_prod = torch.exp(torch.cumsum(log_decay, dim=0))
+
+            # Normalized update: update[i] / decay_prod[i]
+            inv_decay = 1.0 / decay_prod.clamp(min=1e-7)
+            norm_update = update * inv_decay.unsqueeze(-1)  # [cs, b*h, d, d]
+            norm_cumsum = torch.cumsum(norm_update, dim=0)  # [cs, b*h, d, d]
+
+            # State trajectory: state[t] = decay_prod[t] * (carry + norm_cumsum[t])
+            carry_exp = carry.unsqueeze(0)  # [1, b*h, d, d]
+            state_traj = decay_prod.unsqueeze(-1) * (carry_exp + norm_cumsum)  # [cs, b*h, d, d]
+
+            # Query output: y[start:end] = q_c @ state_traj
+            y[start:end] = torch.einsum("thd,thde->the", q_c, state_traj)
+
+            # Carry forward: last state in chunk
+            carry = state_traj[-1]  # [b*h, d, d]
+
+        # Reshape back: [sq, b*heads, head_dim] -> [sq, b, heads*head_dim]
+        y = y.reshape(sq, b, h * d)
+
 
         # Output projection
         output, bias = self.linear_proj(y)

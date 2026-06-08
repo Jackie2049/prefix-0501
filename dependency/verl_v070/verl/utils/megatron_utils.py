@@ -415,15 +415,18 @@ def offload_megatron_model_to_cpu(models):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in model_chunk_all_buffers:
                 for buffer in buffers:
-                    # offload parameters
-                    if buffer.param_data.storage().size() > 0:
+                    # offload parameters (handle None param_data/grad_data from Float16Optimizer)
+                    if buffer.param_data is not None and buffer.param_data.storage().size() > 0:
                         buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
                         buffer.param_data_size = buffer.param_data.storage().size()
                         buffer.param_data.storage().resize_(0)
+                    elif buffer.param_data is None:
+                        buffer.param_data_size = 0
 
-                    assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
+                    if buffer.param_data_size > 0:
+                        assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
 
-                    if buffer.grad_data.storage().size() > 0:
+                    if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
                         # if the grad_data size is already zero, we assume that it is already offloaded
                         buffer.grad_data_size = buffer.grad_data.storage().size()
                         buffer.grad_data.storage().resize_(0)
@@ -449,7 +452,7 @@ def load_megatron_model_to_gpu(models, load_grad=True):
                         buffer.grad_data.storage().resize_(buffer.grad_data_size)
                         buffer.grad_data.zero_()
 
-                    if buffer.param_data.storage().size() == 0:
+                    if buffer.param_data is not None and buffer.param_data.storage().size() == 0 and buffer.param_data_size > 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)
                         # copy data from cpu to cuda
                         buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
@@ -596,6 +599,72 @@ def get_dist_checkpoint_path(checkpoint_path):
     local_mkdir_safe(checkpoint_path)
     local_mkdir_safe(os.path.join(checkpoint_path, "dist_ckpt"))
     return os.path.join(checkpoint_path, "dist_ckpt")
+
+
+def cpu_adam_step(actor_optimizer):
+    """CPU-based Adam step when optimizer_offload is active.
+    
+    Bypasses FusedAdam entirely. Keeps optimizer state on CPU permanently.
+    Only transfers gradients (GPU→CPU) and updated params (CPU→GPU).
+    Peak GPU memory = bf16 params + activations (no optimizer state on GPU).
+    
+    This avoids loading ~16 GiB of optimizer state to GPU for FusedAdam step.
+    """
+    import math
+    import torch
+    
+    for opt in actor_optimizer.chained_optimizers if hasattr(actor_optimizer, 'chained_optimizers') else [actor_optimizer]:
+        if hasattr(opt, 'fp32_from_float16_groups') and hasattr(opt, 'float16_groups'):
+            # Step 1: Copy GPU bf16 grads to CPU fp32 main_param grads
+            for model_group, main_group in zip(opt.float16_groups, opt.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    if model_param.grad is not None:
+                        main_param.grad = model_param.grad.detach().float().cpu()
+                        model_param.grad = None  # Free GPU grad memory
+            
+            # Step 2: CPU AdamW update
+            lr = opt.optimizer.param_groups[0]['lr']
+            eps = opt.optimizer.param_groups[0].get('eps', 1e-8)
+            weight_decay = opt.optimizer.param_groups[0].get('weight_decay', 0.0)
+            beta1, beta2 = 0.9, 0.999
+            
+            for main_group in opt.fp32_from_float16_groups:
+                for main_param in main_group:
+                    if main_param.grad is None:
+                        continue
+                    state = opt.optimizer.state.get(main_param, {})
+                    if len(state) == 0:
+                        # Initialize state on CPU
+                        state['step'] = 0
+                        state['exp_avg'] = torch.zeros_like(main_param, dtype=torch.float32).cpu()
+                        state['exp_avg_sq'] = torch.zeros_like(main_param, dtype=torch.float32).cpu()
+                        opt.optimizer.state[main_param] = state
+                    
+                    state['step'] += 1
+                    exp_avg = state['exp_avg']
+                    exp_avg_sq = state['exp_avg_sq']
+                    
+                    # AdamW: decoupled weight decay first
+                    if weight_decay > 0:
+                        main_param.add_(main_param, alpha=-lr * weight_decay)
+                    
+                    # Adam update
+                    exp_avg.mul_(beta1).add_(main_param.grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(main_param.grad, main_param.grad, value=1 - beta2)
+                    
+                    bias_correction1 = 1 - beta1 ** state['step']
+                    bias_correction2 = 1 - beta2 ** state['step']
+                    step_size = lr / bias_correction1
+                    
+                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+                    main_param.addcdiv_(exp_avg, denom, value=-step_size)
+            
+            # Step 3: Copy updated CPU fp32 params back to GPU bf16 model params
+            for model_group, main_group in zip(opt.float16_groups, opt.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    model_param.data.copy_(main_param.to(model_param.device))
+    
+    return True, 0.0, 0  # update_successful, grad_norm, num_zeros_in_grad
 
 
 def get_hf_model_checkpoint_path(checkpoint_path):

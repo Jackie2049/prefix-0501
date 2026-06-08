@@ -490,7 +490,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
+        num_zeros_in_grad = 0  # Skip count_zeros to save memory if self.config.log_num_zeros_in_grad else 0
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
@@ -852,7 +852,7 @@ class FP32Optimizer(MegatronOptimizer):
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        num_zeros_in_grad = 0  # Skip count_zeros to save memory if self.config.log_num_zeros_in_grad else None
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
@@ -1141,7 +1141,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
 
         # Count the zeros in the grads.
-        num_zeros_in_grad = self.count_zeros()
+        num_zeros_in_grad = 0  # Skip count_zeros to save memory
 
         update_successful = self.step_with_ready_grads()
 

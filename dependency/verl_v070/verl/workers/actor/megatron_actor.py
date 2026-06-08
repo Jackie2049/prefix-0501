@@ -49,7 +49,7 @@ from verl.utils.megatron.router_replay_utils import (
     set_router_replay_data,
 )
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
-from verl.utils.megatron_utils import get_model_config, unwrap_model
+from verl.utils.megatron_utils import get_model_config, unwrap_model, load_megatron_optimizer
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.profiler.profile import Profiler
 from verl.utils.py_functional import append_to_dict
@@ -857,7 +857,16 @@ class MegatronPPOActor(BasePPOActor):
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
-            update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+            # CPU Adam step when optimizer_offload is active.
+            # Bypasses FusedAdam entirely - optimizer state stays on CPU permanently.
+            # Only transfers grads (GPU→CPU) and updated params (CPU→GPU).
+            # Peak GPU memory = bf16 params + activations (no optimizer state on GPU).
+            # Use config flag instead of device check (after offload, device is still 'cuda' but storage is empty)
+            if self.config.megatron.get('optimizer_offload', False):
+                from verl.utils.megatron_utils import cpu_adam_step
+                update_successful, grad_norm, num_zeros_in_grad = cpu_adam_step(self.actor_optimizer)
+            else:
+                update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
 

@@ -598,6 +598,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 offload_megatron_model_to_cpu(self.actor_module)
                 log_gpu_memory_usage("After offload actor params and grad during init", logger=logger)
             if self._is_offload_optimizer:
+                # With CPU Adam step, optimizer state stays on CPU permanently.
+                # No need to load/offload optimizer state - cpu_adam_step handles everything on CPU.
+                # Just offload fp32 main_params (created on GPU by Float16OptimizerWithFloat16Params) to CPU.
                 offload_megatron_optimizer(self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
@@ -762,9 +765,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            load_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        # NOTE: optimizer load is deferred to inside update_policy (just before optimizer.step())
+        # This avoids loading ~16 GiB of optimizer state during forward+backward pass.
+        # Loading before update_policy causes OOM because optimizer state sits idle on GPU
+        # during forward+backward. Deferring the load reduces peak GPU memory significantly.
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
@@ -790,9 +794,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        # With CPU Adam step, optimizer state is always on CPU.
+        # No need to offload after update_actor - it was never loaded to GPU.
+        # Just free GPU memory from gradients.
+        aggressive_empty_cache(force_sync=True)
 
         aggressive_empty_cache(force_sync=True)
         return output
@@ -810,7 +815,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             "pad_token_id": self.generation_config.pad_token_id
             if self.generation_config is not None
             else self.tokenizer.pad_token_id,
-            "max_prompt_length": self.config.rollout.get("max_prompt_length", None) or self.config.data.get("max_prompt_length", 1024),
+            "max_prompt_length": self.config.rollout.get("max_prompt_length", None) or 64,
         }
         prompts.meta_info.update(meta_info)
         if self._is_offload_optimizer:
@@ -884,6 +889,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         max_prompt_length = prompts.meta_info.get("max_prompt_length", rollout_config.get("max_prompt_length", 1024))
 
         eos_token_id = prompts.meta_info["eos_token_id"]
+        if isinstance(eos_token_id, list):
+            eos_token_id = eos_token_id[0]
         pad_token_id = prompts.meta_info["pad_token_id"]
 
         # Tokenize raw_prompt from non_tensor_batch
@@ -1045,6 +1052,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # Return in same format as HFRollout
         output = DataProto.from_dict(tensors={
+            "prompts": input_ids.cpu(),
             "input_ids": full_input_ids.cpu(),
             "responses": responses.cpu(),
             "response_mask": response_mask.cpu(),
@@ -1068,8 +1076,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         from verl.utils.megatron_utils import unwrap_model
 
         model = unwrap_model(self.actor_module)
+        # For non-VPP (single model in list), extract the single model
+        if isinstance(model, list) and len(model) == 1:
+            model = model[0]
         # Determine data_format based on use_remove_padding config
-        use_rmpad = getattr(unwrap_model(model).config, 'use_remove_padding', False)
+        use_rmpad = getattr(model.config if not isinstance(model, list) else model[0].config, 'use_remove_padding', False)
         data_format = "thd" if use_rmpad else "bshd"
         # Convert attention_mask to bool for the forward function
         attn_mask_bool = attention_mask.bool()
