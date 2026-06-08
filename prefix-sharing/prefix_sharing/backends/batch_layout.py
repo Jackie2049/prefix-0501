@@ -222,13 +222,38 @@ class BshdBatchLayout:
         return BshdTokenIndex(row=row, seq_pos=int(valid_positions[valid_offset].item()))
 
     def valid_row(self, tensor: Any, row: int) -> Any:
+        if self._is_compact_valid_tensor(tensor):
+            start = sum(self.valid_lengths[:row])
+            end = start + self.valid_lengths[row]
+            return tensor[start:end]
         return tensor[row, self.valid_token_mask[row]]
 
     def padded_row(self, tensor: Any, row: int) -> Any:
+        if self._is_compact_valid_tensor(tensor):
+            start = sum(self.valid_lengths[:row])
+            end = start + self.valid_lengths[row]
+            return tensor[start:end]
         return tensor[row]
 
     def scatter_valid_row(self, output: Any, row: int, valid_output: Any) -> None:
+        if self._is_compact_valid_tensor(output):
+            start = sum(self.valid_lengths[:row])
+            output[start : start + self.valid_lengths[row]] = valid_output
+            return
         output[row, self.valid_token_mask[row]] = valid_output
+
+    def valid_position_ids(self, *, device: Any | None = None) -> Any:
+        if self.position_ids is None:
+            raise RuntimeError("BshdBatchLayout is missing position_ids")
+        mask = self.valid_token_mask
+        position_ids = self.position_ids
+        if device is not None:
+            mask = mask.to(device=device)
+            position_ids = position_ids.to(device=device)
+        return position_ids[mask]
+
+    def _is_compact_valid_tensor(self, tensor: Any) -> bool:
+        return tensor.dim() >= 2 and int(tensor.shape[0]) == self.total_valid_length
 
 
 def _pad_to_multiple(length: int, align_size: int) -> int:

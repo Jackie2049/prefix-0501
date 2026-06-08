@@ -96,3 +96,25 @@ def test_bshd_batch_layout_reads_and_scatters_dense_valid_tokens():
     assert output[1, 3:5].tolist() == torch.ones(2, 2).tolist()
     assert output[1, :3].abs().sum().item() == 0
     assert output[1, 5].abs().sum().item() == 0
+
+
+def test_bshd_batch_layout_reads_and_scatters_compact_valid_tokens():
+    mask = torch.tensor(
+        [
+            [True, True, True, False],
+            [False, True, True, False],
+        ]
+    )
+    layout = BshdBatchLayout.from_valid_token_mask(mask, position_ids=torch.arange(4).repeat(2, 1))
+    compact = torch.arange(layout.total_valid_length * 2, dtype=torch.float32).reshape(layout.total_valid_length, 2)
+    output = torch.zeros_like(compact)
+
+    assert layout.valid_lengths == [3, 2]
+    assert layout.valid_row(compact, 0).tolist() == compact[:3].tolist()
+    assert layout.valid_row(compact, 1).tolist() == compact[3:5].tolist()
+    assert layout.padded_row(compact, 1).tolist() == compact[3:5].tolist()
+    assert layout.valid_position_ids().tolist() == [0, 1, 2, 1, 2]
+
+    layout.scatter_valid_row(output, 1, torch.ones(2, 2))
+    assert output[:3].abs().sum().item() == 0
+    assert output[3:5].tolist() == torch.ones(2, 2).tolist()

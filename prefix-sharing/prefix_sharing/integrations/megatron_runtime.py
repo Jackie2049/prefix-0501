@@ -52,7 +52,7 @@ def maybe_run_prefix_sharing_attention(
         key,
         q_pos_emb,
         k_pos_emb,
-        batch_runtime_layout.position_ids,
+        batch_runtime_layout,
     )
 
     backend = ctx.backend or TorchReferenceBackend()
@@ -127,18 +127,16 @@ def _apply_positioned_rope(
     key: Any,
     q_pos_emb: Any,
     k_pos_emb: Any,
-    position_ids: Any,
+    batch_runtime_layout: Any,
 ) -> tuple[Any, Any]:
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
-    original_query_shape = query.shape
-    original_key_shape = key.shape
-    positions = position_ids.to(device=query.device, dtype=torch.long).reshape(-1)
-    if query.dim() >= 3 and query.shape[0] != positions.shape[0]:
-        query = query.reshape(positions.shape[0], *query.shape[2:])
-    if key.dim() >= 3 and key.shape[0] != positions.shape[0]:
-        key = key.reshape(positions.shape[0], *key.shape[2:])
-    max_needed = positions.max().item() + 1
+    q_positions = _positions_for_tensor(batch_runtime_layout, query, device=query.device)
+    k_positions = _positions_for_tensor(batch_runtime_layout, key, device=key.device)
+    max_needed = max(q_positions.max().item(), k_positions.max().item()) + 1
+
+    query, q_restore_shape, q_squeeze_batch_dim = _flatten_rope_tensor(query, q_positions)
+    key, k_restore_shape, k_squeeze_batch_dim = _flatten_rope_tensor(key, k_positions)
 
     # Extend q_pos_emb / k_pos_emb when they are shorter than the largest
     # position_id needed by the runtime layout.  THD-mode generated pos_emb
@@ -172,21 +170,71 @@ def _apply_positioned_rope(
         k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
 
     if q_pos_emb is not None:
-        q_freqs = q_pos_emb.index_select(0, positions)
+        q_freqs = q_pos_emb.index_select(0, q_positions)
         query = apply_rotary_pos_emb(
-            query.unsqueeze(1),
+            query.unsqueeze(1) if q_squeeze_batch_dim else query,
             q_freqs,
             config=attention_module.config,
             cu_seqlens=None,
-        ).squeeze(1)
-        query = query.reshape(original_query_shape)
+        )
+        if q_squeeze_batch_dim:
+            query = query.squeeze(1)
+        query = query.reshape(q_restore_shape)
     if k_pos_emb is not None:
-        k_freqs = k_pos_emb.index_select(0, positions)
+        k_freqs = k_pos_emb.index_select(0, k_positions)
         key = apply_rotary_pos_emb(
-            key.unsqueeze(1),
+            key.unsqueeze(1) if k_squeeze_batch_dim else key,
             k_freqs,
             config=attention_module.config,
             cu_seqlens=None,
-        ).squeeze(1)
-        key = key.reshape(original_key_shape)
+        )
+        if k_squeeze_batch_dim:
+            key = key.squeeze(1)
+        key = key.reshape(k_restore_shape)
     return query, key
+
+
+def _positions_for_tensor(batch_runtime_layout: Any, tensor: Any, *, device: Any) -> Any:
+    position_ids = batch_runtime_layout.position_ids.to(device=device, dtype=torch.long)
+    if batch_runtime_layout.layout_kind == "thd":
+        positions = position_ids.reshape(-1)
+    elif batch_runtime_layout.layout_kind == "bshd":
+        valid_positions = batch_runtime_layout.valid_position_ids(device=device).to(dtype=torch.long)
+        full_positions = position_ids.reshape(-1)
+        if tensor.dim() >= 4 and tensor.shape[0] * tensor.shape[1] == full_positions.numel():
+            positions = full_positions
+        elif tensor.shape[0] == valid_positions.numel():
+            positions = valid_positions
+        elif tensor.shape[0] == full_positions.numel():
+            positions = full_positions
+        else:
+            raise RuntimeError(
+                "prefix sharing BSHD RoPE cannot align tensor with position_ids: "
+                f"tensor_shape={tuple(tensor.shape)}, full_positions={full_positions.numel()}, "
+                f"valid_positions={valid_positions.numel()}"
+            )
+    else:
+        raise ValueError(f"unsupported batch runtime layout: {batch_runtime_layout.layout_kind}")
+    return positions.to(device=device, dtype=torch.long).reshape(-1)
+
+
+def _flatten_rope_tensor(tensor: Any, positions: Any) -> tuple[Any, Any, bool]:
+    restore_shape = tensor.shape
+    position_count = int(positions.numel())
+    if tensor.dim() == 3:
+        if tensor.shape[0] != position_count:
+            raise RuntimeError(
+                "prefix sharing RoPE position count does not match 3D tensor: "
+                f"tensor_shape={tuple(tensor.shape)}, positions={position_count}"
+            )
+        return tensor, restore_shape, True
+    if tensor.dim() == 4:
+        if tensor.shape[0] == position_count:
+            return tensor, restore_shape, False
+        if tensor.shape[0] * tensor.shape[1] == position_count:
+            return tensor.reshape(position_count, 1, *tensor.shape[2:]), restore_shape, False
+        raise RuntimeError(
+            "prefix sharing RoPE position count does not match 4D tensor: "
+            f"tensor_shape={tuple(tensor.shape)}, positions={position_count}"
+        )
+    raise RuntimeError(f"prefix sharing RoPE expects 3D or 4D Q/K tensor, got shape={tuple(tensor.shape)}")
