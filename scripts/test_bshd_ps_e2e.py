@@ -65,6 +65,20 @@ parallel_state.initialize_model_parallel(
 tp_rank = parallel_state.get_tensor_model_parallel_rank()
 device = torch.device(f"cuda:{local_rank}")
 
+def _gather_logits_tp(logits_per_rank):
+    """AllGather logits across TP ranks to get full vocab_size logits.
+
+    GPTModel with parallel_output=True splits vocab across TP ranks,
+    so each rank has logits of shape [b, s, vocab_size/TP_SIZE].
+    This function gathers and concatenates to get [b, s, vocab_size].
+    """
+    if TP_SIZE <= 1:
+        return logits_per_rank
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    logits_list = [torch.empty_like(logits_per_rank) for _ in range(TP_SIZE)]
+    torch.distributed.all_gather(logits_list, logits_per_rank, group=tp_group)
+    return torch.cat(logits_list, dim=-1)
+
 # Load HF config
 config = AutoConfig.from_pretrained(HF_MODEL_PATH)
 if local_rank == 0:
@@ -127,8 +141,12 @@ with torch.no_grad():
 torch.cuda.synchronize()
 t_normal = time.time() - t_normal_start
 
+# AllGather logits across TP ranks (parallel_output=True splits vocab across TP)
+full_logits_normal = _gather_logits_tp(logits_normal)
+del logits_normal
+
 # Extract suffix log_probs
-log_probs_normal = F.log_softmax(logits_normal.float(), dim=-1)
+log_probs_normal = F.log_softmax(full_logits_normal.float(), dim=-1)
 suffix_labels = full_input_ids[:, PREFIX_LEN:]  # (N, SUFFIX_LEN)
 # logits at position p predict token at position p+1
 # For suffix starting at PREFIX_LEN: logits[PREFIX_LEN-1] predicts token at PREFIX_LEN
@@ -136,7 +154,7 @@ selected_normal = log_probs_normal[:, PREFIX_LEN-1:-1, :].gather(
     dim=-1, index=suffix_labels.unsqueeze(-1)
 ).squeeze(-1).to(device='cpu', dtype=torch.float32)
 
-del logits_normal, log_probs_normal
+del full_logits_normal, log_probs_normal
 torch.cuda.empty_cache()
 
 if local_rank == 0:
@@ -216,8 +234,12 @@ with prefix_sharing_runtime_context(ps_runtime_state) as ctx:
 torch.cuda.synchronize()
 t_ps = time.time() - t_ps_start
 
+# AllGather logits across TP ranks
+full_suffix_logits = _gather_logits_tp(suffix_logits)
+del suffix_logits
+
 # Extract suffix log_probs from PS forward
-log_probs_ps = F.log_softmax(suffix_logits.float(), dim=-1)
+log_probs_ps = F.log_softmax(full_suffix_logits.float(), dim=-1)
 # PS suffix-only: logits at position p (absolute PREFIX_LEN+p) predict token at p+1 (absolute PREFIX_LEN+p+1)
 # We want log_probs for suffix tokens 1..SUFFIX_LEN-1 (absolute positions PREFIX_LEN+1..total_len-1)
 suffix_labels_ps = suffix_input_ids[:, 1:]  # (N, SUFFIX_LEN-1) — tokens at suffix positions 1..SUFFIX_LEN-1
@@ -225,7 +247,7 @@ selected_ps = log_probs_ps[:, :-1, :].gather(
     dim=-1, index=suffix_labels_ps.unsqueeze(-1)
 ).squeeze(-1)
 
-del suffix_logits, log_probs_ps
+del full_suffix_logits, log_probs_ps
 torch.cuda.empty_cache()
 
 if local_rank == 0:
