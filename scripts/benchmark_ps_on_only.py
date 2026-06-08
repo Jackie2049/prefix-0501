@@ -311,11 +311,11 @@ for step in range(N_STEPS):
         with torch.no_grad():
             ref_output = model(input_ids=full_input_ids, attention_mask=attention_mask,
                               position_ids=position_ids)
-            suffix_logits_ref = ref_output.logits[:, PREFIX_LEN:, :]
-            suffix_log_probs_ref = F.log_softmax(suffix_logits_ref.float(), dim=-1)
-            old_log_prob = suffix_log_probs_ref[:, :-1, :].gather(
+            suffix_logits_ref_slice = ref_output.logits[:, PREFIX_LEN:-1, :].float()
+            suffix_log_probs_ref = F.log_softmax(suffix_logits_ref_slice, dim=-1)
+            old_log_prob = suffix_log_probs_ref.gather(
                 dim=-1, index=suffix_labels.unsqueeze(-1)).squeeze(-1).to(device='cpu', dtype=torch.float32)
-        del ref_output, suffix_logits_ref, suffix_log_probs_ref
+        del ref_output, suffix_logits_ref_slice, suffix_log_probs_ref
         torch.cuda.empty_cache()
     except torch.cuda.OutOfMemoryError:
         ref_ok = False
@@ -346,11 +346,13 @@ for step in range(N_STEPS):
                              position_ids=position_ids_ps)
         suffix_logits_ps = suffix_output.logits
 
-    # Loss: suffix-only positions (PREFIX_LEN:-1 matches PS OFF's [:PREFIX_LEN:-1])
-    suffix_log_probs = F.log_softmax(suffix_logits_ps.float(), dim=-1)
-    new_log_prob = suffix_log_probs[:, PREFIX_LEN:-1, :].gather(
+    # Loss: suffix-only positions. Slice first to reduce log_softmax memory.
+    # (log_softmax on full [N, total_len, vocab] fp32 is huge; slice to suffix first)
+    suffix_logits_slice = suffix_logits_ps[:, PREFIX_LEN:-1, :].float()
+    suffix_log_probs = F.log_softmax(suffix_logits_slice, dim=-1)
+    new_log_prob = suffix_log_probs.gather(
         dim=-1, index=suffix_labels.unsqueeze(-1)).squeeze(-1)
-    del suffix_log_probs
+    del suffix_logits_slice, suffix_log_probs
 
     cos_sim = -1.0
     if ref_ok:
