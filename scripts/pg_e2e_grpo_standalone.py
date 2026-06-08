@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+PG E2E GRPO Competitive Analysis — Clean Standalone Script
+Direct GRPO training loop. Uses HF model.generate() for rollout,
+PrefixGrouper for shared-prefix forward. Collects step timing.
+No prefix-0501 code — only uses PR #4368's prefix_grouper package.
+"""
+
+import os, sys, time, json, uuid, re, copy
+from contextlib import nullcontext
+import numpy as np
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from prefix_grouper import PrefixGrouper
+
+# ── Config ──
+MODEL_PATH = os.environ.get("MODEL_PATH", "/home/zxw/rollout-prefix/models/Qwen2.5-0.5B-Instruct")
+DATA_PATH  = os.environ.get("DATA_PATH", "/home/zxw/rollout-prefix/data/grpo_math/train.parquet")
+USE_PG     = os.environ.get("USE_PG", "0") == "1"
+N          = int(os.environ.get("N", "4"))         # GRPO n per prompt
+P_LEN      = int(os.environ.get("P_LEN", "64"))    # max prompt tokens
+R_LEN      = int(os.environ.get("R_LEN", "128"))   # max response tokens
+NUM_STEPS  = int(os.environ.get("NUM_STEPS", "3"))
+LR         = float(os.environ.get("LR", "1e-6"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4")) # prompts per step (reduce for mem)
+SEED       = 42
+DEVICE     = "cuda"
+MAX_LEN    = P_LEN + R_LEN
+
+
+def load_data():
+    import pandas as pd
+    df = pd.read_parquet(DATA_PATH)
+    prompts = []
+    for i in range(min(BATCH_SIZE, len(df))):
+        p = df.iloc[i]["prompt"]
+        if isinstance(p, np.ndarray):
+            p = list(p)
+        if isinstance(p, list):
+            prompts.append(p)
+        elif isinstance(p, str):
+            try:
+                prompts.append(eval(p))
+            except:
+                prompts.append([{"role": "user", "content": p}])
+    return prompts
+
+
+def compute_log_probs_normal(model, input_ids, attention_mask, prompt_lens):
+    """Standard forward — no prefix sharing."""
+    with torch.no_grad() if not model.training else nullcontext():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = outputs.logits
+    log_probs_list = []
+    for i in range(input_ids.shape[0]):
+        p_len = prompt_lens[i]
+        # Shifted logits: position p_len-1 predicts token at p_len
+        resp_logits = logits[i, p_len-1:-1, :].float()
+        resp_tokens = input_ids[i, p_len:]
+        log_p = F.log_softmax(resp_logits, dim=-1)
+        tok_lp = log_p.gather(dim=-1, index=resp_tokens.unsqueeze(-1)).squeeze(-1)
+        log_probs_list.append(tok_lp[:R_LEN])
+    return torch.stack(log_probs_list)
+
+
+def compute_log_probs_pg(model, tokenizer, input_ids, attention_mask, prompt_lens, uids):
+    """PrefixGrouper forward — shared-prefix attention decomposition."""
+    batch_size = input_ids.shape[0]
+    pad_token_id = tokenizer.pad_token_id or 0
+
+    # Group by uid
+    group_sizes = []
+    cur = 1
+    for i in range(1, len(uids)):
+        if uids[i] == uids[i-1]:
+            cur += 1
+        else:
+            group_sizes.append(cur)
+            cur = 1
+    group_sizes.append(cur)
+
+    # Build masks
+    response_mask = torch.zeros_like(attention_mask)
+    for i in range(batch_size):
+        response_mask[i, prompt_lens[i]:] = attention_mask[i, prompt_lens[i]:]
+
+    # Prefix indices (first seq per group)
+    prefix_indices = []
+    cursor = 0
+    for gs in group_sizes:
+        prefix_indices.append(cursor)
+        cursor += gs
+    prefix_indices_t = torch.tensor(prefix_indices, device=DEVICE)
+
+    # Prefix data
+    prefix_ids = input_ids[prefix_indices_t]
+    prefix_mask = prefix_ids.ne(pad_token_id)
+
+    # Build PG
+    pg = PrefixGrouper.from_ungrouped_masks(
+        prefix_mask=prefix_mask,
+        suffix_mask=response_mask,
+        group_sizes=group_sizes,
+        padding_mode="right",
+        device=DEVICE,
+    )
+
+    # Concat input
+    concat_ids = pg.concat_input(prefix_ids, prefix_mask, input_ids, response_mask)
+    pg_attn_mask = pg.padding_mask
+
+    # Position IDs
+    position_ids = torch.zeros(batch_size, concat_ids.size(1), dtype=torch.long, device=DEVICE)
+    for i in range(len(pg.group_info)):
+        g = pg.group_info[i]
+        prefix_len = g.prefix_len
+        position_ids[i, :prefix_len] = torch.arange(prefix_len, device=DEVICE)
+        cur_pos = prefix_len
+        for s_len in g.suffix_lens:
+            if s_len > 0:
+                position_ids[i, cur_pos:cur_pos+s_len] = torch.arange(prefix_len, prefix_len+s_len, device=DEVICE)
+                cur_pos += s_len
+
+    # Forward
+    outputs = model(input_ids=concat_ids, attention_mask=pg_attn_mask, position_ids=position_ids)
+    logits = outputs.logits
+
+    # Extract log probs per original sequence
+    log_probs_list = []
+    for i in range(batch_size):
+        p_len = prompt_lens[i]
+        # Find where this sequence's suffix starts in concat format
+        # The PG format: [prefix_tokens, suffix_tokens_of_seq_0, suffix_tokens_of_seq_1, ...]
+        # Each row i has prefix_len + its own suffix_len tokens
+        g_idx = 0
+        cumsum = 0
+        for g, gs in enumerate(group_sizes):
+            if i < cumsum + gs:
+                g_idx = g
+                break
+            cumsum += gs
+
+        group = pg.group_info[g_idx]
+        prefix_len = group.prefix_len
+
+        # Offset within group: which suffix slot this sequence occupies
+        local_idx = i - prefix_indices[g_idx]
+        suffix_offset = prefix_len
+        for s in range(local_idx):
+            suffix_offset += group.suffix_lens[s]
+
+        suffix_len = group.suffix_lens[local_idx]
+
+        # Extract logits for response positions (shifted)
+        # Start from suffix_offset, take up to R_LEN tokens
+        start = suffix_offset
+        resp_logits = logits[i, start-1:start+min(R_LEN, suffix_len)-1, :].float()
+        # But we need the ORIGINAL sequence's tokens at these positions
+        # The concat_input has different ordering — use original input_ids for tokens
+        resp_tokens = input_ids[i, p_len:p_len+R_LEN]
+        log_p = F.log_softmax(resp_logits, dim=-1)
+        tok_lp = log_p.gather(dim=-1, index=resp_tokens[:resp_logits.size(0)].unsqueeze(-1)).squeeze(-1)
+        padded = torch.zeros(R_LEN, device=DEVICE, dtype=tok_lp.dtype)
+        padded[:tok_lp.size(0)] = tok_lp
+        log_probs_list.append(padded)
+
+    return torch.stack(log_probs_list)
+
+
+def main():
+    torch.manual_seed(SEED)
+    print(flush=True)
+    print("=== PG E2E GRPO Competitive Analysis ===", flush=True)
+    print(f"USE_PG={USE_PG} (0=OFF, 1=ON)", flush=True)
+    print(f"Model: {MODEL_PATH}", flush=True)
+    print(f"N={N}, BATCH={BATCH_SIZE}, STEPS={NUM_STEPS}", flush=True)
+
+    # Load model
+    print("Loading model...", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.bfloat16, device_map="auto")
+    model.train()
+
+    # Reference model (for KL penalty) — keep on same device, eval mode
+    print("Loading ref model...", flush=True)
+    ref_model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.bfloat16, device_map="auto")
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+
+    # Load data
+    print("Loading data...", flush=True)
+    prompts = load_data()
+    print(f"Loaded {len(prompts)} prompts", flush=True)
+
+    # Tokenize all prompts upfront
+    prompt_texts = []
+    prompt_lens_list = []
+    for p in prompts:
+        chat = tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
+        prompt_texts.append(chat)
+        ids = tokenizer.encode(chat)
+        prompt_lens_list.append(min(len(ids), P_LEN))
+
+    results = []
+    for step in range(NUM_STEPS):
+        print(f"\n--- Step {step+1}/{NUM_STEPS} ---", flush=True)
+        step_t0 = time.time()
+
+        # Phase 1: Rollout (generate n responses per prompt)
+        rollout_t0 = time.time()
+        all_input_ids = []
+        all_attn_mask = []
+        all_prompt_lens = []
+        all_uids = []
+
+        for pi, (chat, p_len) in enumerate(zip(prompt_texts, prompt_lens_list)):
+            uid = str(uuid.uuid4())
+            # Generate n responses
+            for j in range(N):
+                inp = tokenizer(chat, return_tensors="pt", truncation=True, max_length=P_LEN)
+                inp_ids = inp["input_ids"].to(DEVICE)
+                inp_mask = inp["attention_mask"].to(DEVICE)
+                actual_p_len = inp_ids.size(1)
+
+                with torch.no_grad():
+                    gen_out = model.generate(
+                        inp_ids,
+                        attention_mask=inp_mask,
+                        max_new_tokens=R_LEN,
+                        do_sample=True,
+                        temperature=1.0,
+                        top_p=1.0,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                # Extract full sequence (prompt + response)
+                full_ids = gen_out[0]  # 1D tensor
+                full_len = full_ids.size(0)
+
+                # Pad to MAX_LEN
+                padded = torch.full((MAX_LEN,), tokenizer.pad_token_id, dtype=torch.long)
+                padded[:full_len] = full_ids[:MAX_LEN]
+                mask = torch.zeros(MAX_LEN, dtype=torch.long)
+                mask[:min(full_len, MAX_LEN)] = 1
+
+                all_input_ids.append(padded)
+                all_attn_mask.append(mask)
+                all_prompt_lens.append(actual_p_len)
+                all_uids.append(uid)
+
+        input_ids = torch.stack(all_input_ids).to(DEVICE)
+        attn_mask = torch.stack(all_attn_mask).to(DEVICE)
+        rollout_time = time.time() - rollout_t0
+        print(f"  Rollout: {rollout_time:.3f}s ({len(all_input_ids)} sequences)", flush=True)
+
+        # Phase 2: Compute log probs (actor + ref)
+        logprob_t0 = time.time()
+        if USE_PG:
+            log_probs = compute_log_probs_pg(model, tokenizer, input_ids, attn_mask, all_prompt_lens, all_uids)
+        else:
+            log_probs = compute_log_probs_normal(model, input_ids, attn_mask, all_prompt_lens)
+
+        # Ref model log probs (always normal — PG only for actor)
+        with torch.no_grad():
+            ref_out = ref_model(input_ids=input_ids, attention_mask=attn_mask)
+            ref_logits = ref_out.logits
+            ref_log_probs = []
+            for i in range(input_ids.shape[0]):
+                p_len = all_prompt_lens[i]
+                resp_logits = ref_logits[i, p_len-1:-1, :].float()
+                resp_tokens = input_ids[i, p_len:]
+                log_p = F.log_softmax(resp_logits, dim=-1)
+                tok_lp = log_p.gather(dim=-1, index=resp_tokens.unsqueeze(-1)).squeeze(-1)
+                ref_log_probs.append(tok_lp[:R_LEN])
+            ref_log_probs = torch.stack(ref_log_probs)
+
+        logprob_time = time.time() - logprob_t0
+        print(f"  LogProb: {logprob_time:.3f}s", flush=True)
+
+        # Phase 3: GRPO advantages
+        adv_t0 = time.time()
+        advantages = torch.zeros_like(log_probs)
+        for uid in set(all_uids):
+            indices = [i for i, u in enumerate(all_uids) if u == uid]
+            group_lp = log_probs[indices]
+            mean_lp = group_lp.mean()
+            advantages[indices] = group_lp - mean_lp
+
+        # Response mask (only count valid response tokens)
+        resp_mask = torch.zeros_like(log_probs)
+        for i in range(input_ids.shape[0]):
+            p_len = all_prompt_lens[i]
+            actual_len = attn_mask[i].sum().item()
+            resp_len = min(int(actual_len) - p_len, R_LEN)
+            if resp_len > 0:
+                resp_mask[i, :resp_len] = 1.0
+
+        adv_time = time.time() - adv_t0
+        print(f"  Advantages: {adv_time:.3f}s", flush=True)
+
+        # Phase 4: Loss + backward
+        train_t0 = time.time()
+        kl = log_probs - ref_log_probs
+        loss = -(advantages * log_probs) + 0.001 * kl
+        loss = (loss * resp_mask).sum() / resp_mask.sum()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_time = time.time() - train_t0
+        step_time = time.time() - step_t0
+
+        result = {
+            "step_time": step_time,
+            "rollout_time": rollout_time,
+            "logprob_time": logprob_time,
+            "adv_time": adv_time,
+            "train_time": train_time,
+            "loss": loss.item(),
+        }
+        results.append(result)
+        print(f"  Train: {train_time:.3f}s", flush=True)
+        print(f"  Step total: {step_time:.3f}s  (rollout {rollout_time/step_time*100:.0f}% | logprob {logprob_time/step_time*100:.0f}% | train {train_time/step_time*100:.0f}%)", flush=True)
+        print(f"  Loss: {loss.item():.6f}", flush=True)
+
+        # Peak GPU memory
+        peak_mem = torch.cuda.max_memory_allocated() / 1e9
+        print(f"  Peak GPU mem: {peak_mem:.2f} GB", flush=True)
+
+    # Summary
+    avg_step = sum(r['step_time'] for r in results[1:]) / max(1, len(results)-1)  # skip first warmup step
+    avg_rollout = sum(r['rollout_time'] for r in results[1:]) / max(1, len(results)-1)
+    avg_logprob = sum(r['logprob_time'] for r in results[1:]) / max(1, len(results)-1)
+    avg_train = sum(r['train_time'] for r in results[1:]) / max(1, len(results)-1)
+
+    print("\n=== SUMMARY ===", flush=True)
+    print(f"USE_PG={USE_PG} ({'ON' if USE_PG else 'OFF'})", flush=True)
+    print(f"Avg step:     {avg_step:.3f}s", flush=True)
+    print(f"Avg rollout:  {avg_rollout:.3f}s ({avg_rollout/avg_step*100:.1f}%)", flush=True)
+    print(f"Avg logprob:  {avg_logprob:.3f}s ({avg_logprob/avg_step*100:.1f}%)", flush=True)
+    print(f"Avg train:    {avg_train:.3f}s ({avg_train/avg_step*100:.1f}%)", flush=True)
+
+    output_file = f"/home/zxw/rollout-prefix/pg_e2e_results_{'pg_on' if USE_PG else 'pg_off'}.json"
+    with open(output_file, "w") as f:
+        json.dump({
+            "use_pg": USE_PG,
+            "n": N, "batch_size": BATCH_SIZE, "num_steps": NUM_STEPS,
+            "results": results,
+            "avg_step_time": avg_step,
+            "avg_rollout_time": avg_rollout,
+            "avg_logprob_time": avg_logprob,
+            "avg_train_time": avg_train,
+        }, f, indent=2)
+    print(f"Results saved to {output_file}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
