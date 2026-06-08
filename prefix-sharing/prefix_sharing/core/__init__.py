@@ -2,6 +2,11 @@
 
 from prefix_sharing.core.batch_trim import TrimmedBatch, trim_batch, trim_inputs, trim_labels, trim_loss_masks
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
+from prefix_sharing.core.observability import (
+    PrefixSharingLayerStats,
+    PrefixSharingStats,
+    current_prefix_sharing_stats,
+)
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
 from prefix_sharing.core.prefix_store import (
     PREFIX_STATE_TYPE_ATTENTION_KV,
@@ -31,6 +36,9 @@ __all__ = [
     "PrefixActivationStore",
     "PrefixAttentionStore",
     "PrefixDeltanetStore",
+    "PrefixSharingLayerStats",
+    "PrefixSharingStats",
+    "current_prefix_sharing_stats",
     "PrefixSharingPlan",
     "PrefixSharingConfig",
     "PrefixSharingConfigError",

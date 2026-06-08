@@ -400,6 +400,8 @@ def restore_suffix_first_log_probs_from_prefix(
         ]
         restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
         restored[0, index.reuse_1d_pos] = restored_value.reshape(())
+    if ctx.stats is not None:
+        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
     return restored
 
 

@@ -72,6 +72,19 @@ class TorchReferenceBackend:
     ) -> tuple[Any, Any]:
         torch = _torch()
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+
+        # Read stats from ContextVar (no signature change needed).
+        from prefix_sharing.core.observability import current_prefix_sharing_stats
+        stats = current_prefix_sharing_stats()
+
+        # Local counters for stats recording.
+        store_count = 0
+        reuse_count = 0
+        reuse_hit_count = 0
+        reuse_miss_count = 0
+        stored_tokens = 0
+        reused_prefix_tokens = 0
+
         # Input K/V still follow the framework's padded packed layout; only
         # valid tokens may enter the store or expanded KV.
         key_rows = _split_packed(key, layout.padded_lengths)
@@ -107,6 +120,8 @@ class TorchReferenceBackend:
                 )
                 expanded_keys.append(valid_key_row)
                 expanded_values.append(valid_value_row)
+                store_count += 1
+                stored_tokens += valid_key_row.shape[0]
             else:
                 provider = prefix_sharing_plan.provider_index[batch_index]
                 provider_slot_id = PrefixActivationSlotId(
@@ -118,7 +133,31 @@ class TorchReferenceBackend:
                     tp_rank,
                 )
                 # Load the already-published provider KV before building this reuser's expanded KV.
-                entry = store.load(provider_slot_id)
+                try:
+                    entry = store.load(provider_slot_id)
+                    reuse_hit_count += 1
+                except KeyError:
+                    reuse_miss_count += 1
+                    # Record the miss in stats before re-raising, so the audit log
+                    # still reflects the failed attempt.
+                    if stats is not None:
+                        stats.record_attention_kv_build(
+                            layer_id=layer_id,
+                            store_count=store_count,
+                            reuse_count=reuse_count + 1,
+                            reuse_hit_count=reuse_hit_count,
+                            reuse_miss_count=reuse_miss_count,
+                            stored_tokens=stored_tokens,
+                            reused_prefix_tokens=reused_prefix_tokens,
+                            expanded_kv_tokens=sum(k.shape[0] for k in expanded_keys),
+                            valid_q_tokens=sum(
+                                layout.valid_lengths[i] for i in range(batch_index + 1)
+                            ),
+                            padded_q_tokens=sum(
+                                layout.padded_lengths[i] for i in range(batch_index + 1)
+                            ),
+                        )
+                    raise
                 prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
                 expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
                 expanded_value = torch.cat([entry.value_tensor[:prefix_len], valid_value_row], dim=0)
@@ -140,6 +179,25 @@ class TorchReferenceBackend:
                 )
                 expanded_keys.append(expanded_key)
                 expanded_values.append(expanded_value)
+                reuse_count += 1
+                reused_prefix_tokens += prefix_len
+                stored_tokens += expanded_key.shape[0]
+
+        # Record full stats after successful build.
+        if stats is not None:
+            stats.record_attention_kv_build(
+                layer_id=layer_id,
+                store_count=store_count,
+                reuse_count=reuse_count,
+                reuse_hit_count=reuse_hit_count,
+                reuse_miss_count=reuse_miss_count,
+                stored_tokens=stored_tokens,
+                reused_prefix_tokens=reused_prefix_tokens,
+                expanded_kv_tokens=sum(k.shape[0] for k in expanded_keys),
+                valid_q_tokens=sum(layout.valid_lengths),
+                padded_q_tokens=sum(layout.padded_lengths),
+            )
+
         return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
 
     def attention(

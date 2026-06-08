@@ -1,5 +1,10 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+######### profiling #########
+from contextvars import ContextVar
+_profile_stopwatch_var: ContextVar = ContextVar('profile_stopwatch', default=None)
+######### profiling #########
+
 import contextlib
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
@@ -562,6 +567,12 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
+    ######### profiling #########
+    _profile_stopwatch = _profile_stopwatch_var.get()
+    if _profile_stopwatch is not None:
+        _profile_stopwatch.start("minibatch_fwd_bwd")
+    ######### profiling #########
+
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
@@ -592,6 +603,10 @@ def forward_backward_no_pipelining(
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
+                ######### profiling #########
+                if _profile_stopwatch is not None:
+                    _profile_stopwatch.start("microbatch_fwd")
+                ######### profiling #########
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
                     data_iterator,
@@ -606,12 +621,28 @@ def forward_backward_no_pipelining(
                     current_microbatch=i,
                 )
                 total_num_tokens += num_tokens
+                ######### profiling #########
+                if _profile_stopwatch is not None:
+                    _profile_stopwatch.stop("microbatch_fwd")
+                ######### profiling #########
                 if not forward_only:
+                    ######### profiling #########
+                    if _profile_stopwatch is not None:
+                        _profile_stopwatch.start("microbatch_bwd")
+                    ######### profiling #########
                     backward_step(
                         input_tensor, output_tensor, output_tensor_grad, model_type, config
                     )
+                    ######### profiling #########
+                    if _profile_stopwatch is not None:
+                        _profile_stopwatch.stop("microbatch_bwd")
+                    ######### profiling #########
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
+        ######### profiling #########
+        if _profile_stopwatch is not None:
+            _profile_stopwatch.start("microbatch_fwd")
+        ######### profiling #########
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -629,9 +660,21 @@ def forward_backward_no_pipelining(
         )
 
         total_num_tokens += num_tokens
+        ######### profiling #########
+        if _profile_stopwatch is not None:
+            _profile_stopwatch.stop("microbatch_fwd")
+        ######### profiling #########
 
         if not forward_only:
+            ######### profiling #########
+            if _profile_stopwatch is not None:
+                _profile_stopwatch.start("microbatch_bwd")
+            ######### profiling #########
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            ######### profiling #########
+            if _profile_stopwatch is not None:
+                _profile_stopwatch.stop("microbatch_bwd")
+            ######### profiling #########
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -644,6 +687,11 @@ def forward_backward_no_pipelining(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
+
+    ######### profiling #########
+    if _profile_stopwatch is not None:
+        _profile_stopwatch.stop("minibatch_fwd_bwd")
+    ######### profiling #########
 
     if (
         hasattr(config, 'cuda_graph_impl')
