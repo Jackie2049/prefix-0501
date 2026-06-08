@@ -129,6 +129,19 @@ full_position_ids = torch.arange(total_len, device=device).unsqueeze(0).expand(N
 torch.cuda.synchronize()
 t_normal_start = time.time()
 
+# Hook to capture per-layer hidden states during normal forward
+layer_outputs_normal = {}
+def capture_normal_output(module, input, output, layer_idx):
+    if isinstance(output, tuple):
+        layer_outputs_normal[layer_idx] = output[0].detach().cpu().float()
+
+hooks_normal = []
+for i in range(num_layers):
+    h = model.decoder.layers[i].register_forward_hook(
+        lambda m, inp, out, idx=i: capture_normal_output(m, inp, out, idx)
+    )
+    hooks_normal.append(h)
+
 with torch.no_grad():
     # attention_mask=None: causal masking auto-generates the mask
     # (FusedScaleMaskSoftmax line 199: causal mask generated when mask=None)
@@ -140,6 +153,10 @@ with torch.no_grad():
 
 torch.cuda.synchronize()
 t_normal = time.time() - t_normal_start
+
+# Remove normal hooks
+for h in hooks_normal:
+    h.remove()
 
 # AllGather logits across TP ranks (parallel_output=True splits vocab across TP)
 full_logits_normal = _gather_logits_tp(logits_normal)
@@ -207,6 +224,19 @@ ps_runtime_state = PsState(
 torch.cuda.synchronize()
 t_ps_start = time.time()
 
+# Hook to capture per-layer hidden states during PS suffix forward
+layer_outputs_ps = {}
+def capture_ps_output(module, input, output, layer_idx):
+    if isinstance(output, tuple):
+        layer_outputs_ps[layer_idx] = output[0].detach().cpu().float()
+
+hooks_ps = []
+for i in range(num_layers):
+    h = model.decoder.layers[i].register_forward_hook(
+        lambda m, inp, out, idx=i: capture_ps_output(m, inp, out, idx)
+    )
+    hooks_ps.append(h)
+
 with prefix_sharing_runtime_context(ps_runtime_state) as ctx:
     # Prefix pass (no grad)
     with torch.no_grad():
@@ -233,6 +263,31 @@ with prefix_sharing_runtime_context(ps_runtime_state) as ctx:
 
 torch.cuda.synchronize()
 t_ps = time.time() - t_ps_start
+
+# Remove PS hooks
+for h in hooks_ps:
+    h.remove()
+
+# Per-layer hidden state comparison (suffix positions)
+if local_rank == 0:
+    print("\nPer-layer hidden state cos_sim (suffix positions):")
+    for i in range(num_layers):
+        if i in layer_outputs_normal and i in layer_outputs_ps:
+            # Normal: (total_len, N, hidden) → suffix part = (SUFFIX_LEN, N, hidden)
+            normal_suffix_hidden = layer_outputs_normal[i][PREFIX_LEN:, :, :]
+            # PS: suffix forward output = (SUFFIX_LEN, N, hidden)
+            ps_suffix_hidden = layer_outputs_ps[i]
+            if normal_suffix_hidden.shape == ps_suffix_hidden.shape:
+                cs = F.cosine_similarity(
+                    normal_suffix_hidden.flatten(),
+                    ps_suffix_hidden.flatten(),
+                    dim=0,
+                ).item()
+                print(f"  L{i} ({model.decoder.layers[i].self_attention.__class__.__name__}): "
+                      f"cos_sim = {cs:.6f}")
+            else:
+                print(f"  L{i}: shape mismatch normal={normal_suffix_hidden.shape} "
+                      f"vs ps={ps_suffix_hidden.shape}")
 
 # AllGather logits across TP ranks
 full_suffix_logits = _gather_logits_tp(suffix_logits)
