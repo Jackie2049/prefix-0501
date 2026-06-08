@@ -24,9 +24,9 @@ from contextlib import nullcontext
 
 HF_MODEL_PATH = os.path.expanduser("~/rollout-prefix/models/Qwen3-27B-text-only-16layers")
 TP_SIZE = 4
-PREFIX_LEN = 64
-SUFFIX_LEN = 128
-N_SEQUENCES = 4
+PREFIX_LEN = int(os.environ.get("PREFIX_LEN", 64))
+SUFFIX_LEN = int(os.environ.get("SUFFIX_LEN", 128))
+N_SEQUENCES = int(os.environ.get("N_SEQUENCES", 4))
 SEED = 42
 N_STEPS = 5
 
