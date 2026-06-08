@@ -45,16 +45,16 @@ class ModelSpec:
     def layer_type(self, layer_id: int) -> AttentionLayerType:
         """Determine the attention type for a given layer.
 
-        When full_attention_interval > 0, the last layer in each interval
-        group uses full attention (e.g., layers 3,7,11,... for interval=4).
+        When full_attention_interval > 0, layers where layer_id % interval == 0
+        use full attention (matching Qwen3.6's pattern in model_initializer).
         All other layers use linear attention.
         When full_attention_interval == 0, all layers use full attention.
         """
         if self.full_attention_interval <= 0:
             return AttentionLayerType.FULL_ATTENTION
-        # Qwen3.6 pattern: full attention at layers where (layer_id + 1) % interval == 0
-        # i.e., the last layer in each group of `interval` layers
-        if (layer_id + 1) % self.full_attention_interval == 0:
+        # Qwen3.6 pattern: full attention at layers where layer_id % interval == 0
+        # (0-indexed, matching model_initializer.py line 337)
+        if layer_id % self.full_attention_interval == 0:
             return AttentionLayerType.FULL_ATTENTION
         return AttentionLayerType.LINEAR_ATTENTION
 
