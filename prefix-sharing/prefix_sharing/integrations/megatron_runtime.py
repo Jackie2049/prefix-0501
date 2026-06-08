@@ -39,80 +39,275 @@ def maybe_run_prefix_sharing_attention(
     ctx = current_prefix_sharing_context()
     if ctx is None:
         return None
-    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
-        raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
-    if rotary_pos_emb is None and (rotary_pos_cos is None or rotary_pos_sin is None):
-        raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb or rotary_pos_cos/sin")
-    if ctx.packed_batch_layout.packed_position_ids is None:
-        raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
-    packed_batch_layout = ctx.packed_batch_layout
+    # Dispatch based on data format:
+    # THD mode: packed_seq_params with qkv_format='thd' → 3D packed data
+    # BSHD mode: packed_seq_params is None → 4D (sq, b, h, hn) data
+    is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
+    is_bshd = packed_seq_params is None
 
-    if rotary_pos_emb is not None:
-        q_pos_emb, k_pos_emb = rotary_pos_emb
-        query, key = _apply_positioned_rope(
-            attention_module,
-            query,
-            key,
-            q_pos_emb,
-            k_pos_emb,
-            packed_batch_layout.packed_position_ids,
+    if is_thd:
+        # --- THD path (existing) ---
+        if rotary_pos_emb is None and (rotary_pos_cos is None or rotary_pos_sin is None):
+            raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb or rotary_pos_cos/sin")
+        if ctx.packed_batch_layout.packed_position_ids is None:
+            raise RuntimeError("prefix sharing context is missing packed_position_ids")
+
+        packed_batch_layout = ctx.packed_batch_layout
+
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            query, key = _apply_positioned_rope(
+                attention_module,
+                query,
+                key,
+                q_pos_emb,
+                k_pos_emb,
+                packed_batch_layout.packed_position_ids,
+            )
+        else:
+            query, key = _apply_fused_rope(
+                attention_module,
+                query,
+                key,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                packed_batch_layout.packed_position_ids,
+            )
+        backend = ctx.backend or TorchReferenceBackend()
+        global_rank, tp_rank, tp_size = _read_parallel_rank_info()
+        layer_id = _normalize_layer_number(attention_module)
+
+        if layer_id < 0:
+            return None
+        model_spec = ctx.model_spec
+        if model_spec is not None:
+            layer_type = model_spec.layer_type(layer_id)
+            if layer_type == AttentionLayerType.LINEAR_ATTENTION:
+                return None
+
+        prefix_log.debug(
+            "[PS][attention][rank=%s tp=%s/%s layer=%s] THD query=%s key=%s value=%s",
+            global_rank, tp_rank, tp_size, layer_id,
+            tuple(query.shape), tuple(key.shape), tuple(value.shape),
         )
+        expanded_key, expanded_value = backend.build_kv(
+            key,
+            value,
+            ctx.store,
+            ctx.prefix_sharing_plan,
+            packed_batch_layout=packed_batch_layout,
+            layer_id=layer_id,
+            tp_rank=tp_rank,
+        )
+        prefix_log.debug(
+            "[PS][attention] built expanded kv: key=%s value=%s",
+            tuple(expanded_key.shape), tuple(expanded_value.shape),
+        )
+        core_attn_out = backend.attention(
+            query,
+            expanded_key,
+            expanded_value,
+            ctx.prefix_sharing_plan,
+            packed_batch_layout=packed_batch_layout,
+            attention_mask=attention_mask,
+        )
+        # Merge heads: (total_tokens, num_heads, head_dim) -> (total_tokens, hidden)
+        core_attn_out = core_attn_out.reshape(core_attn_out.size(0), -1)
+        return attention_module.linear_proj(core_attn_out)
+
+    elif is_bshd:
+        # --- BSHD path (new) ---
+        return _run_bshd_prefix_sharing_attention(
+            attention_module, query, key, value,
+            rotary_pos_emb, ctx,
+        )
+
     else:
-        query, key = _apply_fused_rope(
-            attention_module,
-            query,
-            key,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            packed_batch_layout.packed_position_ids,
-        )
-    backend = ctx.backend or TorchReferenceBackend()
-    global_rank, tp_rank, tp_size = _read_parallel_rank_info()
-    # Megatron layer_number is 1-indexed; convert to 0-indexed for ModelSpec
-    layer_id = _normalize_layer_number(attention_module)
+        # packed_seq_params exists but qkv_format is not 'thd' — unsupported
+        prefix_log.debug("prefix hook: unsupported packed_seq_params format, falling through")
+        return None
 
-    # Determine layer type for HybridAttention models (e.g., Qwen3.6-27B)
+
+def _run_bshd_prefix_sharing_attention(
+    attention_module: Any,
+    query: Any,
+    key: Any,
+    value: Any,
+    rotary_pos_emb: Any,
+    ctx: Any,
+) -> tuple[Any, Any] | None:
+    """BSHD-mode prefix-sharing attention for Megatron SelfAttention.
+
+    Data format: (sq, b, h, hn) — standard Megatron BSHD format.
+
+    Two-pass approach:
+    - Prefix pass: store K/V (after RoPE), run flash_attn on prefix tokens
+    - Suffix pass: load stored prefix K/V, expand to batch size,
+      concatenate with suffix K/V, run flash_attn_varlen_func with
+      causal=True (handles "prefill with prefix" natively).
+
+    flash_attn_varlen_func with causal=True and different Q/K lengths
+    correctly handles the causal mask: suffix Q[i] at absolute position
+    prefix_len+i can attend to all prefix K tokens (positions 0..prefix_len-1)
+    AND causal suffix K tokens (positions prefix_len..prefix_len+i).
+    """
+    from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+    from prefix_sharing.core.prefix_store import PrefixActivationSlotId, PREFIX_STATE_TYPE_ATTENTION_KV
+
+    layer_id = _normalize_layer_number(attention_module)
     if layer_id < 0:
-        return None  # Could not determine layer_number, skip PS
+        return None
     model_spec = ctx.model_spec
     if model_spec is not None:
         layer_type = model_spec.layer_type(layer_id)
         if layer_type == AttentionLayerType.LINEAR_ATTENTION:
-            # Linear attention layers use recurrent state (GatedDeltaNet),
-            # not standard KV-based attention. Skip KV injection for now;
-            # DeltaNet state reuse is handled by a separate integration point.
             return None
 
-    prefix_log.debug(
-        "[PS][attention][rank=%s tp=%s/%s layer=%s] query=%s key=%s value=%s",
-        global_rank, tp_rank, tp_size, layer_id,
-        tuple(query.shape), tuple(key.shape), tuple(value.shape),
-    )
-    expanded_key, expanded_value = backend.build_kv(
-        key,
-        value,
-        ctx.store,
-        ctx.prefix_sharing_plan,
-        packed_batch_layout=packed_batch_layout,
+    # Apply RoPE (standard Megatron path for BSHD)
+    if rotary_pos_emb is None:
+        logger.debug("[PS][bshd] skipping: no rotary_pos_emb for RoPE")
+        return None
+    q_pos_emb, k_pos_emb = rotary_pos_emb
+    query = apply_rotary_pos_emb(query, q_pos_emb, config=attention_module.config)
+    key = apply_rotary_pos_emb(key, k_pos_emb, config=attention_module.config)
+
+    _, tp_rank, _ = _read_parallel_rank_info()
+
+    slot_id = PrefixActivationSlotId(
+        forward_id=ctx.prefix_sharing_plan.forward_id,
+        micro_batch_id=ctx.prefix_sharing_plan.micro_batch_id,
         layer_id=layer_id,
+        sample_idx_in_batch=0,
+        prefix_state_type=PREFIX_STATE_TYPE_ATTENTION_KV,
         tp_rank=tp_rank,
     )
-    prefix_log.debug(
-        "[PS][attention] built expanded kv: key=%s value=%s",
-        tuple(expanded_key.shape), tuple(expanded_value.shape),
-    )
-    core_attn_out = backend.attention(
-        query,
-        expanded_key,
-        expanded_value,
-        ctx.prefix_sharing_plan,
-        packed_batch_layout=packed_batch_layout,
-        attention_mask=attention_mask,
-    )
-    # Merge heads: (total_tokens, num_heads, head_dim) -> (total_tokens, hidden)
-    core_attn_out = core_attn_out.reshape(core_attn_out.size(0), -1)
-    return attention_module.linear_proj(core_attn_out)
+
+    num_heads = attention_module.num_attention_heads_per_partition
+    kv_heads = attention_module.num_query_groups_per_partition
+    head_dim = attention_module.hidden_size_per_attention_head
+    num_kv_groups = num_heads // kv_heads
+    b = query.shape[1]
+
+    if ctx.store.contains(slot_id):
+        # === Suffix pass: load prefix KV, expand, concatenate ===
+        stored_kv = ctx.store.load(slot_id)
+        prefix_key = stored_kv.key_tensor    # (P, 1_or_b, kv_heads, hn) or (P, kv_heads, hn)
+        prefix_value = stored_kv.value_tensor
+
+        # Normalize to 4D BSHD format
+        if prefix_key.dim() == 3:
+            prefix_key = prefix_key.unsqueeze(1)
+            prefix_value = prefix_value.unsqueeze(1)
+
+        prefix_len = prefix_key.shape[0]
+        suffix_len = query.shape[0]
+
+        # Expand prefix KV from batch=1 to match current batch size
+        prefix_key_expanded = prefix_key.expand(prefix_len, b, -1, -1).contiguous()
+        prefix_value_expanded = prefix_value.expand(prefix_len, b, -1, -1).contiguous()
+
+        # Concatenate prefix + suffix KV along seq dim
+        expanded_key = torch.cat([prefix_key_expanded, key], dim=0)   # (P+S, b, kv_heads, hn)
+        expanded_value = torch.cat([prefix_value_expanded, value], dim=0)
+
+        # GQA expand KV heads
+        if num_kv_groups > 1:
+            expanded_key = expanded_key.repeat_interleave(num_kv_groups, dim=2)
+            expanded_value = expanded_value.repeat_interleave(num_kv_groups, dim=2)
+
+        # Convert BSHD → THD for flash_attn_varlen_func
+        query_flat = query.permute(1, 0, 2, 3).reshape(b * suffix_len, num_heads, head_dim).contiguous()
+        expanded_key_flat = expanded_key.permute(1, 0, 2, 3).reshape(
+            b * (prefix_len + suffix_len), num_heads, head_dim
+        ).contiguous()
+        expanded_value_flat = expanded_value.permute(1, 0, 2, 3).reshape(
+            b * (prefix_len + suffix_len), num_heads, head_dim
+        ).contiguous()
+
+        cu_seqlens_q = torch.tensor(
+            [0] + [suffix_len] * b, device=query.device, dtype=torch.int32
+        ).cumsum(0)
+        cu_seqlens_k = torch.tensor(
+            [0] + [prefix_len + suffix_len] * b, device=query.device, dtype=torch.int32
+        ).cumsum(0)
+
+        input_dtype = query_flat.dtype
+        if input_dtype == torch.float32:
+            query_flat = query_flat.to(torch.float16)
+            expanded_key_flat = expanded_key_flat.to(torch.float16)
+            expanded_value_flat = expanded_value_flat.to(torch.float16)
+
+        from flash_attn import flash_attn_varlen_func
+        attn_output = flash_attn_varlen_func(
+            query_flat, expanded_key_flat, expanded_value_flat,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=suffix_len, max_seqlen_k=prefix_len + suffix_len,
+            dropout_p=0.0, causal=True,
+        )
+        attn_output = attn_output.to(input_dtype)
+
+        # Reshape: (b*S, h, hn) → (S, b, h*hn) for linear_proj
+        attn_output = attn_output.reshape(b, suffix_len, num_heads * head_dim)
+        attn_output = attn_output.permute(1, 0, 2).contiguous()
+
+        logger.debug(
+            "[PS][bshd-attn-inject][layer=%s] Suffix pass: b=%d, suffix=%d, prefix=%d",
+            layer_id, b, suffix_len, prefix_len,
+        )
+        return attention_module.linear_proj(attn_output)
+
+    else:
+        # === Prefix pass: store KV, run flash_attn ===
+        sq = query.shape[0]
+
+        # Store K/V in BSHD format (sq, b, kv_heads, hn)
+        ctx.store.store(
+            slot_id,
+            key_tensor=key.contiguous(),
+            value_tensor=value.contiguous(),
+            prefix_len=sq,
+        )
+
+        logger.debug(
+            "[PS][bshd-attn-store][layer=%s] Prefix pass: stored KV key=%s value=%s",
+            layer_id, tuple(key.shape), tuple(value.shape),
+        )
+
+        # GQA expand KV heads for flash_attn
+        if num_kv_groups > 1:
+            key_expanded = key.repeat_interleave(num_kv_groups, dim=2)
+            value_expanded = value.repeat_interleave(num_kv_groups, dim=2)
+        else:
+            key_expanded = key
+            value_expanded = value
+
+        # Convert BSHD → THD
+        query_flat = query.permute(1, 0, 2, 3).reshape(b * sq, num_heads, head_dim).contiguous()
+        key_flat = key_expanded.permute(1, 0, 2, 3).reshape(b * sq, num_heads, head_dim).contiguous()
+        value_flat = value_expanded.permute(1, 0, 2, 3).reshape(b * sq, num_heads, head_dim).contiguous()
+
+        cu_seqlens = torch.tensor([0] + [sq] * b, device=query.device, dtype=torch.int32).cumsum(0)
+
+        input_dtype = query_flat.dtype
+        if input_dtype == torch.float32:
+            query_flat = query_flat.to(torch.float16)
+            key_flat = key_flat.to(torch.float16)
+            value_flat = value_flat.to(torch.float16)
+
+        from flash_attn import flash_attn_varlen_func
+        attn_output = flash_attn_varlen_func(
+            query_flat, key_flat, value_flat,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=sq, max_seqlen_k=sq,
+            dropout_p=0.0, causal=True,
+        )
+        attn_output = attn_output.to(input_dtype)
+
+        attn_output = attn_output.reshape(b, sq, num_heads * head_dim)
+        attn_output = attn_output.permute(1, 0, 2).contiguous()
+
+        return attention_module.linear_proj(attn_output)
 
 
 def _apply_positioned_rope(
@@ -303,8 +498,13 @@ def maybe_run_prefix_sharing_deltanet(
         return None
     if not ctx.prefix_sharing_plan.has_sharing:
         return None
-    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
-        logger.debug("[PS][deltanet] skipping: no THD packed_seq_params")
+    # THD-only path: require packed_seq_params with qkv_format='thd'
+    # BSHD path: handled by GatedDeltaNetAttention.forward directly (carry state injection)
+    if packed_seq_params is None:
+        logger.debug("[PS][deltanet] skipping THD hook: no packed_seq_params (BSHD mode uses in-class hook)")
+        return None
+    if getattr(packed_seq_params, "qkv_format", None) != "thd":
+        logger.debug("[PS][deltanet] skipping: packed_seq_params.qkv_format is not 'thd'")
         return None
 
     backend = ctx.backend or TorchReferenceBackend()

@@ -168,7 +168,7 @@ class GatedDeltaNetAttention(SelfAttention):
             value = value.repeat_interleave(self.kv_groups, dim=2)
 
 
-        # GatedDeltaNet chunked cumsum attention (vectorized + memory-efficient)
+        # Chunked cumsum attention (vectorized + memory-efficient)
         # Uses vectorized cumsum in chunks to avoid Python for-loop overhead
         # and avoid O(sq * b * h * d^2) full-sequence tensor
         d = self.hidden_size_per_attention_head
@@ -182,12 +182,47 @@ class GatedDeltaNetAttention(SelfAttention):
         beta_flat = beta.reshape(sq, bh, 1)
         decay_flat = decay.reshape(sq, bh, 1)
 
-        # Chunked cumsum: process in chunks of CHUNK_SIZE tokens
-        # Each chunk: vectorized cumsum -> state trajectory -> query output
-        # Carry state forward between chunks
+        # --- Prefix-sharing: carry state injection for two-pass DeltaNet ---
+        ps_slot_id = None
+        ps_ctx = None
+        try:
+            from prefix_sharing.integrations.context import current_prefix_sharing_context
+            from prefix_sharing.core.model_spec import AttentionLayerType
+            from prefix_sharing.core.prefix_store import PrefixActivationSlotId, PREFIX_STATE_TYPE_DELTANET_STATE
+            from prefix_sharing.integrations.megatron_runtime import _read_parallel_rank_info, _normalize_layer_number
+            ps_ctx = current_prefix_sharing_context()
+        except ImportError:
+            ps_ctx = None
+
+        if ps_ctx is not None and ps_ctx.prefix_sharing_plan.has_sharing:
+            ps_layer_id = _normalize_layer_number(self)
+            ps_model_spec = ps_ctx.model_spec
+            if ps_layer_id >= 0 and ps_model_spec is not None and \
+                    ps_model_spec.layer_type(ps_layer_id) == AttentionLayerType.LINEAR_ATTENTION:
+                _, ps_tp_rank, _ = _read_parallel_rank_info()
+                ps_slot_id = PrefixActivationSlotId(
+                    forward_id=ps_ctx.prefix_sharing_plan.forward_id,
+                    micro_batch_id=ps_ctx.prefix_sharing_plan.micro_batch_id,
+                    layer_id=ps_layer_id,
+                    sample_idx_in_batch=0,
+                    prefix_state_type=PREFIX_STATE_TYPE_DELTANET_STATE,
+                    tp_rank=ps_tp_rank,
+                )
+
+        # Initialize carry state
+        carry = torch.zeros(bh, d, d, dtype=query.dtype, device=query.device)
+
+        # Suffix pass: inject stored prefix carry state
+        if ps_slot_id is not None and ps_ctx.deltanet_store.contains(ps_slot_id):
+            stored_state = ps_ctx.deltanet_store.load(ps_slot_id)
+            prefix_carry = stored_state.recurrent_state  # (prefix_bh, d, d)
+            # Expand from prefix batch (1*h) to current batch (N*h)
+            if prefix_carry.shape[0] != bh:
+                prefix_carry = prefix_carry.repeat(bh // prefix_carry.shape[0], 1, 1)
+            carry = prefix_carry.contiguous()
+
         CHUNK_SIZE = 8
         y = torch.zeros(sq, bh, d, dtype=query.dtype, device=query.device)
-        carry = torch.zeros(bh, d, d, dtype=query.dtype, device=query.device)
 
         num_chunks = (sq + CHUNK_SIZE - 1) // CHUNK_SIZE
         for chunk_idx in range(num_chunks):
@@ -227,6 +262,14 @@ class GatedDeltaNetAttention(SelfAttention):
 
         # Reshape back: [sq, b*heads, head_dim] -> [sq, b, heads*head_dim]
         y = y.reshape(sq, b, h * d)
+
+        # --- Prefix-sharing: store carry state for prefix pass ---
+        if ps_slot_id is not None and not ps_ctx.deltanet_store.contains(ps_slot_id):
+            ps_ctx.deltanet_store.store(
+                ps_slot_id,
+                recurrent_state=carry.contiguous(),
+                prefix_len=sq,
+            )
 
 
         # Output projection

@@ -228,11 +228,11 @@ def build_prefix_sharing_micro_batch(
     config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
     logger.debug(f"[PS][prepare] config.validate() returned OK")
 
-    # --- Path 2: missing use_remove_padding ---
-    logger.debug(f"[PS][prepare] checking megatron.use_remove_padding...")
-    if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
-        logger.debug(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
-        raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
+    # --- Path 2: data format validation ---
+    # PS now supports both BSHD (use_remove_padding=False) and THD (use_remove_padding=True)
+    logger.debug("[PS][prepare] checking data format...")
+    use_remove_padding = _read_actor_bool(actor_config, "megatron.use_remove_padding", False)
+    logger.debug(f"[PS][prepare] use_remove_padding={use_remove_padding}")
 
     # --- Path 3: multi_modal check ---
     logger.debug(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
