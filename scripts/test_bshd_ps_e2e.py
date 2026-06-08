@@ -238,23 +238,27 @@ t_ps = time.time() - t_ps_start
 full_suffix_logits = _gather_logits_tp(suffix_logits)
 del suffix_logits
 
-# Compare raw logits (before log_softmax) for diagnostic
-# Normal logits: full_logits_normal[:, PREFIX_LEN-1:-1, :] predicts suffix tokens
-# PS logits: full_suffix_logits predicts suffix tokens
+# Compare per-position logits cos_sim (over vocab dimension)
 normal_suffix_logits_raw = full_logits_normal[:, PREFIX_LEN-1:-1, :].float()  # (N, SUFFIX_LEN, vocab)
 ps_suffix_logits_raw = full_suffix_logits.float()  # (N, SUFFIX_LEN, vocab)
 
-# Align: compare positions 1..SUFFIX_LEN-1 (skip position 0 which is the boundary)
-normal_aligned_logits = normal_suffix_logits_raw[:, 1:, :].to(device='cpu')
-ps_aligned_logits = ps_suffix_logits_raw[:, :-1, :].to(device='cpu')  # PS logits[:-1] predict same tokens as normal logits[1:]
 if local_rank == 0:
-    logits_cos_sim = F.cosine_similarity(
-        normal_aligned_logits.flatten(), ps_aligned_logits.flatten(), dim=0
-    ).item()
-    logits_max_diff = (normal_aligned_logits - ps_aligned_logits).abs().max().item()
-    print(f"  Raw logits cos_sim: {logits_cos_sim:.6f}, max_diff: {logits_max_diff:.6f}")
+    # Per-position logits cos_sim (average over suffix positions)
+    # Align: normal[:, 1:] vs PS[:, :-1] (both predict same suffix tokens)
+    logits_cos_per_pos = []
+    for pos_idx in range(SUFFIX_LEN - 1):
+        cs = F.cosine_similarity(
+            normal_suffix_logits_raw[:, pos_idx+1, :],   # normal: aligned position
+            ps_suffix_logits_raw[:, pos_idx, :],          # PS: suffix position
+            dim=-1,  # cos_sim over vocab dimension for each sequence
+        ).mean().item()  # average over sequences
+        logits_cos_per_pos.append(cs)
+    print(f"  Per-position logits cos_sim (over vocab): min={min(logits_cos_per_pos):.6f}, "
+          f"max={max(logits_cos_per_pos):.6f}, mean={sum(logits_cos_per_pos)/len(logits_cos_per_pos):.6f}")
+    print(f"  Boundary pos logits cos_sim: {logits_cos_per_pos[0]:.6f}")
+    print(f"  Last pos logits cos_sim: {logits_cos_per_pos[-1]:.6f}")
 
-del full_logits_normal, normal_suffix_logits_raw, ps_suffix_logits_raw, normal_aligned_logits, ps_aligned_logits
+del full_logits_normal, normal_suffix_logits_raw, ps_suffix_logits_raw
 torch.cuda.empty_cache()
 
 # Extract suffix log_probs from PS forward
