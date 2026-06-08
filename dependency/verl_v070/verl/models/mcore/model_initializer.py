@@ -18,10 +18,50 @@
 import inspect
 from abc import ABC, abstractmethod
 
+import torch
+
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 from .config_converter import PretrainedConfig, TransformerConfig
+
+
+def _add_output_gate_to_self_attention(attn_module):
+    """Add output gate (gate_proj) to a SelfAttention module.
+
+    Qwen3.6 HybridAttention uses attn_output_gate=True for ALL layers,
+    including full attention (SelfAttention) layers. Megatron's SelfAttention
+    doesn't have built-in output gating, so we add gate_proj and register a
+    forward hook to apply the gate after linear_proj.
+
+    The forward hook works for both normal forward and PS hook paths, since
+    it fires after SelfAttention.forward() returns regardless of whether
+    the PS hook intercepted.
+    """
+    from megatron.core.tensor_parallel import ColumnParallelLinear
+
+    attn_module.attn_output_gate = True
+    attn_module.gate_proj = ColumnParallelLinear(
+        attn_module.config.hidden_size,
+        attn_module.config.hidden_size,
+        config=attn_module.config,
+        init_method=attn_module.config.init_method,
+        gather_output=True,
+        bias=False,
+        skip_bias_add=False,
+        is_expert=False,
+    )
+
+    def _output_gate_hook(module, input, output):
+        """Apply sigmoid gate after linear_proj output."""
+        if isinstance(output, tuple) and len(output) >= 2:
+            hidden_states = input[0]
+            gate = torch.sigmoid(module.gate_proj(hidden_states)[0])
+            gated_output = output[0] * gate
+            return (gated_output, output[1])
+        return output
+
+    attn_module.register_forward_hook(_output_gate_hook)
 
 
 class BaseModelInitializer(ABC):
@@ -67,6 +107,7 @@ class BaseModelInitializer(ABC):
         Returns:
             GPTModel: An initialized GPT model instance
         """
+        rotary_percent = extra_kwargs.pop('rotary_percent', 1.0)
         vp_stage = extra_kwargs.get("vp_stage", None)
         transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
         rope_scaling_args = self.get_rope_scaling_args()
@@ -81,6 +122,7 @@ class BaseModelInitializer(ABC):
             share_embeddings_and_output_weights=share_embeddings_and_output_weights,
             position_embedding_type="rope",
             rotary_base=self.hf_config.rope_theta,
+            rotary_percent=rotary_percent,
             **rope_scaling_args,
             mtp_block_spec=mtp_block_spec,
             **({} if not self.has_vp_stage else {"vp_stage": vp_stage}),
@@ -313,11 +355,14 @@ class Qwen3_6HybridModel(BaseModelInitializer):
             normalization=self.tfconfig.normalization, **extra_kwargs)
 
     def initialize(self, **kwargs):
+        # Pass rotary_percent=partial_rotary_factor for partial RoPE (Qwen3.6)
+        partial_rotary_factor = getattr(self.hf_config, "partial_rotary_factor", 1.0)
+        kwargs.setdefault('rotary_percent', partial_rotary_factor)
+
         model = super().initialize(**kwargs)
 
         # Read HybridAttention config from hf_config
         full_attention_interval = getattr(self.hf_config, "full_attention_interval", 1)
-        partial_rotary_factor = getattr(self.hf_config, "partial_rotary_factor", 1.0)
         attn_output_gate = getattr(self.hf_config, "attn_output_gate", False)
 
         if full_attention_interval <= 1:
@@ -360,5 +405,9 @@ class Qwen3_6HybridModel(BaseModelInitializer):
 
                 # Replace the attention module
                 layer.self_attention = new_attn
+            else:
+                # This is a full attention layer — add output gate if needed
+                if attn_output_gate:
+                    _add_output_gate_to_self_attention(layer.self_attention)
 
         return model
