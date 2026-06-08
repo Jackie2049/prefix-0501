@@ -68,6 +68,7 @@ class PrefixSharingConfig:
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
     boundary_strategy: str = "prefix_last_restore"
 
+    supported_pp_size: int = 1  # Pipeline parallel size supported in phase 1 (1 = no PP)
     supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
     supported_rope_fusion: bool = False  # RoPE fusion kernel support (False = must disable)
     supported_fused_qkv_rope: bool = False  # Fused QKV+RoPE kernel support (False = must disable)
@@ -135,13 +136,7 @@ class PrefixSharingConfig:
         pp_size = _read_config_value(
             model_config,
             "pipeline_model_parallel_size",
-            _read_config_value(model_config, "pipeline_parallel_size", 1),
-        )
-        virtual_pp_size = _read_config_value(model_config, "virtual_pipeline_model_parallel_size", None)
-        num_layers_per_virtual_pipeline_stage = _read_config_value(
-            model_config,
-            "num_layers_per_virtual_pipeline_stage",
-            None,
+            _read_config_value(model_config, "pipeline_parallel_size", self.supported_pp_size),
         )
         cp_size = _read_config_value(
             model_config,
@@ -152,23 +147,11 @@ class PrefixSharingConfig:
         fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
         model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")
 
-        if int(pp_size) < 1:
+        if pp_size != self.supported_pp_size:
             raise PrefixSharingConfigError(
-                f"[Config Error] pipeline_model_parallel_size={pp_size} 不合法。"
-                f"pipeline_model_parallel_size 必须 >= 1，"
-                f"请修改为合法物理 PP 大小，或禁用 prefix sharing。"
-            )
-        if virtual_pp_size not in (None, 1):
-            raise PrefixSharingConfigError(
-                f"[Config Error] virtual_pipeline_model_parallel_size={virtual_pp_size} 不支持当前阶段。"
-                f"当前仅支持物理 pipeline parallel，不支持 virtual pipeline parallel，"
-                f"请关闭 virtual PP 或禁用 prefix sharing。"
-            )
-        if num_layers_per_virtual_pipeline_stage is not None:
-            raise PrefixSharingConfigError(
-                "[Config Error] num_layers_per_virtual_pipeline_stage 不支持当前阶段。"
-                "当前仅支持物理 pipeline parallel，不支持 virtual pipeline parallel，"
-                "请关闭 virtual PP 或禁用 prefix sharing。"
+                f"[Config Error] pipeline_model_parallel_size={pp_size} 不支持当前阶段。"
+                f"Phase 1 仅支持 pipeline_model_parallel_size=1 (无流水线并行)，"
+                f"请修改配置将 PP 大小设为 1，或禁用 prefix sharing。"
             )
         if cp_size != self.supported_cp_size:
             raise PrefixSharingConfigError(
