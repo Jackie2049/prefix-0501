@@ -107,11 +107,15 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         key: Any,
         value: Any,
         prefix_sharing_plan: PrefixSharingPlan,
+        *,
+        packed_batch_layout: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = (
+        q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, pad_layout = (
             self._prepare_flash_inputs(
-                query, key, value, prefix_sharing_plan, attention_mask=kwargs.get("attention_mask")
+                query, key, value, prefix_sharing_plan,
+                attention_mask=kwargs.get("attention_mask"),
+                packed_batch_layout=packed_batch_layout,
             )
         )
 
@@ -125,7 +129,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 max_seqlen_q,
-                max_seqlen_kv, 
+                max_seqlen_kv,
                 dropout_p=kwargs.get("dropout_p", 0.0),
                 softmax_scale=kwargs.get("softmax_scale", None),  # defaults to 1/sqrt(head_dim)
                 causal=kwargs.get("causal", True),
@@ -141,5 +145,10 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
                 f"cu_seqlens_q={cu_seqlens_q.tolist()}, cu_seqlens_kv={cu_seqlens_kv.tolist()}, "
                 f"max_seqlen_q={max_seqlen_q}, max_seqlen_kv={max_seqlen_kv}"
             ) from exc
+
+        # Re-apply TP padding that was stripped in _prepare_flash_inputs so
+        # the output shape matches the original (padded) query tensor.
+        if pad_layout is not None:
+            out = self._repad_output(out, pad_layout)
 
         return out
