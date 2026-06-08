@@ -33,22 +33,26 @@ def maybe_run_prefix_sharing_attention(
     if ctx is None:
         prefix_log.warning("\n\n\nctx is None\n\n\n")
         return None
-    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
-        raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
+    batch_runtime_layout = ctx.batch_runtime_layout
+    if batch_runtime_layout.layout_kind == "thd" and (
+        packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd"
+    ):
+        raise RuntimeError("prefix sharing THD path requires packed_seq_params.qkv_format='thd'")
+    if batch_runtime_layout.layout_kind == "bshd" and packed_seq_params is not None:
+        raise RuntimeError("prefix sharing BSHD path requires packed_seq_params=None")
     if rotary_pos_emb is None:
-        raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb")
-    if ctx.packed_batch_layout.packed_position_ids is None:
-        raise RuntimeError("prefix sharing context is missing packed_position_ids")
+        raise RuntimeError("prefix sharing requires rotary_pos_emb")
+    if batch_runtime_layout.position_ids is None:
+        raise RuntimeError("prefix sharing context is missing layout position_ids")
 
     q_pos_emb, k_pos_emb = rotary_pos_emb
-    packed_batch_layout = ctx.packed_batch_layout
     query, key = _apply_positioned_rope(
         attention_module,
         query,
         key,
         q_pos_emb,
         k_pos_emb,
-        packed_batch_layout.packed_position_ids,
+        batch_runtime_layout.position_ids,
     )
 
     backend = ctx.backend or TorchReferenceBackend()
@@ -59,27 +63,25 @@ def maybe_run_prefix_sharing_attention(
     prefix_log.warning(
         "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
         "enter prefix-sharing path: "
-        "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
-        "padded_lengths=%s, cu_seqlens=%s",
+        "layout_kind=%s, query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s",
         parallel_info.global_rank,
         parallel_info.tp_rank,
         parallel_info.tp_size,
         parallel_info.pp_rank,
         parallel_info.pp_size,
         layer_id,
+        batch_runtime_layout.layout_kind,
         tuple(query.shape),
         tuple(key.shape),
         tuple(value.shape),
-        packed_batch_layout.valid_lengths,
-        packed_batch_layout.padded_lengths,
-        packed_batch_layout.cu_seqlens,
+        batch_runtime_layout.valid_lengths,
     )
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
         ctx.store,
         ctx.prefix_sharing_plan,
-        packed_batch_layout=packed_batch_layout,
+        batch_runtime_layout=batch_runtime_layout,
         layer_id=layer_id,
         tp_rank=parallel_info.tp_rank,
     )
@@ -93,19 +95,30 @@ def maybe_run_prefix_sharing_attention(
         parallel_info.pp_rank,
         parallel_info.pp_size,
         layer_id,
-        tuple(expanded_key.shape),
-        tuple(expanded_value.shape),
+        _shape_for_log(expanded_key),
+        _shape_for_log(expanded_value),
     )
     core_attn_out = backend.attention(
         query,
         expanded_key,
         expanded_value,
         ctx.prefix_sharing_plan,
-        packed_batch_layout=packed_batch_layout,
+        batch_runtime_layout=batch_runtime_layout,
         attention_mask=attention_mask,
     )
-    core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+    if batch_runtime_layout.layout_kind == "thd":
+        core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+    elif batch_runtime_layout.layout_kind == "bshd":
+        core_attn_out = core_attn_out.reshape(core_attn_out.size(0), core_attn_out.size(1), -1)
+    else:
+        raise ValueError(f"unsupported batch runtime layout: {batch_runtime_layout.layout_kind}")
     return attention_module.linear_proj(core_attn_out)
+
+
+def _shape_for_log(value: Any) -> Any:
+    if isinstance(value, list):
+        return [tuple(item.shape) for item in value]
+    return tuple(value.shape)
 
 
 def _apply_positioned_rope(
@@ -114,15 +127,21 @@ def _apply_positioned_rope(
     key: Any,
     q_pos_emb: Any,
     k_pos_emb: Any,
-    packed_position_ids: Any,
+    position_ids: Any,
 ) -> tuple[Any, Any]:
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
-    positions = packed_position_ids.to(device=query.device, dtype=torch.long)
+    original_query_shape = query.shape
+    original_key_shape = key.shape
+    positions = position_ids.to(device=query.device, dtype=torch.long).reshape(-1)
+    if query.dim() >= 3 and query.shape[0] != positions.shape[0]:
+        query = query.reshape(positions.shape[0], *query.shape[2:])
+    if key.dim() >= 3 and key.shape[0] != positions.shape[0]:
+        key = key.reshape(positions.shape[0], *key.shape[2:])
     max_needed = positions.max().item() + 1
 
     # Extend q_pos_emb / k_pos_emb when they are shorter than the largest
-    # position_id needed by packed_position_ids.  THD-mode generated pos_emb
+    # position_id needed by the runtime layout.  THD-mode generated pos_emb
     # only covers positions 0 .. max_seqlen_q-1, which is too small because
     # prefix-sharing preserves the original position_ids (e.g. suffix starts
     # at position 75).
@@ -160,6 +179,7 @@ def _apply_positioned_rope(
             config=attention_module.config,
             cu_seqlens=None,
         ).squeeze(1)
+        query = query.reshape(original_query_shape)
     if k_pos_emb is not None:
         k_freqs = k_pos_emb.index_select(0, positions)
         key = apply_rotary_pos_emb(
@@ -168,4 +188,5 @@ def _apply_positioned_rope(
             config=attention_module.config,
             cu_seqlens=None,
         ).squeeze(1)
+        key = key.reshape(original_key_shape)
     return query, key

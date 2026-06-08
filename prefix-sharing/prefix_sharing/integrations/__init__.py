@@ -1,14 +1,14 @@
 """Framework patch integrations."""
 
 from prefix_sharing.integrations.context import (
-    PackedPrefixLastRestoreIndex,
+    PrefixLastRestoreIndex,
     PrefixSharingRuntimeContext,
     current_prefix_sharing_context,
     prefix_sharing_runtime_context,
 )
 from prefix_sharing.integrations.patch_manager import PatchHandle, PatchManager
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo, get_megatron_parallel_info
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import BatchRuntimeLayout, BshdBatchLayout, ThdBatchLayout
 from prefix_sharing.integrations.verl_mcore import (
     PrefixSharingRuntimeState,
     VerlMCoreBatchAdapter,
@@ -23,8 +23,10 @@ from prefix_sharing.integrations.verl_mcore import (
 __all__ = [
     "PatchHandle",
     "PatchManager",
-    "PackedBatchLayout",
-    "PackedPrefixLastRestoreIndex",
+    "BatchRuntimeLayout",
+    "BshdBatchLayout",
+    "PrefixLastRestoreIndex",
+    "ThdBatchLayout",
     "MegatronParallelInfo",
     "PrefixSharingRuntimeContext",
     "PrefixSharingRuntimeState",

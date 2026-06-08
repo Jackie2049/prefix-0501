@@ -11,7 +11,7 @@ import math
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import BatchRuntimeLayout, BshdBatchLayout, ThdBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import (
@@ -66,16 +66,16 @@ class TorchReferenceBackend:
         store: PrefixAttentionStore,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
-        packed_batch_layout: Any | None = None,
+        batch_runtime_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
         torch = _torch()
-        layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        # Input K/V still follow the framework's padded packed layout; only
-        # valid tokens may enter the store or expanded KV.
-        key_rows = _split_packed(key, layout.padded_lengths)
-        value_rows = _split_packed(value, layout.padded_lengths)
+        layout = batch_runtime_layout or ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        is_bshd = layout.layout_kind == "bshd"
+        is_thd = layout.layout_kind == "thd"
+        key_rows = [layout.padded_row(key, row) for row in range(layout.batch_size)]
+        value_rows = [layout.padded_row(value, row) for row in range(layout.batch_size)]
         expanded_keys = []
         expanded_values = []
         # This loop relies on the current online detector invariant that a provider
@@ -86,8 +86,8 @@ class TorchReferenceBackend:
         # topology-aware build phase.
         for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
             valid_length = layout.valid_lengths[batch_index]
-            valid_key_row = key_row[:valid_length]
-            valid_value_row = value_row[:valid_length]
+            valid_key_row = layout.valid_row(key, batch_index)
+            valid_value_row = layout.valid_row(value, batch_index)
             if not prefix_sharing_plan.is_reuser(batch_index):
                 slot_id = PrefixActivationSlotId(
                     prefix_sharing_plan.forward_id,
@@ -140,7 +140,11 @@ class TorchReferenceBackend:
                 )
                 expanded_keys.append(expanded_key)
                 expanded_values.append(expanded_value)
-        return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
+        if is_bshd:
+            return expanded_keys, expanded_values
+        if is_thd:
+            return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
+        raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
 
     def attention(
         self,
@@ -149,25 +153,37 @@ class TorchReferenceBackend:
         value: Any,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
-        packed_batch_layout: Any | None = None,
+        batch_runtime_layout: Any | None = None,
         **_: Any,
     ) -> Any:
         torch = _torch()
-        layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        # Query keeps the framework packed shape, so split by padded lengths.
-        # K/V were already depadded and prefix-expanded by build_kv().
-        query_rows = _split_packed(query, layout.padded_lengths)
-        key_rows = _split_packed(key, prefix_sharing_plan.expanded_lengths_kv)
-        value_rows = _split_packed(value, prefix_sharing_plan.expanded_lengths_kv)
+        layout = batch_runtime_layout or ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        is_bshd = layout.layout_kind == "bshd"
+        is_thd = layout.layout_kind == "thd"
+        query_rows = [layout.padded_row(query, row) for row in range(layout.batch_size)]
+        if is_bshd:
+            key_rows = key
+            value_rows = value
+            dense_output = torch.zeros_like(query)
+        elif is_thd:
+            key_rows = _split_packed(key, prefix_sharing_plan.expanded_lengths_kv)
+            value_rows = _split_packed(value, prefix_sharing_plan.expanded_lengths_kv)
+            dense_output = None
+        else:
+            raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
         outputs = []
         for batch_index, (q_row, k_row, v_row) in enumerate(zip(query_rows, key_rows, value_rows)):
             valid_length = layout.valid_lengths[batch_index]
-            # Padding query slots are layout-only; they must not participate in attention.
-            q_valid = q_row[:valid_length]
+            # Padding/non-kept query slots are layout-only; they must not participate in attention.
+            q_valid = layout.valid_row(query, batch_index)
             prefix_len = prefix_sharing_plan.q_position_offsets[batch_index]
             if valid_length == 0:
-                outputs.append(torch.zeros_like(q_row))
-                continue
+                if is_bshd:
+                    continue
+                if is_thd:
+                    outputs.append(torch.zeros_like(q_row))
+                    continue
+                raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
             mask = _causal_q_kv_mask(
                 q_len=q_valid.shape[0],
                 kv_len=k_row.shape[0],
@@ -175,13 +191,22 @@ class TorchReferenceBackend:
                 device=q_valid.device,
             )
             valid_output = _attention_row(q_valid, k_row, v_row, mask)
+            if is_bshd:
+                layout.scatter_valid_row(dense_output, batch_index, valid_output)
+                continue
+            if not is_thd:
+                raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
             if valid_length == q_row.shape[0]:
                 outputs.append(valid_output)
                 continue
             padded_output = torch.zeros_like(q_row)
             padded_output[:valid_length] = valid_output
             outputs.append(padded_output)
-        return torch.cat(outputs, dim=0)
+        if is_bshd:
+            return dense_output
+        if is_thd:
+            return torch.cat(outputs, dim=0)
+        raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
 
     def gated_attention(
         self,
@@ -191,7 +216,7 @@ class TorchReferenceBackend:
         gate: Any,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
-        packed_batch_layout: Any | None = None,
+        batch_runtime_layout: Any | None = None,
         **kwargs: Any,
     ) -> Any:
         """Apply Qwen3.5-style output gate after prefix-expanded attention.
@@ -207,7 +232,7 @@ class TorchReferenceBackend:
             key,
             value,
             prefix_sharing_plan,
-            packed_batch_layout=packed_batch_layout,
+            batch_runtime_layout=batch_runtime_layout,
             **kwargs,
         )
         if attention_output.shape != gate.shape:
@@ -220,7 +245,7 @@ class TorchReferenceBackend:
         store: PrefixDeltanetStore,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
-        packed_batch_layout: Any | None = None,
+        batch_runtime_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
     ) -> Any:
@@ -233,12 +258,20 @@ class TorchReferenceBackend:
         """
 
         torch = _torch()
-        layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        update_rows = _split_packed(state_update, layout.padded_lengths)
+        layout = batch_runtime_layout or ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        is_bshd = layout.layout_kind == "bshd"
+        is_thd = layout.layout_kind == "thd"
+        update_rows = [layout.padded_row(state_update, row) for row in range(layout.batch_size)]
+        if is_bshd:
+            dense_output = torch.zeros_like(state_update)
+        elif is_thd:
+            dense_output = None
+        else:
+            raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
         outputs = []
         for batch_index, update_row in enumerate(update_rows):
             valid_length = layout.valid_lengths[batch_index]
-            valid_update_row = update_row[:valid_length]
+            valid_update_row = layout.valid_row(state_update, batch_index)
             if not prefix_sharing_plan.is_reuser(batch_index):
                 state_trajectory = torch.cumsum(valid_update_row, dim=0)
                 slot_id = PrefixActivationSlotId(
@@ -257,7 +290,12 @@ class TorchReferenceBackend:
                     prefix_len=state_trajectory.shape[0],
                     overwrite=True,
                 )
-                outputs.append(_pad_like_row(state_trajectory, update_row))
+                if is_bshd:
+                    layout.scatter_valid_row(dense_output, batch_index, state_trajectory)
+                elif is_thd:
+                    outputs.append(_pad_like_row(state_trajectory, update_row))
+                else:
+                    raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
                 continue
 
             provider = prefix_sharing_plan.provider_index[batch_index]
@@ -298,8 +336,17 @@ class TorchReferenceBackend:
                 prefix_len=own_state_trajectory.shape[0],
                 overwrite=True,
             )
-            outputs.append(_pad_like_row(suffix_trajectory, update_row))
-        return torch.cat(outputs, dim=0)
+            if is_bshd:
+                layout.scatter_valid_row(dense_output, batch_index, suffix_trajectory)
+            elif is_thd:
+                outputs.append(_pad_like_row(suffix_trajectory, update_row))
+            else:
+                raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
+        if is_bshd:
+            return dense_output
+        if is_thd:
+            return torch.cat(outputs, dim=0)
+        raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
 
 
 def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:

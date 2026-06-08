@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, Sequence, TypeVar
 
 from prefix_sharing.backends.factory import get_backend_instance
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import BatchRuntimeLayout, BshdBatchLayout, BshdTokenIndex, ThdBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.batch_trim import (
     TrimmedBatch,
@@ -47,7 +47,7 @@ T = TypeVar("T")
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
-    packed_batch_layout: PackedBatchLayout
+    batch_runtime_layout: BatchRuntimeLayout
     parallel_info: MegatronParallelInfo
 
 
@@ -114,7 +114,7 @@ class VerlMCoreBatchAdapter:
         runtime_state = PrefixSharingRuntimeState(
             prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
             backend=get_backend_instance(self.config),
-            packed_batch_layout=PackedBatchLayout.from_valid_lengths(
+            batch_runtime_layout=ThdBatchLayout.from_valid_lengths(
                 prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
             ),
             parallel_info=get_megatron_parallel_info(),
@@ -220,14 +220,14 @@ def build_prefix_sharing_micro_batch(
     config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
     logger.warning(f"[PS][prepare] config.validate() returned OK")
 
-    # --- Path 2: missing use_remove_padding ---
-    logger.warning(f"[PS][prepare] checking megatron.use_remove_padding...")
-    if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
-        logger.warning(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
-        raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
-
     # --- Path 3: multi_modal check ---
-    logger.warning(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
+    use_remove_padding = _read_actor_bool(actor_config, "megatron.use_remove_padding", False)
+    logger.warning(
+        "[PS][prepare] megatron.use_remove_padding=%s, about to batch.get(multi_modal_inputs)...",
+        use_remove_padding,
+    )
+    if not use_remove_padding:
+        logger.warning("[PS][prepare] use_remove_padding=False, building BSHD runtime layout")
     multi_modal_inputs = batch.get("multi_modal_inputs")
     if multi_modal_inputs is not None:
         # tensorclass 无法遍历（触发 CUDA 同步），改用底层 td 检查字段数
@@ -300,35 +300,58 @@ def build_prefix_sharing_micro_batch(
         if parallel_info.cp_size > 1
         else parallel_info.tp_size
     )
-    packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
-        kept_position_rows,
-        align_size=int(align_size),
-    )
-    logger.warning(
-        "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s "
-        "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] packed_batch_layout: "
-        "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
-        "total_valid=%s, total_padded=%s",
-        parallel_info.global_rank,
-        parallel_info.tp_rank,
-        parallel_info.tp_size,
-        parallel_info.cp_rank,
-        parallel_info.cp_size,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        parallel_info.is_pipeline_first_stage,
-        parallel_info.is_pipeline_last_stage,
-        packed_batch_layout.valid_lengths,
-        packed_batch_layout.padded_lengths,
-        packed_batch_layout.cu_seqlens,
-        packed_batch_layout.max_seqlen,
-        packed_batch_layout.total_valid_length,
-        packed_batch_layout.total_padded_length,
-    )
+    if use_remove_padding:
+        batch_runtime_layout = ThdBatchLayout.from_kept_position_rows(
+            kept_position_rows,
+            align_size=int(align_size),
+        )
+        logger.warning(
+            "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s "
+            "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] thd_batch_layout: "
+            "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
+            "total_valid=%s, total_padded=%s",
+            parallel_info.global_rank,
+            parallel_info.tp_rank,
+            parallel_info.tp_size,
+            parallel_info.cp_rank,
+            parallel_info.cp_size,
+            parallel_info.pp_rank,
+            parallel_info.pp_size,
+            parallel_info.is_pipeline_first_stage,
+            parallel_info.is_pipeline_last_stage,
+            batch_runtime_layout.valid_lengths,
+            batch_runtime_layout.padded_lengths,
+            batch_runtime_layout.cu_seqlens,
+            batch_runtime_layout.max_seqlen,
+            batch_runtime_layout.total_valid_length,
+            batch_runtime_layout.total_padded_length,
+        )
+    else:
+        batch_runtime_layout = BshdBatchLayout.from_valid_token_mask(
+            new_attention_mask,
+            position_ids=new_position_ids,
+        )
+        logger.warning(
+            "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s "
+            "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] bshd_batch_layout: "
+            "valid_lengths=%s, max_seqlen=%s, total_valid=%s",
+            parallel_info.global_rank,
+            parallel_info.tp_rank,
+            parallel_info.tp_size,
+            parallel_info.cp_rank,
+            parallel_info.cp_size,
+            parallel_info.pp_rank,
+            parallel_info.pp_size,
+            parallel_info.is_pipeline_first_stage,
+            parallel_info.is_pipeline_last_stage,
+            batch_runtime_layout.valid_lengths,
+            batch_runtime_layout.max_seqlen,
+            batch_runtime_layout.total_valid_length,
+        )
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         backend=get_backend_instance(config, backend),
-        packed_batch_layout=packed_batch_layout,
+        batch_runtime_layout=batch_runtime_layout,
         parallel_info=parallel_info,
     )
     logger.warning(
@@ -371,18 +394,34 @@ def restore_suffix_first_log_probs_from_prefix(
         len(ctx.prefix_last_restore_indices),
     )
     restored = log_probs.clone()
+    layout = ctx.batch_runtime_layout
     for index in ctx.prefix_last_restore_indices:
-        provider_logits = logits[
-            0:1,
-            index.provider_1d_pos : index.provider_1d_pos + 1,
-            :,
-        ].clone()
-        reuse_label = labels[
-            0:1,
-            index.reuse_1d_pos : index.reuse_1d_pos + 1,
-        ]
-        restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-        restored[0, index.reuse_1d_pos] = restored_value.reshape(())
+        if layout.layout_kind == "thd":
+            provider_pos = int(index.provider_token_index)
+            reuse_pos = int(index.reuse_token_index)
+            provider_logits = logits[0:1, provider_pos : provider_pos + 1, :].clone()
+            reuse_label = labels[0:1, reuse_pos : reuse_pos + 1]
+            restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
+            restored[0, reuse_pos] = restored_value.reshape(())
+            continue
+        if layout.layout_kind == "bshd":
+            provider_pos = index.provider_token_index
+            reuse_pos = index.reuse_token_index
+            if not isinstance(provider_pos, BshdTokenIndex) or not isinstance(reuse_pos, BshdTokenIndex):
+                raise TypeError("BSHD prefix-last restore requires BshdTokenIndex values")
+            provider_logits = logits[
+                provider_pos.row : provider_pos.row + 1,
+                provider_pos.seq_pos : provider_pos.seq_pos + 1,
+                :,
+            ].clone()
+            reuse_label = labels[
+                reuse_pos.row : reuse_pos.row + 1,
+                reuse_pos.seq_pos : reuse_pos.seq_pos + 1,
+            ]
+            restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
+            restored[reuse_pos.row, reuse_pos.seq_pos] = restored_value.reshape(())
+            continue
+        raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
     return restored
 
 

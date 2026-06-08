@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import BshdBatchLayout, ThdBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.logprob import (
@@ -126,7 +126,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
         forward_id=3,
         micro_batch_id=1,
     )
-    layout = PackedBatchLayout(
+    layout = ThdBatchLayout(
         valid_lengths=[5, 2],
         padded_lengths=padded_lengths,
         cu_seqlens=cu_seqlens,
@@ -143,7 +143,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
         value,
         store,
         prefix_sharing_plan,
-        packed_batch_layout=layout,
+        batch_runtime_layout=layout,
         layer_id=0,
     )
     output = backend.attention(
@@ -151,7 +151,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
         expanded_key,
         expanded_value,
         prefix_sharing_plan,
-        packed_batch_layout=layout,
+        batch_runtime_layout=layout,
     )
 
     provider_slot_id = PrefixActivationSlotId(
@@ -177,6 +177,71 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
     assert output.shape == query.shape
     for padding_index in padding_indices:
         assert output[padding_index].abs().sum().item() == 0
+
+
+def test_torch_reference_backend_bshd_attention_matches_thd_valid_tokens():
+    prefix_sharing_plan = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)).plan(
+        [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]],
+        forward_id=30,
+        micro_batch_id=1,
+    )
+    bshd_layout = BshdBatchLayout.from_valid_token_mask(
+        torch.tensor(
+            [
+                [True, True, True, True, True, False],
+                [False, False, False, True, True, False],
+            ]
+        )
+    )
+    thd_layout = ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+    backend = TorchReferenceBackend()
+    query_bshd = torch.randn(2, 6, 3)
+    key_bshd = torch.randn(2, 6, 3)
+    value_bshd = torch.randn(2, 6, 3)
+    query_thd = torch.cat([bshd_layout.valid_row(query_bshd, 0), bshd_layout.valid_row(query_bshd, 1)], dim=0)
+    key_thd = torch.cat([bshd_layout.valid_row(key_bshd, 0), bshd_layout.valid_row(key_bshd, 1)], dim=0)
+    value_thd = torch.cat([bshd_layout.valid_row(value_bshd, 0), bshd_layout.valid_row(value_bshd, 1)], dim=0)
+
+    bshd_store = PrefixAttentionStore()
+    bshd_key, bshd_value = backend.build_kv(
+        key_bshd,
+        value_bshd,
+        bshd_store,
+        prefix_sharing_plan,
+        batch_runtime_layout=bshd_layout,
+        layer_id=0,
+    )
+    bshd_output = backend.attention(
+        query_bshd,
+        bshd_key,
+        bshd_value,
+        prefix_sharing_plan,
+        batch_runtime_layout=bshd_layout,
+    )
+
+    thd_store = PrefixAttentionStore()
+    thd_key, thd_value = backend.build_kv(
+        key_thd,
+        value_thd,
+        thd_store,
+        prefix_sharing_plan,
+        batch_runtime_layout=thd_layout,
+        layer_id=0,
+    )
+    thd_output = backend.attention(
+        query_thd,
+        thd_key,
+        thd_value,
+        prefix_sharing_plan,
+        batch_runtime_layout=thd_layout,
+    )
+
+    assert bshd_output.shape == query_bshd.shape
+    assert torch.allclose(bshd_layout.valid_row(bshd_output, 0), thd_output[:5])
+    assert torch.allclose(bshd_layout.valid_row(bshd_output, 1), thd_output[5:])
+    assert bshd_output[0, 5].abs().sum().item() == 0
+    assert bshd_output[1, :3].abs().sum().item() == 0
+    assert bshd_output[1, 5].abs().sum().item() == 0
 
 
 def test_torch_reference_backend_gated_attention_keeps_gate_on_current_tokens():
@@ -281,7 +346,7 @@ def test_torch_reference_backend_deltanet_states_ignore_padding_slots(tp_size, p
         forward_id=6,
         micro_batch_id=1,
     )
-    layout = PackedBatchLayout(
+    layout = ThdBatchLayout(
         valid_lengths=[3, 1],
         padded_lengths=padded_lengths,
         cu_seqlens=cu_seqlens,
@@ -295,14 +360,14 @@ def test_torch_reference_backend_deltanet_states_ignore_padding_slots(tp_size, p
         state_update,
         store,
         prefix_sharing_plan,
-        packed_batch_layout=layout,
+        batch_runtime_layout=layout,
         layer_id=0,
         tp_rank=tp_size,
     )
 
     assert output.shape == state_update.shape
-    assert layout.valid_slice(0, output).abs().sum() > 0
-    assert layout.valid_slice(1, output).abs().sum() > 0
+    assert layout.valid_row(output, 0).abs().sum() > 0
+    assert layout.valid_row(output, 1).abs().sum() > 0
     for batch_index, padded_length in enumerate(layout.padded_lengths):
         valid_length = layout.valid_lengths[batch_index]
         if valid_length < padded_length:
