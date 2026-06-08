@@ -30,6 +30,7 @@ export ENABLE_PREFIX_SHARING=1        # 启用 prefix sharing
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     --config-name='ppo_megatron_trainer' \
+    algorithm.adv_estimator=grpo \
     data.train_files=/path/to/data/512_gsm8k/train.parquet \
     data.val_files=/path/to/data/512_gsm8k/test.parquet \
     data.train_batch_size=8 \
@@ -39,6 +40,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.use_kl_loss=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
@@ -48,9 +50,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.ref.megatron.override_transformer_config.use_flash_attn=True \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    critic.optim.lr=1e-5 \
-    critic.model.path=/path/to/Qwen2.5-0.5B \
-    critic.ppo_micro_batch_size_per_gpu=1 \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.logger=console \
     trainer.val_before_train=False \
@@ -72,6 +71,7 @@ export ENABLE_PREFIX_SHARING=1          # 启用 prefix sharing
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     --config-name='ppo_megatron_trainer' \
+    algorithm.adv_estimator=grpo \
     data.train_files=/path/to/data/512_gsm8k/train.parquet \
     data.val_files=/path/to/data/512_gsm8k/test.parquet \
     data.train_batch_size=8 \
@@ -81,6 +81,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -88,9 +89,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    critic.optim.lr=1e-5 \
-    critic.model.path=/path/to/Qwen2.5-0.5B \
-    critic.ppo_micro_batch_size_per_gpu=1 \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.logger=console \
     trainer.val_before_train=False \
@@ -182,6 +180,15 @@ actor_rollout_ref.rollout.tensor_model_parallel_size=1
 ```
 
 第一轮建议先保持 `actor_rollout_ref.rollout.tensor_model_parallel_size=1`，只验证 Megatron actor/ref 的 TP=2 prefix-sharing 路径。若需要同时验证 rollout TP，再单独改为 `2`。
+
+当前已支持 Megatron actor/ref 的物理 PP 和 Megatron TP-bound SP。启用 PP 时可按资源覆盖 `pipeline_model_parallel_size`；启用 SP 时在 TP 配置基础上追加：
+
+```bash
+actor_rollout_ref.actor.megatron.sequence_parallel=True \
+actor_rollout_ref.ref.megatron.sequence_parallel=True
+```
+
+SP 支持范围为 Megatron `sequence_parallel=True` 且 prefix-sharing attention hook / prefix-last restore 仍使用 global packed THD token 坐标；若未来训练引擎把 hook 输入改为 SP-local shard，运行时 guard 会显式报错，需要单独适配 local/global 坐标映射。
 
 建议测试顺序：
 
