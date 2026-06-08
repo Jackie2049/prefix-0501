@@ -53,8 +53,13 @@ def _add_output_gate_to_self_attention(attn_module):
     )
 
     def _output_gate_hook(module, input, output):
-        """Apply output gate after linear_proj (NOTE: config has output_gate_type="swish"
-        but using sigmoid for stability with random weights; swish validation needed)."""
+        """Apply output gate after linear_proj.
+
+        Config says output_gate_type="swish" but the real Qwen3.6 HuggingFace
+        implementation uses torch.sigmoid(gate) (modeling_qwen3_next.py line 413).
+        The gate is embedded in a doubled q_proj (2*head_dim), not a separate
+        gate_proj — our Megatron model adds a separate gate_proj for convenience.
+        """
         if isinstance(output, tuple) and len(output) >= 2:
             hidden_states = input[0]
             gate = torch.sigmoid(module.gate_proj(hidden_states)[0])
@@ -371,6 +376,9 @@ class Qwen3_6HybridModel(BaseModelInitializer):
             return model
 
         # Replace linear attention layers with GatedDeltaNetAttention
+        # Real Qwen3.6 pattern: self_attn at layer_idx % interval == interval - 1
+        # (e.g., interval=4 → self_attn at L3, L7, L11, L15)
+        # All other layers use GatedDeltaNet linear attention
         from .gated_delta_net import GatedDeltaNetAttention
 
         # Get the SelfAttentionSubmodules from the block spec
@@ -380,7 +388,7 @@ class Qwen3_6HybridModel(BaseModelInitializer):
         sa_submodules = sa_modspec.submodules
 
         for i, layer in enumerate(model.decoder.layers):
-            if i % full_attention_interval != 0:
+            if i % full_attention_interval != full_attention_interval - 1:
                 # This is a linear attention layer — replace SelfAttention
                 old_attn = layer.self_attention
 

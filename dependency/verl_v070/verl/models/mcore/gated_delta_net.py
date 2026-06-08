@@ -295,8 +295,10 @@ class GatedDeltaNetAttention(SelfAttention):
         # Output projection
         output, bias = self.linear_proj(y)
 
-        # Output gate (NOTE: config has output_gate_type="swish" but using sigmoid for
-        # stability with random weights; swish validation needed with real weights)
+        # Output gate: config says "swish" but real Qwen3.6 uses sigmoid
+        # (validated: modeling_qwen3_next.py line 413 uses torch.sigmoid(gate))
+        # Our gate_proj is a separate ColumnParallelLinear; real model embeds
+        # gate in doubled q_proj dimensions.
         if self.attn_output_gate:
             gate = torch.sigmoid(self.gate_proj(hidden_states)[0])
             output = output * gate
