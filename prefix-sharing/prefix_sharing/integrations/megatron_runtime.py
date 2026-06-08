@@ -200,8 +200,15 @@ def _positions_for_tensor(batch_runtime_layout: Any, tensor: Any, *, device: Any
         positions = position_ids.reshape(-1)
     elif batch_runtime_layout.layout_kind == "bshd":
         valid_positions = batch_runtime_layout.valid_position_ids(device=device).to(dtype=torch.long)
+        kept_padded_positions = batch_runtime_layout.kept_padded_position_ids(device=device).to(dtype=torch.long)
         full_positions = position_ids.reshape(-1)
-        if tensor.dim() >= 4 and tensor.shape[0] * tensor.shape[1] == full_positions.numel():
+        if (
+            tensor.dim() >= 4
+            and tensor.shape[0] == kept_padded_positions.shape[0]
+            and tensor.shape[1] == kept_padded_positions.shape[1]
+        ):
+            positions = kept_padded_positions.reshape(-1)
+        elif tensor.dim() >= 4 and tensor.shape[0] * tensor.shape[1] == full_positions.numel():
             positions = full_positions
         elif tensor.shape[0] == valid_positions.numel():
             positions = valid_positions
@@ -211,7 +218,8 @@ def _positions_for_tensor(batch_runtime_layout: Any, tensor: Any, *, device: Any
             raise RuntimeError(
                 "prefix sharing BSHD RoPE cannot align tensor with position_ids: "
                 f"tensor_shape={tuple(tensor.shape)}, full_positions={full_positions.numel()}, "
-                f"valid_positions={valid_positions.numel()}"
+                f"valid_positions={valid_positions.numel()}, "
+                f"kept_padded_positions={kept_padded_positions.numel()}"
             )
     else:
         raise ValueError(f"unsupported batch runtime layout: {batch_runtime_layout.layout_kind}")

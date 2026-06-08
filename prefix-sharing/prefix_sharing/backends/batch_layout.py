@@ -226,6 +226,8 @@ class BshdBatchLayout:
             start = sum(self.valid_lengths[:row])
             end = start + self.valid_lengths[row]
             return tensor[start:end]
+        if self._is_kept_padded_sbh_tensor(tensor):
+            return tensor[: self.valid_lengths[row], row]
         return tensor[row, self.valid_token_mask[row]]
 
     def padded_row(self, tensor: Any, row: int) -> Any:
@@ -233,12 +235,17 @@ class BshdBatchLayout:
             start = sum(self.valid_lengths[:row])
             end = start + self.valid_lengths[row]
             return tensor[start:end]
+        if self._is_kept_padded_sbh_tensor(tensor):
+            return tensor[:, row]
         return tensor[row]
 
     def scatter_valid_row(self, output: Any, row: int, valid_output: Any) -> None:
         if self._is_compact_valid_tensor(output):
             start = sum(self.valid_lengths[:row])
             output[start : start + self.valid_lengths[row]] = valid_output
+            return
+        if self._is_kept_padded_sbh_tensor(output):
+            output[: self.valid_lengths[row], row] = valid_output
             return
         output[row, self.valid_token_mask[row]] = valid_output
 
@@ -252,8 +259,37 @@ class BshdBatchLayout:
             position_ids = position_ids.to(device=device)
         return position_ids[mask]
 
+    def kept_padded_position_ids(self, *, device: Any | None = None) -> Any:
+        if self.position_ids is None:
+            raise RuntimeError("BshdBatchLayout is missing position_ids")
+        torch = _torch()
+        mask = self.valid_token_mask
+        position_ids = self.position_ids
+        if device is not None:
+            mask = mask.to(device=device)
+            position_ids = position_ids.to(device=device)
+        max_valid_length = max(self.valid_lengths, default=0)
+        rows = []
+        for row, valid_length in enumerate(self.valid_lengths):
+            valid_positions = position_ids[row, mask[row]]
+            pad_length = max_valid_length - valid_length
+            if pad_length > 0:
+                padding = torch.zeros(pad_length, dtype=valid_positions.dtype, device=valid_positions.device)
+                valid_positions = torch.cat([valid_positions, padding], dim=0)
+            rows.append(valid_positions)
+        if not rows:
+            return torch.empty(0, 0, dtype=position_ids.dtype, device=position_ids.device)
+        return torch.stack(rows, dim=1)
+
     def _is_compact_valid_tensor(self, tensor: Any) -> bool:
         return tensor.dim() >= 2 and int(tensor.shape[0]) == self.total_valid_length
+
+    def _is_kept_padded_sbh_tensor(self, tensor: Any) -> bool:
+        return (
+            tensor.dim() >= 3
+            and int(tensor.shape[0]) == max(self.valid_lengths, default=0)
+            and int(tensor.shape[1]) == self.batch_size
+        )
 
 
 def _pad_to_multiple(length: int, align_size: int) -> int:
