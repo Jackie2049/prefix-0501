@@ -256,10 +256,10 @@ def _run_bshd_prefix_sharing_attention(
 
         cu_seqlens_q = torch.tensor(
             [0] + [suffix_len] * b, device=query.device, dtype=torch.int32
-        ).cumsum(0)
+        ).cumsum(0).to(torch.int32)
         cu_seqlens_k = torch.tensor(
             [0] + [prefix_len + suffix_len] * b, device=query.device, dtype=torch.int32
-        ).cumsum(0)
+        ).cumsum(0).to(torch.int32)
 
         input_dtype = query_flat.dtype
         if input_dtype == torch.float32:
@@ -316,7 +316,7 @@ def _run_bshd_prefix_sharing_attention(
         key_flat = key_expanded.permute(1, 0, 2, 3).reshape(b * sq, num_heads, head_dim).contiguous()
         value_flat = value_expanded.permute(1, 0, 2, 3).reshape(b * sq, num_heads, head_dim).contiguous()
 
-        cu_seqlens = torch.tensor([0] + [sq] * b, device=query.device, dtype=torch.int32).cumsum(0)
+        cu_seqlens = torch.tensor([0] + [sq] * b, device=query.device, dtype=torch.int32).cumsum(0).to(torch.int32)
 
         input_dtype = query_flat.dtype
         if input_dtype == torch.float32:
