@@ -11,6 +11,8 @@ class ModelConfig:
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: Optional[int] = None
     num_layers_per_virtual_pipeline_stage: Optional[int] = None
+    tensor_model_parallel_size: int = 1
+    sequence_parallel: bool = False
     context_parallel_size: int = 1
     apply_rope_fusion: bool = False
     fused_single_qkv_rope: bool = False
@@ -31,6 +33,12 @@ def test_enabled_config_accepts_phase_one_constraints():
 def test_enabled_config_accepts_physical_pipeline_parallel_sizes(pp_size):
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     config.validate(ModelConfig(pipeline_model_parallel_size=pp_size))
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_enabled_config_accepts_megatron_sequence_parallel_with_common_tp_sizes(tp_size):
+    config = PrefixSharingConfig(enable_prefix_sharing=True)
+    config.validate(ModelConfig(tensor_model_parallel_size=tp_size, sequence_parallel=True))
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", "y"])

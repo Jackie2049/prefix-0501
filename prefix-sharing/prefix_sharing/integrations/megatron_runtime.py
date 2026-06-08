@@ -8,6 +8,7 @@ import torch
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.integrations.context import current_prefix_sharing_context
+from prefix_sharing.integrations.utils import ensure_global_packed_token_lengths
 
 
 def maybe_run_prefix_sharing_attention(
@@ -40,8 +41,18 @@ def maybe_run_prefix_sharing_attention(
     if ctx.packed_batch_layout.packed_position_ids is None:
         raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
-    q_pos_emb, k_pos_emb = rotary_pos_emb
     packed_batch_layout = ctx.packed_batch_layout
+    ensure_global_packed_token_lengths(
+        {
+            "query_length": query.shape[0],
+            "key_length": key.shape[0],
+            "value_length": value.shape[0],
+        },
+        total_padded_length=packed_batch_layout.total_padded_length,
+        context="attention hook",
+    )
+
+    q_pos_emb, k_pos_emb = rotary_pos_emb
     query, key = _apply_positioned_rope(
         attention_module,
         query,
@@ -59,6 +70,7 @@ def maybe_run_prefix_sharing_attention(
     prefix_log.warning(
         "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
         "enter prefix-sharing path: "
+        "sequence_parallel=%s query_token_length=%s total_padded_length=%s "
         "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
         "padded_lengths=%s, cu_seqlens=%s",
         parallel_info.global_rank,
@@ -67,6 +79,9 @@ def maybe_run_prefix_sharing_attention(
         parallel_info.pp_rank,
         parallel_info.pp_size,
         layer_id,
+        getattr(getattr(attention_module, "config", None), "sequence_parallel", None),
+        query.shape[0],
+        packed_batch_layout.total_padded_length,
         tuple(query.shape),
         tuple(key.shape),
         tuple(value.shape),

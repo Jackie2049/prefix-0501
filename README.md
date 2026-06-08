@@ -181,6 +181,15 @@ actor_rollout_ref.rollout.tensor_model_parallel_size=1
 
 第一轮建议先保持 `actor_rollout_ref.rollout.tensor_model_parallel_size=1`，只验证 Megatron actor/ref 的 TP=2 prefix-sharing 路径。若需要同时验证 rollout TP，再单独改为 `2`。
 
+当前已支持 Megatron actor/ref 的物理 PP 和 Megatron TP-bound SP。启用 PP 时可按资源覆盖 `pipeline_model_parallel_size`；启用 SP 时在 TP 配置基础上追加：
+
+```bash
+actor_rollout_ref.actor.megatron.sequence_parallel=True \
+actor_rollout_ref.ref.megatron.sequence_parallel=True
+```
+
+SP 支持范围为 Megatron `sequence_parallel=True` 且 prefix-sharing attention hook / prefix-last restore 仍使用 global packed THD token 坐标；若未来训练引擎把 hook 输入改为 SP-local shard，运行时 guard 会显式报错，需要单独适配 local/global 坐标映射。
+
 建议测试顺序：
 
 1. `ENABLE_PREFIX_SHARING=0` 跑 TP=2，确认原始 Megatron TP 环境可用。

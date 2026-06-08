@@ -35,6 +35,7 @@ from prefix_sharing.integrations.megatron_attention import IntegrationUnavailabl
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.patch_manager import PatchHandle
+from prefix_sharing.integrations.utils import ensure_global_packed_token_lengths
 
 import logging
 logger = logging.getLogger(__name__)
@@ -353,22 +354,38 @@ def restore_suffix_first_log_probs_from_prefix(
     if not parallel_info.is_pipeline_last_stage:
         logger.warning(
             "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-            "skip prefix-last restore on non-last PP stage: restore_indices=%s",
+            "skip prefix-last restore on non-last PP stage: restore_indices=%s "
+            "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
             parallel_info.global_rank,
             parallel_info.pp_rank,
             parallel_info.pp_size,
             parallel_info.is_pipeline_last_stage,
             len(ctx.prefix_last_restore_indices),
+            logits.shape[1],
+            log_probs.shape[1],
+            ctx.packed_batch_layout.total_padded_length,
         )
         return log_probs
+    ensure_global_packed_token_lengths(
+        {
+            "logits_token_length": logits.shape[1],
+            "log_probs_token_length": log_probs.shape[1],
+        },
+        total_padded_length=ctx.packed_batch_layout.total_padded_length,
+        context="prefix-last restore",
+    )
     logger.warning(
         "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-        "running prefix-last restore: restore_indices=%s",
+        "running prefix-last restore: restore_indices=%s "
+        "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
         parallel_info.global_rank,
         parallel_info.pp_rank,
         parallel_info.pp_size,
         parallel_info.is_pipeline_last_stage,
         len(ctx.prefix_last_restore_indices),
+        logits.shape[1],
+        log_probs.shape[1],
+        ctx.packed_batch_layout.total_padded_length,
     )
     restored = log_probs.clone()
     for index in ctx.prefix_last_restore_indices:
