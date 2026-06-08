@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""v17: BSHD-mode Prefix-Sharing E2E test for Qwen3-27B (16-layer).
+"""v18: BSHD-mode Prefix-Sharing E2E test for Qwen3-27B (16-layer).
 
-Uses the ACTUAL model pipeline: Qwen3_6HybridModel → GPTModel with
-SelfAttention for full-attention layers and GatedDeltaNetAttention for
-linear-attention layers.
+Key fixes from v17:
+1. Override sequence_parallel=False (critical for BSHD PS, TP>1 defaults to True)
+2. Pass attention_mask=None (DotProductAttention expects 4D mask, causal masking
+   auto-generates it when mask=None — see FusedScaleMaskSoftmax line 199)
+3. Skip preprocess_bshd (no left padding needed for same-length sequences,
+   avoids 2D→4D mask format mismatch)
 
-BSHD mode = use_remove_padding=False (packed_seq_params=None).
-Q/K/V are 4D (sq, b, h, hn) format.
-
-PS flow:
+PS flow (same as v17):
 - Prefix pass: SelfAttention/GatedDeltaNetAttention forward → store KV/carry
 - Suffix pass: SelfAttention loads stored KV, expands + concatenates → flash_attn_varlen_func
                 GatedDeltaNet loads stored carry state → injects as initial state
+
+Note: PS hook intercepts BEFORE RoPE (attention.py lines 582-606 before 608-645),
+so the hook can apply RoPE at correct absolute positions.
 
 Usage: torchrun --nproc_per_node=4 scripts/test_bshd_ps_e2e.py
 """
@@ -71,9 +74,12 @@ if local_rank == 0:
           f"attn_output_gate={config.attn_output_gate}")
 
 # Initialize model via Qwen3_6HybridModel → GPTModel (same as verl training)
+# CRITICAL: override sequence_parallel=False for BSHD PS
 from verl.models.mcore.registry import init_mcore_model, hf_to_mcore_config
 
-tfconfig = hf_to_mcore_config(config, torch.bfloat16)
+tfconfig = hf_to_mcore_config(config, torch.bfloat16, sequence_parallel=False)
+if local_rank == 0:
+    print(f"TransformerConfig: sequence_parallel={tfconfig.sequence_parallel}")
 model = init_mcore_model(tfconfig, config, pre_process=True, post_process=True)
 model = model.to(device)
 
@@ -104,26 +110,18 @@ suffix_tokens_list = [torch.randint(0, vocab_size, (SUFFIX_LEN,), dtype=torch.lo
                       for _ in range(N_SEQUENCES)]
 full_sequences = [torch.cat([prefix_tokens, suffix]) for suffix in suffix_tokens_list]
 full_input_ids = torch.stack(full_sequences)  # (N, total_len)
-
-full_attention_mask = torch.ones(N_SEQUENCES, total_len, dtype=torch.bool, device=device)
 full_position_ids = torch.arange(total_len, device=device).unsqueeze(0).expand(N_SEQUENCES, -1)
-
-# BSHD-mode forward: preprocess_bshd(input_ids, attention_mask, position_ids)
-from verl.models.mcore.util import preprocess_bshd
-
-processed_ids, processed_mask, processed_pos = preprocess_bshd(
-    full_input_ids, full_attention_mask, full_position_ids
-)
 
 torch.cuda.synchronize()
 t_normal_start = time.time()
 
 with torch.no_grad():
-    # GPTModel with post_process=True returns logits [b, s, h] directly
+    # attention_mask=None: causal masking auto-generates the mask
+    # (FusedScaleMaskSoftmax line 199: causal mask generated when mask=None)
     logits_normal = model(
-        input_ids=processed_ids,
-        position_ids=processed_pos,
-        attention_mask=processed_mask,
+        input_ids=full_input_ids,
+        position_ids=full_position_ids,
+        attention_mask=None,
     )
 
 torch.cuda.synchronize()
@@ -148,18 +146,9 @@ if local_rank == 0:
 suffix_input_ids = torch.stack(suffix_tokens_list)  # (N, SUFFIX_LEN)
 prefix_input_ids = prefix_tokens.unsqueeze(0)  # (1, PREFIX_LEN)
 
-suffix_attention_mask = torch.ones(N_SEQUENCES, SUFFIX_LEN, dtype=torch.bool, device=device)
+# Suffix position_ids start at PREFIX_LEN (absolute positions)
 suffix_position_ids = torch.arange(PREFIX_LEN, total_len, device=device).unsqueeze(0).expand(N_SEQUENCES, -1)
-prefix_attention_mask_p = torch.ones(1, PREFIX_LEN, dtype=torch.bool, device=device)
-prefix_position_ids_p = torch.arange(PREFIX_LEN, device=device).unsqueeze(0)
-
-# Preprocess both passes
-prefix_ids_proc, prefix_mask_proc, prefix_pos_proc = preprocess_bshd(
-    prefix_input_ids, prefix_attention_mask_p, prefix_position_ids_p
-)
-suffix_ids_proc, suffix_mask_proc, suffix_pos_proc = preprocess_bshd(
-    suffix_input_ids, suffix_attention_mask, suffix_position_ids
-)
+prefix_position_ids = torch.arange(PREFIX_LEN, device=device).unsqueeze(0)
 
 # Build PS context
 from prefix_sharing.core.config import PrefixSharingConfig
@@ -204,9 +193,9 @@ with prefix_sharing_runtime_context(ps_runtime_state) as ctx:
     # Prefix pass (no grad)
     with torch.no_grad():
         prefix_logits = model(
-            input_ids=prefix_ids_proc,
-            position_ids=prefix_pos_proc,
-            attention_mask=prefix_mask_proc,
+            input_ids=prefix_input_ids,
+            position_ids=prefix_position_ids,
+            attention_mask=None,
         )
     del prefix_logits
     torch.cuda.empty_cache()
@@ -219,9 +208,9 @@ with prefix_sharing_runtime_context(ps_runtime_state) as ctx:
 
     # Suffix pass (with gradients)
     suffix_logits = model(
-        input_ids=suffix_ids_proc,
-        position_ids=suffix_pos_proc,
-        attention_mask=suffix_mask_proc,
+        input_ids=suffix_input_ids,
+        position_ids=suffix_position_ids,
+        attention_mask=None,
     )
 
 torch.cuda.synchronize()
@@ -276,10 +265,6 @@ if local_rank == 0:
     print(f"{'='*60}")
 
 # ===== Step 4: Backward pass (gradient flow check) =====
-suffix_ids_proc2, suffix_mask_proc2, suffix_pos_proc2 = preprocess_bshd(
-    suffix_input_ids, suffix_attention_mask, suffix_position_ids
-)
-
 ps_runtime_state2 = PsState(
     prefix_sharing_plan=ps_plan,
     packed_batch_layout=suffix_layout,
@@ -292,18 +277,18 @@ with prefix_sharing_runtime_context(ps_runtime_state2) as ctx2:
     # Prefix pass
     with torch.no_grad():
         prefix_logits2 = model(
-            input_ids=prefix_ids_proc,
-            position_ids=prefix_pos_proc,
-            attention_mask=prefix_mask_proc,
+            input_ids=prefix_input_ids,
+            position_ids=prefix_position_ids,
+            attention_mask=None,
         )
     del prefix_logits2
     torch.cuda.empty_cache()
 
     # Suffix pass with gradients
     suffix_logits2 = model(
-        input_ids=suffix_ids_proc2,
-        position_ids=suffix_pos_proc2,
-        attention_mask=suffix_mask_proc2,
+        input_ids=suffix_input_ids,
+        position_ids=suffix_position_ids,
+        attention_mask=None,
     )
 
 loss = suffix_logits2.float().mean()

@@ -164,13 +164,41 @@ def _run_bshd_prefix_sharing_attention(
         if layer_type == AttentionLayerType.LINEAR_ATTENTION:
             return None
 
-    # Apply RoPE (standard Megatron path for BSHD)
+    # Apply RoPE at correct absolute positions.
+    # The PS hook intercepts BEFORE SelfAttention's RoPE, so we own RoPE.
+    # For prefix pass: positions 0..PREFIX_LEN-1 (rotary_pos_emb is correct)
+    # For suffix pass: positions PREFIX_LEN..total_len-1 (need offset correction)
     if rotary_pos_emb is None:
         logger.debug("[PS][bshd] skipping: no rotary_pos_emb for RoPE")
         return None
-    q_pos_emb, k_pos_emb = rotary_pos_emb
-    query = apply_rotary_pos_emb(query, q_pos_emb, config=attention_module.config)
-    key = apply_rotary_pos_emb(key, k_pos_emb, config=attention_module.config)
+
+    # Check whether we're in suffix pass (prefix KV already stored) or prefix pass
+    is_suffix_pass = ctx.store.contains(slot_id)
+
+    if is_suffix_pass:
+        # --- Suffix pass: apply RoPE at absolute positions PREFIX_LEN..total_len-1 ---
+        # rotary_pos_emb covers positions 0..suffix_len-1 (from suffix forward's rotary_seq_len)
+        # We need positions PREFIX_LEN..total_len-1. Extend and slice.
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+        prefix_len_actual = ctx.store.load(slot_id).key_tensor.shape[0]  # stored prefix seq_len
+        suffix_len = query.shape[0]
+        total_len_needed = prefix_len_actual + suffix_len
+
+        q_pos_emb_extended = _extend_rope_pos_emb(q_pos_emb, total_len_needed)
+        k_pos_emb_extended = _extend_rope_pos_emb(k_pos_emb, total_len_needed)
+
+        # Select the suffix range: positions PREFIX_LEN..total_len-1
+        suffix_positions = torch.arange(prefix_len_actual, total_len_needed, device=query.device)
+        q_pos_emb_suffix = q_pos_emb_extended.index_select(0, suffix_positions)
+        k_pos_emb_suffix = k_pos_emb_extended.index_select(0, suffix_positions)
+
+        query = apply_rotary_pos_emb(query, q_pos_emb_suffix, config=attention_module.config)
+        key = apply_rotary_pos_emb(key, k_pos_emb_suffix, config=attention_module.config)
+    else:
+        # --- Prefix pass: apply RoPE at positions 0..PREFIX_LEN-1 (standard path) ---
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+        query = apply_rotary_pos_emb(query, q_pos_emb, config=attention_module.config)
+        key = apply_rotary_pos_emb(key, k_pos_emb, config=attention_module.config)
 
     _, tp_rank, _ = _read_parallel_rank_info()
 
@@ -431,6 +459,40 @@ def _apply_fused_rope(
         cu_seqlens=None,
     ).squeeze(1)
     return query, key
+
+
+def _extend_rope_pos_emb(pos_emb: torch.Tensor, max_needed: int) -> torch.Tensor:
+    """Extend a RotaryEmbedding pos_emb tensor to cover more positions.
+
+    RoPE angles are linear in position: freqs[p] = p * inv_freq.
+    The step (inv_freq) is recovered from pos_emb[1] - pos_emb[0].
+
+    Args:
+        pos_emb: [seq_len, 1, 1, head_dim] RoPE embedding tensor
+        max_needed: total number of positions needed
+
+    Returns:
+        Extended pos_emb of shape [max_needed, 1, 1, head_dim]
+    """
+    if max_needed <= pos_emb.shape[0]:
+        return pos_emb
+
+    if pos_emb.shape[0] < 2:
+        # Can't recover step from a single entry — rare edge case
+        return pos_emb
+
+    dim_half = pos_emb.shape[-1] // 2
+    # The pos_emb format is interleaved: first half is cos-like, second half is sin-like
+    # Step recovery must use the same half for both cos and sin components
+    step = pos_emb[1:2, :, :, :dim_half] - pos_emb[0:1, :, :, :dim_half]
+    extra_positions = torch.arange(
+        pos_emb.shape[0], max_needed,
+        device=pos_emb.device, dtype=pos_emb.dtype,
+    )
+    extra_angles = extra_positions[:, None, None, None] * step
+    # Mirror the step for the second half (sin component)
+    extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
+    return torch.cat([pos_emb, extra_emb], dim=0)
 
 
 def _normalize_layer_number(attention_module: Any) -> int:
