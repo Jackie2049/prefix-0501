@@ -226,6 +226,12 @@ bash scripts/install_vllm_sglang_mcore.sh
 
 该脚本会安装 vLLM、SGLang、FlashAttention、TransformerEngine 等依赖。注意脚本中默认安装的 Megatron-LM 版本与本项目不同，本项目使用 `dependency/Megatron-LM-core_v0.12.1` 的快照版本，需在第 1 步单独安装覆盖。
 
+**注意**：对于非 Qwen3.5 模型的场景，需配套安装 transformers 4.57.6 版本：
+
+```bash
+pip install transformers==4.57.6
+```
+
 ### MindSpeed（NPU）
 
 MindSpeed 是华为 Ascend NPU 适配层，需要根据 NPU 环境单独安装，请参考 MindSpeed 官方文档和团队经验。
