@@ -154,7 +154,7 @@ selected_normal = log_probs_normal[:, PREFIX_LEN-1:-1, :].gather(
     dim=-1, index=suffix_labels.unsqueeze(-1)
 ).squeeze(-1).to(device='cpu', dtype=torch.float32)
 
-del full_logits_normal, log_probs_normal
+del log_probs_normal
 torch.cuda.empty_cache()
 
 if local_rank == 0:
@@ -237,6 +237,25 @@ t_ps = time.time() - t_ps_start
 # AllGather logits across TP ranks
 full_suffix_logits = _gather_logits_tp(suffix_logits)
 del suffix_logits
+
+# Compare raw logits (before log_softmax) for diagnostic
+# Normal logits: full_logits_normal[:, PREFIX_LEN-1:-1, :] predicts suffix tokens
+# PS logits: full_suffix_logits predicts suffix tokens
+normal_suffix_logits_raw = full_logits_normal[:, PREFIX_LEN-1:-1, :].float()  # (N, SUFFIX_LEN, vocab)
+ps_suffix_logits_raw = full_suffix_logits.float()  # (N, SUFFIX_LEN, vocab)
+
+# Align: compare positions 1..SUFFIX_LEN-1 (skip position 0 which is the boundary)
+normal_aligned_logits = normal_suffix_logits_raw[:, 1:, :].to(device='cpu')
+ps_aligned_logits = ps_suffix_logits_raw[:, :-1, :].to(device='cpu')  # PS logits[:-1] predict same tokens as normal logits[1:]
+if local_rank == 0:
+    logits_cos_sim = F.cosine_similarity(
+        normal_aligned_logits.flatten(), ps_aligned_logits.flatten(), dim=0
+    ).item()
+    logits_max_diff = (normal_aligned_logits - ps_aligned_logits).abs().max().item()
+    print(f"  Raw logits cos_sim: {logits_cos_sim:.6f}, max_diff: {logits_max_diff:.6f}")
+
+del full_logits_normal, normal_suffix_logits_raw, ps_suffix_logits_raw, normal_aligned_logits, ps_aligned_logits
+torch.cuda.empty_cache()
 
 # Extract suffix log_probs from PS forward
 log_probs_ps = F.log_softmax(full_suffix_logits.float(), dim=-1)
