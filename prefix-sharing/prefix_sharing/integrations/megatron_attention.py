@@ -116,6 +116,12 @@ def _make_patched_forward(original_forward: Any) -> Any:
             hidden_states,
         )
 
+        # For self attention, duplicate rotary_pos_emb if not already a tuple
+        # (same pattern as SelfAttention.forward). The BSHD PS path expects
+        # (q_pos_emb, k_pos_emb) tuple format.
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+
         # In THD (remove-padding) mode, the tensor shape is [total_tokens, heads, head_dim]
         # but Megatron's get_query_key_value_tensors may output [sq, b, h, hn].
         # We need to flatten to [total_tokens, heads, head_dim] for our backends.
