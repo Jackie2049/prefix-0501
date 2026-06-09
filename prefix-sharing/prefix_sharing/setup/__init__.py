@@ -36,15 +36,14 @@ def check() -> DetectedVersions:
         raise IncompatibleEnvironment(
             f"不兼容的版本组合: verl={versions.verl}, "
             f"megatron_core={versions.megatron_core}, "
-            f"megatron_bridge={versions.megatron_bridge}, "
             f"mindspeed={versions.mindspeed}。\n"
             + _format_compat_matrix()
         )
     logger.info(
         "[PS] Version check: verl=%s, megatron_core=%s, "
-        "megatron_bridge=%s, mindspeed=%s → compatible (patch_set=%s)",
+        "mindspeed=%s → compatible (patch_set=%s)",
         versions.verl, versions.megatron_core,
-        versions.megatron_bridge, versions.mindspeed,
+        versions.mindspeed,
         entry.patch_set_id,
     )
     return versions
@@ -93,8 +92,6 @@ def _format_compat_matrix() -> str:
         if e.verl is not None:
             parts.append(f"verl={e.verl}")
         parts.append(f"megatron-core={e.megatron_core}")
-        if e.megatron_bridge is not None:
-            parts.append(f"megatron-bridge={e.megatron_bridge}")
         if e.mindspeed is not None:
             parts.append(f"mindspeed={e.mindspeed}")
         lines.append(f"  组合{e.patch_set_id}: " + " + ".join(parts))

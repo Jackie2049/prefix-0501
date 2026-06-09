@@ -16,7 +16,6 @@ class CompatEntry:
 
     verl: str | None
     megatron_core: str | None
-    megatron_bridge: str | None
     mindspeed: str | None
     patch_set_id: str
     notes: str = ""
@@ -27,8 +26,6 @@ class CompatEntry:
         if not _version_match(self.verl, versions.verl):
             return False
         if not _version_match(self.megatron_core, versions.megatron_core):
-            return False
-        if not _version_match(self.megatron_bridge, versions.megatron_bridge):
             return False
         if not _version_match(self.mindspeed, versions.mindspeed):
             return False
@@ -48,11 +45,10 @@ def _version_match(required: str | None, detected: str | None) -> bool:
 
 # ── 兼容矩阵：只支持以下两个版本组合 ──
 COMPAT_MATRIX: list[CompatEntry] = [
-    # 组合一：verl + Megatron Core + Megatron Bridge + MindSpeed
+    # 组合一：verl + Megatron Core + MindSpeed
     CompatEntry(
         verl="0.8.0.dev",
         megatron_core="0.16.0",
-        megatron_bridge="0.4.0",
         mindspeed="0.15.3",
         patch_set_id="verl080_mcore016_ms0153",
         notes="verl PPO pipeline + MindSpeed NPU; PP=1, CP=1, "
@@ -62,7 +58,6 @@ COMPAT_MATRIX: list[CompatEntry] = [
     CompatEntry(
         verl=None,
         megatron_core="0.12.0",
-        megatron_bridge=None,
         mindspeed="0.12.0",
         patch_set_id="mcore012_ms012",
         notes="纯 Megatron + MindSpeed 训练; 无 verl; "

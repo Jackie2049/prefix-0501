@@ -42,7 +42,7 @@ setup 模块**只做三件事**：
 
 | 职责 | 说明 |
 |------|------|
-| **版本校验** | 探测运行环境中的 verl、Megatron Core、Megatron Bridge、MindSpeed 版本，对照兼容矩阵决定能否 patch |
+| **版本校验** | 探测运行环境中的 verl、Megatron Core、MindSpeed 版本，对照兼容矩阵决定能否 patch |
 | **patch 注入** | 为校验通过的版本组合，选择对应的 patch wrapper，通过 `LoggedPatchManager` 运行时替换目标方法 |
 | **patch 管理** | 提供 `describe()` 查看 patch 详情、`disable()` 回滚并打印恢复日志 |
 
@@ -179,13 +179,12 @@ setup 不依赖 integrations 的 `verl_mcore.py`、`megatron_runtime.py`、`mega
 
 只支持以下版本组合，**精确字符串 `==` 匹配**，不支持版本范围模糊匹配：
 
-#### 组合一：verl + Megatron Core + Megatron Bridge + MindSpeed
+#### 组合一：verl + Megatron Core + MindSpeed
 
 | 库 | 版本 | patch_set_id |
 |----|------|-------------|
 | verl | `0.8.0.dev` | `verl080_mcore016_ms0153` |
 | megatron-core | `0.16.0` | |
-| megatron-bridge | `0.4.0` | |
 | mindspeed | `0.15.3` | |
 
 适用场景：verl PPO pipeline + MindSpeed NPU 加速
@@ -213,7 +212,6 @@ Patch 目标：
 |----|-------------|---------|
 | verl | `verl.__version__` | 属性访问 |
 | megatron-core | `megatron.core.__version__` | 属性访问 |
-| megatron-bridge | `megatron.bridge.__version__` | 属性访问 |
 | mindspeed | `importlib.metadata.version("mindspeed")` | 包管理器查询（MindSpeed 不暴露 `__version__`） |
 
 ### 3.3 匹配规则
@@ -238,7 +236,6 @@ flowchart TD
 class CompatEntry:
     verl: str | None            # 精确版本号，None 表示不需要该库
     megatron_core: str | None
-    megatron_bridge: str | None  # 组合二时为 None
     mindspeed: str | None
     patch_set_id: str
     notes: str = ""              # 附加说明
@@ -417,7 +414,7 @@ actor:
 **安装时**：
 
 ```
-[PS] Detected: verl=0.8.0.dev, megatron_core=0.16.0, megatron_bridge=0.4.0, mindspeed=0.15.3
+[PS] Detected: verl=0.8.0.dev, megatron_core=0.16.0, mindspeed=0.15.3
 [PS] Version check → compatible (patch_set=verl080_mcore016_ms0153)
 [PS] Patched megatron.core.transformer.attention.Attention.forward: Attention.forward → patched_forward
 [PS] Patched verl.utils.megatron.tensor_parallel.vocab_parallel_log_probs_from_logits → patched_fn
@@ -449,7 +446,7 @@ PatchHandle (ACTIVE, 3 patches):
 ```
 IncompatibleEnvironment: 不兼容的版本组合: verl=0.9.0, megatron_core=0.17.0, mindspeed=None
   支持的组合：
-  组合一: verl=0.8.0.dev + megatron-core=0.16.0 + megatron-bridge=0.4.0 + mindspeed=0.15.3
+  组合一: verl=0.8.0.dev + megatron-core=0.16.0 + mindspeed=0.15.3
   组合二: megatron-core=0.12.0 + mindspeed=0.12.0 (无 verl)
 ```
 

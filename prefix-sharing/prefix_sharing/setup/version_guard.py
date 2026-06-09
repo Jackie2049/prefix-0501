@@ -14,12 +14,11 @@ logger = logging.getLogger(__name__)
 class DetectedVersions:
     verl: str | None
     megatron_core: str | None
-    megatron_bridge: str | None
     mindspeed: str | None
 
 
 def detect_versions() -> DetectedVersions:
-    """探测当前环境中 verl、Megatron Core、Megatron Bridge、MindSpeed 的版本。
+    """探测当前环境中 verl、Megatron Core、MindSpeed 的版本。
 
     探测顺序：sys.modules → importlib.import_module → importlib.metadata
 
@@ -27,18 +26,15 @@ def detect_versions() -> DetectedVersions:
     """
     verl_ver = _detect("verl", "__version__")
     mcore_ver = _detect("megatron.core", "__version__")
-    mbridge_ver = _detect("megatron.bridge", "__version__")
     ms_ver = _detect_mindspeed()
 
     logger.info(
-        "[PS] Detected: verl=%s, megatron_core=%s, "
-        "megatron_bridge=%s, mindspeed=%s",
-        verl_ver, mcore_ver, mbridge_ver, ms_ver,
+        "[PS] Detected: verl=%s, megatron_core=%s, mindspeed=%s",
+        verl_ver, mcore_ver, ms_ver,
     )
     return DetectedVersions(
         verl=verl_ver,
         megatron_core=mcore_ver,
-        megatron_bridge=mbridge_ver,
         mindspeed=ms_ver,
     )
 
