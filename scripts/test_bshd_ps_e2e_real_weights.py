@@ -389,6 +389,20 @@ attn_integration = MegatronAttentionIntegration(
 patch_handle = attn_integration.install()
 if local_rank == 0:
     print("  SelfAttention KV injection patch installed")
+    # Verify patch is active
+    from megatron.core.transformer.attention import SelfAttention
+    sa_fwd_name = SelfAttention.forward.__name__
+    print(f"  SelfAttention.forward name: {sa_fwd_name}")
+    # Check L3 SelfAttention instance
+    l3_attn = model.decoder.layers[3].self_attention
+    l3_fwd_name = l3_attn.forward.__func__.__name__ if hasattr(l3_attn.forward, '__func__') else 'unknown'
+    l3_cls = l3_attn.__class__.__name__
+    print(f"  L3 attn class: {l3_cls}, forward.__func__.__name: {l3_fwd_name}")
+    # Check if forward on the instance vs class are different
+    l3_instance_fwd = type(l3_attn).__dict__.get('forward', None)
+    print(f"  L3 instance dict has 'forward': {l3_instance_fwd is not None}")
+    sa_class_fwd = SelfAttention.__dict__.get('forward', None)
+    print(f"  SelfAttention class dict 'forward' name: {sa_class_fwd.__name__ if sa_class_fwd else 'None'}")
 
 @dataclass
 class PsState:
