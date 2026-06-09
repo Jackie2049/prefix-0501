@@ -403,7 +403,7 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             v_size_tp = full_weight_v.shape[0] // tp_size
             total_size = q_size_tp + k_size_tp + v_size_tp
 
-            sizes = [total_size]
+            sizes = [total_size * tp_size]
             if not bias:
                 sizes.append(full_weight_q.shape[1])
             new_weight_qkv = torch.empty(*sizes, dtype=params_dtype, device=get_device_id())
