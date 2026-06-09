@@ -431,50 +431,50 @@ def restore_suffix_first_log_probs_from_prefix(
 def _take_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: BshdTokenIndex, *, keep_vocab_dim: bool) -> Any:
     valid_offset = _bshd_valid_offset(layout, token_index)
     if _is_compact_bshd_tensor(tensor, layout):
-        compact_pos = sum(layout.valid_lengths[: token_index.row]) + valid_offset
+        compact_pos = sum(layout.valid_lengths[: token_index.seq_idx_in_batch]) + valid_offset
         if keep_vocab_dim:
             return tensor[compact_pos : compact_pos + 1].unsqueeze(0)
         return tensor[compact_pos : compact_pos + 1].unsqueeze(0)
-    if _is_kept_padded_sbh_tensor(tensor, layout):
+    if _is_padded_sbh_tensor(tensor, layout):
         if keep_vocab_dim:
-            return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1, :]
-        return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1]
+            return tensor[valid_offset : valid_offset + 1, token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, :]
+        return tensor[valid_offset : valid_offset + 1, token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1]
     if _is_kept_padded_bsh_tensor(tensor, layout):
         if keep_vocab_dim:
-            return tensor[token_index.row : token_index.row + 1, valid_offset : valid_offset + 1, :]
-        return tensor[token_index.row : token_index.row + 1, valid_offset : valid_offset + 1]
+            return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, valid_offset : valid_offset + 1, :]
+        return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, valid_offset : valid_offset + 1]
     if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
-        flat_pos = valid_offset * layout.batch_size + token_index.row
+        flat_pos = valid_offset * layout.batch_size + token_index.seq_idx_in_batch
         return tensor[:, flat_pos : flat_pos + 1, :] if keep_vocab_dim else tensor[:, flat_pos : flat_pos + 1]
     if _is_flattened_full_bshd_tensor(tensor, layout):
-        flat_pos = token_index.row * layout.max_seqlen + token_index.seq_pos
+        flat_pos = token_index.seq_idx_in_batch * layout.max_seqlen + token_index.token_idx_in_seq
         return tensor[:, flat_pos : flat_pos + 1, :] if keep_vocab_dim else tensor[:, flat_pos : flat_pos + 1]
     if keep_vocab_dim:
-        return tensor[token_index.row : token_index.row + 1, token_index.seq_pos : token_index.seq_pos + 1, :]
-    return tensor[token_index.row : token_index.row + 1, token_index.seq_pos : token_index.seq_pos + 1]
+        return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, token_index.token_idx_in_seq : token_index.token_idx_in_seq + 1, :]
+    return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, token_index.token_idx_in_seq : token_index.token_idx_in_seq + 1]
 
 
 def _write_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: BshdTokenIndex, value: Any) -> None:
     valid_offset = _bshd_valid_offset(layout, token_index)
     if _is_compact_bshd_tensor(tensor, layout):
-        compact_pos = sum(layout.valid_lengths[: token_index.row]) + valid_offset
+        compact_pos = sum(layout.valid_lengths[: token_index.seq_idx_in_batch]) + valid_offset
         tensor[compact_pos] = value
         return
-    if _is_kept_padded_sbh_tensor(tensor, layout):
-        tensor[valid_offset, token_index.row] = value
+    if _is_padded_sbh_tensor(tensor, layout):
+        tensor[valid_offset, token_index.seq_idx_in_batch] = value
         return
     if _is_kept_padded_bsh_tensor(tensor, layout):
-        tensor[token_index.row, valid_offset] = value
+        tensor[token_index.seq_idx_in_batch, valid_offset] = value
         return
     if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
-        flat_pos = valid_offset * layout.batch_size + token_index.row
+        flat_pos = valid_offset * layout.batch_size + token_index.seq_idx_in_batch
         tensor[:, flat_pos] = value
         return
     if _is_flattened_full_bshd_tensor(tensor, layout):
-        flat_pos = token_index.row * layout.max_seqlen + token_index.seq_pos
+        flat_pos = token_index.seq_idx_in_batch * layout.max_seqlen + token_index.token_idx_in_seq
         tensor[:, flat_pos] = value
         return
-    tensor[token_index.row, token_index.seq_pos] = value
+    tensor[token_index.seq_idx_in_batch, token_index.token_idx_in_seq] = value
 
 
 def _ensure_non_empty_bshd_restore_token(
@@ -501,9 +501,9 @@ def _ensure_non_empty_bshd_restore_token(
 
 
 def _bshd_valid_offset(layout: BshdBatchLayout, token_index: BshdTokenIndex) -> int:
-    row_mask = layout.valid_token_mask[token_index.row]
-    preceding = row_mask[: token_index.seq_pos].sum()
-    if not bool(row_mask[token_index.seq_pos]):
+    row_mask = layout.valid_token_mask[token_index.seq_idx_in_batch]
+    preceding = row_mask[: token_index.token_idx_in_seq].sum()
+    if not bool(row_mask[token_index.token_idx_in_seq]):
         raise IndexError("BshdTokenIndex points to a non-valid token")
     return int(preceding.detach().cpu().item())
 
@@ -512,7 +512,7 @@ def _is_compact_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
     return tensor.dim() >= 1 and int(tensor.shape[0]) == layout.total_valid_length
 
 
-def _is_kept_padded_sbh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+def _is_padded_sbh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
     max_valid_length = max(layout.valid_lengths, default=0)
     return (
         tensor.dim() >= 2

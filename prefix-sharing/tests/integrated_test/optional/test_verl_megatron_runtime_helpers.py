@@ -121,8 +121,8 @@ def test_build_prefix_sharing_micro_batch_builds_bshd_layout_without_remove_padd
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         provider_index = ctx.prefix_last_restore_indices[0].provider_token_index
         reuse_index = ctx.prefix_last_restore_indices[0].reuse_token_index
-        assert (provider_index.row, provider_index.seq_pos) == (0, 3)
-        assert (reuse_index.row, reuse_index.seq_pos) == (1, 4)
+        assert (provider_index.seq_idx_in_batch, provider_index.token_idx_in_seq) == (0, 3)
+        assert (reuse_index.seq_idx_in_batch, reuse_index.token_idx_in_seq) == (1, 4)
 
 
 @pytest.mark.parametrize(

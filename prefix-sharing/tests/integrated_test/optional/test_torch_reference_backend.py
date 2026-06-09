@@ -198,9 +198,9 @@ def test_torch_reference_backend_bshd_attention_matches_thd_valid_tokens():
     query_bshd = torch.randn(2, 6, 3)
     key_bshd = torch.randn(2, 6, 3)
     value_bshd = torch.randn(2, 6, 3)
-    query_thd = torch.cat([bshd_layout.valid_row(query_bshd, 0), bshd_layout.valid_row(query_bshd, 1)], dim=0)
-    key_thd = torch.cat([bshd_layout.valid_row(key_bshd, 0), bshd_layout.valid_row(key_bshd, 1)], dim=0)
-    value_thd = torch.cat([bshd_layout.valid_row(value_bshd, 0), bshd_layout.valid_row(value_bshd, 1)], dim=0)
+    query_thd = torch.cat([bshd_layout.valid_tokens(query_bshd, 0), bshd_layout.valid_tokens(query_bshd, 1)], dim=0)
+    key_thd = torch.cat([bshd_layout.valid_tokens(key_bshd, 0), bshd_layout.valid_tokens(key_bshd, 1)], dim=0)
+    value_thd = torch.cat([bshd_layout.valid_tokens(value_bshd, 0), bshd_layout.valid_tokens(value_bshd, 1)], dim=0)
 
     bshd_store = PrefixAttentionStore()
     bshd_key, bshd_value = backend.build_kv(
@@ -237,8 +237,8 @@ def test_torch_reference_backend_bshd_attention_matches_thd_valid_tokens():
     )
 
     assert bshd_output.shape == query_bshd.shape
-    assert torch.allclose(bshd_layout.valid_row(bshd_output, 0), thd_output[:5])
-    assert torch.allclose(bshd_layout.valid_row(bshd_output, 1), thd_output[5:])
+    assert torch.allclose(bshd_layout.valid_tokens(bshd_output, 0), thd_output[:5])
+    assert torch.allclose(bshd_layout.valid_tokens(bshd_output, 1), thd_output[5:])
     assert bshd_output[0, 5].abs().sum().item() == 0
     assert bshd_output[1, :3].abs().sum().item() == 0
     assert bshd_output[1, 5].abs().sum().item() == 0
@@ -366,13 +366,13 @@ def test_torch_reference_backend_deltanet_states_ignore_padding_slots(tp_size, p
     )
 
     assert output.shape == state_update.shape
-    assert layout.valid_row(output, 0).abs().sum() > 0
-    assert layout.valid_row(output, 1).abs().sum() > 0
+    assert layout.valid_tokens(output, 0).abs().sum() > 0
+    assert layout.valid_tokens(output, 1).abs().sum() > 0
     for batch_index, padded_length in enumerate(layout.padded_lengths):
         valid_length = layout.valid_lengths[batch_index]
         if valid_length < padded_length:
-            row_start = layout.row_start(batch_index)
-            assert output[row_start + valid_length : row_start + padded_length].abs().sum().item() == 0
+            seq_start = layout.seq_start(batch_index)
+            assert output[seq_start + valid_length : seq_start + padded_length].abs().sum().item() == 0
 
 
 def test_prefix_last_restore_tensor_keeps_autograd_path():

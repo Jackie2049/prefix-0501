@@ -87,5 +87,5 @@ def test_prefix_sharing_runtime_context_uses_bshd_layout_for_restore_indices():
     )
 
     with prefix_sharing_runtime_context(runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_token_index == BshdTokenIndex(row=0, seq_pos=2)
-        assert ctx.prefix_last_restore_indices[0].reuse_token_index == BshdTokenIndex(row=1, seq_pos=3)
+        assert ctx.prefix_last_restore_indices[0].provider_token_index == BshdTokenIndex(seq_idx_in_batch=0, token_idx_in_seq=2)
+        assert ctx.prefix_last_restore_indices[0].reuse_token_index == BshdTokenIndex(seq_idx_in_batch=1, token_idx_in_seq=3)
