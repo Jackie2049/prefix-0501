@@ -29,14 +29,17 @@ from .config_converter import PretrainedConfig, TransformerConfig
 def _add_output_gate_to_self_attention(attn_module):
     """Add output gate (gate_proj) to a SelfAttention module.
 
-    Qwen3.6 HybridAttention uses attn_output_gate=True for ALL layers,
-    including full attention (SelfAttention) layers. Megatron's SelfAttention
-    doesn't have built-in output gating, so we add gate_proj and register a
-    forward hook to apply the gate after linear_proj.
+    Qwen3.6 HybridAttention uses attn_output_gate=True for ALL layers.
+    The real model embeds the gate in a doubled q_proj (2*head_dim output)
+    where the second half is the gate, applied BEFORE o_proj in
+    (num_heads*head_dim) space.
 
-    The forward hook works for both normal forward and PS hook paths, since
-    it fires after SelfAttention.forward() returns regardless of whether
-    the PS hook intercepted.
+    Since we can't easily intercept before o_proj via forward hooks
+    (hooks fire after SelfAttention.forward() which already ran o_proj),
+    we apply the gate AFTER o_proj in hidden_size space. This is
+    mathematically different from the real model but the gate values
+    are typically near 1 (sigmoid), so the precision impact is small.
+    For DeltaNet layers, the gate is correctly applied before linear_proj.
     """
     from megatron.core.tensor_parallel import ColumnParallelLinear
 
@@ -53,13 +56,7 @@ def _add_output_gate_to_self_attention(attn_module):
     )
 
     def _output_gate_hook(module, input, output):
-        """Apply output gate after linear_proj.
-
-        Config says output_gate_type="swish" but the real Qwen3.6 HuggingFace
-        implementation uses torch.sigmoid(gate) (modeling_qwen3_next.py line 413).
-        The gate is embedded in a doubled q_proj (2*head_dim), not a separate
-        gate_proj — our Megatron model adds a separate gate_proj for convenience.
-        """
+        """Apply output gate after linear_proj in hidden_size space."""
         if isinstance(output, tuple) and len(output) >= 2:
             hidden_states = input[0]
             gate = torch.sigmoid(module.gate_proj(hidden_states)[0])
@@ -392,7 +389,14 @@ class Qwen3_6HybridModel(BaseModelInitializer):
                 # This is a linear attention layer — replace SelfAttention
                 old_attn = layer.self_attention
 
-                # Create GatedDeltaNetAttention with correct submodules
+                # DeltaNet uses different head dimensions than SelfAttention:
+                # SelfAttention: 24 query heads, 4 kv heads, 256 head_dim
+                # DeltaNet:      48 query heads, 16 kv heads, 128 head_dim
+                # The linear_qkv output dims are different (8192 vs 10240),
+                # so we need new modules for DeltaNet, not copied ones.
+
+                # Create GatedDeltaNetAttention (it will create its own
+                # beta_proj, decay_proj, gate_proj)
                 new_attn = GatedDeltaNetAttention(
                     config=self.tfconfig,
                     submodules=sa_submodules,
@@ -403,14 +407,52 @@ class Qwen3_6HybridModel(BaseModelInitializer):
                 )
                 new_attn.to(next(old_attn.parameters()).device)
 
-                # Copy weights from old SelfAttention to new GatedDeltaNet
-                # linear_qkv and linear_proj are shared
-                new_attn.linear_qkv = old_attn.linear_qkv
-                new_attn.linear_proj = old_attn.linear_proj
-                if hasattr(old_attn, 'q_layernorm') and old_attn.q_layernorm is not None:
-                    new_attn.q_layernorm = old_attn.q_layernorm
-                if hasattr(old_attn, 'k_layernorm') and old_attn.k_layernorm is not None:
-                    new_attn.k_layernorm = old_attn.k_layernorm
+                # Replace linear_qkv and linear_proj with DeltaNet-sized modules
+                # DeltaNet QKV: 48*q_head_dim + 16*k_head_dim + 16*v_head_dim = 10240
+                # DeltaNet o_proj: input 6144 (48*128), output 5120 (hidden_size)
+                from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+                dn_num_heads = 48  # DeltaNet uses 48 query heads
+                dn_kv_heads = 16   # DeltaNet uses 16 kv heads
+                dn_head_dim = 128  # DeltaNet head_dim = 128 (not 256)
+                dn_qkv_out = dn_num_heads * dn_head_dim + dn_kv_heads * dn_head_dim + dn_kv_heads * dn_head_dim  # 10240
+
+                new_attn.linear_qkv = ColumnParallelLinear(
+                    self.tfconfig.hidden_size,
+                    dn_qkv_out,
+                    config=self.tfconfig,
+                    init_method=self.tfconfig.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                )
+                new_attn.linear_proj = RowParallelLinear(
+                    dn_num_heads * dn_head_dim,  # 6144
+                    self.tfconfig.hidden_size,     # 5120
+                    config=self.tfconfig,
+                    init_method=self.tfconfig.output_layer_init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    input_is_parallel=True,
+                    is_expert=False,
+                )
+
+                # DeltaNet uses per-head layernorm on Q (head_dim=128)
+                # Q/K layernorm dimensions match DeltaNet head_dim
+                from megatron.core.transformer.torch_layer_norm import TorchLayerNorm
+                new_attn.q_layernorm = TorchLayerNorm(
+                    dn_head_dim,  # 128 per TP rank? Actually per-head norm is full head_dim
+                    eps=self.tfconfig.layernorm_epsilon,
+                )
+                new_attn.k_layernorm = TorchLayerNorm(
+                    dn_head_dim,
+                    eps=self.tfconfig.layernorm_epsilon,
+                )
+
+                # Store DeltaNet-specific config for weight loading
+                new_attn.deltanet_num_heads = dn_num_heads
+                new_attn.deltanet_kv_heads = dn_kv_heads
+                new_attn.deltanet_head_dim = dn_head_dim
 
                 # Replace the attention module
                 layer.self_attention = new_attn

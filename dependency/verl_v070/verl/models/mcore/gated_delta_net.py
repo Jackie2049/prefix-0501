@@ -67,19 +67,29 @@ class GatedDeltaNetAttention(SelfAttention):
         self.partial_rotary_factor = partial_rotary_factor
         self.attn_output_gate = attn_output_gate
 
-        # Store dimensions
-        self.rope_dim = int(self.hidden_size_per_attention_head * partial_rotary_factor)
+        # DeltaNet uses different head dimensions than SelfAttention:
+        # SelfAttention: 24 query heads, 4 kv heads, 256 head_dim
+        # DeltaNet:      48 query heads, 16 kv heads, 128 head_dim
+        # These are set by model_initializer when creating DeltaNet modules.
+        # Default to DeltaNet dimensions for Qwen3.6-27B (16-layer).
+        self.deltanet_num_heads = getattr(self, 'deltanet_num_heads', 48)
+        self.deltanet_kv_heads = getattr(self, 'deltanet_kv_heads', 16)
+        self.deltanet_head_dim = getattr(self, 'deltanet_head_dim', 128)
+
+        # Override inherited dimensions with DeltaNet-specific values
+        self.hidden_size_per_attention_head = self.deltanet_head_dim  # 128, not 256
+        self.rope_dim = int(self.deltanet_head_dim * partial_rotary_factor)  # 32 (0.25*128)
 
         tp_size = self.config.tensor_model_parallel_size
-        self.num_heads_per_tp = self.config.num_attention_heads // tp_size
-        self.num_kv_heads_per_tp = self.config.num_query_groups // tp_size
-        self.kv_groups = self.num_heads_per_tp // self.num_kv_heads_per_tp
+        self.num_heads_per_tp = self.deltanet_num_heads // tp_size  # 12 per TP=4
+        self.num_kv_heads_per_tp = self.deltanet_kv_heads // tp_size  # 4 per TP=4
+        self.kv_groups = self.num_heads_per_tp // self.num_kv_heads_per_tp  # 3
 
-        # Beta and decay projections: hidden_size -> num_heads_per_tp
+        # Beta and decay projections: hidden_size -> deltanet_num_heads (48)
         from megatron.core.tensor_parallel import ColumnParallelLinear
         self.beta_proj = ColumnParallelLinear(
             self.config.hidden_size,
-            self.config.num_attention_heads,
+            self.deltanet_num_heads,  # 48, not 24
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -89,7 +99,7 @@ class GatedDeltaNetAttention(SelfAttention):
         )
         self.decay_proj = ColumnParallelLinear(
             self.config.hidden_size,
-            self.config.num_attention_heads,
+            self.deltanet_num_heads,  # 48, not 24
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -98,15 +108,17 @@ class GatedDeltaNetAttention(SelfAttention):
             is_expert=False,
         )
 
-        # Output gate
+        # Output gate: applied in (deltanet_num_heads*deltanet_head_dim) space BEFORE linear_proj
+        # Real Qwen3.6: gate = sigmoid(in_proj_z(hidden)) applied to attn output
+        # before out_proj. Gate output dim = 48*128 = 6144.
         if self.attn_output_gate:
             from megatron.core.tensor_parallel import ColumnParallelLinear as CPL
             self.gate_proj = CPL(
                 self.config.hidden_size,
-                self.config.hidden_size,
+                self.deltanet_num_heads * self.deltanet_head_dim,  # 48*128 = 6144
                 config=self.config,
                 init_method=self.config.init_method,
-                gather_output=True,  # Must gather to match linear_proj output shape
+                gather_output=True,  # Must gather since linear_proj expects gathered input
                 bias=False,
                 skip_bias_add=False,
                 is_expert=False,
@@ -132,12 +144,31 @@ class GatedDeltaNetAttention(SelfAttention):
         """
         # hidden_states: [sq, b, h]
 
-        # QKV projection using inherited linear_qkv
-        # Use parent's get_query_key_value_tensors for correct GQA interleaved split
-        query, key, value = self.get_query_key_value_tensors(hidden_states, None)
-        sq, b, _ = hidden_states.size()
+        # QKV projection — custom split for DeltaNet dimensions
+        # DeltaNet linear_qkv output: [sq, b, 48*128 + 16*128 + 16*128] per full TP
+        # = [sq, b, dn_qkv_out] where dn_qkv_out varies per TP rank
+        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        # mixed_qkv: [sq, b, num_heads_per_tp * head_dim + 2 * num_kv_heads_per_tp * head_dim]
+        # = [sq, b, 12*128 + 2*4*128] per TP=4 = [sq, b, 2560]
 
-        # Note: QK layernorm is already applied by get_query_key_value_tensors()
+        # Split Q, K, V: no GQA interleaving needed for DeltaNet (simple split)
+        # DeltaNet uses straightforward [Q, K, V] layout (not interleaved)
+        q_sz = self.num_heads_per_tp * self.deltanet_head_dim
+        kv_sz = self.num_kv_heads_per_tp * self.deltanet_head_dim
+        query = mixed_qkv[..., :q_sz]
+        key = mixed_qkv[..., q_sz:q_sz + kv_sz]
+        value = mixed_qkv[..., q_sz + kv_sz:]
+
+        # Reshape to [sq, b, heads, head_dim]
+        query = query.view(sq, b, self.num_heads_per_tp, self.deltanet_head_dim)
+        key = key.view(sq, b, self.num_kv_heads_per_tp, self.deltanet_head_dim)
+        value = value.view(sq, b, self.num_kv_heads_per_tp, self.deltanet_head_dim)
+
+        # Q/K layernorm (per-head normalization)
+        if hasattr(self, 'q_layernorm') and self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+        if hasattr(self, 'k_layernorm') and self.k_layernorm is not None:
+            key = self.k_layernorm(key)
 
         # --- Prefix-sharing: detect context early (needed for RoPE correction) ---
         ps_slot_id = None
@@ -192,16 +223,13 @@ class GatedDeltaNetAttention(SelfAttention):
             rotary_pos_emb = (q_pos_emb_suffix, k_pos_emb_suffix)
 
         if rotary_pos_emb is not None:
-            from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            if q_pos_emb is not None:
-                query = apply_rotary_pos_emb(query, q_pos_emb, config=self.config)
-            if k_pos_emb is not None:
-                key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config)
+            # DeltaNet uses partial RoPE with rope_dim=32 (0.25*128 head_dim)
+            # SelfAttention's pos_emb has 64 dims (0.25*256). We need to
+            # truncate to rope_dim=32 and apply partial RoPE correctly.
+            query, key = self._apply_rotary_emb(query, key, q_pos_emb, k_pos_emb)
         elif rotary_pos_cos is not None and rotary_pos_sin is not None:
-            from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb_with_cos_sin
-            key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos, rotary_pos_sin)
-            query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos, rotary_pos_sin)
+            query, key = self._apply_fused_rotary_emb(query, key, rotary_pos_cos, rotary_pos_sin)
 
         # Beta and decay
         beta = torch.sigmoid(self.beta_proj(hidden_states)[0])  # [sq, b, heads_per_tp]
@@ -292,27 +320,38 @@ class GatedDeltaNetAttention(SelfAttention):
             )
 
 
-        # Output projection
-        output, bias = self.linear_proj(y)
-
-        # Output gate: config says "swish" but real Qwen3.6 uses sigmoid
-        # (validated: modeling_qwen3_next.py line 413 uses torch.sigmoid(gate))
-        # Our gate_proj is a separate ColumnParallelLinear; real model embeds
-        # gate in doubled q_proj dimensions.
+        # Output gate: applied BEFORE linear_proj in (num_heads*head_dim) space
+        # Real Qwen3.6: gate = sigmoid(in_proj_z(hidden_states)) applied to
+        # attention output before out_proj. Gate output dim = num_heads*head_dim.
         if self.attn_output_gate:
             gate = torch.sigmoid(self.gate_proj(hidden_states)[0])
-            output = output * gate
+            y = y * gate  # Apply gate in attention space, before o_proj
+
+        # Output projection (after gate)
+        output, bias = self.linear_proj(y)
 
         return output, bias
 
     def _apply_rotary_emb(self, query, key, q_pos_emb, k_pos_emb):
-        """Apply partial RoPE: only rotate the first rope_dim dimensions."""
+        """Apply partial RoPE: only rotate the first rope_dim dimensions.
+
+        For DeltaNet, rope_dim=32 (0.25*128 head_dim). The pos_emb from
+        Megatron's RotaryEmbedding has 64 dims (0.25*256 SelfAttention head_dim).
+        We truncate pos_emb to rope_dim before applying.
+        """
         from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
         if self.partial_rotary_factor < 1.0:
-            rope_dim = self.rope_dim
+            rope_dim = self.rope_dim  # 32 for DeltaNet (0.25*128)
             q_rot, q_pass = query[..., :rope_dim], query[..., rope_dim:]
             k_rot, k_pass = key[..., :rope_dim], key[..., rope_dim:]
+
+            # Truncate pos_emb to DeltaNet rope_dim if it's larger
+            # (pos_emb from Megatron may have 64 dims for SelfAttention)
+            if q_pos_emb is not None and q_pos_emb.shape[-1] > rope_dim:
+                q_pos_emb = q_pos_emb[..., :rope_dim]
+            if k_pos_emb is not None and k_pos_emb.shape[-1] > rope_dim:
+                k_pos_emb = k_pos_emb[..., :rope_dim]
 
             q_rot = apply_rotary_pos_emb(q_rot, q_pos_emb, config=self.config)
             k_rot = apply_rotary_pos_emb(k_rot, k_pos_emb, config=self.config)
@@ -326,13 +365,19 @@ class GatedDeltaNetAttention(SelfAttention):
         return query, key
 
     def _apply_fused_rotary_emb(self, query, key, cos, sin):
-        """Apply partial RoPE with fused cos/sin."""
+        """Apply partial RoPE with fused cos/sin. Truncate pos_emb to rope_dim."""
         from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb_with_cos_sin
 
         if self.partial_rotary_factor < 1.0:
-            rope_dim = self.rope_dim
+            rope_dim = self.rope_dim  # 32 for DeltaNet
             q_rot, q_pass = query[..., :rope_dim], query[..., rope_dim:]
             k_rot, k_pass = key[..., :rope_dim], key[..., rope_dim:]
+
+            # Truncate cos/sin to rope_dim if needed
+            if cos.shape[-1] > rope_dim:
+                cos = cos[..., :rope_dim]
+            if sin.shape[-1] > rope_dim:
+                sin = sin[..., :rope_dim]
 
             q_rot = apply_rotary_pos_emb_with_cos_sin(q_rot, cos, sin, config=self.config)
             k_rot = apply_rotary_pos_emb_with_cos_sin(k_rot, cos, sin, config=self.config)
