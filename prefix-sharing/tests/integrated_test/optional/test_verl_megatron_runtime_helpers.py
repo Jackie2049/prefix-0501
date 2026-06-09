@@ -5,8 +5,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from prefix_sharing.backends.batch_layout import BshdBatchLayout
+from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
+from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.verl_mcore import (
+    PrefixSharingRuntimeState,
     build_prefix_sharing_micro_batch,
     restore_suffix_first_log_probs_from_prefix,
 )
@@ -434,6 +438,75 @@ def test_restore_suffix_first_log_probs_from_prefix_supports_bshd_kept_padded_bs
     restored[1, 0].backward()
     assert logits.grad is not None
     assert logits.grad[0, 3].abs().sum() > 0
+
+
+def test_restore_suffix_first_log_probs_from_prefix_supports_tp_padded_bsh_indices():
+    logits = torch.randn(8, 96, 8, requires_grad=True)
+    labels = torch.zeros(8, 96, dtype=torch.long)
+    labels[1, 0] = 3
+    log_probs = torch.zeros(8, 96, requires_grad=True)
+    valid_lengths = [95, 32, 32, 32, 95, 32, 32, 32]
+    mask = torch.zeros(8, 160, dtype=torch.bool)
+    mask[0, 65:160] = True
+    mask[1, 128:160] = True
+    for row in range(2, 8):
+        mask[row, 128:160] = True
+    layout = BshdBatchLayout.from_valid_token_mask(mask, position_ids=torch.arange(160).repeat(8, 1))
+    prefix_sharing_plan = PrefixSharingPlan(
+        forward_id=0,
+        micro_batch_id=0,
+        batch_size=8,
+        original_lengths=[160] * 8,
+        reuse_specs=[],
+        group_ids=[0] * 8,
+        is_provider=[True, False, False, False, True, False, False, False],
+        provider_index=[0, 0, 0, 0, 4, 4, 4, 4],
+        prefix_lens=[0, 128, 128, 128, 0, 128, 128, 128],
+        suffix_lens=[95, 32, 32, 32, 95, 32, 32, 32],
+        kept_lengths_q=valid_lengths,
+        expanded_lengths_kv=[95, 160, 160, 160, 95, 160, 160, 160],
+        cu_seqlens_q=[0, 95, 127, 159, 191, 286, 318, 350, 382],
+        cu_seqlens_kv=[0, 95, 255, 415, 575, 670, 830, 990, 1150],
+        max_seqlen_q=95,
+        max_seqlen_kv=160,
+        q_position_offsets=[65, 128, 128, 128, 65, 128, 128, 128],
+        kv_position_offsets=[65, 0, 0, 0, 65, 0, 0, 0],
+        input_keep_ranges=[(65, 160), (128, 160), (128, 160), (128, 160), (65, 160), (128, 160), (128, 160), (128, 160)],
+        label_keep_ranges=[(65, 160), (128, 160), (128, 160), (128, 160), (65, 160), (128, 160), (128, 160), (128, 160)],
+        loss_mask_keep_ranges=[(65, 160), (128, 160), (128, 160), (128, 160), (65, 160), (128, 160), (128, 160), (128, 160)],
+        prefix_last_restore=[
+            PrefixLastRestoreSpec(
+                reuse_idx_in_batch=1,
+                provider_idx_in_batch=0,
+                provider_prefix_last_pos=127,
+                reuse_first_suffix_label_pos=128,
+                output_slot=0,
+                group_id=0,
+            )
+        ],
+    )
+    runtime_state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=prefix_sharing_plan,
+        backend=None,
+        batch_runtime_layout=layout,
+        parallel_info=MegatronParallelInfo(),
+    )
+
+    def gather_fn(provider_logits, reuse_label):
+        assert provider_logits.shape == (1, 1, 8)
+        assert reuse_label.shape == (1, 1)
+        return torch.gather(
+            torch.log_softmax(provider_logits, dim=-1),
+            dim=-1,
+            index=reuse_label.unsqueeze(-1),
+        ).squeeze(-1)
+
+    with prefix_sharing_runtime_context(runtime_state):
+        restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
+
+    restored[1, 0].backward()
+    assert logits.grad is not None
+    assert logits.grad[0, 62].abs().sum() > 0
 
 
 def test_restore_suffix_first_log_probs_from_prefix_supports_bshd_flattened_kept_padded_indices():

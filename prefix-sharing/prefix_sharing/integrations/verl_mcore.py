@@ -526,8 +526,9 @@ def _is_kept_padded_bsh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
     return (
         tensor.dim() >= 2
         and int(tensor.shape[0]) == layout.batch_size
-        and int(tensor.shape[1]) == max_valid_length
+        and int(tensor.shape[1]) >= max_valid_length
         and max_valid_length != layout.max_seqlen
+        and int(tensor.shape[1]) != layout.max_seqlen
     )
 
 
