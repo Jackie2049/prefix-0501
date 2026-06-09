@@ -51,7 +51,7 @@ class PatchRegistry:
             else:
                 pending.append(spec)
 
-        handle = mgr.handle()
+        handle = PatchHandle(shared_records, specs=list(cls._specs))
 
         if pending:
             _activate_import_hook(pending, shared_records)

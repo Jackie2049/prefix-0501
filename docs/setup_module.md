@@ -456,29 +456,39 @@ IncompatibleEnvironment: 不兼容的版本组合: verl=0.9.0, megatron_core=0.1
 
 ### 5.4 验证 patch 内容
 
-`install()` 后，用户可以通过 `inspect_patch()` 查看被替换函数的源码，确认替换逻辑正确：
+`install()` 后，用户可通过 `inspect_patch()` 查看被替换函数的源码，确认替换逻辑正确：
 
 ```python
 >>> handle = ps_setup.install()
 
-# 查看所有 patch 的替换函数源码
+# 查看所有 patch 的状态和替换函数源码
 >>> print(handle.inspect_patch())
 
 # 仅查看第 1 个 patch（Attention.forward）的源码
 >>> print(handle.inspect_patch(1))
 
-── megatron.core.transformer.attention.Attention.forward: Attention.forward → patched_forward ──
+── Attention.forward → prefix-sharing intercept (mcore 0.16.x) ── [pending: import megatron.core.transformer.attention to activate]
 
-def patched_forward(self, hidden_states, attention_mask, ...):
-    ctx = current_prefix_sharing_context()
-    if ctx is not None:
-        # prefix-sharing path: QKV + RoPE + KV expansion + attention + projection
-        ...
-    # normal path: call original_forward
-    return original_forward(self, hidden_states, ...)
+def make_attention_patch(original_forward):
+    """创建 Attention.forward 的 patch wrapper。"""
+    def patched_forward(self, hidden_states, attention_mask, ...):
+        ctx = current_prefix_sharing_context()
+        if ctx is not None:
+            # prefix-sharing path: QKV + RoPE + KV expansion + attention + projection
+            ...
+        # normal path: call original_forward
+        return original_forward(self, hidden_states, ...)
+    return patched_forward
 ```
 
-`inspect_patch()` 使用 `inspect.getsource()` 获取替换函数的 Python 源码。若源码不可用（如动态生成函数），则返回函数签名信息。
+**状态说明**：
+
+| 状态 | 含义 |
+|------|------|
+| `[applied]` | 目标模块已加载，patch 已替换生效，显示替换函数源码 |
+| `[pending: import X to activate]` | 目标模块尚未加载，import hook 已注册；显示 patch_factory 源码；模块 import 后自动生效 |
+
+当目标模块被 import 后，`inspect_patch()` 会自动从 `[pending]` 变为 `[applied]`，并展示实际替换函数的源码。
 
 ---
 
