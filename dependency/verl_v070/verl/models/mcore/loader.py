@@ -380,6 +380,73 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             if (i == tp_rank) and (tensor is not None):
                 tensor.data.copy_(sync_tensor)
 
+    def _broadcast_tp_shard_tensor_qkv_simple(tensor, q_name, k_name, v_name, bias=False) -> torch.Tensor:
+        """broadcast QKV tensor in TP shards across mp_group, simple [Q,K,V] concat.
+
+        Unlike _broadcast_tp_shard_tensor_qkv which creates GQA-interleaved format,
+        this function uses simple concatenation: [Q_shard, K_shard, V_shard].
+        Used for GatedDeltaNet (linear attention) layers which expect simple layout.
+        """
+        nonlocal state_dict
+        nonlocal mp_group
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+
+        if torch.distributed.get_rank() == src_rank:
+            assert q_name in state_dict and k_name in state_dict and v_name in state_dict
+            full_weight_q = state_dict[q_name]
+            full_weight_k = state_dict[k_name]
+            full_weight_v = state_dict[v_name]
+
+            q_size_tp = full_weight_q.shape[0] // tp_size
+            k_size_tp = full_weight_k.shape[0] // tp_size
+            v_size_tp = full_weight_v.shape[0] // tp_size
+            total_size = q_size_tp + k_size_tp + v_size_tp
+
+            sizes = [total_size]
+            if not bias:
+                sizes.append(full_weight_q.shape[1])
+            new_weight_qkv = torch.empty(*sizes, dtype=params_dtype, device=get_device_id())
+            for i in range(tp_size):
+                q_part = full_weight_q[i * q_size_tp : (i + 1) * q_size_tp]
+                k_part = full_weight_k[i * k_size_tp : (i + 1) * k_size_tp]
+                v_part = full_weight_v[i * v_size_tp : (i + 1) * v_size_tp]
+                new_weight_qkv[i * total_size : (i + 1) * total_size].copy_(
+                    torch.cat([q_part, k_part, v_part], dim=0)
+                )
+
+            tensor_chunk = torch.chunk(new_weight_qkv, tp_size, dim=0)
+            chunk_shape = tensor_chunk[0].shape
+        else:
+            chunk_shape = None
+
+        obj_list = [chunk_shape]
+        dist.broadcast_object_list(obj_list, src=src_rank, group=mp_group)
+        chunk_shape = obj_list[0]
+        if chunk_shape is None:
+            print_rank_0(f"tp_shard tensor:[{q_name, k_name, v_name}] not in state_dict, skip loading")
+            return
+
+        if tensor is None:
+            sync_tensor = torch.empty(
+                chunk_shape,
+                dtype=params_dtype,
+                device=get_device_id(),
+                requires_grad=False,
+            )
+        else:
+            assert tensor.shape == chunk_shape, (
+                f"rank #{torch.distributed.get_rank()} tensor {q_name} shape {tensor.shape} != {chunk_shape}"
+            )
+            sync_tensor = torch.empty_like(tensor, device=get_device_id(), requires_grad=False)
+
+        # Only one chunk since all shards are the same size
+        if torch.distributed.get_rank() == src_rank:
+            sync_tensor.data.copy_(tensor_chunk[tp_rank])
+        dist.broadcast(sync_tensor, src=src_rank, group=mp_group)
+        if tensor is not None:
+            tensor.data.copy_(sync_tensor)
+
     if dp_rank == 0:
         # Embeddings
         # -------------------
@@ -429,20 +496,39 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                     f"{layer_name}.self_attn.k_norm.weight",
                 )
 
-            _broadcast_tp_shard_tensor_qkv(
-                sync_layer.self_attention.linear_qkv.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.self_attn.q_proj.weight",
-                f"{layer_name}.self_attn.k_proj.weight",
-                f"{layer_name}.self_attn.v_proj.weight",
-            )
-            if f"{layer_name}.self_attn.q_proj.bias" in state_dict:
-                _broadcast_tp_shard_tensor_qkv(
-                    sync_layer.self_attention.linear_qkv.bias if dst_pp_rank == pp_rank else None,
-                    f"{layer_name}.self_attn.q_proj.bias",
-                    f"{layer_name}.self_attn.k_proj.bias",
-                    f"{layer_name}.self_attn.v_proj.bias",
-                    bias=True,
+            # DeltaNet layers use simple [Q,K,V] layout (not GQA-interleaved)
+            # SelfAttention layers use GQA-interleaved layout
+            is_deltanet_layer = hasattr(sync_layer.self_attention, 'beta_proj')
+            if is_deltanet_layer:
+                _broadcast_tp_shard_tensor_qkv_simple(
+                    sync_layer.self_attention.linear_qkv.weight if dst_pp_rank == pp_rank else None,
+                    f"{layer_name}.self_attn.q_proj.weight",
+                    f"{layer_name}.self_attn.k_proj.weight",
+                    f"{layer_name}.self_attn.v_proj.weight",
                 )
+                if f"{layer_name}.self_attn.q_proj.bias" in state_dict:
+                    _broadcast_tp_shard_tensor_qkv_simple(
+                        sync_layer.self_attention.linear_qkv.bias if dst_pp_rank == pp_rank else None,
+                        f"{layer_name}.self_attn.q_proj.bias",
+                        f"{layer_name}.self_attn.k_proj.bias",
+                        f"{layer_name}.self_attn.v_proj.bias",
+                        bias=True,
+                    )
+            else:
+                _broadcast_tp_shard_tensor_qkv(
+                    sync_layer.self_attention.linear_qkv.weight if dst_pp_rank == pp_rank else None,
+                    f"{layer_name}.self_attn.q_proj.weight",
+                    f"{layer_name}.self_attn.k_proj.weight",
+                    f"{layer_name}.self_attn.v_proj.weight",
+                )
+                if f"{layer_name}.self_attn.q_proj.bias" in state_dict:
+                    _broadcast_tp_shard_tensor_qkv(
+                        sync_layer.self_attention.linear_qkv.bias if dst_pp_rank == pp_rank else None,
+                        f"{layer_name}.self_attn.q_proj.bias",
+                        f"{layer_name}.self_attn.k_proj.bias",
+                        f"{layer_name}.self_attn.v_proj.bias",
+                        bias=True,
+                    )
 
             _broadcast_tp_shard_tensor(
                 sync_layer.self_attention.linear_proj.weight if dst_pp_rank == pp_rank else None,
