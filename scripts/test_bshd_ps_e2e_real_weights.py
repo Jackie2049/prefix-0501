@@ -82,27 +82,202 @@ if local_rank == 0:
 model = init_mcore_model(tfconfig, config, pre_process=True, post_process=True)
 model = model.to(device)
 
-# ===== Load real converted weights via verl loader =====
+# ===== Load real converted weights (direct TP sharding, no distributed loader) =====
 if local_rank == 0:
     print(f"\n[1] Loading converted weights from {CONVERTED_PT}...")
 
-# Only rank 0 loads the state_dict; other ranks pass empty dict
-if rank == 0:
-    converted_sd = torch.load(CONVERTED_PT, map_location="cpu", weights_only=True)
-    if local_rank == 0:
-        print(f"  Loaded {len(converted_sd)} keys from converted .pt")
-else:
-    converted_sd = {}
+# All ranks load from shared filesystem (simpler than distributed broadcast)
+converted_sd = torch.load(CONVERTED_PT, map_location="cpu", weights_only=True)
+if local_rank == 0:
+    print(f"  Loaded {len(converted_sd)} keys from converted .pt")
 
-from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
-load_state_dict_to_megatron_gptmodel(converted_sd, [model], config, torch.bfloat16)
+FULL_ATTENTION_INTERVAL = config.full_attention_interval  # 4
+num_layers = config.num_hidden_layers  # 16
+
+# Sharding dimensions
+sa_num_heads = config.num_attention_heads  # 24 (SelfAttention)
+sa_num_kv_heads = config.num_key_value_heads  # 4 (SelfAttention)
+sa_head_dim = config.head_dim  # 256 (SelfAttention)
+dn_num_heads = getattr(config, 'deltanet_num_heads', 48)  # DeltaNet
+dn_num_kv_heads = getattr(config, 'deltanet_kv_heads', 16)  # DeltaNet
+dn_head_dim = sa_head_dim // 2 if sa_head_dim == 256 else 128  # 128 (DeltaNet)
+hidden_size = config.hidden_size  # 5120
+intermediate_size = config.intermediate_size  # 17408
+
+# Embedding + final layernorm + lm_head (vocab-sharded)
+model.embedding.word_embeddings.weight.data.copy_(
+    converted_sd['model.embed_tokens.weight'][tp_rank * (config.vocab_size // TP_SIZE):
+                                               (tp_rank + 1) * (config.vocab_size // TP_SIZE)]
+)
+model.decoder.final_layernorm.weight.data.copy_(converted_sd['model.norm.weight'])
+model.output_layer.weight.data.copy_(
+    converted_sd['lm_head.weight'][tp_rank * (config.vocab_size // TP_SIZE):
+                                    (tp_rank + 1) * (config.vocab_size // TP_SIZE)]
+)
+
+for layer_idx in range(num_layers):
+    is_dn = layer_idx % FULL_ATTENTION_INTERVAL != FULL_ATTENTION_INTERVAL - 1
+    layer_name = f"model.layers.{layer_idx}"
+    layer = model.decoder.layers[layer_idx]
+    attn = layer.self_attention
+
+    # Input layernorm
+    ln_key = f'{layer_name}.input_layernorm.weight'
+    if hasattr(layer, 'input_layernorm') and hasattr(layer.input_layernorm, 'weight'):
+        layer.input_layernorm.weight.data.copy_(converted_sd[ln_key])
+    elif hasattr(attn.linear_qkv, 'layer_norm_weight'):
+        attn.linear_qkv.layer_norm_weight.data.copy_(converted_sd[ln_key])
+
+    # Post attention layernorm
+    post_ln_key = f'{layer_name}.post_attention_layernorm.weight'
+    if hasattr(layer, 'pre_mlp_layernorm') and hasattr(layer.pre_mlp_layernorm, 'weight'):
+        layer.pre_mlp_layernorm.weight.data.copy_(converted_sd[post_ln_key])
+    elif hasattr(layer.mlp.linear_fc1, 'layer_norm_weight'):
+        layer.mlp.linear_fc1.layer_norm_weight.data.copy_(converted_sd[post_ln_key])
+
+    # MLP (gate+up interleaved, down column-sharded)
+    gate_w = converted_sd[f'{layer_name}.mlp.gate_proj.weight']
+    up_w = converted_sd[f'{layer_name}.mlp.up_proj.weight']
+    int_size_tp = intermediate_size // TP_SIZE
+    gate_w_tp = gate_w[tp_rank * int_size_tp:(tp_rank + 1) * int_size_tp]
+    up_w_tp = up_w[tp_rank * int_size_tp:(tp_rank + 1) * int_size_tp]
+    layer.mlp.linear_fc1.weight.data.copy_(torch.cat([gate_w_tp, up_w_tp], dim=0))
+    layer.mlp.linear_fc2.weight.data.copy_(
+        converted_sd[f'{layer_name}.mlp.down_proj.weight'][:, tp_rank * int_size_tp:(tp_rank + 1) * int_size_tp]
+    )
+
+    # Q/K norm (shared across both attention types)
+    if hasattr(attn, 'q_layernorm') and attn.q_layernorm is not None:
+        qnorm_key = f'{layer_name}.self_attn.q_norm.weight'
+        if qnorm_key in converted_sd:
+            attn.q_layernorm.weight.data.copy_(converted_sd[qnorm_key])
+    if hasattr(attn, 'k_layernorm') and attn.k_layernorm is not None:
+        knorm_key = f'{layer_name}.self_attn.k_norm.weight'
+        if knorm_key in converted_sd:
+            attn.k_layernorm.weight.data.copy_(converted_sd[knorm_key])
+
+    # o_proj (column-sharded for both types)
+    o_proj_key = f'{layer_name}.self_attn.o_proj.weight'
+    if is_dn:
+        # DeltaNet: o_proj maps from (num_heads*head_dim) → hidden_size
+        # ColumnParallelLinear shards output dim, so we shard along dim=1
+        dn_hidden_per_head = dn_num_heads * dn_head_dim  # 48*128=6144
+        layer.self_attention.linear_proj.weight.data.copy_(
+            converted_sd[o_proj_key][:, tp_rank * (dn_hidden_per_head // TP_SIZE):
+                                      (tp_rank + 1) * (dn_hidden_per_head // TP_SIZE)]
+        )
+    else:
+        # SelfAttention: o_proj maps from (num_heads*head_dim) → hidden_size
+        # ColumnParallelLinear shards output dim (dim=1 for RowParallel)
+        sa_hidden_per_head = sa_num_heads * sa_head_dim  # 24*256=6144
+        layer.self_attention.linear_proj.weight.data.copy_(
+            converted_sd[o_proj_key][:, tp_rank * (sa_hidden_per_head // TP_SIZE):
+                                      (tp_rank + 1) * (sa_hidden_per_head // TP_SIZE)]
+        )
+
+    if is_dn:
+        # DeltaNet QKV: simple [Q, K, V] concat with TP sharding
+        q_w = converted_sd[f'{layer_name}.self_attn.q_proj.weight']
+        k_w = converted_sd[f'{layer_name}.self_attn.k_proj.weight']
+        v_w = converted_sd[f'{layer_name}.self_attn.v_proj.weight']
+        q_size_tp = dn_num_heads * dn_head_dim // TP_SIZE  # 48*128//4=1536
+        k_size_tp = dn_num_kv_heads * dn_head_dim // TP_SIZE  # 16*128//4=512
+        v_size_tp = dn_num_kv_heads * dn_head_dim // TP_SIZE  # 512
+        q_tp = q_w[tp_rank * q_size_tp:(tp_rank + 1) * q_size_tp]
+        k_tp = k_w[tp_rank * k_size_tp:(tp_rank + 1) * k_size_tp]
+        v_tp = v_w[tp_rank * v_size_tp:(tp_rank + 1) * v_size_tp]
+        attn.linear_qkv.weight.data.copy_(torch.cat([q_tp, k_tp, v_tp], dim=0))
+
+        # DeltaNet-specific projections (beta, decay sharded along output dim)
+        attn.beta_proj.weight.data.copy_(
+            converted_sd[f'{layer_name}.self_attn.beta_proj.weight']
+            [tp_rank * (dn_num_heads // TP_SIZE):(tp_rank + 1) * (dn_num_heads // TP_SIZE)]
+        )
+        if f'{layer_name}.self_attn.beta_proj.bias' in converted_sd:
+            attn.beta_proj.bias.data.copy_(
+                converted_sd[f'{layer_name}.self_attn.beta_proj.bias']
+                [tp_rank * (dn_num_heads // TP_SIZE):(tp_rank + 1) * (dn_num_heads // TP_SIZE)]
+            )
+        attn.decay_proj.weight.data.copy_(
+            converted_sd[f'{layer_name}.self_attn.decay_proj.weight']
+            [tp_rank * (dn_num_heads // TP_SIZE):(tp_rank + 1) * (dn_num_heads // TP_SIZE)]
+        )
+        if f'{layer_name}.self_attn.decay_proj.bias' in converted_sd:
+            attn.decay_proj.bias.data.copy_(
+                converted_sd[f'{layer_name}.self_attn.decay_proj.bias']
+                [tp_rank * (dn_num_heads // TP_SIZE):(tp_rank + 1) * (dn_num_heads // TP_SIZE)]
+            )
+
+        # DeltaNet gate_proj (sharded along output dim: num_heads*head_dim)
+        if hasattr(attn, 'gate_proj'):
+            gate_key = f'{layer_name}.self_attn.gate_proj.weight'
+            if gate_key in converted_sd:
+                dn_gate_dim = dn_num_heads * dn_head_dim  # 6144
+                attn.gate_proj.weight.data.copy_(
+                    converted_sd[gate_key]
+                    [tp_rank * (dn_gate_dim // TP_SIZE):(tp_rank + 1) * (dn_gate_dim // TP_SIZE)]
+                )
+
+        # DeltaNet buffers (not TP-sharded, all ranks get full copy)
+        for buf_name, sd_name in [
+            ('conv1d_weight', f'{layer_name}.self_attn.conv1d.weight'),
+            ('A_log', f'{layer_name}.self_attn.A_log'),
+            ('dt_bias', f'{layer_name}.self_attn.dt_bias'),
+            ('norm_weight', f'{layer_name}.self_attn.norm.weight'),
+        ]:
+            if sd_name in converted_sd:
+                setattr(attn, buf_name,
+                        converted_sd[sd_name].clone().to(attn.linear_qkv.weight.device))
+
+    else:
+        # SelfAttention QKV: GQA-interleaved format with TP sharding
+        q_w = converted_sd[f'{layer_name}.self_attn.q_proj.weight']
+        k_w = converted_sd[f'{layer_name}.self_attn.k_proj.weight']
+        v_w = converted_sd[f'{layer_name}.self_attn.v_proj.weight']
+        # GQA interleaving: per KV-group, [Q_group, K_group, V_group]
+        num_q_heads = sa_num_heads  # 24
+        num_kv_heads = sa_num_kv_heads  # 4
+        head_dim = sa_head_dim  # 256
+        num_qg = num_q_heads // num_kv_heads  # 6
+        q_size_tp = num_q_heads * head_dim // TP_SIZE  # 1536
+        kv_size_tp = num_kv_heads * head_dim // TP_SIZE  # 256
+        qkv_tp_size = q_size_tp + 2 * kv_size_tp  # 2048
+        # Per TP rank: 1 KV group (since 4 KV groups / 4 TP = 1)
+        num_kv_groups_tp = num_kv_heads // TP_SIZE  # 1
+        qkv_interleaved = torch.zeros(qkv_tp_size, hidden_size, dtype=q_w.dtype)
+        for g in range(num_kv_groups_tp):
+            # Global group index for this TP rank
+            global_g = tp_rank * num_kv_groups_tp + g
+            q_per_group = num_qg * head_dim  # 6*256=1536
+            k_per_group = head_dim  # 256
+            v_per_group = head_dim  # 256
+            total_per_group = q_per_group + k_per_group + v_per_group  # 2048
+            q_start = global_g * num_qg * head_dim
+            q_end = q_start + q_per_group
+            k_start = global_g * head_dim
+            k_end = k_start + k_per_group
+            v_start = global_g * head_dim
+            v_end = v_start + v_per_group
+            offset = g * total_per_group
+            qkv_interleaved[offset:offset + q_per_group] = q_w[q_start:q_end]
+            qkv_interleaved[offset + q_per_group:offset + q_per_group + k_per_group] = k_w[k_start:k_end]
+            qkv_interleaved[offset + q_per_group + k_per_group:offset + total_per_group] = v_w[v_start:v_end]
+        attn.linear_qkv.weight.data.copy_(qkv_interleaved)
+
+        # SelfAttention gate_proj (sharded along output dim: hidden_size)
+        if hasattr(attn, 'gate_proj'):
+            gate_key = f'{layer_name}.self_attn.gate_proj.weight'
+            if gate_key in converted_sd:
+                attn.gate_proj.weight.data.copy_(
+                    converted_sd[gate_key]
+                    [tp_rank * (hidden_size // TP_SIZE):(tp_rank + 1) * (hidden_size // TP_SIZE)]
+                )
 
 if local_rank == 0:
-    print("  Weights loaded via verl loader!")
+    print("  Weights loaded via direct TP sharding!")
 
-# Free state_dict on rank 0 to save CPU memory
-if rank == 0:
-    del converted_sd
+del converted_sd
+torch.cuda.empty_cache()
 
 # Verify model architecture
 num_layers = len(model.decoder.layers)
