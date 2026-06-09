@@ -73,6 +73,7 @@ def _activate_import_hook(pending_specs: list[PatchSpec]) -> None:
     _original_import = builtins.__import__
 
     def hooked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        global _original_import
         module = _original_import(name, globals, locals, fromlist, level)
         if name in lookup:
             spec = lookup.pop(name)
