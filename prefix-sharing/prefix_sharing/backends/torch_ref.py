@@ -71,7 +71,7 @@ class TorchReferenceBackend:
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
         torch = _torch()
-        layout = batch_runtime_layout or ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        layout = batch_runtime_layout or ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         is_bshd = layout.layout_kind == "bshd"
         is_thd = layout.layout_kind == "thd"
         key_rows = [layout.padded_row(key, row) for row in range(layout.batch_size)]
@@ -157,7 +157,7 @@ class TorchReferenceBackend:
         **_: Any,
     ) -> Any:
         torch = _torch()
-        layout = batch_runtime_layout or ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        layout = batch_runtime_layout or ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         is_bshd = layout.layout_kind == "bshd"
         is_thd = layout.layout_kind == "thd"
         query_rows = [layout.padded_row(query, row) for row in range(layout.batch_size)]
@@ -258,7 +258,7 @@ class TorchReferenceBackend:
         """
 
         torch = _torch()
-        layout = batch_runtime_layout or ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        layout = batch_runtime_layout or ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         is_bshd = layout.layout_kind == "bshd"
         is_thd = layout.layout_kind == "thd"
         update_rows = [layout.padded_row(state_update, row) for row in range(layout.batch_size)]

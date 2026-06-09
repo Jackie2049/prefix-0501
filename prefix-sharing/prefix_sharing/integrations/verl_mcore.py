@@ -114,7 +114,7 @@ class VerlMCoreBatchAdapter:
         runtime_state = PrefixSharingRuntimeState(
             prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
             backend=get_backend_instance(self.config),
-            batch_runtime_layout=ThdBatchLayout.from_valid_lengths(
+            batch_runtime_layout=ThdBatchLayout.construct_from_valid_lengths(
                 prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
             ),
             parallel_info=get_megatron_parallel_info(),
@@ -282,13 +282,13 @@ def build_prefix_sharing_micro_batch(
     new_attention_mask[:] = False
     new_input_ids = input_ids.clone()
     new_position_ids = position_ids.clone()
-    kept_position_rows = []
+    kept_position_ids = []
 
     for row, indices in enumerate(valid_indices):
         keep_start, keep_end = prefix_sharing_plan.input_keep_ranges[row]
         kept_indices = indices[keep_start:keep_end]
         new_attention_mask[row, kept_indices] = True
-        kept_position_rows.append(position_ids[row, kept_indices])
+        kept_position_ids.append(position_ids[row, kept_indices])
 
     trimmed_micro_batch["input_ids"] = new_input_ids
     trimmed_micro_batch["attention_mask"] = new_attention_mask
@@ -301,8 +301,8 @@ def build_prefix_sharing_micro_batch(
         else parallel_info.tp_size
     )
     if use_remove_padding:
-        batch_runtime_layout = ThdBatchLayout.from_kept_position_rows(
-            kept_position_rows,
+        batch_runtime_layout = ThdBatchLayout.construct_from_kept_position_ids(
+            kept_position_ids,
             align_size=int(align_size),
         )
         logger.warning(

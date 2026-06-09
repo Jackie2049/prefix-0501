@@ -38,7 +38,7 @@ def test_thd_batch_layout_aligns_valid_rows_for_common_tensor_parallel_sizes(
     expected_positions,
     expected_mask,
 ):
-    layout = ThdBatchLayout.from_kept_position_rows(
+    layout = ThdBatchLayout.construct_from_kept_position_ids(
         [
             torch.tensor([0, 1, 2, 3, 4]),
             torch.tensor([3, 4]),
@@ -59,7 +59,7 @@ def test_thd_batch_layout_aligns_valid_rows_for_common_tensor_parallel_sizes(
 
 
 def test_thd_batch_layout_rejects_padding_slot_as_valid_index():
-    layout = ThdBatchLayout.from_kept_position_rows(
+    layout = ThdBatchLayout.construct_from_kept_position_ids(
         [torch.tensor([0, 1, 2])],
         align_size=2,
     )

@@ -75,7 +75,7 @@ class ThdBatchLayout:
             raise ValueError("cu_seqlens must be the cumulative padded lengths")
 
     @classmethod
-    def from_valid_lengths(cls, valid_lengths: Sequence[int]) -> "ThdBatchLayout":
+    def construct_from_valid_lengths(cls, valid_lengths: Sequence[int]) -> "ThdBatchLayout":
         lengths = [int(length) for length in valid_lengths]
         return cls(
             valid_lengths=lengths,
@@ -87,24 +87,24 @@ class ThdBatchLayout:
         )
 
     @classmethod
-    def from_kept_position_rows(
+    def construct_from_kept_position_ids(
         cls,
-        kept_position_rows: Sequence[Any],
+        kept_position_ids: Sequence[Any],
         *,
         align_size: int,
     ) -> "ThdBatchLayout":
         if align_size < 1:
             raise ValueError("align_size must be >= 1")
-        if not kept_position_rows:
-            return cls.from_valid_lengths([])
+        if not kept_position_ids:
+            return cls.construct_from_valid_lengths([])
 
-        first = kept_position_rows[0]
+        first = kept_position_ids[0]
         torch = _torch()
-        valid_lengths = [int(row.shape[0]) for row in kept_position_rows]
+        valid_lengths = [int(row.shape[0]) for row in kept_position_ids]
         padded_lengths = [_pad_to_multiple(length, align_size) for length in valid_lengths]
         packed_position_rows = []
         valid_mask_rows = []
-        for row, valid_length, padded_length in zip(kept_position_rows, valid_lengths, padded_lengths):
+        for row, valid_length, padded_length in zip(kept_position_ids, valid_lengths, padded_lengths):
             row = row.to(first.device)
             pad_length = padded_length - valid_length
             valid_mask_rows.append(

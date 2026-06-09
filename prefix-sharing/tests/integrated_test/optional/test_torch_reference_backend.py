@@ -193,7 +193,7 @@ def test_torch_reference_backend_bshd_attention_matches_thd_valid_tokens():
             ]
         )
     )
-    thd_layout = ThdBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+    thd_layout = ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
     backend = TorchReferenceBackend()
     query_bshd = torch.randn(2, 6, 3)
     key_bshd = torch.randn(2, 6, 3)
