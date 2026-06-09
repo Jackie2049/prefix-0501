@@ -85,13 +85,13 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
 
 def test_build_prefix_sharing_micro_batch_builds_bshd_layout_without_remove_padding():
     batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
-        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
-        "position_ids": torch.arange(5).repeat(2, 1),
+        "input_ids": torch.tensor([[0, 1, 2, 3, 10, 11], [0, 1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 6, dtype=torch.bool),
+        "position_ids": torch.arange(6).repeat(2, 1),
         "responses": torch.tensor([[10, 11], [20, 21]]),
     }
     actor_config = {
-        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 4},
         "megatron": {"use_remove_padding": False},
     }
     model_config = SimpleNamespace(
@@ -106,19 +106,19 @@ def test_build_prefix_sharing_micro_batch_builds_bshd_layout_without_remove_padd
 
     assert prefix_sharing_runtime_state is not None
     assert trimmed_micro_batch["attention_mask"].tolist() == [
-        [True, True, True, True, True],
-        [False, False, False, True, True],
+        [True, True, True, True, True, True],
+        [False, False, False, False, True, True],
     ]
     layout = prefix_sharing_runtime_state.batch_runtime_layout
     assert layout.layout_kind == "bshd"
-    assert layout.valid_lengths == [5, 2]
-    assert layout.max_seqlen == 5
+    assert layout.valid_lengths == [6, 2]
+    assert layout.max_seqlen == 6
     assert layout.valid_token_mask.tolist() == trimmed_micro_batch["attention_mask"].tolist()
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         provider_index = ctx.prefix_last_restore_indices[0].provider_token_index
         reuse_index = ctx.prefix_last_restore_indices[0].reuse_token_index
-        assert (provider_index.row, provider_index.seq_pos) == (0, 2)
-        assert (reuse_index.row, reuse_index.seq_pos) == (1, 3)
+        assert (provider_index.row, provider_index.seq_pos) == (0, 3)
+        assert (reuse_index.row, reuse_index.seq_pos) == (1, 4)
 
 
 @pytest.mark.parametrize(
@@ -389,6 +389,51 @@ def test_restore_suffix_first_log_probs_from_prefix_supports_bshd_kept_padded_sb
     restored[0, 1].backward()
     assert logits.grad is not None
     assert logits.grad[2, 0].abs().sum() > 0
+
+
+def test_restore_suffix_first_log_probs_from_prefix_supports_bshd_kept_padded_bsh_indices():
+    logits = torch.randn(2, 6, 8, requires_grad=True)
+    labels = torch.tensor(
+        [
+            [0, 0, 0, 0, 10, 11],
+            [3, 4, 0, 0, 0, 0],
+        ]
+    )
+    log_probs = torch.zeros(2, 6, requires_grad=True)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4, 10, 11, 0], [1, 2, 3, 4, 20, 21, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1, 0]], dtype=torch.bool),
+        "position_ids": torch.arange(7).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 4},
+        "megatron": {"use_remove_padding": False},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+
+    def gather_fn(provider_logits, reuse_label):
+        assert provider_logits.shape == (1, 1, 8)
+        assert reuse_label.shape == (1, 1)
+        return torch.gather(
+            torch.log_softmax(provider_logits, dim=-1),
+            dim=-1,
+            index=reuse_label.unsqueeze(-1),
+        ).squeeze(-1)
+
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
+        restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
+
+    restored[1, 0].backward()
+    assert logits.grad is not None
+    assert logits.grad[0, 3].abs().sum() > 0
 
 
 def test_restore_suffix_first_log_probs_from_prefix_supports_bshd_flattened_kept_padded_indices():

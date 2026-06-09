@@ -411,6 +411,16 @@ def restore_suffix_first_log_probs_from_prefix(
                 raise TypeError("BSHD prefix-last restore requires BshdTokenIndex values")
             provider_logits = _take_bshd_restore_token(logits, layout, provider_pos, keep_vocab_dim=True).clone()
             reuse_label = _take_bshd_restore_token(labels, layout, reuse_pos, keep_vocab_dim=False)
+            _ensure_non_empty_bshd_restore_token(
+                provider_logits=provider_logits,
+                reuse_label=reuse_label,
+                logits=logits,
+                labels=labels,
+                log_probs=log_probs,
+                layout=layout,
+                provider_pos=provider_pos,
+                reuse_pos=reuse_pos,
+            )
             restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
             _write_bshd_restore_token(restored, layout, reuse_pos, restored_value.reshape(()))
             continue
@@ -429,6 +439,10 @@ def _take_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: 
         if keep_vocab_dim:
             return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1, :]
         return tensor[valid_offset : valid_offset + 1, token_index.row : token_index.row + 1]
+    if _is_kept_padded_bsh_tensor(tensor, layout):
+        if keep_vocab_dim:
+            return tensor[token_index.row : token_index.row + 1, valid_offset : valid_offset + 1, :]
+        return tensor[token_index.row : token_index.row + 1, valid_offset : valid_offset + 1]
     if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
         flat_pos = valid_offset * layout.batch_size + token_index.row
         return tensor[:, flat_pos : flat_pos + 1, :] if keep_vocab_dim else tensor[:, flat_pos : flat_pos + 1]
@@ -449,6 +463,9 @@ def _write_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index:
     if _is_kept_padded_sbh_tensor(tensor, layout):
         tensor[valid_offset, token_index.row] = value
         return
+    if _is_kept_padded_bsh_tensor(tensor, layout):
+        tensor[token_index.row, valid_offset] = value
+        return
     if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
         flat_pos = valid_offset * layout.batch_size + token_index.row
         tensor[:, flat_pos] = value
@@ -458,6 +475,29 @@ def _write_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index:
         tensor[:, flat_pos] = value
         return
     tensor[token_index.row, token_index.seq_pos] = value
+
+
+def _ensure_non_empty_bshd_restore_token(
+    *,
+    provider_logits: Any,
+    reuse_label: Any,
+    logits: Any,
+    labels: Any,
+    log_probs: Any,
+    layout: BshdBatchLayout,
+    provider_pos: BshdTokenIndex,
+    reuse_pos: BshdTokenIndex,
+) -> None:
+    if provider_logits.numel() > 0 and reuse_label.numel() > 0:
+        return
+    raise RuntimeError(
+        "prefix sharing BSHD restore selected an empty token: "
+        f"logits_shape={tuple(logits.shape)}, labels_shape={tuple(labels.shape)}, "
+        f"log_probs_shape={tuple(log_probs.shape)}, provider_pos={provider_pos}, "
+        f"reuse_pos={reuse_pos}, provider_valid_offset={_bshd_valid_offset(layout, provider_pos)}, "
+        f"reuse_valid_offset={_bshd_valid_offset(layout, reuse_pos)}, "
+        f"valid_lengths={layout.valid_lengths}, max_seqlen={layout.max_seqlen}"
+    )
 
 
 def _bshd_valid_offset(layout: BshdBatchLayout, token_index: BshdTokenIndex) -> int:
@@ -477,6 +517,16 @@ def _is_kept_padded_sbh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
         tensor.dim() >= 2
         and int(tensor.shape[0]) == max(layout.valid_lengths, default=0)
         and int(tensor.shape[1]) == layout.batch_size
+    )
+
+
+def _is_kept_padded_bsh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    max_valid_length = max(layout.valid_lengths, default=0)
+    return (
+        tensor.dim() >= 2
+        and int(tensor.shape[0]) == layout.batch_size
+        and int(tensor.shape[1]) == max_valid_length
+        and max_valid_length != layout.max_seqlen
     )
 
 
