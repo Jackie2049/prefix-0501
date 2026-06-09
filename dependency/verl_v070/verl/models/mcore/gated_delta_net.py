@@ -124,6 +124,21 @@ class GatedDeltaNetAttention(SelfAttention):
                 is_expert=False,
             )
 
+        # DeltaNet-specific parameters from real Qwen3.6 model.
+        # These are stored as buffers (non-trainable) until the forward
+        # computation is updated to use them. The real model uses:
+        #   conv1d: causal conv1d applied before QKV projection
+        #   A_log: per-head decay rate (log of negative exponential)
+        #   dt_bias: per-head time-step bias
+        #   norm: per-head layernorm on Q output (head_dim=128)
+        # Current simplified forward uses beta_proj/decay_proj instead of
+        # A_log/dt_bias, and doesn't use conv1d or norm.
+        # These buffers are loaded from converted weights for future use.
+        self.register_buffer('conv1d_weight', None)  # (qkv_out, 1, 4) - conv1d kernel
+        self.register_buffer('A_log', None)  # (num_heads) - per-head decay log
+        self.register_buffer('dt_bias', None)  # (num_heads) - per-head time-step bias
+        self.register_buffer('norm_weight', None)  # (head_dim) - per-head Q layernorm
+
     def forward(
         self,
         hidden_states: Tensor,
