@@ -122,19 +122,22 @@ def _make_patched_forward(original_forward: Any) -> Any:
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
 
-        # In THD (remove-padding) mode, the tensor shape is [total_tokens, heads, head_dim]
-        # but Megatron's get_query_key_value_tensors may output [sq, b, h, hn].
-        # We need to flatten to [total_tokens, heads, head_dim] for our backends.
-        if query.dim() == 4:
-            # [sq, b, h, hn] -> [sq * b, h, hn] — THD mode has b=1, so just squeeze
-            query = query.reshape(-1, query.shape[-2], query.shape[-1])
-            key = key.reshape(-1, key.shape[-2], key.shape[-1])
-            value = value.reshape(-1, value.shape[-2], value.shape[-1])
-        elif query.dim() != 3:
-            raise RuntimeError(
-                f"prefix sharing expects QKV tensors with 3 or 4 dims, "
-                f"got query.dim()={query.dim()}, shape={tuple(query.shape)}"
-            )
+        # In THD (remove-padding) mode, the backend expects 3D format
+        # [total_tokens, heads, head_dim]. Reshape from 4D to 3D only for THD.
+        # For BSHD mode (packed_seq_params=None), keep 4D [sq, b, h, hn] format
+        # which the BSHD path expects (it reads b=query.shape[1]).
+        is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        if is_thd:
+            if query.dim() == 4:
+                # [sq, b, h, hn] -> [sq * b, h, hn] — THD mode has b=1, so just squeeze
+                query = query.reshape(-1, query.shape[-2], query.shape[-1])
+                key = key.reshape(-1, key.shape[-2], key.shape[-1])
+                value = value.reshape(-1, value.shape[-2], value.shape[-1])
+            elif query.dim() != 3:
+                raise RuntimeError(
+                    f"prefix sharing expects QKV tensors with 3 or 4 dims, "
+                    f"got query.dim()={query.dim()}, shape={tuple(query.shape)}"
+                )
 
         from prefix_sharing.integrations.megatron_runtime import (
             maybe_run_prefix_sharing_attention,
