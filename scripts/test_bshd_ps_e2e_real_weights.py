@@ -377,6 +377,19 @@ suffix_layout = PackedBatchLayout.from_valid_lengths(suffix_lengths)
 
 model_spec = ModelSpec.from_hf_config(config)
 
+# Install SelfAttention KV injection monkey-patch
+# This makes SelfAttention layers (L3,7,11,15) store/inject KV during PS forward.
+# DeltaNet layers have their own forward (carry injection) — unaffected by this patch.
+from prefix_sharing.integrations.megatron_attention import MegatronAttentionIntegration
+from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+attn_integration = MegatronAttentionIntegration(
+    config=ps_config,
+    backend=TorchReferenceBackend(),
+)
+patch_handle = attn_integration.install()
+if local_rank == 0:
+    print("  SelfAttention KV injection patch installed")
+
 @dataclass
 class PsState:
     prefix_sharing_plan: object
@@ -583,5 +596,6 @@ if local_rank == 0:
         print(f"\n*** BSHD PS E2E Real Weights: FAIL (cos_sim={overall_cos:.6f}) ***")
 
 # Cleanup
+patch_handle.disable()
 parallel_state.destroy_model_parallel()
 torch.distributed.destroy_process_group()
