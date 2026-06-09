@@ -22,6 +22,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.identity_op import IdentityOp
 
 from .config_converter import PretrainedConfig, TransformerConfig
 
@@ -439,13 +440,15 @@ class Qwen3_6HybridModel(BaseModelInitializer):
 
                 # DeltaNet uses per-head layernorm on Q (head_dim=128)
                 # Q/K layernorm dimensions match DeltaNet head_dim
-                from megatron.core.transformer.torch_layer_norm import TorchLayerNorm
-                new_attn.q_layernorm = TorchLayerNorm(
-                    dn_head_dim,  # 128 per TP rank? Actually per-head norm is full head_dim
+                from megatron.core.transformer.torch_norm import WrappedTorchNorm
+                new_attn.q_layernorm = WrappedTorchNorm(
+                    config=self.tfconfig,
+                    hidden_size=dn_head_dim,  # 128 per TP rank? Actually per-head norm is full head_dim
                     eps=self.tfconfig.layernorm_epsilon,
                 )
-                new_attn.k_layernorm = TorchLayerNorm(
-                    dn_head_dim,
+                new_attn.k_layernorm = WrappedTorchNorm(
+                    config=self.tfconfig,
+                    hidden_size=dn_head_dim,
                     eps=self.tfconfig.layernorm_epsilon,
                 )
 
@@ -453,6 +456,25 @@ class Qwen3_6HybridModel(BaseModelInitializer):
                 new_attn.deltanet_num_heads = dn_num_heads
                 new_attn.deltanet_kv_heads = dn_kv_heads
                 new_attn.deltanet_head_dim = dn_head_dim
+
+                # For DeltaNet layers, the block spec uses IdentityOp for
+                # input_layernorm (norm fused into linear_qkv) and
+                # pre_mlp_layernorm (norm fused into MLP). But we created
+                # new linear_qkv without the fused layer_norm_weight.
+                # Solution: replace IdentityOp with actual RMSNorm modules.
+                from megatron.core.transformer.torch_norm import WrappedTorchNorm
+                if isinstance(layer.input_layernorm, IdentityOp):
+                    layer.input_layernorm = WrappedTorchNorm(
+                        config=self.tfconfig,
+                        hidden_size=self.tfconfig.hidden_size,
+                        eps=self.tfconfig.layernorm_epsilon,
+                    )
+                if isinstance(layer.pre_mlp_layernorm, IdentityOp):
+                    layer.pre_mlp_layernorm = WrappedTorchNorm(
+                        config=self.tfconfig,
+                        hidden_size=self.tfconfig.hidden_size,
+                        eps=self.tfconfig.layernorm_epsilon,
+                    )
 
                 # Replace the attention module
                 layer.self_attention = new_attn

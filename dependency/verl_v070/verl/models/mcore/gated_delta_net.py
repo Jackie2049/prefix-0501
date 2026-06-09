@@ -158,6 +158,8 @@ class GatedDeltaNetAttention(SelfAttention):
         Returns (output, bias) like SelfAttention.
         """
         # hidden_states: [sq, b, h]
+        sq = hidden_states.shape[0]
+        b = hidden_states.shape[1]
 
         # QKV projection — custom split for DeltaNet dimensions
         # DeltaNet linear_qkv output: [sq, b, 48*128 + 16*128 + 16*128] per full TP
