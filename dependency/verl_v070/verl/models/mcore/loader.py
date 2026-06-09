@@ -594,6 +594,8 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             # These are small, non-TP-sharded tensors stored as module buffers.
             # register_buffer initializes them as None, so we broadcast the data
             # then set the buffer with the loaded tensor.
+            # All ranks must participate in broadcast collectives (even if they
+            # don't have state_dict), otherwise it deadlocks.
             deltanet_buffers = [
                 ('conv1d_weight', f"{layer_name}.self_attn.conv1d.weight"),
                 ('A_log', f"{layer_name}.self_attn.A_log"),
@@ -601,24 +603,25 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 ('norm_weight', f"{layer_name}.self_attn.norm.weight"),
             ]
             for buf_attr, sd_key in deltanet_buffers:
-                if sd_key in state_dict:
-                    # Broadcast the buffer data across TP ranks
-                    # _broadcast_tensor with None creates empty tensor + broadcasts
-                    loaded_buf = None
-                    if torch.distributed.get_rank() == src_rank:
+                loaded_buf = None
+                buf_shape = None
+                if torch.distributed.get_rank() == src_rank:
+                    if sd_key in state_dict:
                         loaded_buf = state_dict[sd_key].to(params_dtype).to(get_device_id())
-                    # Broadcast shape first
-                    shape_list = [loaded_buf.shape if loaded_buf is not None else None]
-                    dist.broadcast_object_list(shape_list, src=src_rank, group=mp_group)
-                    buf_shape = shape_list[0]
-                    if buf_shape is not None:
-                        if loaded_buf is None:
-                            loaded_buf = torch.empty(buf_shape, dtype=params_dtype,
-                                                     device=get_device_id(), requires_grad=False)
-                        dist.broadcast(loaded_buf, src=src_rank, group=mp_group)
-                        # Set buffer on the model module (if this rank owns the model)
-                        if dst_pp_rank == pp_rank and hasattr(attn, buf_attr):
-                            setattr(attn, buf_attr, loaded_buf)
+                        buf_shape = loaded_buf.shape
+                # Broadcast shape first — all ranks must call this
+                shape_list = [buf_shape]
+                dist.broadcast_object_list(shape_list, src=src_rank, group=mp_group)
+                buf_shape = shape_list[0]
+                if buf_shape is not None:
+                    if loaded_buf is None:
+                        loaded_buf = torch.empty(buf_shape, dtype=params_dtype,
+                                                 device=get_device_id(), requires_grad=False)
+                    # Broadcast data — all ranks must call this
+                    dist.broadcast(loaded_buf, src=src_rank, group=mp_group)
+                    # Set buffer on the model module (if this rank owns the model)
+                    if dst_pp_rank == pp_rank and hasattr(attn, buf_attr):
+                        setattr(attn, buf_attr, loaded_buf)
 
             # post_attention_layernorm.weight: when fused it's on
             # mlp.linear_fc1.layer_norm_weight; when separate it's on
