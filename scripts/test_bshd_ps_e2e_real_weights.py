@@ -389,28 +389,6 @@ attn_integration = MegatronAttentionIntegration(
 patch_handle = attn_integration.install()
 if local_rank == 0:
     print("  SelfAttention KV injection patch installed")
-    # Verify patch is active
-    from megatron.core.transformer.attention import SelfAttention
-    sa_fwd_name = SelfAttention.forward.__name__
-    print(f"  SelfAttention.forward name: {sa_fwd_name}")
-    # Check L3 SelfAttention instance
-    l3_attn = model.decoder.layers[3].self_attention
-    l3_fwd_name = l3_attn.forward.__func__.__name__ if hasattr(l3_attn.forward, '__func__') else 'unknown'
-    l3_cls = l3_attn.__class__.__name__
-    print(f"  L3 attn class: {l3_cls}, forward.__func__.__name: {l3_fwd_name}")
-    # Add debug hook on L3 SelfAttention to trace PS forward
-    def _debug_sa_pre_hook(module, args, kwargs):
-        from prefix_sharing.integrations.context import current_prefix_sharing_context
-        ctx = current_prefix_sharing_context()
-        has_rpe = kwargs.get('rotary_pos_emb') is not None if 'rotary_pos_emb' in kwargs else (len(args) > 4 and args[4] is not None)
-        print(f"  [DEBUG] L3 SelfAttention.forward called: ctx={ctx is not None}, rotary_pos_emb={has_rpe}, args_len={len(args)}, kwargs_keys={list(kwargs.keys())}")
-        if ctx is not None:
-            print(f"  [DEBUG]   ctx.plan.has_sharing={ctx.prefix_sharing_plan.has_sharing}, ctx.model_spec={ctx.model_spec is not None}")
-            if ctx.model_spec is not None:
-                from prefix_sharing.core.model_spec import AttentionLayerType
-                lt = ctx.model_spec.layer_type(3)
-                print(f"  [DEBUG]   model_spec.layer_type(3)={lt} (expected FULL_ATTENTION={AttentionLayerType.FULL_ATTENTION})")
-    model.decoder.layers[3].self_attention.register_forward_pre_hook(_debug_sa_pre_hook, with_kwargs=True)
 
 @dataclass
 class PsState:
