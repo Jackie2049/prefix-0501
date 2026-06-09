@@ -133,8 +133,9 @@ class PatchHandle:
 class LoggedPatchManager:
     """安装属性 patch 并写日志，与 PatchManager 功能相同。"""
 
-    def __init__(self) -> None:
-        self._records: list[PatchRecord] = []
+    def __init__(self, records: list[PatchRecord] | None = None) -> None:
+        # 支持传入外部共享列表，使 import hook 和即时 patch 共用同一份记录
+        self._records: list[PatchRecord] = records if records is not None else []
 
     def patch_attr(self, target: Any, attr_name: str, replacement: Any) -> None:
         """替换 target.attr_name 并记录 + 写日志。"""
@@ -163,9 +164,8 @@ class LoggedPatchManager:
         )
 
     def handle(self) -> PatchHandle:
-        records = list(self._records)
-        self._records.clear()
-        return PatchHandle(records)
+        """返回 PatchHandle，共享内部记录列表（不复制/不清空）。"""
+        return PatchHandle(self._records)
 
     def rollback(self) -> None:
         self.handle().disable()

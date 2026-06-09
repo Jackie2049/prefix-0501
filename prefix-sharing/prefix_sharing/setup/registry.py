@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from prefix_sharing.setup.logged_patch import LoggedPatchManager, PatchHandle
+from prefix_sharing.setup.logged_patch import LoggedPatchManager, PatchHandle, PatchRecord
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,10 @@ class PatchRegistry:
     @classmethod
     def install_all(cls) -> PatchHandle:
         """对已加载模块立即 patch；对未加载模块注册 import hook。"""
-        mgr = LoggedPatchManager()
+        # 共享记录列表：即时 patch 和 import hook 共用，
+        # 使 PatchHandle 始终拥有完整的 patch 记录。
+        shared_records: list[PatchRecord] = []
+        mgr = LoggedPatchManager(shared_records)
         pending: list[PatchSpec] = []
 
         for spec in cls._specs:
@@ -51,7 +54,7 @@ class PatchRegistry:
         handle = mgr.handle()
 
         if pending:
-            _activate_import_hook(pending)
+            _activate_import_hook(pending, shared_records)
 
         return handle
 
@@ -59,10 +62,14 @@ class PatchRegistry:
 _original_import = None
 
 
-def _activate_import_hook(pending_specs: list[PatchSpec]) -> None:
+def _activate_import_hook(
+    pending_specs: list[PatchSpec],
+    shared_records: list[PatchRecord],
+) -> None:
     """对未加载的目标模块，临时拦截 __import__，加载时自动 patch。
 
     所有目标模块加载完毕后立即恢复原始 __import__。
+    patch 记录追加到 shared_records，使 PatchHandle 始终完整。
     """
     global _original_import
 
@@ -84,6 +91,15 @@ def _activate_import_hook(pending_specs: list[PatchSpec]) -> None:
             original = getattr(target_obj, attr_name)
             patched = spec.patch_factory(original)
             setattr(target_obj, attr_name, patched)
+            # 记录追加到共享列表，使 handle.describe() / inspect_patch() 可见
+            shared_records.append(
+                PatchRecord(
+                    target=target_obj,
+                    attr_name=attr_name,
+                    original=original,
+                    replacement=patched,
+                )
+            )
             logger.info(
                 "[PS] Auto-patched %s on import of %s",
                 spec.description, name,
