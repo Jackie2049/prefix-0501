@@ -288,6 +288,18 @@ class MegatronPPOActor(BasePPOActor):
                     async_op=False,
                 )
                 log_probs = log_probs.to("cpu")
+                
+
+                ########## prefix-sharing logprob dump ##########
+                _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
+                if _ps_dump_dir:
+                    os.makedirs(_ps_dump_dir, exist_ok=True)
+                    if torch.distributed.get_rank() == 0:
+                        torch.save(log_probs.clone(), os.path.join(_ps_dump_dir, "logprobs.pt"))
+                        torch.save(input_ids.cpu().clone(), os.path.join(_ps_dump_dir, "input_ids.pt"))
+                ########## prefix-sharing logprob dump ##########
+
+
                 if calculate_entropy:
                     # Note that o[0] is metrics, o[1] is entropy
                     if mpu.is_pipeline_last_stage(ignore_virtual=True):
