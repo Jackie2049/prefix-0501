@@ -398,11 +398,19 @@ if local_rank == 0:
     l3_fwd_name = l3_attn.forward.__func__.__name__ if hasattr(l3_attn.forward, '__func__') else 'unknown'
     l3_cls = l3_attn.__class__.__name__
     print(f"  L3 attn class: {l3_cls}, forward.__func__.__name: {l3_fwd_name}")
-    # Check if forward on the instance vs class are different
-    l3_instance_fwd = type(l3_attn).__dict__.get('forward', None)
-    print(f"  L3 instance dict has 'forward': {l3_instance_fwd is not None}")
-    sa_class_fwd = SelfAttention.__dict__.get('forward', None)
-    print(f"  SelfAttention class dict 'forward' name: {sa_class_fwd.__name__ if sa_class_fwd else 'None'}")
+    # Add debug hook on L3 SelfAttention to trace PS forward
+    def _debug_sa_pre_hook(module, args, kwargs):
+        from prefix_sharing.integrations.context import current_prefix_sharing_context
+        ctx = current_prefix_sharing_context()
+        has_rpe = kwargs.get('rotary_pos_emb') is not None if 'rotary_pos_emb' in kwargs else (len(args) > 4 and args[4] is not None)
+        print(f"  [DEBUG] L3 SelfAttention.forward called: ctx={ctx is not None}, rotary_pos_emb={has_rpe}, args_len={len(args)}, kwargs_keys={list(kwargs.keys())}")
+        if ctx is not None:
+            print(f"  [DEBUG]   ctx.plan.has_sharing={ctx.prefix_sharing_plan.has_sharing}, ctx.model_spec={ctx.model_spec is not None}")
+            if ctx.model_spec is not None:
+                from prefix_sharing.core.model_spec import AttentionLayerType
+                lt = ctx.model_spec.layer_type(3)
+                print(f"  [DEBUG]   model_spec.layer_type(3)={lt} (expected FULL_ATTENTION={AttentionLayerType.FULL_ATTENTION})")
+    model.decoder.layers[3].self_attention.register_forward_pre_hook(_debug_sa_pre_hook, with_kwargs=True)
 
 @dataclass
 class PsState:
