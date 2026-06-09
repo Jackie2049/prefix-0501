@@ -77,7 +77,10 @@ def _activate_import_hook(pending_specs: list[PatchSpec]) -> None:
         module = _original_import(name, globals, locals, fromlist, level)
         if name in lookup:
             spec = lookup.pop(name)
-            target_obj, attr_name = spec.target_getter(module)
+            # __import__ 在 fromlist 为空时返回顶层包而非子模块，
+            # 必须从 sys.modules 取实际加载的模块对象。
+            actual_module = sys.modules[name]
+            target_obj, attr_name = spec.target_getter(actual_module)
             original = getattr(target_obj, attr_name)
             patched = spec.patch_factory(original)
             setattr(target_obj, attr_name, patched)

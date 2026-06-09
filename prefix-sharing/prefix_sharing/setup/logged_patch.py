@@ -4,12 +4,14 @@
 - patch_attr 时 INFO 日志
 - disable 时 INFO 日志（逐条打印恢复详情）
 - describe() 方法返回人类可读 patch 清单
+- inspect_patch() 方法返回被替换函数的源码，供用户验证
 
 此文件独立于 integrations/patch_manager.py，不影响原有代码。
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from types import TracebackType
@@ -25,6 +27,16 @@ def _target_name(target: Any) -> str:
     if hasattr(target, "__name__"):
         return target.__name__
     return repr(target)
+
+
+def _safe_signature(fn: Any) -> str:
+    """尝试获取函数签名，失败时返回基本信息。"""
+    try:
+        sig = inspect.signature(fn)
+        return f"{getattr(fn, '__qualname__', getattr(fn, '__name__', '?'))}{sig}"
+    except (ValueError, TypeError):
+        name = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+        return f"{name}(...)"
 
 
 @dataclass(frozen=True)
@@ -75,6 +87,35 @@ class PatchHandle:
         lines = [f"PatchHandle ({status}, {len(self._records)} patches):"]
         for i, r in enumerate(self._records, 1):
             lines.append(f"  {i}. {r.describe()}")
+        return "\n".join(lines)
+
+    def inspect_patch(self, index: int | None = None) -> str:
+        """查看被替换函数的源码，供用户验证 patch 内容。
+
+        Args:
+            index: patch 序号（1-based）。None 时返回所有 patch 的源码。
+
+        Returns:
+            源码字符串。无法获取源码时（如动态生成函数），返回函数签名信息。
+        """
+        if index is not None:
+            records = [self._records[index - 1]]
+            header = f"Patch #{index}:"
+        else:
+            records = self._records
+            header = "All patches:"
+
+        lines = [header]
+        for i, r in enumerate(records, 1 if index is None else index):
+            lines.append(f"\n── {r.describe()} ──")
+            try:
+                source = inspect.getsource(r.replacement)
+                lines.append(source)
+            except (OSError, TypeError):
+                # 动态生成的函数可能无法获取源码
+                sig = _safe_signature(r.replacement)
+                lines.append(f"(source unavailable) signature: {sig}")
+            lines.append("")
         return "\n".join(lines)
 
     def __enter__(self) -> "PatchHandle":

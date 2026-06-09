@@ -385,12 +385,16 @@ handle = ps_setup.install()
 versions = ps_setup.check()
 print(f"verl={versions.verl}, mcore={versions.megatron_core}, ms={versions.mindspeed}")
 
-# 查看 patch 详情
+# 查看 patch 详情（名称 + 状态）
 print(handle.describe())
+
+# 查看被替换函数的源码（验证 patch 内容）
+print(handle.inspect_patch())       # 所有 patch 的源码
+print(handle.inspect_patch(1))      # 仅第 1 个 patch 的源码
 
 # 回滚所有 patch
 handle.disable()
-```
+``
 
 > ⚠️ **注意**：当前 `prefix_sharing/__init__.py` 尚未导出 `install`/`check`/`IncompatibleEnvironment`，需通过 `prefix_sharing.setup` 子模块访问。
 
@@ -449,6 +453,32 @@ IncompatibleEnvironment: 不兼容的版本组合: verl=0.9.0, megatron_core=0.1
   组合一: verl=0.8.0.dev + megatron-core=0.16.0 + mindspeed=0.15.3
   组合二: megatron-core=0.12.0 + mindspeed=0.12.0 (无 verl)
 ```
+
+### 5.4 验证 patch 内容
+
+`install()` 后，用户可以通过 `inspect_patch()` 查看被替换函数的源码，确认替换逻辑正确：
+
+```python
+>>> handle = ps_setup.install()
+
+# 查看所有 patch 的替换函数源码
+>>> print(handle.inspect_patch())
+
+# 仅查看第 1 个 patch（Attention.forward）的源码
+>>> print(handle.inspect_patch(1))
+
+── megatron.core.transformer.attention.Attention.forward: Attention.forward → patched_forward ──
+
+def patched_forward(self, hidden_states, attention_mask, ...):
+    ctx = current_prefix_sharing_context()
+    if ctx is not None:
+        # prefix-sharing path: QKV + RoPE + KV expansion + attention + projection
+        ...
+    # normal path: call original_forward
+    return original_forward(self, hidden_states, ...)
+```
+
+`inspect_patch()` 使用 `inspect.getsource()` 获取替换函数的 Python 源码。若源码不可用（如动态生成函数），则返回函数签名信息。
 
 ---
 
