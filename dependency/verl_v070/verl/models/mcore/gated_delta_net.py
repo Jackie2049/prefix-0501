@@ -118,7 +118,7 @@ class GatedDeltaNetAttention(SelfAttention):
                 self.deltanet_num_heads * self.deltanet_head_dim,  # 48*128 = 6144
                 config=self.config,
                 init_method=self.config.init_method,
-                gather_output=True,  # Must gather since linear_proj expects gathered input
+                gather_output=False,  # Must NOT gather — output matches TP-sharded y
                 bias=False,
                 skip_bias_add=False,
                 is_expert=False,
