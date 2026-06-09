@@ -259,7 +259,7 @@ class BshdBatchLayout:
             position_ids = position_ids.to(device=device)
         return position_ids[mask]
 
-    def kept_padded_position_ids(self, *, device: Any | None = None) -> Any:
+    def kept_padded_position_ids(self, *, device: Any | None = None, padded_length: int | None = None) -> Any:
         if self.position_ids is None:
             raise RuntimeError("BshdBatchLayout is missing position_ids")
         torch = _torch()
@@ -269,10 +269,13 @@ class BshdBatchLayout:
             mask = mask.to(device=device)
             position_ids = position_ids.to(device=device)
         max_valid_length = max(self.valid_lengths, default=0)
+        target_length = max_valid_length if padded_length is None else int(padded_length)
+        if target_length < max_valid_length:
+            raise ValueError("padded_length cannot be smaller than max valid length")
         rows = []
         for row, valid_length in enumerate(self.valid_lengths):
             valid_positions = position_ids[row, mask[row]]
-            pad_length = max_valid_length - valid_length
+            pad_length = target_length - valid_length
             if pad_length > 0:
                 padding = torch.zeros(pad_length, dtype=valid_positions.dtype, device=valid_positions.device)
                 valid_positions = torch.cat([valid_positions, padding], dim=0)
@@ -285,9 +288,10 @@ class BshdBatchLayout:
         return tensor.dim() >= 2 and int(tensor.shape[0]) == self.total_valid_length
 
     def _is_kept_padded_sbh_tensor(self, tensor: Any) -> bool:
+        max_valid_length = max(self.valid_lengths, default=0)
         return (
             tensor.dim() >= 3
-            and int(tensor.shape[0]) == max(self.valid_lengths, default=0)
+            and int(tensor.shape[0]) >= max_valid_length
             and int(tensor.shape[1]) == self.batch_size
         )
 

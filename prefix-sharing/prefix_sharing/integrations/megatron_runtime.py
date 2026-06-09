@@ -204,10 +204,13 @@ def _positions_for_tensor(batch_runtime_layout: Any, tensor: Any, *, device: Any
         full_positions = position_ids.reshape(-1)
         if (
             tensor.dim() >= 4
-            and tensor.shape[0] == kept_padded_positions.shape[0]
+            and tensor.shape[0] >= kept_padded_positions.shape[0]
             and tensor.shape[1] == kept_padded_positions.shape[1]
         ):
-            positions = kept_padded_positions.reshape(-1)
+            positions = batch_runtime_layout.kept_padded_position_ids(
+                device=device,
+                padded_length=int(tensor.shape[0]),
+            ).to(dtype=torch.long).reshape(-1)
         elif tensor.dim() >= 4 and tensor.shape[0] * tensor.shape[1] == full_positions.numel():
             positions = full_positions
         elif tensor.shape[0] == valid_positions.numel():

@@ -513,9 +513,10 @@ def _is_compact_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
 
 
 def _is_kept_padded_sbh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    max_valid_length = max(layout.valid_lengths, default=0)
     return (
         tensor.dim() >= 2
-        and int(tensor.shape[0]) == max(layout.valid_lengths, default=0)
+        and int(tensor.shape[0]) >= max_valid_length
         and int(tensor.shape[1]) == layout.batch_size
     )
 

@@ -145,3 +145,31 @@ def test_bshd_batch_layout_reads_and_scatters_kept_padded_sbh_tokens():
     layout.scatter_valid_row(output, 1, torch.ones(2, 2))
     assert output[:2, 1].tolist() == torch.ones(2, 2).tolist()
     assert output[2, 1].abs().sum().item() == 0
+
+
+def test_bshd_batch_layout_reads_and_scatters_tp_padded_sbh_tokens():
+    mask = torch.tensor(
+        [
+            [True, True, True, False, False],
+            [False, True, True, False, False],
+            [True, False, False, False, False],
+        ]
+    )
+    layout = BshdBatchLayout.from_valid_token_mask(mask, position_ids=torch.arange(5).repeat(3, 1))
+    tp_padded = torch.arange(4 * 3 * 2, dtype=torch.float32).reshape(4, 3, 2)
+    output = torch.zeros_like(tp_padded)
+
+    assert layout.valid_lengths == [3, 2, 1]
+    assert layout.valid_row(tp_padded, 0).tolist() == tp_padded[:3, 0].tolist()
+    assert layout.valid_row(tp_padded, 1).tolist() == tp_padded[:2, 1].tolist()
+    assert layout.padded_row(tp_padded, 2).tolist() == tp_padded[:, 2].tolist()
+    assert layout.kept_padded_position_ids(padded_length=4).tolist() == [
+        [0, 1, 0],
+        [1, 2, 0],
+        [2, 0, 0],
+        [0, 0, 0],
+    ]
+
+    layout.scatter_valid_row(output, 1, torch.ones(2, 2))
+    assert output[:2, 1].tolist() == torch.ones(2, 2).tolist()
+    assert output[2:, 1].abs().sum().item() == 0
