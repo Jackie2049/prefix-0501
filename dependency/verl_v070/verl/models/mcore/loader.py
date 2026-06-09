@@ -440,12 +440,13 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             )
             sync_tensor = torch.empty_like(tensor, device=get_device_id(), requires_grad=False)
 
-        # Only one chunk since all shards are the same size
-        if torch.distributed.get_rank() == src_rank:
-            sync_tensor.data.copy_(tensor_chunk[tp_rank])
-        dist.broadcast(sync_tensor, src=src_rank, group=mp_group)
-        if tensor is not None:
-            tensor.data.copy_(sync_tensor)
+        # Broadcast each TP shard; each rank picks its own shard
+        for i in range(tp_size):
+            if torch.distributed.get_rank() == src_rank:
+                sync_tensor.data.copy_(tensor_chunk[i])
+            dist.broadcast(sync_tensor, src=src_rank, group=mp_group)
+            if (i == tp_rank) and (tensor is not None):
+                tensor.data.copy_(sync_tensor)
 
     if dp_rank == 0:
         # Embeddings
