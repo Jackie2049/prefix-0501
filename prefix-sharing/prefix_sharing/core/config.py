@@ -6,17 +6,14 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from prefix_sharing.utils import deep_get
+
 
 class PrefixSharingConfigError(ValueError):
     """Raised when prefix sharing is enabled under unsupported constraints."""
 
 
-def _read_config_value(config: Any, name: str, default: Any = None) -> Any:
-    if config is None:
-        return default
-    if isinstance(config, Mapping):
-        return config.get(name, default)
-    return getattr(config, name, default)
+_read_config_value = deep_get
 
 
 def _env_enables_prefix_sharing() -> bool:

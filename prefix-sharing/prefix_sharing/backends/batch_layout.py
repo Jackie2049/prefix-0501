@@ -8,10 +8,11 @@ inputs, and backends consume it to read/write valid token rows safely.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import accumulate
 from typing import Any, Protocol, Sequence
 
 import torch
+
+from prefix_sharing.utils import cumsum as _cumsum
 
 
 @dataclass(frozen=True)
@@ -325,13 +326,6 @@ class BshdBatchLayout:
 
 def _pad_to_multiple(length: int, align_size: int) -> int:
     return int(length + (align_size - length % align_size) % align_size)
-
-
-def _cumsum(lengths: Sequence[int]) -> list[int]:
-    """Cumulative sum with a leading 0; list length = n + 1."""
-    values = [0]
-    values.extend(accumulate(int(l) for l in lengths))
-    return values
 
 
 

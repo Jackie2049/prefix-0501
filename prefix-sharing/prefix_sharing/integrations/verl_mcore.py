@@ -31,6 +31,7 @@ from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
+from prefix_sharing.utils import deep_get
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
@@ -222,12 +223,10 @@ def build_prefix_sharing_micro_batch(
 
     # --- Path 3: multi_modal check ---
     use_remove_padding = _read_actor_bool(actor_config, "megatron.use_remove_padding", False)
-    logger.warning(
-        "[PS][prepare] megatron.use_remove_padding=%s, about to batch.get(multi_modal_inputs)...",
-        use_remove_padding,
-    )
-    if not use_remove_padding:
-        logger.warning("[PS][prepare] use_remove_padding=False, building BSHD runtime layout")
+    if use_remove_padding:
+        logger.warning("[PS][prepare] use_remove_padding=True, building packed THD runtime layout")
+    else:
+        logger.warning("[PS][prepare] use_remove_padding=False, building dense BSHD runtime layout")
     multi_modal_inputs = batch.get("multi_modal_inputs")
     if multi_modal_inputs is not None:
         # tensorclass 无法遍历（触发 CUDA 同步），改用底层 td 检查字段数
@@ -558,16 +557,4 @@ def _read_actor_bool(config: Any, dotted_name: str, default: bool) -> bool:
 
 
 def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
-    current = config
-    for part in dotted_name.split("."):
-        if current is None:
-            return default
-        if isinstance(current, Mapping):
-            current = current.get(part, default)
-        else:
-            getter = getattr(current, "get", None)
-            if callable(getter):
-                current = getter(part, default)
-            else:
-                current = getattr(current, part, default)
-    return current
+    return deep_get(config, dotted_name, default)

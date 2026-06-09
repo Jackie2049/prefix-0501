@@ -55,6 +55,8 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from prefix_sharing.utils import cumsum as _cumsum
+
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
 
@@ -168,15 +170,6 @@ class PrefixSharingPlan:
 
 
 _forward_ids = itertools.count(1)
-
-
-def _cumsum(lengths: Sequence[int]) -> list[int]:
-    values = [0]
-    total = 0
-    for length in lengths:
-        total += int(length)
-        values.append(total)
-    return values
 
 
 @dataclass
