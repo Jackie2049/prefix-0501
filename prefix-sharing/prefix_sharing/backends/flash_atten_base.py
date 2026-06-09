@@ -8,6 +8,7 @@ kernels, while keeping hardware-specific dispatch in the concrete backends.
 
 from __future__ import annotations
 
+import torch
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
@@ -17,14 +18,6 @@ from prefix_sharing.core.planner import PrefixSharingPlan
 
 class FlashBackendValidationError(RuntimeError):
     """Raised when a flash-attention backend cannot run with the given plan."""
-
-
-def _torch() -> Any:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("Flash Attention backends require PyTorch") from exc
-    return torch
 
 
 class FlashAttentionMixin:
@@ -62,13 +55,6 @@ class FlashAttentionMixin:
     # Tensor normalisation helpers
     # ------------------------------------------------------------------
     def _ensure_3d_thd(self, tensor: Any, name: str) -> Any:
-        """Ensure packed tensor is (total_tokens, num_heads, head_dim).
-
-        The Megatron hook squeezes the dummy batch dimension before handing
-        tensors to the backend, so we expect 3-D inputs.  If 2-D is ever
-        received we raise loudily rather than guessing.
-        """
-        torch = _torch()
         if tensor.dim() == 3:
             return tensor
         if tensor.dim() == 2:
@@ -82,7 +68,6 @@ class FlashAttentionMixin:
 
     def _build_cu_seqlens_tensor(self, lengths: list[int], device: Any, dtype: Any = None) -> Any:
         """Convert a Python list of cumulative lengths to a CUDA/NPU tensor."""
-        torch = _torch()
         t = torch.tensor(lengths, device=device)
         if dtype is not None:
             t = t.to(dtype=dtype)
@@ -106,7 +91,6 @@ class FlashAttentionMixin:
         max_seqlen_q : int
         max_seqlen_kv : int
         """
-        torch = _torch()
         self._validate_plan_for_flash(prefix_sharing_plan)
 
         q = self._ensure_3d_thd(query, "query")

@@ -58,12 +58,12 @@ def get_megatron_parallel_info() -> MegatronParallelInfo:
         if hasattr(mpu, "get_virtual_pipeline_model_parallel_world_size"):
             raw_virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
             virtual_pp_size = None if raw_virtual_pp_size is None else int(raw_virtual_pp_size)
-        is_pipeline_first_stage = _read_pipeline_stage_flag(
+        is_pipeline_first_stage = get_pipeline_stage(
             mpu,
             "is_pipeline_first_stage",
             fallback=pp_rank == 0,
         )
-        is_pipeline_last_stage = _read_pipeline_stage_flag(
+        is_pipeline_last_stage = get_pipeline_stage(
             mpu,
             "is_pipeline_last_stage",
             fallback=pp_rank == pp_size - 1,
@@ -86,7 +86,7 @@ def get_megatron_parallel_info() -> MegatronParallelInfo:
     )
 
 
-def _read_pipeline_stage_flag(mpu: object, name: str, *, fallback: bool) -> bool:
+def get_pipeline_stage(mpu: object, name: str, *, fallback: bool) -> bool:
     predicate = getattr(mpu, name, None)
     if predicate is None:
         return fallback

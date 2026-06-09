@@ -1,13 +1,9 @@
-"""Pure PyTorch reference backend.
-
-This module imports torch lazily so the package can be developed and tested in
-CPU environments where PyTorch is not installed. Tests that exercise this module
-skip automatically when torch is unavailable.
-"""
+"""Pure PyTorch reference backend."""
 
 from __future__ import annotations
 
 import math
+import torch
 from typing import Any
 
 from prefix_sharing.backends.base import BackendCapabilities
@@ -23,15 +19,17 @@ from prefix_sharing.core.prefix_store import (
 )
 
 
-def _torch() -> Any:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("TorchReferenceBackend requires PyTorch") from exc
-    return torch
-
-
 class TorchReferenceBackend:
+    """Pure-PyTorch reference backend for correctness verification.
+
+    Produces the same prefix-expanded KV and attention outputs as a real
+    integration, but using explicit Python loops and standard torch ops —
+    no fused kernels, no Flash Attention.  Useful for debugging and as a
+    ground truth for GPU/NPU backend comparisons.
+    """
+
+    # Declared capabilities: this backend runs everywhere (CPU, CUDA, CANN)
+    # and supports all prefix-sharing features.
     capabilities = BackendCapabilities(
         name="torch_ref",
         supports_cpu=True,
@@ -70,14 +68,26 @@ class TorchReferenceBackend:
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
-        torch = _torch()
+        """Build prefix-expanded key/value tensors for attention.
+
+        Provider rows keep their own suffix KV; reuser rows prepend the
+        provider's prefix KV before their suffix, producing longer expanded
+        KV sequences.  Each row publishes its (possibly expanded) KV to the
+        store so that later reusers in the same micro-batch can load it.
+        """
+
+        # -- Resolve layout; fall back to THD if caller did not supply one --
         layout = batch_runtime_layout or ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         is_bshd = layout.layout_kind == "bshd"
         is_thd = layout.layout_kind == "thd"
-        key_rows = [layout.padded_row(key, row) for row in range(layout.batch_size)]
-        value_rows = [layout.padded_row(value, row) for row in range(layout.batch_size)]
+
+        # -- Slice per-row padded KV views for the assembly loop below --
+        key_rows = [layout.padded_tokens(key, seq_idx_in_batch) for seq_idx_in_batch in range(layout.batch_size)]
+        value_rows = [layout.padded_tokens(value, seq_idx_in_batch) for seq_idx_in_batch in range(layout.batch_size)]
         expanded_keys = []
         expanded_values = []
+
+        # -- Sequential KV assembly loop --
         # This loop relies on the current online detector invariant that a provider
         # appears before every reuser that loads from it. All rows' QKV tensors have
         # already been produced in parallel by this point; the ordering here only
@@ -86,8 +96,10 @@ class TorchReferenceBackend:
         # topology-aware build phase.
         for batch_index, (key_row, value_row) in enumerate(zip(key_rows, value_rows)):
             valid_length = layout.valid_lengths[batch_index]
-            valid_key_row = layout.valid_row(key, batch_index)
-            valid_value_row = layout.valid_row(value, batch_index)
+            valid_key_row = layout.valid_tokens(key, batch_index)
+            valid_value_row = layout.valid_tokens(value, batch_index)
+
+            # -- Provider path: publish own suffix KV, no expansion needed --
             if not prefix_sharing_plan.is_reuser(batch_index):
                 slot_id = PrefixActivationSlotId(
                     prefix_sharing_plan.forward_id,
@@ -107,6 +119,8 @@ class TorchReferenceBackend:
                 )
                 expanded_keys.append(valid_key_row)
                 expanded_values.append(valid_value_row)
+
+            # -- Reuser path: load provider prefix KV, prepend to own suffix --
             else:
                 provider = prefix_sharing_plan.provider_index[batch_index]
                 provider_slot_id = PrefixActivationSlotId(
@@ -140,6 +154,8 @@ class TorchReferenceBackend:
                 )
                 expanded_keys.append(expanded_key)
                 expanded_values.append(expanded_value)
+
+        # -- Return: BSHD keeps per-row lists; THD concatenates into packed 1-D tensors --
         if is_bshd:
             return expanded_keys, expanded_values
         if is_thd:
@@ -156,11 +172,23 @@ class TorchReferenceBackend:
         batch_runtime_layout: Any | None = None,
         **_: Any,
     ) -> Any:
-        torch = _torch()
+        """Run per-row causal attention over prefix-expanded KV.
+
+        Each row computes scaled dot-product attention between its valid query
+        tokens and the full expanded KV for that row, masked so that query
+        positions can only attend to positions ≤ their absolute offset in
+        the original sequence.  Padding slots are excluded from attention.
+        """
+
+        # -- Resolve layout --
         layout = batch_runtime_layout or ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         is_bshd = layout.layout_kind == "bshd"
         is_thd = layout.layout_kind == "thd"
-        query_rows = [layout.padded_row(query, row) for row in range(layout.batch_size)]
+
+        # -- Slice per-row padded query views --
+        query_rows = [layout.padded_tokens(query, seq_idx_in_batch) for seq_idx_in_batch in range(layout.batch_size)]
+
+        # -- Prepare KV rows and output tensor according to layout kind --
         if is_bshd:
             key_rows = key
             value_rows = value
@@ -171,12 +199,17 @@ class TorchReferenceBackend:
             dense_output = None
         else:
             raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
+
+        # -- Per-row attention loop --
         outputs = []
         for batch_index, (q_row, k_row, v_row) in enumerate(zip(query_rows, key_rows, value_rows)):
             valid_length = layout.valid_lengths[batch_index]
-            # Padding/non-kept query slots are layout-only; they must not participate in attention.
-            q_valid = layout.valid_row(query, batch_index)
+
+            # Extract only the valid (non-padding) query tokens for this row.
+            q_valid = layout.valid_tokens(query, batch_index)
             prefix_len = prefix_sharing_plan.q_position_offsets[batch_index]
+
+            # -- Skip empty rows: BSHD just ignores them; THD emits a zero placeholder --
             if valid_length == 0:
                 if is_bshd:
                     continue
@@ -184,6 +217,9 @@ class TorchReferenceBackend:
                     outputs.append(torch.zeros_like(q_row))
                     continue
                 raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
+
+            # -- Build causal mask: each query position can attend to KV positions
+            #    at or before its absolute offset in the original sequence. --
             mask = _causal_q_kv_mask(
                 q_len=q_valid.shape[0],
                 kv_len=k_row.shape[0],
@@ -191,9 +227,13 @@ class TorchReferenceBackend:
                 device=q_valid.device,
             )
             valid_output = _attention_row(q_valid, k_row, v_row, mask)
+
+            # -- BSHD: write valid output directly into the dense output tensor --
             if is_bshd:
-                layout.scatter_valid_row(dense_output, batch_index, valid_output)
+                layout.write_valid_tokens(dense_output, batch_index, valid_output)
                 continue
+
+            # -- THD: collect per-row outputs; pad if the row has padding slots --
             if not is_thd:
                 raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
             if valid_length == q_row.shape[0]:
@@ -202,6 +242,8 @@ class TorchReferenceBackend:
             padded_output = torch.zeros_like(q_row)
             padded_output[:valid_length] = valid_output
             outputs.append(padded_output)
+
+        # -- Return: BSHD yields the dense tensor; THD concatenates into packed 1-D --
         if is_bshd:
             return dense_output
         if is_thd:
@@ -225,8 +267,6 @@ class TorchReferenceBackend:
         prefix sharing must not cache it. This reference helper keeps that
         invariant explicit for future HybridAttention integrations.
         """
-
-        torch = _torch()
         attention_output = self.attention(
             query,
             key,
@@ -257,11 +297,14 @@ class TorchReferenceBackend:
         params.
         """
 
-        torch = _torch()
         layout = batch_runtime_layout or ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         is_bshd = layout.layout_kind == "bshd"
         is_thd = layout.layout_kind == "thd"
-        update_rows = [layout.padded_row(state_update, row) for row in range(layout.batch_size)]
+
+        # -- Slice per-row padded state-update views --
+        update_rows = [layout.padded_tokens(state_update, seq_idx_in_batch) for seq_idx_in_batch in range(layout.batch_size)]
+
+        # -- Allocate output tensor according to layout kind --
         if is_bshd:
             dense_output = torch.zeros_like(state_update)
         elif is_thd:
@@ -269,9 +312,13 @@ class TorchReferenceBackend:
         else:
             raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
         outputs = []
+
+        # -- Sequential state assembly loop (same ordering invariant as build_kv) --
         for batch_index, update_row in enumerate(update_rows):
             valid_length = layout.valid_lengths[batch_index]
-            valid_update_row = layout.valid_row(state_update, batch_index)
+            valid_update_row = layout.valid_tokens(state_update, batch_index)
+
+            # -- Provider path: cumsum the state update, publish as a trajectory --
             if not prefix_sharing_plan.is_reuser(batch_index):
                 state_trajectory = torch.cumsum(valid_update_row, dim=0)
                 slot_id = PrefixActivationSlotId(
@@ -291,13 +338,14 @@ class TorchReferenceBackend:
                     overwrite=True,
                 )
                 if is_bshd:
-                    layout.scatter_valid_row(dense_output, batch_index, state_trajectory)
+                    layout.write_valid_tokens(dense_output, batch_index, state_trajectory)
                 elif is_thd:
-                    outputs.append(_pad_like_row(state_trajectory, update_row))
+                    outputs.append(_pad_like_tokens(state_trajectory, update_row))
                 else:
                     raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
                 continue
 
+            # -- Reuser path: load provider prefix trajectory, then cumsum own suffix --
             provider = prefix_sharing_plan.provider_index[batch_index]
             provider_slot_id = PrefixActivationSlotId(
                 prefix_sharing_plan.forward_id,
@@ -337,11 +385,13 @@ class TorchReferenceBackend:
                 overwrite=True,
             )
             if is_bshd:
-                layout.scatter_valid_row(dense_output, batch_index, suffix_trajectory)
+                layout.write_valid_tokens(dense_output, batch_index, suffix_trajectory)
             elif is_thd:
-                outputs.append(_pad_like_row(suffix_trajectory, update_row))
+                outputs.append(_pad_like_tokens(suffix_trajectory, update_row))
             else:
                 raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
+
+        # -- Return: BSHD yields the dense tensor; THD concatenates into packed 1-D --
         if is_bshd:
             return dense_output
         if is_thd:
@@ -350,7 +400,7 @@ class TorchReferenceBackend:
 
 
 def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:
-    torch = _torch()
+    """Split a 1-D packed tensor into per-row chunks along dim-0."""
     if not lengths:
         return []
     if sum(lengths) != tensor.shape[0]:
@@ -359,14 +409,14 @@ def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:
 
 
 def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any:
-    torch = _torch()
+    """Build a 2-D causal mask where each query position can attend to KV at or before its absolute offset."""
     q_positions = torch.arange(q_start, q_start + q_len, device=device).unsqueeze(1)
     kv_positions = torch.arange(0, kv_len, device=device).unsqueeze(0)
     return kv_positions <= q_positions
 
 
 def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
-    torch = _torch()
+    """Scaled dot-product attention for a single row, supporting MHA (2-D) and GQA (3-D)."""
     scale = math.sqrt(q_row.shape[-1])
     if q_row.dim() == 2:
         scores = q_row @ k_row.transpose(-1, -2) / scale
@@ -391,10 +441,10 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
     return torch.einsum("hqk,khd->qhd", probs, v_row)
 
 
-def _pad_like_row(valid_row: Any, packed_row: Any) -> Any:
-    if valid_row.shape[0] == packed_row.shape[0]:
-        return valid_row
-    torch = _torch()
-    padded_row = torch.zeros_like(packed_row)
-    padded_row[: valid_row.shape[0]] = valid_row
-    return padded_row
+def _pad_like_tokens(valid_tokens: Any, packed_tokens: Any) -> Any:
+    """Zero-pad a valid-length tensor to match the shape of a padded row."""
+    if valid_tokens.shape[0] == packed_tokens.shape[0]:
+        return valid_tokens
+    padded_tokens = torch.zeros_like(packed_tokens)
+    padded_tokens[: valid_tokens.shape[0]] = valid_tokens
+    return padded_tokens
