@@ -31,7 +31,7 @@ from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
-from prefix_sharing.utils import deep_get
+from prefix_sharing.utils import read_config_value
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
@@ -208,7 +208,7 @@ def build_prefix_sharing_micro_batch(
     logger.warning(f"[PS][prepare] ENTER: batch_size={batch_size}, batch_keys={list(batch.keys())}")
 
     config = PrefixSharingConfig.from_raw(
-        _read_actor_value(actor_config, "prefix_sharing_config", None)
+        read_config_value(actor_config, "prefix_sharing_config", None)
     )
 
     # --- Path 1: prefix sharing disabled by config ---
@@ -222,7 +222,7 @@ def build_prefix_sharing_micro_batch(
     logger.warning(f"[PS][prepare] config.validate() returned OK")
 
     # --- Path 3: multi_modal check ---
-    use_remove_padding = _read_actor_bool(actor_config, "megatron.use_remove_padding", False)
+    use_remove_padding = bool(read_config_value(actor_config, "megatron.use_remove_padding", False))
     if use_remove_padding:
         logger.warning("[PS][prepare] use_remove_padding=True, building packed THD runtime layout")
     else:
@@ -551,10 +551,3 @@ def _clone_batch(batch: Any) -> Any:
     return dict(batch)
 
 
-def _read_actor_bool(config: Any, dotted_name: str, default: bool) -> bool:
-    value = _read_actor_value(config, dotted_name, default)
-    return bool(value)
-
-
-def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
-    return deep_get(config, dotted_name, default)

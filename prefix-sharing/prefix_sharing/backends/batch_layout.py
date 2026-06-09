@@ -246,7 +246,7 @@ class BshdBatchLayout:
         return BshdTokenIndex(seq_idx_in_batch=seq_idx_in_batch, token_idx_in_seq=int(valid_positions[valid_offset].item()))
 
     def valid_tokens(self, tensor: Any, seq_idx_in_batch: int) -> Any:
-        """Extract only the valid (non-padding) tokens from sequence *seq_idx_in_batch*; supports compact, SBH, and dense tensors."""
+        """Extract only the valid (non-padding) tokens from sequence *seq_idx_in_batch*."""
         if self._is_compact_valid_tensor(tensor):
             start = sum(self.valid_lengths[:seq_idx_in_batch])
             end = start + self.valid_lengths[seq_idx_in_batch]
@@ -256,7 +256,7 @@ class BshdBatchLayout:
         return tensor[seq_idx_in_batch, self.valid_token_mask[seq_idx_in_batch]]
 
     def padded_tokens(self, tensor: Any, seq_idx_in_batch: int) -> Any:
-        """Extract the full padded sequence (valid tokens + alignment padding); supports compact, SBH, and dense tensors."""
+        """Extract the full padded sequence (valid tokens + alignment padding)."""
         if self._is_compact_valid_tensor(tensor):
             start = sum(self.valid_lengths[:seq_idx_in_batch])
             end = start + self.valid_lengths[seq_idx_in_batch]
@@ -322,6 +322,7 @@ class BshdBatchLayout:
             and int(tensor.shape[0]) >= max_valid_length
             and int(tensor.shape[1]) == self.batch_size
         )
+
 
 
 def _pad_to_multiple(length: int, align_size: int) -> int:

@@ -13,7 +13,7 @@ def cumsum(lengths: Sequence[int]) -> list[int]:
     return values
 
 
-def deep_get(config: Any, dotted_key: str, default: Any = None) -> Any:
+def read_config_value(config: Any, dotted_key: str, default: Any = None) -> Any:
     """Walk a dotted path through nested configs, returning *default* on any miss.
 
     Handles ``Mapping`` (dotted), objects with a ``.get()`` method, and plain

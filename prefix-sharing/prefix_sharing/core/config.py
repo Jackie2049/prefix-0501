@@ -6,14 +6,11 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from prefix_sharing.utils import deep_get
+from prefix_sharing.utils import read_config_value
 
 
 class PrefixSharingConfigError(ValueError):
     """Raised when prefix sharing is enabled under unsupported constraints."""
-
-
-_read_config_value = deep_get
 
 
 def _env_enables_prefix_sharing() -> bool:
@@ -129,25 +126,25 @@ class PrefixSharingConfig:
                 "phase 1 supports only integrate_mode='verl_megatron_actor'"
             )
 
-        pp_size = _read_config_value(
+        pp_size = read_config_value(
             model_config,
             "pipeline_model_parallel_size",
-            _read_config_value(model_config, "pipeline_parallel_size", 1),
+            read_config_value(model_config, "pipeline_parallel_size", 1),
         )
-        virtual_pp_size = _read_config_value(model_config, "virtual_pipeline_model_parallel_size", None)
-        num_layers_per_virtual_pipeline_stage = _read_config_value(
+        virtual_pp_size = read_config_value(model_config, "virtual_pipeline_model_parallel_size", None)
+        num_layers_per_virtual_pipeline_stage = read_config_value(
             model_config,
             "num_layers_per_virtual_pipeline_stage",
             None,
         )
-        cp_size = _read_config_value(
+        cp_size = read_config_value(
             model_config,
             "context_parallel_size",
             self.supported_cp_size,
         )
-        rope_fusion = _read_config_value(model_config, "apply_rope_fusion", False)
-        fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
-        model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")
+        rope_fusion = read_config_value(model_config, "apply_rope_fusion", False)
+        fused_qkv_rope = read_config_value(model_config, "fused_single_qkv_rope", False)
+        model_type = read_config_value(model_config, "model_type", "text_only_causal_lm")
 
         if int(pp_size) < 1:
             raise PrefixSharingConfigError(
