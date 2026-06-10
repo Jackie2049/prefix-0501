@@ -34,8 +34,6 @@ cov.json
 # Data
 # data/
 outputs/
-data/
-models/
 log/
 
 # Backup git directories

@@ -155,7 +155,20 @@ PYTHONPATH=prefix-sharing pytest -q \
 
 ---
 
-## 8. 禁止事项
+## 8. PR 规范
+
+- 每个 PR 的 body 中**必须**包含 `## 测试结果` 小节
+- 测试结果小节中需提供：
+  - 运行的测试命令
+  - 测试通过/失败/跳过的数量摘要
+  - 如果有 skip，需简要说明 skip 原因（如缺少 GPU、verl、torch_npu 等本地不可用的 optional 依赖）
+  - 如果未跑测试（仅文档/依赖快照等改动），必须在测试结果小节中**明确说明未跑测试的原因**
+- PR 提交前，开发者必须确认本地测试已通过；测试结果小节中的数据应与本地实际结果一致
+- PR title 格式参照 commit message 格式：`[type] 中文简要说明`
+
+---
+
+## 9. 禁止事项
 
 - 在 `dependency/` 中做超出必要的 verl / Megatron 改动，或把 core 算法散落到 dependency 中
 - prefix KV 缓存使用 `detach()` 或切断 autograd 图
@@ -166,7 +179,7 @@ PYTHONPATH=prefix-sharing pytest -q \
 
 ---
 
-## 9. 进一步阅读
+## 10. 进一步阅读
 
 - 专项开发规范：[`prefix-sharing/AGENTS.md`](prefix-sharing/AGENTS.md)
 - 概念与语义约定：[`docs/concepts.md`](docs/concepts.md)
