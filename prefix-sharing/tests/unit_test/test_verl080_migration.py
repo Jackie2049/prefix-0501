@@ -259,3 +259,40 @@ def test_read_ps_config_returns_none_for_empty_config():
     engine_config = type("EngineConfig", (), {})()
     result = _read_ps_config(engine_config)
     assert result is None
+
+
+# ═══════════════════════════════════════
+# __init__.py auto-activation 逻辑
+# ═══════════════════════════════════════
+
+
+def test_auto_activation_skips_without_env_var(monkeypatch):
+    """没有 ENABLE_PREFIX_SHARING 环境变量时，不触发 setup.install()。"""
+    monkeypatch.delenv("ENABLE_PREFIX_SHARING", raising=False)
+    import importlib
+    import prefix_sharing
+    importlib.reload(prefix_sharing)
+    assert prefix_sharing._patch_handle is None
+
+
+def test_auto_activation_skips_with_env_var_false(monkeypatch):
+    """ENABLE_PREFIX_SHARING=0 时，不触发 setup.install()。"""
+    monkeypatch.setenv("ENABLE_PREFIX_SHARING", "0")
+    import importlib
+    import prefix_sharing
+    importlib.reload(prefix_sharing)
+    assert prefix_sharing._patch_handle is None
+
+
+def test_auto_activation_attempts_with_env_var_true(monkeypatch):
+    """ENABLE_PREFIX_SHARING=1 时，尝试调用 setup.install()。
+
+    本地环境没有 verl/Megatron，install() 会因版本不兼容抛异常，
+    _auto_install_patches 应捕获异常并设 _patch_handle=None。
+    """
+    monkeypatch.setenv("ENABLE_PREFIX_SHARING", "1")
+    import importlib
+    import prefix_sharing
+    importlib.reload(prefix_sharing)
+    # 本地没有 verl/Megatron，版本不兼容，应安全回退
+    assert prefix_sharing._patch_handle is None
