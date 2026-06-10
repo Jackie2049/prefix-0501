@@ -1,4 +1,11 @@
-"""Patch 注册与调度：PatchSpec 注册 + LoggedPatchManager 安装 + import hook。"""
+"""Patch 注册与调度：PatchSpec 注册 + LoggedPatchManager 安装 + import hook。
+
+设计要点：
+- 模块已加载且目标存在 → 立即 patch
+- 模块已加载但目标不存在（模块正在 import 中）→ 加入 pending，稍后重试
+- 模块未加载 → import hook 拦截，加载完成后 patch
+- import hook 完成后立即恢复原始 __import__
+"""
 
 from __future__ import annotations
 
@@ -34,9 +41,16 @@ class PatchRegistry:
 
     @classmethod
     def install_all(cls) -> PatchHandle:
-        """对已加载模块立即 patch；对未加载模块注册 import hook。"""
-        # 共享记录列表：即时 patch 和 import hook 共用，
-        # 使 PatchHandle 始终拥有完整的 patch 记录。
+        """应用所有已注册的 patch。
+
+        三种情况：
+        1. 模块已加载且目标可解析 → 立即 patch
+        2. 模块已加载但目标不可解析（模块正在 import 中）→ 加入 pending
+        3. 模块未加载 → 加入 pending，由 import hook 在加载时 patch
+
+        所有 pending 最终统一由 import hook 处理。
+        import hook 在模块加载完成后才尝试解析目标，确保类定义已完成。
+        """
         shared_records: list[PatchRecord] = []
         mgr = LoggedPatchManager(shared_records)
         pending: list[PatchSpec] = []
@@ -44,10 +58,25 @@ class PatchRegistry:
         for spec in cls._specs:
             module = sys.modules.get(spec.module_name)
             if module is not None:
-                target_obj, attr_name = spec.target_getter(module)
-                original = getattr(target_obj, attr_name)
-                patched = spec.patch_factory(original)
-                mgr.patch_attr(target_obj, attr_name, patched)
+                try:
+                    target_obj, attr_name = spec.target_getter(module)
+                    original = getattr(target_obj, attr_name)
+                    patched = spec.patch_factory(original)
+                    mgr.patch_attr(target_obj, attr_name, patched)
+                    logger.info(
+                        "[PS] Immediately patched %s (module already loaded)",
+                        spec.description,
+                    )
+                except (AttributeError, KeyError):
+                    # 模块已加载但目标不存在——
+                    # 可能是模块正在 import 中，类定义尚未完成。
+                    # 加入 pending，等模块完全加载后再 patch。
+                    pending.append(spec)
+                    logger.info(
+                        "[PS] Target not yet defined in %s, "
+                        "deferring patch: %s",
+                        spec.module_name, spec.description,
+                    )
             else:
                 pending.append(spec)
 
@@ -66,15 +95,18 @@ def _activate_import_hook(
     pending_specs: list[PatchSpec],
     shared_records: list[PatchRecord],
 ) -> None:
-    """对未加载的目标模块，临时拦截 __import__，加载时自动 patch。
+    """对未加载或目标尚未定义的模块，临时拦截 __import__。
 
-    所有目标模块加载完毕后立即恢复原始 __import__。
-    patch 记录追加到 shared_records，使 PatchHandle 始终完整。
+    模块加载完成后，尝试解析目标并 patch。如果目标仍然不存在
+    （极端情况：模块被 import 但类在延迟定义），记录 warning 并跳过。
+
+    所有 pending 模块处理完毕后立即恢复原始 __import__。
     """
     global _original_import
 
     if _original_import is not None:
-        return  # hook 已激活
+        logger.info("[PS] Import hook already active, skipping re-activation")
+        return
 
     lookup = {spec.module_name: spec for spec in pending_specs}
     _original_import = builtins.__import__
@@ -82,34 +114,47 @@ def _activate_import_hook(
     def hooked_import(name, globals=None, locals=None, fromlist=(), level=0):
         global _original_import
         module = _original_import(name, globals, locals, fromlist, level)
+
         if name in lookup:
             spec = lookup.pop(name)
             # __import__ 在 fromlist 为空时返回顶层包而非子模块，
             # 必须从 sys.modules 取实际加载的模块对象。
             actual_module = sys.modules[name]
-            target_obj, attr_name = spec.target_getter(actual_module)
-            original = getattr(target_obj, attr_name)
-            patched = spec.patch_factory(original)
-            setattr(target_obj, attr_name, patched)
-            # 记录追加到共享列表，使 handle.describe() / inspect_patch() 可见
-            shared_records.append(
-                PatchRecord(
-                    target=target_obj,
-                    attr_name=attr_name,
-                    original=original,
-                    replacement=patched,
+
+            try:
+                target_obj, attr_name = spec.target_getter(actual_module)
+                original = getattr(target_obj, attr_name)
+                patched = spec.patch_factory(original)
+                setattr(target_obj, attr_name, patched)
+                shared_records.append(
+                    PatchRecord(
+                        target=target_obj,
+                        attr_name=attr_name,
+                        original=original,
+                        replacement=patched,
+                    )
                 )
-            )
-            logger.info(
-                "[PS] Auto-patched %s on import of %s",
-                spec.description, name,
-            )
+                logger.info(
+                    "[PS] Auto-patched %s on import of %s",
+                    spec.description, name,
+                )
+            except (AttributeError, KeyError):
+                # 模块已加载但目标仍未定义——
+                # 这种情况极少发生，通常是模块结构异常。
+                logger.warning(
+                    "[PS] Could not resolve target for %s "
+                    "after import of %s; skipping this patch. "
+                    "The patch target may not exist in this module version.",
+                    spec.description, name,
+                )
+
             if not lookup:
                 builtins.__import__ = _original_import
                 _original_import = None
                 logger.info(
                     "[PS] All import hooks resolved, __import__ restored"
                 )
+
         return module
 
     builtins.__import__ = hooked_import
