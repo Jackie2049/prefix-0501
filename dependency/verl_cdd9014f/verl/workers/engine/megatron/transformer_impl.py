@@ -18,6 +18,14 @@ import os
 from functools import partial
 from typing import Any, Callable, ContextManager, Iterator, Optional
 
+# prefix-sharing: 特性使能入口
+# ENABLE_PREFIX_SHARING 环境变量触发 monkey patch 注入，
+# 不安装 prefix_sharing 时此 import 被跳过，不影响正常训练。
+try:
+    import prefix_sharing
+except ModuleNotFoundError:
+    pass
+
 import torch
 import torch.distributed
 from megatron.core import parallel_state as mpu
