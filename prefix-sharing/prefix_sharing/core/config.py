@@ -194,3 +194,42 @@ class PrefixSharingConfig:
                 f"Phase 1 仅支持 model_type='text_only_causal_lm' (纯文本因果语言模型)，"
                 f"请使用支持的模型类型或禁用 prefix sharing。"
             )
+
+    def validate_for_engine(
+        self,
+        use_remove_padding: bool = True,
+        integrate_mode: str = "verl_megatron_actor",
+    ) -> None:
+        """Validate phase-1 constraints for verl engine 架构（verl 0.8.0+）。
+
+        与 validate() 不同，此方法从 engine_config 而非 model_config 读取配置。
+        用于 setup/patches 中的 forward_step patch，此时只有 engine_config
+        可用（self.engine_config），而非 Megatron TransformerConfig。
+        """
+        if not self.enable_prefix_sharing:
+            return
+
+        # 基础校验
+        if self.detector != "trie":
+            raise PrefixSharingConfigError("phase 1 supports only detector='trie'")
+        if self.backend not in {"torch_ref", "flash_atten_gpu", "flash_atten_npu"}:
+            raise PrefixSharingConfigError(
+                f"backend='{self.backend}' is not supported. "
+                f"Supported: torch_ref, flash_atten_gpu, flash_atten_npu"
+            )
+        if self.boundary_strategy != "prefix_last_restore":
+            raise PrefixSharingConfigError(
+                "phase 1 only supports boundary_strategy='prefix_last_restore'"
+            )
+        if self.min_prefix_len < 1:
+            raise PrefixSharingConfigError("min_prefix_len must be >= 1")
+        if self.min_group_size < 2:
+            raise PrefixSharingConfigError("min_group_size must be >= 2")
+
+        # THD packed layout 需要 use_remove_padding
+        if not use_remove_padding:
+            raise PrefixSharingConfigError(
+                "[Config Error] Phase 1 THD 路径要求 use_remove_padding=True。"
+                "BSHD 路径 (use_remove_padding=False) 尚未在当前 patch 中支持，"
+                "请启用 use_remove_padding 或使用 BSHD 专用 patch set。"
+            )

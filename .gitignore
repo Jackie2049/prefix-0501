@@ -31,8 +31,7 @@ cov.json
 *.ckpt
 *.safetensors
 
-# Data
-# data/
+# Logs
 outputs/
 log/
 

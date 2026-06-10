@@ -50,6 +50,7 @@ class PrefixSharingRuntimeState:
     backend: Any
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
+    kept_position_ids: Any | None = None
 
 
 @dataclass(frozen=True)

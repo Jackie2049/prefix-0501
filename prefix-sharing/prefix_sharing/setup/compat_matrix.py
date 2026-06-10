@@ -43,9 +43,18 @@ def _version_match(required: str | None, detected: str | None) -> bool:
     return detected == required
 
 
-# ── 兼容矩阵：只支持以下两个版本组合 ──
+# ── 兼容矩阵：支持以下版本组合 ──
 COMPAT_MATRIX: list[CompatEntry] = [
-    # 组合一：verl + Megatron Core + MindSpeed
+    # 组合一：verl 0.8.0 + Megatron Core 0.16.1 + MindSpeed 0.16.0（Qwen3.5 NPU 配套）
+    CompatEntry(
+        verl="0.8.0.dev",
+        megatron_core="0.16.1",
+        mindspeed="0.16.0",
+        patch_set_id="verl080_mcore0161_ms0160",
+        notes="verl 0.8.0 + Megatron core 0.16.1 + MindSpeed 0.16.0; "
+              "Qwen3.5 NPU RL 官方推荐配套; no Parallel, no FA, no fused kernels, no MTP",
+    ),
+    # 组合二：verl 0.8.0 + Megatron Core 0.16.0 + MindSpeed 0.15.3（旧版 NPU）
     CompatEntry(
         verl="0.8.0.dev",
         megatron_core="0.16.0",
@@ -54,7 +63,7 @@ COMPAT_MATRIX: list[CompatEntry] = [
         notes="verl PPO pipeline + MindSpeed NPU; PP=1, CP=1, "
               "no fused kernels, no MTP, no multi-modal",
     ),
-    # 组合二：纯 Megatron Core + MindSpeed（无 verl）
+    # 组合三：纯 Megatron Core + MindSpeed（无 verl）
     CompatEntry(
         verl=None,
         megatron_core="0.12.0",
