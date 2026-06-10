@@ -16,6 +16,16 @@
 # HACK Avoid cpu worker trigger cuda jit error
 import os
 
+# prefix-sharing: 特性使能入口
+# ENABLE_PREFIX_SHARING 环境变量触发 monkey patch 注入，
+# 不安装 prefix_sharing 时此 import 被跳过，不影响正常训练。
+# 放在 __init__.py 确保在 transformer_impl 等子模块加载之前触发，
+# registry.install_all() 自动处理模块加载时序。
+try:
+    import prefix_sharing
+except ModuleNotFoundError:
+    pass
+
 from verl.utils.device import is_cuda_available
 
 if not is_cuda_available and "TORCH_CUDA_ARCH_LIST" not in os.environ:

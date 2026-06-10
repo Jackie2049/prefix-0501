@@ -18,18 +18,6 @@ import os
 from functools import partial
 from typing import Any, Callable, ContextManager, Iterator, Optional
 
-# prefix-sharing: 特性使能入口
-# ENABLE_PREFIX_SHARING 环境变量触发 monkey patch 注入，
-# 不安装 prefix_sharing 时此 import 被跳过，不影响正常训练。
-# registry.install_all() 会自动处理：
-# - 模块已加载且目标存在 → 立即 patch
-# - 模块已加载但目标不存在（正在 import 中）→ import hook 等定义完成后 patch
-# - 模块未加载 → import hook 等模块加载后 patch
-try:
-    import prefix_sharing
-except ModuleNotFoundError:
-    pass
-
 import torch
 import torch.distributed
 from megatron.core import parallel_state as mpu
