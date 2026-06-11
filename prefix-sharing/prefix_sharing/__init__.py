@@ -14,8 +14,35 @@ Monkey-patch activation:
     pure library (core + backends).
 """
 
-import os
 import logging
+import os
+import sys
+
+
+def _ensure_logging_visible() -> None:
+    """确保 prefix_sharing namespace 的 INFO 日志对用户可见。
+
+    verl 等训练框架的 root logger 通常设为 WARNING，
+    会导致 prefix_sharing 的 INFO 日志被过滤。
+    通过在 prefix_sharing namespace 上配置专属 handler + INFO 级别 + propagate=False，
+    所有子模块（setup.registry, patches.forward_step, integrations.context 等）
+    的 INFO 日志都能经由 propagate 链到达此 namespace logger 并输出到 stderr，
+    不再受 root logger 级别限制。
+    用户已自行配置 handler 时，不干预。
+    """
+    ns_logger = logging.getLogger("prefix_sharing")
+    if ns_logger.handlers:
+        return  # 用户已自行配置，不干预
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    ns_logger.addHandler(handler)
+    ns_logger.setLevel(logging.INFO)
+    ns_logger.propagate = False
+
+
+_ensure_logging_visible()
+
 
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec, TriePrefixDetector

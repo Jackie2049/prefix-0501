@@ -40,9 +40,16 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
 
         # ── prefix-sharing: micro-batch重组 ──
         ps_state = None
-        ps_config = _read_ps_config(self.engine_config)
+        ps_config_raw = _read_ps_config(self.engine_config)
 
-        if ps_config and ps_config.get("enable_prefix_sharing", False):
+        # 与 v070 行为一致：先看 prefix_sharing_config，
+        # 如果没设置再看 ENABLE_PREFIX_SHARING 环境变量。
+        # PrefixSharingConfig.from_raw() 实现了这个分层逻辑。
+        from prefix_sharing.core.config import PrefixSharingConfig
+
+        ps_config = PrefixSharingConfig.from_raw(ps_config_raw)
+
+        if ps_config.enable_prefix_sharing:
             # 必须在 batch.to(device) 之后做 prefix-sharing 处理，
             # 因为 extract_sequences 需要 tensor 操作。
             # 但原始 forward_step 会再次 batch.to(device)，
@@ -115,21 +122,15 @@ def _read_ps_config(engine_config: Any) -> dict | None:
 def _build_ps_state(
     engine_self: Any,
     batch: Any,
-    ps_config: dict,
+    ps_config: PrefixSharingConfig,
 ) -> Any | None:
     """从 batch 中提取序列 → plan → trim → 构建 PrefixSharingRuntimeState。
 
     返回 None 表示当前 micro-batch 没有共享前缀，不做处理。
 
-    分阶段说明：
-    ─ PATH 1: prefix sharing disabled（由上游 make_forward_step_patch 处理）
-    ─ PATH 2: use_remove_padding=False（由 validate_for_engine 检查，BSHD 暂不支持）
-    ─ PATH 3: multi-modal content（Phase 1 仅支持 text-only）
-    ─ PATH 4: 数据格式不匹配（由 runtime_adapters 处理）
-    ─ PATH 5: 当前 micro-batch 无共享前缀 → 返回 None
-    ─ PATH 6: 检测到共享前缀 → trim → 构建 runtime state
+    ps_config 参数已经是 PrefixSharingConfig 对象（由调用方
+    通过 PrefixSharingConfig.from_raw() 解析完成），不需要再次 from_raw。
     """
-    from prefix_sharing.core.config import PrefixSharingConfig
     from prefix_sharing.core.planner import PrefixSharingPlanner
     from prefix_sharing.setup.runtime_adapters import (
         extract_sequences_from_batch,
@@ -142,7 +143,7 @@ def _build_ps_state(
     from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 
     # ── 阶段 1: 配置校验 ──
-    config = PrefixSharingConfig.from_raw(ps_config)
+    config = ps_config
     use_remove_padding = getattr(
         engine_self.engine_config, "use_remove_padding", True
     )
