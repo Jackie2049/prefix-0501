@@ -6,6 +6,8 @@
   --tag train  : 对比 logits_train.pt + entropy_train.pt + label.pt（训练前向，forward_only=False）
   (不设 --tag) : 对比 logprobs.pt + input_ids.pt（legacy，向前兼容）
 
+--tag 模式下若目录中存在 logprobs.pt，也会自动加载一并对比。
+
 完整流程：
   # 第一遍：开启 prefix-sharing
   ENABLE_PREFIX_SHARING=1 PREFIX_SHARING_DUMP_DIR=./dump_on python -m verl.trainer.main_ppo ...
@@ -26,18 +28,13 @@ import sys
 
 import torch
 
+
 # ──────────────────────────────────────────────
 # 公共工具
 # ──────────────────────────────────────────────
 
-
 def cast_to_dtype(t: torch.Tensor, dtype_str: str) -> torch.Tensor:
-    """将 tensor 转成目标精度再回升至 float32，模拟混合精度下的量化误差。
-
-    模型以 bf16/fp16 运行时，输出在计算过程存在中间精度损失。
-    通过先降精度再回升，可以模拟这种误差，避免 dump 时已是 float32
-    而掩盖实际运行时的不一致。
-    """
+    """将 tensor 转成目标精度再回升至 float32，模拟混合精度下的量化误差。"""
     if dtype_str == "bfloat16":
         return t.to(torch.bfloat16).to(torch.float32)
     elif dtype_str == "float16":
@@ -61,7 +58,6 @@ def load_tensor(filepath: str, dtype: str | None = None) -> torch.Tensor:
 # ──────────────────────────────────────────────
 # Legacy: logprobs.pt + input_ids.pt
 # ──────────────────────────────────────────────
-
 
 def load_legacy_dump(dump_dir: str) -> tuple[torch.Tensor, torch.Tensor | None]:
     """加载 legacy dump: (logprobs, input_ids)。"""
@@ -93,6 +89,211 @@ def load_legacy_dump(dump_dir: str) -> tuple[torch.Tensor, torch.Tensor | None]:
     return lp, ids
 
 
+# ──────────────────────────────────────────────
+# 对比结果结构
+# ──────────────────────────────────────────────
+
+class CompareResult:
+    """单个对比项的结果汇总。"""
+    def __init__(self, name: str, shape: tuple[int, ...], max_diff: float, mean_diff: float,
+                 n_mismatch: int, n_total: int | None = None, passed: bool = False):
+        self.name = name
+        self.shape = shape
+        self.max_diff = max_diff
+        self.mean_diff = mean_diff
+        self.n_mismatch = n_mismatch
+        self.n_total = n_total
+        self.passed = passed
+
+    @staticmethod
+    def from_2d_diff(name: str, diff: torch.Tensor, mask: torch.Tensor, atol: float,
+                     n_total: int | None = None) -> "CompareResult":
+        n_mismatch = (diff > atol).sum().item()
+        max_diff = diff[mask].max().item() if mask.any() else 0.0
+        mean_diff = diff[mask].mean().item() if mask.any() else 0.0
+        return CompareResult(
+            name=name, shape=tuple(diff.shape),
+            max_diff=max_diff, mean_diff=mean_diff,
+            n_mismatch=n_mismatch, n_total=n_total or int(mask.sum().item()),
+            passed=(n_mismatch == 0),
+        )
+
+
+def _compute_2d_diff(t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """计算 2D 张量的绝对差异和有效 mask。"""
+    diff = (t1 - t2).abs()
+    mask = (t1 != 0) | (t2 != 0)
+    return diff, mask
+
+
+def _compute_3d_diff(t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """计算 3D 张量的绝对差异和有效 mask（全量参与）。"""
+    diff = (t1 - t2).abs()
+    mask = torch.ones_like(diff, dtype=torch.bool)
+    return diff, mask
+
+
+# ──────────────────────────────────────────────
+# 输出工具
+# ──────────────────────────────────────────────
+
+_SEP_DOUBLE = "=" * 70
+_SEP_SINGLE = "-" * 70
+_SEP_THIN   = "─" * 70
+
+CHECK = "✓"
+CROSS = "✗"
+
+
+def _fmt_shape(s: tuple[int, ...]) -> str:
+    return "(" + ", ".join(str(x) for x in s) + ")"
+
+
+def _print_header(tag: str, dir1: str, dir2: str):
+    print(_SEP_DOUBLE)
+    print(f"  Prefix-Sharing Precision Report  —  tag={tag}")
+    print(f"  ON : {dir1}")
+    print(f"  OFF: {dir2}")
+    print(_SEP_DOUBLE)
+    print()
+
+
+def _print_summary_table(results: list[CompareResult], atol: float):
+    """横向对比表格：一眼看出谁通过、谁异常。"""
+    print(_SEP_DOUBLE)
+    print(f"  SUMMARY  (atol={atol:.1e})")
+    print(_SEP_DOUBLE)
+    print(f"  {'NAME':<20s} {'SHAPE':<24s} {'MAX_DIFF':>14s}  {'MEAN_DIFF':>14s}  {'MISMATCHES':>12s}  {'STATUS':>8s}")
+    print(f"  {'─'*20} {'─'*24} {'─'*14}  {'─'*14}  {'─'*12}  {'─'*8}")
+
+    for r in results:
+        status = f"  {CHECK} PASS" if r.passed else f"  {CROSS} FAIL"
+        n_str = f"{r.n_mismatch}/{r.n_total}" if r.n_total else str(r.n_mismatch)
+        print(f"  {r.name:<20s} {_fmt_shape(r.shape):<24s} {r.max_diff:>14.6e}  {r.mean_diff:>14.6e}  {n_str:>12s}  {status}")
+    print(_SEP_DOUBLE)
+    print()
+
+
+def _print_pass(name: str, shape: tuple[int, ...], n_active: int):
+    """单条目全对通过的简短输出。"""
+    print(f"─── {name}  shape={_fmt_shape(shape)}  active_tokens={n_active} ───")
+    print(f"  {CHECK} ALL MATCH — consistent with baseline")
+    print()
+
+
+def _print_2d_detail(
+    name: str, t1: torch.Tensor, t2: torch.Tensor,
+    diff: torch.Tensor, mask: torch.Tensor, atol: float,
+    label_ids: torch.Tensor | None,
+):
+    """打印 2D 张量的详细不匹配信息。"""
+    B, L = t1.shape
+    active = mask.sum().item()
+    n_mismatch = (diff > atol).sum().item()
+    max_diff = diff[mask].max().item() if mask.any() else 0.0
+    mean_diff = diff[mask].mean().item() if mask.any() else 0.0
+
+    print(_SEP_THIN)
+    print(f"─── {name}  shape=({B}, {L})  active_tokens={active} ───")
+    print(f"    max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  mismatched={n_mismatch}")
+    print(_SEP_THIN)
+
+    if n_mismatch == 0:
+        print(f"  {CHECK} ALL MATCH")
+        print()
+        return
+
+    mismatch_pos = (diff > atol).nonzero(as_tuple=False)
+    n_show = min(20, mismatch_pos.size(0))
+    label_suffix = "" if label_ids is None else f" (label token id)"
+
+    print(f"  {CROSS} 前 {n_show} 个不匹配位置 (on=sharing_ON  off=sharing_OFF):")
+    print(f"  {'POS':>10s}  {'TOKEN':>10s}  {'ON':>14s}  {'OFF':>14s}  {'DIFF':>14s}  {'REL%':>10s}")
+    print(f"  {'─'*10}  {'─'*10}  {'─'*14}  {'─'*14}  {'─'*14}  {'─'*10}")
+
+    for idx in mismatch_pos[:n_show]:
+        b, p = idx[0].item(), idx[1].item()
+        tok = str(label_ids[b, p].item()) if label_ids is not None else "—"
+        on_val = t1[b, p].item()
+        off_val = t2[b, p].item()
+        d = diff[b, p].item()
+        rel = abs(d / max(abs(on_val), abs(off_val), 1e-8)) * 100
+        print(f"  [{b:>4d},{p:>4d}]  {tok:>10s}  {on_val:>14.6f}  {off_val:>14.6f}  {d:>14.6e}  {rel:>9.2f}%")
+
+    # 每行汇总
+    per_row = (diff > atol).sum(dim=1)
+    print(f"\n  Row summary:")
+    for b in range(B):
+        n_row = int(per_row[b].item())
+        if n_row > 0:
+            row_max = diff[b].max().item()
+            row_max_pos = diff[b].argmax().item()
+            label_hint = ""
+            if label_ids is not None and label_ids.shape[1] > row_max_pos:
+                label_hint = f" token={label_ids[b, row_max_pos].item()}"
+            print(f"    row[{b}]: {n_row}/{L} mismatches  "
+                  f"(max_diff={row_max:.6e} @ col={row_max_pos}{label_hint})")
+    print()
+
+
+def _print_3d_detail(
+    name: str, t1: torch.Tensor, t2: torch.Tensor,
+    diff: torch.Tensor, atol: float,
+    label_ids: torch.Tensor | None,
+):
+    """打印 3D 张量的详细不匹配信息。"""
+    B, L, V = t1.shape
+    n_total = int(diff.numel())
+    n_mismatch = (diff > atol).sum().item()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+
+    # 每 (b, l) 位置在 vocab 维度上的最大差异
+    diff_per_pos = diff.max(dim=-1).values  # [B, L]
+    mismatched_positions = int((diff_per_pos > atol).sum().item())
+
+    print(_SEP_THIN)
+    print(f"─── {name}  shape=({B}, {L}, {V})  total_elements={n_total} ───")
+    print(f"    element-wise:  max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  mismatched={n_mismatch}")
+    print(f"    per-position (max over vocab):  {mismatched_positions}/{B*L} positions affected")
+    print(_SEP_THIN)
+
+    if n_mismatch == 0:
+        print(f"  {CHECK} ALL MATCH")
+        print()
+        return
+
+    # 差异最大的 topk 元素
+    flat_top = diff.view(-1).topk(min(10, n_mismatch))
+    print(f"  {CROSS} 差异最大的 {flat_top.values.size(0)} 个元素 (b, l, vocab_index):")
+    print(f"  {'POS':>20s}  {'TOKEN':>10s}  {'VOCAB_IDX':>10s}  {'ON':>14s}  {'OFF':>14s}  {'DIFF':>14s}")
+    print(f"  {'─'*20}  {'─'*10}  {'─'*10}  {'─'*14}  {'─'*14}  {'─'*14}")
+    for val, flat_idx in zip(flat_top.values, flat_top.indices):
+        b = int(flat_idx // (L * V))
+        rest = int(flat_idx % (L * V))
+        l = int(rest // V)
+        v = int(rest % V)
+        tok = str(label_ids[b, l].item()) if label_ids is not None else "—"
+        print(f"  [{b:>4d},{l:>4d},{v:>4d}]  {tok:>10s}  {v:>10d}  {t1[b,l,v]:>14.6f}  {t2[b,l,v]:>14.6f}  {val:>14.6e}")
+
+    # 每 (b, l) 位置跨 vocab 最大差异 topk
+    n_show = min(10, B * L)
+    top_pos = diff_per_pos.view(-1).topk(n_show)
+    print(f"\n  跨 vocab 差异最大的 {n_show} 个 (b, l) 位置:")
+    print(f"  {'POS':>10s}  {'TOKEN':>10s}  {'MAX_DIFF':>16s}")
+    print(f"  {'─'*10}  {'─'*10}  {'─'*16}")
+    for val, flat_idx in zip(top_pos.values, top_pos.indices):
+        b = int(flat_idx // L)
+        l = int(flat_idx % L)
+        tok = str(label_ids[b, l].item()) if label_ids is not None else "—"
+        print(f"  [{b:>4d},{l:>4d}]  {tok:>10s}  {val:>16.6e}")
+    print()
+
+
+# ──────────────────────────────────────────────
+# 主流程
+# ──────────────────────────────────────────────
+
 def compare_legacy(dir1: str, dir2: str, atol: float, dtype: str | None):
     """对比 legacy logprobs.pt。"""
     d1, d1_ids = load_legacy_dump(dir1)
@@ -102,163 +303,120 @@ def compare_legacy(dir1: str, dir2: str, atol: float, dtype: str | None):
         d1 = cast_to_dtype(d1, dtype)
         d2 = cast_to_dtype(d2, dtype)
 
-    _compare_2d(d1, d2, atol, label_ids=d1_ids, name="logprobs")
-
-
-# ──────────────────────────────────────────────
-# 新 dump: logits_{tag}.pt + entropy_{tag}.pt + label.pt
-# ──────────────────────────────────────────────
+    _print_header("", dir1, dir2)
+    diff, mask = _compute_2d_diff(d1, d2)
+    r = CompareResult.from_2d_diff("logprobs", diff, mask, atol)
+    _print_summary_table([r], atol)
+    if r.passed:
+        _print_pass("logprobs", r.shape, int(mask.sum().item()))
+    else:
+        _print_2d_detail("logprobs", d1, d2, diff, mask, atol, label_ids=d1_ids)
 
 
 def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | None):
-    """对比新格式 dump: logits_{tag}.pt + entropy_{tag}.pt, 以及 label.pt。"""
+    """对比新格式 dump: logits_{tag}.pt + entropy_{tag}.pt + label.pt + (可选) logprobs.pt。"""
+
+    _print_header(tag, dir1, dir2)
 
     # 加载 label（两面共用）
     label = None
     label_path1 = os.path.join(dir1, "label.pt")
     if os.path.exists(label_path1):
         label = load_tensor(label_path1)
-        print(f"label  shape={tuple(label.shape)}")
+        print(f"label  shape={_fmt_shape(tuple(label.shape))}")
+        print()
 
-    # ── entropy ──
+    # ── 收集所有对比结果 ──
+    results: list[CompareResult] = []
+    detail_data: list[dict] = []  # 存不匹配项的原始数据，后续展开详情
+
+    # entropy
     ent_file = f"entropy_{tag}.pt"
     ent1_path = os.path.join(dir1, ent_file)
     ent2_path = os.path.join(dir2, ent_file)
     if os.path.exists(ent1_path) and os.path.exists(ent2_path):
         ent1 = load_tensor(ent1_path, dtype)
         ent2 = load_tensor(ent2_path, dtype)
-        print(f"\n─── entropy_{tag}.pt ───")
-        _compare_2d(ent1, ent2, atol, label_ids=label, name=f"entropy_{tag}")
-    else:
-        print(f"\n─── entropy_{tag}.pt ─── SKIP (file not found)")
+        diff, mask = _compute_2d_diff(ent1, ent2)
+        r = CompareResult.from_2d_diff(f"entropy_{tag}", diff, mask, atol)
+        results.append(r)
+        detail_data.append({
+            "type": "2d", "name": f"entropy_{tag}",
+            "t1": ent1, "t2": ent2, "diff": diff, "mask": mask, "atol": atol,
+            "label_ids": label, "result": r,
+        })
 
-    # ── logits ──
+    # logits
     log_file = f"logits_{tag}.pt"
     log1_path = os.path.join(dir1, log_file)
     log2_path = os.path.join(dir2, log_file)
     if os.path.exists(log1_path) and os.path.exists(log2_path):
         log1 = load_tensor(log1_path, dtype)
         log2 = load_tensor(log2_path, dtype)
-        print(f"\n─── logits_{tag}.pt ───")
-        _compare_3d(log1, log2, atol, label_ids=label, name=f"logits_{tag}")
-    else:
-        print(f"\n─── logits_{tag}.pt ─── SKIP (file not found)")
-
-
-# ──────────────────────────────────────────────
-# 通用对比核心
-# ──────────────────────────────────────────────
-
-
-def _compare_2d(
-    t1: torch.Tensor,
-    t2: torch.Tensor,
-    atol: float,
-    label_ids: torch.Tensor | None = None,
-    name: str = "tensor",
-):
-    """逐元素对比两个 2D tensor [B, L]。"""
-    assert t1.shape == t2.shape, f"shape mismatch: {t1.shape} vs {t2.shape}"
-
-    B, L = t1.shape
-    diff = (t1 - t2).abs()
-
-    # 只关注非零位置（两边至少有一边非零）
-    mask = (t1 != 0) | (t2 != 0)
-    active = mask.sum().item()
-    n_mismatch = (diff > atol).sum().item()
-
-    max_diff = diff[mask].max().item() if mask.any() else 0.0
-    mean_diff = diff[mask].mean().item() if mask.any() else 0.0
-
-    print(f"shape=({B}, {L})  active_tokens={active}")
-    print(f"max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  mismatched={n_mismatch}")
-
-    if n_mismatch == 0:
-        print(f"ALL MATCH — {name} consistent with baseline")
-        return
-
-    mismatch_pos = (diff > atol).nonzero(as_tuple=False)
-    n_show = min(20, mismatch_pos.size(0))
-    print(f"\n前 {n_show} 个不匹配位置:")
-    for idx in mismatch_pos[:n_show]:
-        b, p = idx[0].item(), idx[1].item()
-        parts = [f"[{b},{p}]"]
-        if label_ids is not None:
-            parts.append(f"token={label_ids[b, p].item()}")
-        parts.append(f"on={t1[b, p]:.6f}")
-        parts.append(f"off={t2[b, p]:.6f}")
-        parts.append(f"diff={diff[b, p]:.6e}")
-        print("  " + "  ".join(parts))
-
-    # 汇总每行不匹配数
-    per_row = (diff > atol).sum(dim=1)
-    for b in range(B):
-        n_row = per_row[b].item()
-        if n_row > 0:
-            row_max = diff[b].max().item()
-            row_max_pos = diff[b].argmax().item()
-            print(f"  row[{b}]: {int(n_row)} mismatches "
-                  f"(max_diff_in_row={row_max:.6e} @ col {row_max_pos})")
-
-
-def _compare_3d(
-    t1: torch.Tensor,
-    t2: torch.Tensor,
-    atol: float,
-    label_ids: torch.Tensor | None = None,
-    name: str = "tensor",
-):
-    """逐元素对比两个 3D tensor [B, L, V]（logits）。
-
-    报告逐元素整体差异 + 每 (b, l) 位置跨 vocab 维度的最大差异。
-    """
-    assert t1.shape == t2.shape, f"shape mismatch: {t1.shape} vs {t2.shape}"
-
-    B, L, V = t1.shape
-    diff = (t1 - t2).abs()
-
-    # 逐元素整体
-    n_total = diff.numel()
-    n_mismatch = (diff > atol).sum().item()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-
-    # 每 (b, l) 位置在 vocab 维度上的最大差异
-    diff_per_pos = diff.max(dim=-1).values  # [B, L]
-    mismatched_positions = (diff_per_pos > atol).sum().item()
-
-    print(f"shape=({B}, {L}, {V})  total_elements={n_total}")
-    print(f"element-wise: max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  mismatched={n_mismatch}")
-    print(f"per-position (max over vocab): mismatched_positions={mismatched_positions}")
-
-    if n_mismatch == 0:
-        print(f"ALL MATCH — {name} consistent with baseline")
-        return
-
-    # 找出差异最大的位置
-    flat_top = diff.view(-1).topk(min(10, n_mismatch))
-    print(f"\n差异最大的 {flat_top.values.size(0)} 个元素:")
-    for val, flat_idx in zip(flat_top.values, flat_top.indices):
-        b = flat_idx // (L * V)
-        rest = flat_idx % (L * V)
-        l = rest // V
-        v = rest % V
-        token_hint = f"token={label_ids[b, l].item()}" if label_ids is not None else ""
-        print(
-            f"  [{b},{l},{v}] {token_hint}  "
-            f"on={t1[b, l, v]:.6f}  off={t2[b, l, v]:.6f}  diff={val:.6e}"
+        diff, mask = _compute_3d_diff(log1, log2)
+        r = CompareResult.from_2d_diff  # reuse base logic
+        n_mismatch = (diff > atol).sum().item()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        r = CompareResult(
+            name=f"logits_{tag}",
+            shape=tuple(log1.shape),
+            max_diff=max_diff,
+            mean_diff=mean_diff,
+            n_mismatch=int(n_mismatch),
+            n_total=int(diff.numel()),
+            passed=(n_mismatch == 0),
         )
+        results.append(r)
+        detail_data.append({
+            "type": "3d", "name": f"logits_{tag}",
+            "t1": log1, "t2": log2, "diff": diff, "mask": mask, "atol": atol,
+            "label_ids": label, "result": r,
+        })
 
-    # 汇总每行每位置跨 vocab 的最大差异
-    n_show = min(10, B * L)
-    top_pos = diff_per_pos.view(-1).topk(n_show)
-    print(f"\n跨 vocab 差异最大的 {n_show} 个 (b, l) 位置:")
-    for val, flat_idx in zip(top_pos.values, top_pos.indices):
-        b = flat_idx // L
-        l = flat_idx % L
-        token_hint = f"token={label_ids[b, l].item()}" if label_ids is not None else ""
-        print(f"  [{b},{l}] {token_hint}  max_diff_over_vocab={val:.6e}")
+    # logprobs (legacy，如果存在就一起对比)
+    lp_path1 = os.path.join(dir1, "logprobs.pt")
+    lp_path2 = os.path.join(dir2, "logprobs.pt")
+    if os.path.exists(lp_path1) and os.path.exists(lp_path2):
+        lp1 = load_tensor(lp_path1)
+        lp2 = load_tensor(lp_path2)
+        if dtype:
+            lp1 = cast_to_dtype(lp1, dtype)
+            lp2 = cast_to_dtype(lp2, dtype)
+        diff, mask = _compute_2d_diff(lp1, lp2)
+        r = CompareResult.from_2d_diff("logprobs", diff, mask, atol)
+        results.append(r)
+        detail_data.append({
+            "type": "2d", "name": "logprobs",
+            "t1": lp1, "t2": lp2, "diff": diff, "mask": mask, "atol": atol,
+            "label_ids": label, "result": r,
+        })
+
+    if not results:
+        print("No dump files found.")
+        return
+
+    # ── 输出 ──
+    _print_summary_table(results, atol)
+
+    # 判断逻辑：logits 坏 → entropy 一定坏（entropy 从 logits 算的）
+    # 只展开 fail 项的详情
+    for d in detail_data:
+        r = d["result"]
+        if r.passed:
+            if d["type"] == "2d":
+                _print_pass(d["name"], r.shape, int(d["mask"].sum().item()))
+            else:
+                print(f"─── {d['name']}  shape={_fmt_shape(r.shape)} ───")
+                print(f"  {CHECK} ALL MATCH")
+                print()
+        else:
+            if d["type"] == "2d":
+                _print_2d_detail(d["name"], d["t1"], d["t2"], d["diff"], d["mask"],
+                                 d["atol"], d["label_ids"])
+            else:
+                _print_3d_detail(d["name"], d["t1"], d["t2"], d["diff"],
+                                 d["atol"], d["label_ids"])
 
 
 # ──────────────────────────────────────────────
