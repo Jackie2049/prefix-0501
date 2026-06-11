@@ -24,6 +24,10 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         logits_processor_func,
         postprocess_micro_batch_func,
     ):
+        # ── 清理跨 micro-batch 残留（每个 forward_step 开头执行） ──
+        from prefix_sharing.integrations.verl_mcore import clear_trimmed_valid_lengths
+        clear_trimmed_valid_lengths()
+
         # ── 消费 micro-batch ──
         batch = next(batch_iter)
 
