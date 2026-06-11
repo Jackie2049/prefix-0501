@@ -388,6 +388,7 @@ def restore_suffix_first_log_probs_from_prefix(
     labels: Any,
     log_probs: Any,
     vocab_parallel_log_probs_fn: Any,
+    vocab_parallel_entropy_fn: Any = None,
 ) -> Any:
     """Compute restore logprobs and cache for later 2D injection.
 
@@ -426,10 +427,13 @@ def restore_suffix_first_log_probs_from_prefix(
 
         if index.is_interior_response:
             # Interior: label is in shared prefix, available at
-            # provider_1d_pos + 1 in the provider's packed labels.
+            # provider_1d_pos in the provider's packed labels.
+            # In verl convention, label[p] = token at p+1.
+            # provider_1d_pos maps to interior_pos - 1 (logits position),
+            # so labels[provider_1d_pos] = token at interior_pos.
             provider_label = labels[
                 0:1,
-                index.provider_1d_pos + 1 : index.provider_1d_pos + 2,
+                index.provider_1d_pos : index.provider_1d_pos + 1,
             ]
         else:
             # Prefix-last: label is the reuser's first suffix token,
@@ -444,6 +448,13 @@ def restore_suffix_first_log_probs_from_prefix(
 
         restored_logprob = vocab_parallel_log_probs_fn(provider_logits, provider_label).reshape(())
         ctx.logprob_restore_cache[(index.reuse_idx_in_batch, index.target_2d_pos)] = restored_logprob
+
+        # Compute entropy from the same provider logits for trimmed-prefix restoration.
+        # provider_logits has shape [1, 1, V//tp]; squeeze to [1, V//tp] for entropy fn.
+        if vocab_parallel_entropy_fn is not None:
+            provider_logits_2d = provider_logits.squeeze(0)
+            restored_entropy = vocab_parallel_entropy_fn(provider_logits_2d).reshape(())
+            ctx.entropy_restore_cache[(index.reuse_idx_in_batch, index.target_2d_pos)] = restored_entropy
 
     # Return log_probs unchanged — all restores are cached for 2D injection.
     return log_probs
@@ -476,6 +487,37 @@ def write_restored_logprobs_to_2d(
 
     for (batch_idx, target_2d_pos), logprob in ctx.logprob_restore_cache.items():
         log_probs[batch_idx, target_2d_pos] = logprob
+
+    return output
+
+
+def write_restored_entropy_to_2d(
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    """Drain the entropy restore cache into the 2D output tensor.
+
+    Called after ``postprocess_packed_seqs`` has converted packed entropy
+    back to [B, L] shape. Iterates
+    :attr:`PrefixSharingRuntimeContext.entropy_restore_cache` and writes
+    each non-detached scalar tensor to ``output["entropy"][batch_idx, target_2d_pos]``.
+
+    Must be called while ``prefix_sharing_runtime_context`` is still active
+    (i.e. before the context manager exits).
+
+    Returns:
+        ``output`` with ``entropy`` mutated in-place.
+    """
+
+    ctx = current_prefix_sharing_context()
+    if ctx is None or not ctx.entropy_restore_cache:
+        return output
+
+    entropy = output.get("entropy")
+    if entropy is None:
+        return output
+
+    for (batch_idx, target_2d_pos), ent_val in ctx.entropy_restore_cache.items():
+        entropy[batch_idx, target_2d_pos] = ent_val
 
     return output
 

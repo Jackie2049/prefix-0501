@@ -67,12 +67,14 @@ try:
         build_prefix_sharing_micro_batch,
         restore_suffix_first_log_probs_from_prefix,
         write_restored_logprobs_to_2d,
+        write_restored_entropy_to_2d,
     )
 except ModuleNotFoundError:
     prefix_sharing_runtime_context = None
     build_prefix_sharing_micro_batch = None
     restore_suffix_first_log_probs_from_prefix = None
     write_restored_logprobs_to_2d = None
+    write_restored_entropy_to_2d = None
 ######### prefix-sharing #########
 
 __all__ = ["MegatronPPOActor"]
@@ -688,14 +690,8 @@ class MegatronPPOActor(BasePPOActor):
                         entropy = vocab_parallel_entropy(logits)
                         ret["entropy"] = entropy
                         ########## prefix-sharing logits/entropy dump ##########
-                        _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
-                        if _ps_dump_dir:
-                            os.makedirs(_ps_dump_dir, exist_ok=True)
-                            if torch.distributed.get_rank() == 0:
-                                tag = "old" if forward_only else "train"
-                                torch.save(logits.detach().clone(), os.path.join(_ps_dump_dir, f"logits_{tag}.pt"))
-                                torch.save(entropy.detach().clone(), os.path.join(_ps_dump_dir, f"entropy_{tag}.pt"))
-                                torch.save(label.detach().cpu().clone(), os.path.join(_ps_dump_dir, "label.pt"))
+                        # (moved to 2D space after all restores, see below)
+                        pass
                         ########## prefix-sharing logits/entropy dump ##########
                     else:
                         logits_bak = logits
@@ -710,6 +706,7 @@ class MegatronPPOActor(BasePPOActor):
                             label,
                             log_probs,
                             vocab_parallel_log_probs_from_logits,
+                            vocab_parallel_entropy if calculate_entropy else None,
                         )
                     ######### prefix-sharing #########
                     ret["log_probs"] = log_probs
@@ -731,7 +728,7 @@ class MegatronPPOActor(BasePPOActor):
                         logits_processor_args=logits_processor_args,
                         data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                     )
-                    # Drain logprob restore cache into 2D output.
+                    # Drain logprob/entropy restore caches into 2D output.
                     # All restores (interior-response + prefix-last) are
                     # computed and cached during the logits_processor stage
                     # (packed 1D). After postprocess_packed_seqs converts
@@ -739,6 +736,22 @@ class MegatronPPOActor(BasePPOActor):
                     # correct 2D position so loss_func sees complete rows.
                     if write_restored_logprobs_to_2d is not None:
                         output = write_restored_logprobs_to_2d(output)
+                    if write_restored_entropy_to_2d is not None:
+                        output = write_restored_entropy_to_2d(output)
+                    ########## prefix-sharing dump (2D space after all restores) ##########
+                    _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
+                    if _ps_dump_dir and forward_only:
+                        os.makedirs(_ps_dump_dir, exist_ok=True)
+                        if torch.distributed.get_rank() == 0:
+                            tag = "old" if forward_only else "train"
+                            torch.save(output["log_probs"].detach().clone(),
+                                       os.path.join(_ps_dump_dir, f"logprobs_{tag}.pt"))
+                            if "entropy" in output:
+                                torch.save(output["entropy"].detach().clone(),
+                                           os.path.join(_ps_dump_dir, f"entropy_{tag}.pt"))
+                            torch.save(label.detach().cpu().clone(),
+                                       os.path.join(_ps_dump_dir, "label.pt"))
+                    ########## prefix-sharing dump ##########
                 ######### prefix-sharing #########
 
             if forward_only:

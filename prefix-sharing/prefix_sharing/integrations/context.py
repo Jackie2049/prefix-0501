@@ -49,6 +49,13 @@ class PrefixSharingRuntimeContext:
     and drained to 2D output after postprocess_packed_seqs.
     Holds both interior-response and prefix-last restore entries.
     """
+    entropy_restore_cache: dict[tuple[int, int], Any] = field(default_factory=dict)
+    """Cache for restored entropy scalars keyed by (batch_idx, target_2d_pos).
+
+    Same pattern as logprob_restore_cache: populated during packed 1D
+    logits_processor stage and drained to 2D output after
+    postprocess_packed_seqs.
+    """
     stats: PrefixSharingStats | None = None
 
 
@@ -72,7 +79,8 @@ def _build_prefix_last_restore_indices(
 
         if spec.is_interior_response:
             # Interior: label is in shared prefix, available in provider's
-            # packed labels at provider_1d_pos + 1.
+            # packed labels at provider_1d_pos (label[p] = token at p+1,
+            # so label[interior_pos-1] = token at interior_pos).
             reuse_1d = -1  # sentinel: no slot in reuser packed region
         else:
             # Prefix-last: label (reuser's first suffix token) is NOT in

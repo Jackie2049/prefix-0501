@@ -48,7 +48,7 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
     assert current_prefix_sharing_context() is None
 
 
@@ -125,14 +125,15 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
     assert layout.valid_token_mask.tolist() == expected_mask
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == expected_cu_seqlens[1]
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
 def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path():
     # THD compact format: [1, total_kept_tokens, V]
     # row0 (provider) all 5 tokens, row1 (reuser) suffix 2 tokens (positions 3,4)
     # total = 5 + 2 = 7, align_size=1 so no padding
-    logits = torch.randn(1, 7, 8, requires_grad=True)
+    # vocab_size must be >= max(input_ids)+1 = 22 to accommodate label_value=20/21
+    logits = torch.randn(1, 7, 32, requires_grad=True)
     labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
     log_probs = torch.zeros(1, 7, requires_grad=True)
     batch = {
@@ -162,9 +163,12 @@ def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path
         ).squeeze(-1)
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
+        restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
         assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 1
+        # Restored logprob is cached keyed by (reuse_idx_in_batch, target_2d_pos).
+        # Reuser index 1, prefix-last at position 2 (prefix_len-1).
+        cached_logprob = ctx.logprob_restore_cache[(1, 2)]
 
-    restored[0, 5].backward()
+    cached_logprob.backward()
     assert logits.grad is not None
     assert logits.grad[0, 2].abs().sum() > 0
