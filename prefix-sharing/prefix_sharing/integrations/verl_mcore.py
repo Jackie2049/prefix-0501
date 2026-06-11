@@ -516,6 +516,18 @@ def write_restored_entropy_to_2d(
     if entropy is None:
         return output
 
+    ########## prefix-sharing entropy restore diagnostic ##########
+    import torch.distributed as _ps_dist
+    if _ps_dist.is_initialized() and _ps_dist.get_rank() == 0:
+        from verl.utils.logger import logger as _ps_logger
+        nz = sum(1 for v in ctx.entropy_restore_cache.values() if v is not None and abs(float(v)) > 1e-8)
+        _ps_logger.warning(
+            f"[PS][DIAG][entropy_restore] cache_size={len(ctx.entropy_restore_cache)} "
+            f"nonzero_count={nz} "
+            f"sample_keys={list(ctx.entropy_restore_cache.keys())[:5]}"
+        )
+    ########## prefix-sharing entropy restore diagnostic ##########
+
     for (batch_idx, target_2d_pos), ent_val in ctx.entropy_restore_cache.items():
         entropy[batch_idx, target_2d_pos] = ent_val
 

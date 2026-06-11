@@ -710,6 +710,22 @@ class MegatronPPOActor(BasePPOActor):
                         )
                     ######### prefix-sharing #########
                     ret["log_probs"] = log_probs
+                    ########## prefix-sharing packed diagnostic ##########
+                    if calculate_entropy and "entropy" in ret:
+                        _e = ret["entropy"]
+                        # entropy in packed space: check if ALL packed entries are non-zero
+                        _e_nz = int((_e.abs() > 1e-8).sum())
+                        _e_total = _e.numel()
+                        import torch.distributed as _ps_dist
+                        if _ps_dist.is_initialized() and _ps_dist.get_rank() == 0:
+                            from verl.utils.logger import logger as _ps_logger
+                            _ps_logger.warning(
+                                f"[PS][DIAG][packed] entropy packed nonzero={_e_nz}/{_e_total} "
+                                f"shape={list(_e.shape)} "
+                                f"last10_mean={_e.view(-1)[-10:].mean().item():.6f} "
+                                f"label_mask_packed_nz={int(label_mask.sum())}/{label_mask.numel()}"
+                            )
+                    ########## prefix-sharing packed diagnostic ##########
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
@@ -738,6 +754,33 @@ class MegatronPPOActor(BasePPOActor):
                         output = write_restored_logprobs_to_2d(output)
                     if write_restored_entropy_to_2d is not None:
                         output = write_restored_entropy_to_2d(output)
+                    ########## prefix-sharing diagnostic ##########
+                    if forward_only:
+                        import torch.distributed as dist
+                        if dist.is_initialized() and dist.get_rank() == 0:
+                            _ps_lp = output.get("log_probs")
+                            _ps_ent = output.get("entropy")
+                            _ps_am = label_mask  # 2D: has been cropped via batch-level logic
+                            logger.warning(
+                                f"[PS][DIAG] response_length={response_length} "
+                                f"attn_mask_sums={attention_mask.sum(dim=1).tolist()} "
+                                f"label_key_positions_1071_1091={label_mask[:, 1071:1092].int().tolist() if label_mask.size(1) > 1091 else 'OOB'}"
+                            )
+                            if _ps_lp is not None and _ps_lp.size(1) > 1091:
+                                lp_slice = _ps_lp[:, 1071:1092]
+                                nz_count = int((lp_slice.abs() > 1e-8).sum())
+                                logger.warning(
+                                    f"[PS][DIAG] log_probs[:, 1071:1092] nonzero_count={nz_count}/{lp_slice.numel()} "
+                                    f"sample_row7={_ps_lp[7, 1071:1092].tolist() if _ps_lp.size(0) > 7 else 'OOB'}"
+                                )
+                            if _ps_ent is not None and _ps_ent.size(1) > 1091:
+                                ent_slice = _ps_ent[:, 1071:1092]
+                                nz_count = int((ent_slice.abs() > 1e-8).sum())
+                                logger.warning(
+                                    f"[PS][DIAG] entropy[:, 1071:1092] nonzero_count={nz_count}/{ent_slice.numel()} "
+                                    f"sample_row7={_ps_ent[7, 1071:1092].tolist() if _ps_ent.size(0) > 7 else 'OOB'}"
+                                )
+                    ########## prefix-sharing diagnostic ##########
                     ########## prefix-sharing dump (2D space after all restores) ##########
                     _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
                     if _ps_dump_dir and forward_only:
