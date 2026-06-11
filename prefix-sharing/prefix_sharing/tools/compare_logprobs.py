@@ -96,14 +96,21 @@ def load_legacy_dump(dump_dir: str) -> tuple[torch.Tensor, torch.Tensor | None]:
 class CompareResult:
     """单个对比项的结果汇总。"""
     def __init__(self, name: str, shape: tuple[int, ...], max_diff: float, mean_diff: float,
-                 n_mismatch: int, n_total: int | None = None, passed: bool = False):
+                 n_mismatch: int, n_total: int | None = None, passed: bool = False,
+                 *, shape_on: tuple[int, ...] | None = None, shape_off: tuple[int, ...] | None = None):
         self.name = name
-        self.shape = shape
+        self.shape = shape  # 如果 shape 一致则存公共 shape；不一致则存空 tuple
         self.max_diff = max_diff
         self.mean_diff = mean_diff
         self.n_mismatch = n_mismatch
         self.n_total = n_total
         self.passed = passed
+        self.shape_on = shape_on
+        self.shape_off = shape_off
+
+    @property
+    def shape_mismatch(self) -> bool:
+        return self.shape_on is not None and self.shape_off is not None
 
     @staticmethod
     def from_2d_diff(name: str, diff: torch.Tensor, mask: torch.Tensor, atol: float,
@@ -116,6 +123,16 @@ class CompareResult:
             max_diff=max_diff, mean_diff=mean_diff,
             n_mismatch=n_mismatch, n_total=n_total or int(mask.sum().item()),
             passed=(n_mismatch == 0),
+        )
+
+    @staticmethod
+    def shape_mismatch_result(name: str, shape_on: tuple[int, ...], shape_off: tuple[int, ...]) -> "CompareResult":
+        """创建 shape 不匹配的结果。"""
+        return CompareResult(
+            name=name, shape=(),
+            max_diff=float("nan"), mean_diff=float("nan"),
+            n_mismatch=-1, n_total=None, passed=False,
+            shape_on=shape_on, shape_off=shape_off,
         )
 
 
@@ -163,13 +180,18 @@ def _print_summary_table(results: list[CompareResult], atol: float):
     print(_SEP_DOUBLE)
     print(f"  SUMMARY  (atol={atol:.1e})")
     print(_SEP_DOUBLE)
-    print(f"  {'NAME':<20s} {'SHAPE':<24s} {'MAX_DIFF':>14s}  {'MEAN_DIFF':>14s}  {'MISMATCHES':>12s}  {'STATUS':>8s}")
-    print(f"  {'─'*20} {'─'*24} {'─'*14}  {'─'*14}  {'─'*12}  {'─'*8}")
+    print(f"  {'NAME':<20s} {'SHAPE (ON / OFF)':<34s} {'MAX_DIFF':>14s}  {'MEAN_DIFF':>14s}  {'MISMATCHES':>12s}  {'STATUS':>8s}")
+    print(f"  {'─'*20} {'─'*34} {'─'*14}  {'─'*14}  {'─'*12}  {'─'*8}")
 
     for r in results:
-        status = f"  {CHECK} PASS" if r.passed else f"  {CROSS} FAIL"
-        n_str = f"{r.n_mismatch}/{r.n_total}" if r.n_total else str(r.n_mismatch)
-        print(f"  {r.name:<20s} {_fmt_shape(r.shape):<24s} {r.max_diff:>14.6e}  {r.mean_diff:>14.6e}  {n_str:>12s}  {status}")
+        if r.shape_mismatch:
+            status = f"  {CROSS} SHAPE"
+            shape_str = f"{_fmt_shape(r.shape_on)} / {_fmt_shape(r.shape_off)}"
+            print(f"  {r.name:<20s} {shape_str:<34s} {'—':>14s}  {'—':>14s}  {'—':>12s}  {status}")
+        else:
+            status = f"  {CHECK} PASS" if r.passed else f"  {CROSS} FAIL"
+            n_str = f"{r.n_mismatch}/{r.n_total}" if r.n_total else str(r.n_mismatch)
+            print(f"  {r.name:<20s} {_fmt_shape(r.shape):<34s} {r.max_diff:>14.6e}  {r.mean_diff:>14.6e}  {n_str:>12s}  {status}")
     print(_SEP_DOUBLE)
     print()
 
@@ -178,6 +200,24 @@ def _print_pass(name: str, shape: tuple[int, ...], n_active: int):
     """单条目全对通过的简短输出。"""
     print(f"─── {name}  shape={_fmt_shape(shape)}  active_tokens={n_active} ───")
     print(f"  {CHECK} ALL MATCH — consistent with baseline")
+    print()
+
+
+def _print_shape_mismatch(name: str, shape_on: tuple[int, ...], shape_off: tuple[int, ...],
+                          t1: torch.Tensor, t2: torch.Tensor):
+    """打印 shape 不匹配的诊断信息。"""
+    print(_SEP_THIN)
+    print(f"─── {name}  SHAPE MISMATCH ───")
+    print(f"    sharing ON  shape: {_fmt_shape(shape_on)}   (packed / trimmed)")
+    print(f"    sharing OFF shape: {_fmt_shape(shape_off)}   (full unpadded)")
+    print(f"    ON/OFF ratio: {shape_on[1] / shape_off[1]:.4f}x  (seq dim)")
+    print()
+    print(f"  {CROSS} Cannot compare element-wise — prefix-sharing changes sequence layout.")
+    print(f"     This is EXPECTED: packing trims redundant prefix tokens, reducing seq_len.")
+    print(f"     To verify correctness, run with identical seq_len (e.g. no packing)")
+    print(f"     or compare per-token values after unpacking to the original layout.")
+    print(f"  ON  stats:  min={t1.min().item():.4f}  max={t1.max().item():.4f}  mean={t1.mean().item():.4f}")
+    print(f"  OFF stats:  min={t2.min().item():.4f}  max={t2.max().item():.4f}  mean={t2.mean().item():.4f}")
     print()
 
 
@@ -337,14 +377,21 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
     if os.path.exists(ent1_path) and os.path.exists(ent2_path):
         ent1 = load_tensor(ent1_path, dtype)
         ent2 = load_tensor(ent2_path, dtype)
-        diff, mask = _compute_2d_diff(ent1, ent2)
-        r = CompareResult.from_2d_diff(f"entropy_{tag}", diff, mask, atol)
-        results.append(r)
-        detail_data.append({
-            "type": "2d", "name": f"entropy_{tag}",
-            "t1": ent1, "t2": ent2, "diff": diff, "mask": mask, "atol": atol,
-            "label_ids": label, "result": r,
-        })
+        if ent1.shape != ent2.shape:
+            r = CompareResult.shape_mismatch_result(
+                f"entropy_{tag}", tuple(ent1.shape), tuple(ent2.shape))
+            results.append(r)
+            detail_data.append({"type": "shape_mismatch", "name": f"entropy_{tag}",
+                                "t1": ent1, "t2": ent2, "result": r})
+        else:
+            diff, mask = _compute_2d_diff(ent1, ent2)
+            r = CompareResult.from_2d_diff(f"entropy_{tag}", diff, mask, atol)
+            results.append(r)
+            detail_data.append({
+                "type": "2d", "name": f"entropy_{tag}",
+                "t1": ent1, "t2": ent2, "diff": diff, "mask": mask, "atol": atol,
+                "label_ids": label, "result": r,
+            })
 
     # logits
     log_file = f"logits_{tag}.pt"
@@ -353,26 +400,32 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
     if os.path.exists(log1_path) and os.path.exists(log2_path):
         log1 = load_tensor(log1_path, dtype)
         log2 = load_tensor(log2_path, dtype)
-        diff, mask = _compute_3d_diff(log1, log2)
-        r = CompareResult.from_2d_diff  # reuse base logic
-        n_mismatch = (diff > atol).sum().item()
-        max_diff = diff.max().item()
-        mean_diff = diff.mean().item()
-        r = CompareResult(
-            name=f"logits_{tag}",
-            shape=tuple(log1.shape),
-            max_diff=max_diff,
-            mean_diff=mean_diff,
-            n_mismatch=int(n_mismatch),
-            n_total=int(diff.numel()),
-            passed=(n_mismatch == 0),
-        )
-        results.append(r)
-        detail_data.append({
-            "type": "3d", "name": f"logits_{tag}",
-            "t1": log1, "t2": log2, "diff": diff, "mask": mask, "atol": atol,
-            "label_ids": label, "result": r,
-        })
+        if log1.shape != log2.shape:
+            r = CompareResult.shape_mismatch_result(
+                f"logits_{tag}", tuple(log1.shape), tuple(log2.shape))
+            results.append(r)
+            detail_data.append({"type": "shape_mismatch", "name": f"logits_{tag}",
+                                "t1": log1, "t2": log2, "result": r})
+        else:
+            diff, mask = _compute_3d_diff(log1, log2)
+            n_mismatch = (diff > atol).sum().item()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            r = CompareResult(
+                name=f"logits_{tag}",
+                shape=tuple(log1.shape),
+                max_diff=max_diff,
+                mean_diff=mean_diff,
+                n_mismatch=int(n_mismatch),
+                n_total=int(diff.numel()),
+                passed=(n_mismatch == 0),
+            )
+            results.append(r)
+            detail_data.append({
+                "type": "3d", "name": f"logits_{tag}",
+                "t1": log1, "t2": log2, "diff": diff, "mask": mask, "atol": atol,
+                "label_ids": label, "result": r,
+            })
 
     # logprobs (legacy，如果存在就一起对比)
     lp_path1 = os.path.join(dir1, "logprobs.pt")
@@ -383,14 +436,21 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
         if dtype:
             lp1 = cast_to_dtype(lp1, dtype)
             lp2 = cast_to_dtype(lp2, dtype)
-        diff, mask = _compute_2d_diff(lp1, lp2)
-        r = CompareResult.from_2d_diff("logprobs", diff, mask, atol)
-        results.append(r)
-        detail_data.append({
-            "type": "2d", "name": "logprobs",
-            "t1": lp1, "t2": lp2, "diff": diff, "mask": mask, "atol": atol,
-            "label_ids": label, "result": r,
-        })
+        if lp1.shape != lp2.shape:
+            r = CompareResult.shape_mismatch_result(
+                "logprobs", tuple(lp1.shape), tuple(lp2.shape))
+            results.append(r)
+            detail_data.append({"type": "shape_mismatch", "name": "logprobs",
+                                "t1": lp1, "t2": lp2, "result": r})
+        else:
+            diff, mask = _compute_2d_diff(lp1, lp2)
+            r = CompareResult.from_2d_diff("logprobs", diff, mask, atol)
+            results.append(r)
+            detail_data.append({
+                "type": "2d", "name": "logprobs",
+                "t1": lp1, "t2": lp2, "diff": diff, "mask": mask, "atol": atol,
+                "label_ids": label, "result": r,
+            })
 
     if not results:
         print("No dump files found.")
@@ -403,7 +463,9 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
     # 只展开 fail 项的详情
     for d in detail_data:
         r = d["result"]
-        if r.passed:
+        if d["type"] == "shape_mismatch":
+            _print_shape_mismatch(d["name"], r.shape_on, r.shape_off, d["t1"], d["t2"])
+        elif r.passed:
             if d["type"] == "2d":
                 _print_pass(d["name"], r.shape, int(d["mask"].sum().item()))
             else:
