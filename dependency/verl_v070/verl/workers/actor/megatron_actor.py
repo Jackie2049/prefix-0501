@@ -760,25 +760,33 @@ class MegatronPPOActor(BasePPOActor):
                         if dist.is_initialized() and dist.get_rank() == 0:
                             _ps_lp = output.get("log_probs")
                             _ps_ent = output.get("entropy")
-                            _ps_am = label_mask  # 2D: has been cropped via batch-level logic
-                            logger.warning(
-                                f"[PS][DIAG] response_length={response_length} "
-                                f"attn_mask_sums={attention_mask.sum(dim=1).tolist()} "
-                                f"label_key_positions_1071_1091={label_mask[:, 1071:1092].int().tolist() if label_mask.size(1) > 1091 else 'OOB'}"
-                            )
-                            if _ps_lp is not None and _ps_lp.size(1) > 1091:
-                                lp_slice = _ps_lp[:, 1071:1092]
-                                nz_count = int((lp_slice.abs() > 1e-8).sum())
+                            _am_sums = attention_mask.sum(dim=1).int().tolist()
+                            # Only check rows that are actual reusers (have suffix positions in trimmed mask)
+                            _valid_rows = [i for i, s in enumerate(_am_sums) if s > 0]
+                            if _valid_rows and _ps_ent is not None and _ps_ent.size(1) > 1091:
+                                # For each reuser row, check the LAST 20 suffix positions in 2D
+                                for _row in _valid_rows:
+                                    _ent_row = _ps_ent[_row]
+                                    _lp_row = _ps_lp[_row] if _ps_lp is not None else None
+                                    _am_row = attention_mask[_row]
+                                    _suffix_positions = _am_row.nonzero(as_tuple=True)[0].tolist()
+                                    if _suffix_positions:
+                                        _suffix_last20 = _suffix_positions[-20:]
+                                        _ent_vals = _ent_row[_suffix_last20].tolist()
+                                        _lp_vals = _lp_row[_suffix_last20].tolist() if _lp_row is not None else None
+                                        _ent_nz = sum(1 for v in _ent_vals if abs(v) > 1e-8)
+                                        _lp_nz = sum(1 for v in _lp_vals if abs(v) > 1e-8) if _lp_vals else -1
+                                        logger.warning(
+                                            f"[PS][DIAG] row={_row} suffix_len={len(_suffix_positions)} "
+                                            f"positions={_suffix_positions[:3]}...{_suffix_positions[-3:]} "
+                                            f"last20_entropy_nz={_ent_nz}/20 "
+                                            f"last20_logprob_nz={_lp_nz}/20 "
+                                            f"entropy_snip={_ent_vals[:3]}...{_ent_vals[-3:]}"
+                                        )
+                            else:
                                 logger.warning(
-                                    f"[PS][DIAG] log_probs[:, 1071:1092] nonzero_count={nz_count}/{lp_slice.numel()} "
-                                    f"sample_row7={_ps_lp[7, 1071:1092].tolist() if _ps_lp.size(0) > 7 else 'OOB'}"
-                                )
-                            if _ps_ent is not None and _ps_ent.size(1) > 1091:
-                                ent_slice = _ps_ent[:, 1071:1092]
-                                nz_count = int((ent_slice.abs() > 1e-8).sum())
-                                logger.warning(
-                                    f"[PS][DIAG] entropy[:, 1071:1092] nonzero_count={nz_count}/{ent_slice.numel()} "
-                                    f"sample_row7={_ps_ent[7, 1071:1092].tolist() if _ps_ent.size(0) > 7 else 'OOB'}"
+                                    f"[PS][DIAG] NO_VALID_ROWS response_length={response_length} "
+                                    f"attn_mask_sums={_am_sums} batch_size={attention_mask.size(0)}"
                                 )
                     ########## prefix-sharing diagnostic ##########
                     ########## prefix-sharing dump (2D space after all restores) ##########
