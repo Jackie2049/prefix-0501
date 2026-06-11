@@ -12,6 +12,7 @@ from prefix_sharing.setup.registry import PatchSpec
 from .forward_step import patch_verl_forward_step
 from .attention import patch_megatron_attention
 from .vocab_logprobs import patch_megatron_vocab
+from .nopadding import patch_no_padding_2_padding
 
 PATCH_SET: list[PatchSpec] = [
     PatchSpec(
@@ -35,5 +36,11 @@ PATCH_SET: list[PatchSpec] = [
         target_getter=lambda mod: (mod, "vocab_parallel_log_probs_from_logits"),
         patch_factory=patch_megatron_vocab,
         description="vocab_parallel_log_probs → auto logprob restore (verl 0.8.0)",
+    ),
+    PatchSpec(
+        module_name="verl.workers.utils.padding",
+        target_getter=lambda mod: (mod, "no_padding_2_padding"),
+        patch_factory=patch_no_padding_2_padding,
+        description="no_padding_2_padding → corrected sequence lengths for trimmed batch",
     ),
 ]

@@ -50,6 +50,27 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# ═══════════════════════════════════════════════════════════════
+# 跨 patch 传递裁剪后的序列长度
+# ═══════════════════════════════════════════════════════════════
+
+_ps_trimmed_valid_lengths: list[int] | None = None
+"""no_padding_2_padding 补丁读取的裁剪后序列长度。不消费（被多次调用）。"""
+
+
+def set_trimmed_valid_lengths(lengths: list[int]) -> None:
+    global _ps_trimmed_valid_lengths
+    _ps_trimmed_valid_lengths = lengths
+
+
+def get_trimmed_valid_lengths() -> list[int] | None:
+    return _ps_trimmed_valid_lengths
+
+
+def clear_trimmed_valid_lengths() -> None:
+    global _ps_trimmed_valid_lengths
+    _ps_trimmed_valid_lengths = None
+
 
 @dataclass(frozen=True)
 class PrefixSharingRuntimeState:
@@ -569,6 +590,10 @@ def build_prefix_sharing_micro_batch_verl080(
         plan,
         packed_layout,
     )
+
+    # 存入裁剪后的 valid_lengths，供 no_padding_2_padding patch 使用
+    set_trimmed_valid_lengths(packed_layout.valid_lengths)
+
     return trimmed_batch, state
 
 
