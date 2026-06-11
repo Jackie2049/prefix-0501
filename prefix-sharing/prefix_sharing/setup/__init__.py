@@ -22,16 +22,16 @@ logger = logging.getLogger(__name__)
 
 
 def _ensure_logging_visible() -> None:
-    """确保 prefix_sharing.setup 的 INFO 日志对用户可见。
+    """确保 prefix_sharing 的 INFO 日志对用户可见。
 
-    Python logging 默认只输出 WARNING 及以上级别，
-    但 patch 安装信息（INFO 级别）对使用者至关重要。
-    此函数为 prefix_sharing.setup 日志命名空间配置
+    verl 等训练框架的 root logger 通常只输出 WARNING 及以上级别，
+    但 prefix-sharing 的 patch 安装、运行状态信息（INFO 级别）
+    对使用者至关重要。此函数为 prefix_sharing 日志命名空间配置
     专用的 StreamHandler(stderr) + INFO 级别 + propagate=False，
     确保 [PS] 消息始终可见，不受 root logger 配置影响。
     用户已自行配置 handler 时，不干预。
     """
-    ns_logger = logging.getLogger("prefix_sharing.setup")
+    ns_logger = logging.getLogger("prefix_sharing")
     if ns_logger.handlers:
         return  # 用户已自行配置，不干预
     handler = logging.StreamHandler(sys.stderr)
