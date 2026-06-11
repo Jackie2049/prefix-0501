@@ -1,10 +1,10 @@
-"""Patch: vocab_parallel_log_probs_from_logits — verl 0.8.0
+"""Patch: vocab_parallel_log_probs_from_logits — thin wrapper
 
 无 context → 直接调用原始函数
-有 context → 调用原始 + runtime_adapters.restore_logprobs
+有 context → 调用原始 + integrations.restore_suffix_first_log_probs_from_prefix
 
-与 verl080_mcore016_ms0153 版本完全一致，因为
-vocab_parallel_log_probs_from_logits 的签名在两个 verl 版本中没有变化。
+业务逻辑（PP stage 检查、global packed token length 验证、logprob 还原）
+全部由 integrations 层处理，本 patch 只负责编排调用顺序。
 """
 
 from __future__ import annotations
@@ -24,15 +24,14 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
 
         ctx = current_prefix_sharing_context()
         if ctx is not None and ctx.prefix_last_restore_indices:
-            from prefix_sharing.setup.runtime_adapters import restore_logprobs
-
-            log_probs = restore_logprobs(
-                logits,
-                labels,
-                log_probs,
-                original_fn,
-                ctx.prefix_last_restore_indices,
+            from prefix_sharing.integrations.verl_mcore import (
+                restore_suffix_first_log_probs_from_prefix,
             )
+
+            log_probs = restore_suffix_first_log_probs_from_prefix(
+                logits, labels, log_probs, original_fn,
+            )
+
         return log_probs
 
     return patched_fn

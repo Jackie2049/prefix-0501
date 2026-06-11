@@ -5,7 +5,8 @@
 - PrefixSharingRuntimeState.kept_position_ids 字段
 - PrefixSharingRuntimeContext.kept_position_ids 传递
 - compat_matrix 新条目版本匹配
-- forward_step._read_ps_config 读取逻辑
+- integrations.verl_mcore.read_ps_config_from_engine_config 读取逻辑
+- integrations.megatron_runtime v0.16.1 API helpers
 
 需要 verl/Megatron 运行环境的 patch 联动测试（forward_step → attention → vocab_logprobs）
 属于 integrated_test，本地不可运行，在 NPU/GPU 环境中单独验证。
@@ -174,23 +175,7 @@ def test_compat_matrix_does_not_match_wrong_mcore():
         mindspeed="0.16.0",
     )
     matching = [e for e in COMPAT_MATRIX if e.match(versions)]
-    # 应匹配旧的 mcore016_ms0153 条目（verl=0.8.0.dev, mcore=0.16.0, ms=0.15.3）
-    # 但 ms=0.16.0 也不匹配 ms=0.15.3，所以没有匹配
     assert len(matching) == 0
-
-
-def test_compat_matrix_matches_old_mcore_ms_combo():
-    from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX
-    from prefix_sharing.setup.version_guard import DetectedVersions
-
-    versions = DetectedVersions(
-        verl="0.8.0.dev",
-        megatron_core="0.16.0",
-        mindspeed="0.15.3",
-    )
-    matching = [e for e in COMPAT_MATRIX if e.match(versions)]
-    assert len(matching) == 1
-    assert matching[0].patch_set_id == "verl080_mcore016_ms0153"
 
 
 def test_compat_matrix_no_match_raises_incompatible():
@@ -207,13 +192,13 @@ def test_compat_matrix_no_match_raises_incompatible():
 
 
 # ═══════════════════════════════════════
-# forward_step._read_ps_config 读取逻辑
+# integrations.verl_mcore.read_ps_config_from_engine_config 读取逻辑
 # ═══════════════════════════════════════
 
 
 def test_read_ps_config_from_override_dict():
-    from prefix_sharing.setup.patches.verl080_mcore0161_ms0160.forward_step import (
-        _read_ps_config,
+    from prefix_sharing.integrations.verl_mcore import (
+        read_ps_config_from_engine_config,
     )
 
     engine_config = type("EngineConfig", (), {
@@ -221,25 +206,25 @@ def test_read_ps_config_from_override_dict():
             "prefix_sharing_config": {"enable_prefix_sharing": True},
         },
     })()
-    result = _read_ps_config(engine_config)
+    result = read_ps_config_from_engine_config(engine_config)
     assert result == {"enable_prefix_sharing": True}
 
 
 def test_read_ps_config_returns_none_when_missing():
-    from prefix_sharing.setup.patches.verl080_mcore0161_ms0160.forward_step import (
-        _read_ps_config,
+    from prefix_sharing.integrations.verl_mcore import (
+        read_ps_config_from_engine_config,
     )
 
     engine_config = type("EngineConfig", (), {
         "override_transformer_config": {},
     })()
-    result = _read_ps_config(engine_config)
+    result = read_ps_config_from_engine_config(engine_config)
     assert result is None
 
 
 def test_read_ps_config_from_direct_attr():
-    from prefix_sharing.setup.patches.verl080_mcore0161_ms0160.forward_step import (
-        _read_ps_config,
+    from prefix_sharing.integrations.verl_mcore import (
+        read_ps_config_from_engine_config,
     )
 
     engine_config = type("EngineConfig", (), {
@@ -247,18 +232,60 @@ def test_read_ps_config_from_direct_attr():
             "prefix_sharing_config": {"enable_prefix_sharing": True},
         })(),
     })()
-    result = _read_ps_config(engine_config)
+    result = read_ps_config_from_engine_config(engine_config)
     assert result == {"enable_prefix_sharing": True}
 
 
 def test_read_ps_config_returns_none_for_empty_config():
-    from prefix_sharing.setup.patches.verl080_mcore0161_ms0160.forward_step import (
-        _read_ps_config,
+    from prefix_sharing.integrations.verl_mcore import (
+        read_ps_config_from_engine_config,
     )
 
     engine_config = type("EngineConfig", (), {})()
-    result = _read_ps_config(engine_config)
+    result = read_ps_config_from_engine_config(engine_config)
     assert result is None
+
+
+# ═══════════════════════════════════════
+# integrations.megatron_runtime v0.16.1 helpers
+# ═══════════════════════════════════════
+
+
+def test_extract_cu_seqlens_returns_none_for_none_params():
+    from prefix_sharing.integrations.megatron_runtime import _extract_cu_seqlens
+    assert _extract_cu_seqlens(None, "cu_seqlens_q_padded", "cu_seqlens_q") is None
+
+
+def test_extract_cu_seqlens_prefers_padded_attr():
+    from prefix_sharing.integrations.megatron_runtime import _extract_cu_seqlens
+    params = type("Params", (), {
+        "cu_seqlens_q_padded": [0, 10],
+        "cu_seqlens_q": [0, 8],
+    })()
+    result = _extract_cu_seqlens(params, "cu_seqlens_q_padded", "cu_seqlens_q")
+    assert result == [0, 10]
+
+
+def test_extract_cu_seqlens_falls_back_to_primary():
+    from prefix_sharing.integrations.megatron_runtime import _extract_cu_seqlens
+    params = type("Params", (), {
+        "cu_seqlens_q": [0, 8],
+    })()
+    result = _extract_cu_seqlens(params, "cu_seqlens_q_padded", "cu_seqlens_q")
+    assert result == [0, 8]
+
+
+def test_get_yarn_mscale_fallback_without_megatron():
+    from prefix_sharing.integrations.megatron_runtime import _get_yarn_mscale
+    # Fake attention_module without real Megatron — should fallback to 1.0
+    fake_module = type("Attn", (), {"config": None})()
+    assert _get_yarn_mscale(fake_module) == 1.0
+
+
+def test_get_cp_group_returns_none_without_pg_collection():
+    from prefix_sharing.integrations.megatron_runtime import _get_cp_group
+    fake_module = type("Attn", (), {})()
+    assert _get_cp_group(fake_module) is None
 
 
 # ═══════════════════════════════════════

@@ -52,6 +52,13 @@ def maybe_run_prefix_sharing_attention(
         context="attention hook",
     )
 
+    # v0.16.1: extract cu_seqlens, mscale, cp_group from runtime objects.
+    # Returns None/defaults for v070 (mcore <= 0.15.x) — backward compatible.
+    cu_seqlens_q = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_q_padded", "cu_seqlens_q")
+    cu_seqlens_kv = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_kv_padded", "cu_seqlens_kv")
+    mscale = _get_yarn_mscale(attention_module)
+    cp_group = _get_cp_group(attention_module)
+
     q_pos_emb, k_pos_emb = rotary_pos_emb
     query, key = _apply_positioned_rope(
         attention_module,
@@ -60,6 +67,10 @@ def maybe_run_prefix_sharing_attention(
         q_pos_emb,
         k_pos_emb,
         packed_batch_layout.packed_position_ids,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        mscale=mscale,
+        cp_group=cp_group,
     )
 
     backend = ctx.backend or TorchReferenceBackend()
@@ -130,7 +141,22 @@ def _apply_positioned_rope(
     q_pos_emb: Any,
     k_pos_emb: Any,
     packed_position_ids: Any,
+    *,
+    cu_seqlens_q: Any | None = None,
+    cu_seqlens_kv: Any | None = None,
+    mscale: float | None = None,
+    cp_group: Any | None = None,
 ) -> tuple[Any, Any]:
+    """Apply RoPE using packed_position_ids, with optional v0.16.1 API params.
+
+    v070 (mcore <= 0.15.x): cu_seqlens=None, no mscale/cp_group.
+    v0.16.1+ (mcore 0.16.1): cu_seqlens from packed_seq_params, mscale for
+    yarn models, cp_group for context parallel.
+
+    Backward compatible: mscale and cp_group are only passed to
+    apply_rotary_pos_emb when they differ from defaults, so v0.15.x
+    (which doesn't have these kwargs) won't get a TypeError.
+    """
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
     positions = packed_position_ids.to(device=query.device, dtype=torch.long)
@@ -147,7 +173,6 @@ def _apply_positioned_rope(
     if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
         dim_half = q_pos_emb.shape[-1] // 2
         step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
-        n_extra = max_needed - q_pos_emb.shape[0]
         extra_positions = torch.arange(
             q_pos_emb.shape[0], max_needed,
             device=q_pos_emb.device, dtype=q_pos_emb.dtype,
@@ -158,7 +183,6 @@ def _apply_positioned_rope(
     if k_pos_emb is not None and max_needed > k_pos_emb.shape[0]:
         dim_half = k_pos_emb.shape[-1] // 2
         step = k_pos_emb[1:2, :, :, :dim_half] - k_pos_emb[0:1, :, :, :dim_half]
-        n_extra = max_needed - k_pos_emb.shape[0]
         extra_positions = torch.arange(
             k_pos_emb.shape[0], max_needed,
             device=k_pos_emb.device, dtype=k_pos_emb.dtype,
@@ -167,20 +191,69 @@ def _apply_positioned_rope(
         extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
         k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
 
+    # Build kwargs for apply_rotary_pos_emb.
+    # Only include version-specific params when they're provided,
+    # to maintain backward compat with v070 (mcore <= 0.15.x).
+    def _rope_kwargs(cu_seqlens: Any | None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"config": attention_module.config, "cu_seqlens": cu_seqlens}
+        if mscale is not None and mscale != 1.0:
+            kwargs["mscale"] = mscale
+        if cp_group is not None:
+            kwargs["cp_group"] = cp_group
+        return kwargs
+
     if q_pos_emb is not None:
         q_freqs = q_pos_emb.index_select(0, positions)
         query = apply_rotary_pos_emb(
             query.unsqueeze(1),
             q_freqs,
-            config=attention_module.config,
-            cu_seqlens=None,
+            **_rope_kwargs(cu_seqlens_q),
         ).squeeze(1)
     if k_pos_emb is not None:
         k_freqs = k_pos_emb.index_select(0, positions)
         key = apply_rotary_pos_emb(
             key.unsqueeze(1),
             k_freqs,
-            config=attention_module.config,
-            cu_seqlens=None,
+            **_rope_kwargs(cu_seqlens_kv),
         ).squeeze(1)
     return query, key
+
+
+# ═══════════════════════════════════════
+# v0.16.1 API helpers (backward compatible with v070)
+# ═══════════════════════════════════════
+
+def _extract_cu_seqlens(packed_seq_params: Any, primary_attr: str, fallback_attr: str) -> Any | None:
+    """Extract cu_seqlens from packed_seq_params, preferring padded version.
+
+    Returns None for v070 (mcore <= 0.15.x) where these attributes don't exist.
+    """
+    if packed_seq_params is None:
+        return None
+    val = getattr(packed_seq_params, primary_attr, None)
+    if val is None:
+        val = getattr(packed_seq_params, fallback_attr, None)
+    return val
+
+
+def _get_yarn_mscale(attention_module: Any) -> float:
+    """Get yarn mscale from attention module config (v0.16.1+).
+
+    Returns 1.0 for v070 (mcore <= 0.15.x) where this function doesn't exist.
+    """
+    try:
+        from megatron.core.transformer.attention import _yarn_get_concentration_factor_from_config
+        return float(_yarn_get_concentration_factor_from_config(attention_module.config))
+    except (ImportError, AttributeError):
+        return 1.0
+
+
+def _get_cp_group(attention_module: Any) -> Any | None:
+    """Get context parallel group from attention module (v0.16.1+).
+
+    Returns None for v070 (mcore <= 0.15.x) where pg_collection doesn't exist.
+    """
+    pg_collection = getattr(attention_module, "pg_collection", None)
+    if pg_collection is None:
+        return None
+    return getattr(pg_collection, "cp", None)

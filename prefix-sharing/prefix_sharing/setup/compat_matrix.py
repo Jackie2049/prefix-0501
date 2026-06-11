@@ -54,16 +54,7 @@ COMPAT_MATRIX: list[CompatEntry] = [
         notes="verl 0.8.0 + Megatron core 0.16.1 + MindSpeed 0.16.0; "
               "Qwen3.5 NPU RL 官方推荐配套; no Parallel, no FA, no fused kernels, no MTP",
     ),
-    # 组合二：verl 0.8.0 + Megatron Core 0.16.0 + MindSpeed 0.15.3（旧版 NPU）
-    CompatEntry(
-        verl="0.8.0.dev",
-        megatron_core="0.16.0",
-        mindspeed="0.15.3",
-        patch_set_id="verl080_mcore016_ms0153",
-        notes="verl PPO pipeline + MindSpeed NPU; PP=1, CP=1, "
-              "no fused kernels, no MTP, no multi-modal",
-    ),
-    # 组合三：纯 Megatron Core + MindSpeed（无 verl）
+    # 组合二：纯 Megatron Core + MindSpeed（无 verl）
     CompatEntry(
         verl=None,
         megatron_core="0.12.0",

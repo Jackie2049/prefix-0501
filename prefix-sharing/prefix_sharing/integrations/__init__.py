@@ -17,7 +17,12 @@ from prefix_sharing.integrations.verl_mcore import (
     enable_prefix_sharing,
     prefix_sharing_enabled,
     build_prefix_sharing_micro_batch,
+    build_prefix_sharing_micro_batch_verl080,
     restore_suffix_first_log_probs_from_prefix,
+    read_ps_config_from_engine_config,
+)
+from prefix_sharing.integrations.megatron_runtime import (
+    maybe_run_prefix_sharing_attention,
 )
 
 __all__ = [
@@ -36,6 +41,9 @@ __all__ = [
     "prefix_sharing_runtime_context",
     "prefix_sharing_enabled",
     "build_prefix_sharing_micro_batch",
+    "build_prefix_sharing_micro_batch_verl080",
     "restore_suffix_first_log_probs_from_prefix",
+    "read_ps_config_from_engine_config",
+    "maybe_run_prefix_sharing_attention",
     "get_megatron_parallel_info",
 ]

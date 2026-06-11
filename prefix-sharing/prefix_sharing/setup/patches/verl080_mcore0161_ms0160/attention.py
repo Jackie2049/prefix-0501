@@ -1,31 +1,19 @@
-"""Patch: Attention.forward — Megatron Core v0.16.1
+"""Patch: Attention.forward — thin wrapper
 
-无 prefix-sharing context → 调用原始 forward
-有 context → 自行 QKV + THD squeeze + runtime_adapters RoPE (含 cp_group)
-             + backends build_kv/attention + self.linear_proj
+无 context → 调用原始 forward
+有 context → QKV + THD squeeze → delegate to integrations.maybe_run_prefix_sharing_attention
 
-与 verl080_mcore016_ms0153 的 attention.py 的关键区别：
-- mcore 0.16.1 的 apply_rotary_pos_emb 新增 cp_group 参数，
-  由 attention_module.pg_collection.cp 传入
-- kept_position_ids 现在从 ctx.kept_position_ids 获取
-  （PrefixSharingRuntimeState 新增了此字段）
+业务逻辑（RoPE、KV expansion、attention 计算）全部由 integrations 层处理，
+本 patch 只负责 QKV 提取（attention module 交互）和 THD squeeze（格式适配）。
 """
 
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
 
 def patch_megatron_attention(original_forward: Any) -> Any:
     """创建 Attention.forward 的 patch wrapper。"""
-
-    attn_mod = importlib.import_module("megatron.core.transformer.attention")
-    _yarn_fn = getattr(
-        attn_mod,
-        "_yarn_get_concentration_factor_from_config",
-        lambda config: 1.0,
-    )
 
     def patched_forward(
         self,
@@ -46,65 +34,58 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         from prefix_sharing.integrations.context import current_prefix_sharing_context
 
         ctx = current_prefix_sharing_context()
-        if ctx is not None:
-            # ── prefix-sharing path ──
-            # phase 1: training, THD, no fusion, no output gate
-            query, key, value = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                split_qkv=True,
-                output_gate=False,
-            )
-            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
-                query = query.squeeze(1)
-                key = key.squeeze(1)
-                value = value.squeeze(1)
-
-            # RoPE — 使用 runtime_adapters 适配 v0.16.x 的 cp_group 参数
-            from prefix_sharing.setup.runtime_adapters import (
-                apply_positioned_rope_v016,
-            )
-
-            query, key = apply_positioned_rope_v016(
+        if ctx is None:
+            # ── normal path: 调用原始 forward ──
+            return original_forward(
                 self,
-                query,
-                key,
-                rotary_pos_emb[0] if rotary_pos_emb else None,
-                rotary_pos_emb[1] if rotary_pos_emb else None,
-                ctx.kept_position_ids,
-                packed_seq_params,
-                mscale=_yarn_fn(self.config),
+                hidden_states,
+                attention_mask,
+                key_value_states=key_value_states,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                inference_params=inference_params,
             )
 
-            # KV expansion + attention — 使用 backends
-            from prefix_sharing.backends.torch_ref import TorchReferenceBackend
+        # ── prefix-sharing path ──
+        # phase 1: training, THD, no fusion, no output gate
 
-            backend = ctx.backend or TorchReferenceBackend()
-            tp_rank = _tensor_parallel_rank()
-            layer_id = int(getattr(self, "layer_number", 0) or 0)
+        # QKV extraction — attention module interaction, not business logic
+        query, key, value = self.get_query_key_value_tensors(
+            hidden_states,
+            key_value_states,
+            split_qkv=True,
+            output_gate=False,
+        )
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
 
-            expanded_key, expanded_value = backend.build_kv(
-                key,
-                value,
-                ctx.store,
-                ctx.prefix_sharing_plan,
-                layer_id=layer_id,
-                tp_rank=tp_rank,
-            )
-            core_attn_out = backend.attention(
-                query,
-                expanded_key,
-                expanded_value,
-                ctx.prefix_sharing_plan,
-                attention_mask=attention_mask,
-            )
-            core_attn_out = core_attn_out.reshape(
-                core_attn_out.size(0), 1, -1
-            )
-            output, bias = self.linear_proj(core_attn_out)
-            return output, bias
+        # delegate to verified integrations code
+        from prefix_sharing.integrations.megatron_runtime import (
+            maybe_run_prefix_sharing_attention,
+        )
 
-        # ── normal path: 调用原始 forward ──
+        result = maybe_run_prefix_sharing_attention(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            packed_seq_params,
+        )
+        if result is not None:
+            return result
+
+        # fallback: should not reach here if context is active,
+        # but return original forward as safety net
         return original_forward(
             self,
             hidden_states,
@@ -122,11 +103,3 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         )
 
     return patched_forward
-
-
-def _tensor_parallel_rank() -> int:
-    try:
-        from megatron.core import parallel_state
-        return int(parallel_state.get_tensor_model_parallel_rank())
-    except Exception:
-        return 0

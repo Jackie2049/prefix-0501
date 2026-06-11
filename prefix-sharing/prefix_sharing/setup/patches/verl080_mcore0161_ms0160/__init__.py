@@ -5,9 +5,7 @@ Patch 目标：
 2. Attention.forward                     → prefix-sharing attention 拦截
 3. vocab_parallel_log_probs_from_logits  → 自动 logprob restore
 
-与 verl080_mcore016_ms0153 的区别：
-- forward_step patch 需适配 verl_cdd9014f 的 engine 架构和 TensorDict 数据格式
-- Attention.forward patch 需适配 mcore 0.16.1 的 cp_group 参数
+所有业务逻辑由 integrations 层处理，本 patch set 只负责 thin wrapper 编排。
 """
 
 from prefix_sharing.setup.registry import PatchSpec

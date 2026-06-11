@@ -1,13 +1,20 @@
 """verl Megatron actor integration helpers.
 
-This module has two layers:
+This module covers both v070 and v080 (verl 0.8.0 engine) paths:
 
-* ``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
-  verl-style micro-batch payload into prefix-sharing metadata plus trimmed
-  inputs/labels/masks, and it assembles restored logprobs after forward.
-* ``VerlMCoreIntegration`` installs the Megatron attention patch. The real
-  Megatron QKV rewiring still requires the framework runtime and remains guarded
-  by optional integration tests.
+* v070: ``build_prefix_sharing_micro_batch`` and ``restore_suffix_first_log_probs_from_prefix``
+  handle the invasive integration via ``megatron_actor.py``.
+* v080: ``build_prefix_sharing_micro_batch_verl080`` and ``read_ps_config_from_engine_config``
+  handle the monkey-patch integration via ``setup/patches/``.
+
+Both paths share the same core logic (plan -> trim -> layout -> state).
+
+``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
+verl-style micro-batch payload into prefix-sharing metadata plus trimmed
+inputs/labels/masks, and it assembles restored logprobs after forward.
+``VerlMCoreIntegration`` installs the Megatron attention patch. The real
+Megatron QKV rewiring still requires the framework runtime and remains guarded
+by optional integration tests.
 """
 
 from __future__ import annotations
@@ -431,3 +438,237 @@ def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
             else:
                 current = getattr(current, part, default)
     return current
+
+
+# ═══════════════════════════════════════════════════════════════
+# verl 0.8.0 engine 架构适配
+# ═══════════════════════════════════════════════════════════════
+
+
+def read_ps_config_from_engine_config(engine_config: Any) -> Any | None:
+    """从 verl080 engine_config 读取 prefix_sharing_config。
+
+    verl080 engine_config 中 prefix_sharing_config 的位置：
+    1. engine_config.override_transformer_config 是 dict -> 从 dict 中取
+    2. engine_config.override_transformer_config 是对象 -> 从对象属性取
+    3. 回退 -> engine_config.prefix_sharing_config（直接挂在 engine_config 上）
+    """
+    override = getattr(engine_config, "override_transformer_config", None)
+    if override is not None:
+        if isinstance(override, dict):
+            return override.get("prefix_sharing_config")
+        return getattr(override, "prefix_sharing_config", None)
+    return getattr(engine_config, "prefix_sharing_config", None)
+
+
+def build_prefix_sharing_micro_batch_verl080(
+    engine_self: Any,
+    batch: Any,
+    ps_config: PrefixSharingConfig,
+) -> tuple[Any, PrefixSharingRuntimeState | None]:
+    """verl 0.8.0 engine 架构下的 prefix-sharing micro-batch 构建。
+
+    与 v070 的 build_prefix_sharing_micro_batch 共用核心流程（PATH 1-6），
+    差异仅在 config 来源和 batch 格式适配。
+
+    参数 ps_config 已由调用方通过 PrefixSharingConfig.from_raw() 解析完成，
+    不需要再次 from_raw。
+
+    核心原则：以 v070 验证过的 2D + attention_mask 路径为主，
+    NestedTensor 路径仅在 GPU + use_remove_padding=True 时作为可选优化。
+    NPU 不支持 torch.nested，所有 NPU 场景都走 2D 路径。
+    """
+    # ── PATH 1: prefix sharing disabled ──
+    if not ps_config.enable_prefix_sharing:
+        logger.info("[PS][prepare] PATH 1: prefix sharing disabled")
+        return batch, None
+
+    # ── 阶段 1: 配置校验 ──
+    use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
+    ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
+
+    # ── 阶段 2: fused kernels guard ──
+    try:
+        from verl.utils import tensordict_utils as tu
+        use_fused = tu.get_non_tensor_data(batch, "use_fused_kernels", default=False)
+    except Exception:
+        use_fused = False
+    if use_fused:
+        raise RuntimeError("prefix sharing phase 1 requires fused kernels disabled")
+
+    # ── 阶段 2.5: dynamic CP guard ──
+    if getattr(engine_self.engine_config, "dynamic_context_parallel", False):
+        raise RuntimeError("prefix sharing phase 1 does not support dynamic context parallel")
+
+    # ── 阶段 3: 从 batch 提取 2D tensors ──
+    # NestedTensor -> 转换为 2D + attention_mask -> 复用 v070 逻辑
+    # Plain 2D tensor -> 直接使用（与 v070 完全一致）
+    attention_mask, input_ids, position_ids = _extract_2d_tensors_from_batch(batch)
+
+    # ── PATH 4: wrong tensor dims ──
+    if attention_mask.dim() != 2 or input_ids.dim() != 2 or position_ids.dim() != 2:
+        logger.info("[PS][prepare] PATH 4: non-2D tensors detected")
+        return batch, None
+
+    # ── 阶段 4: 提取序列（与 v070 完全一致）──
+    attention_mask_bool = attention_mask.to(bool)
+    valid_indices = [
+        attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+        for row in range(input_ids.shape[0])
+    ]
+    sequences = [
+        input_ids[row, indices].detach().cpu().tolist()
+        for row, indices in enumerate(valid_indices)
+    ]
+
+    # ── 阶段 5: 前缀共享规划（与 v070 完全一致）──
+    plan = PrefixSharingPlanner(ps_config).plan(sequences)
+
+    # ── PATH 5: no sharing found ──
+    if not plan.has_sharing:
+        logger.info("[PS][prepare] PATH 5: no sharing detected")
+        return batch, None
+
+    # ── 阶段 6: trim + layout + state（与 v070 PATH 6 完全一致）──
+    trimmed_batch = _clone_batch(batch)
+    new_attention_mask = attention_mask_bool.clone()
+    new_attention_mask[:] = False
+    kept_position_rows = []
+
+    for row, indices in enumerate(valid_indices):
+        keep_start, keep_end = plan.input_keep_ranges[row]
+        kept_indices = indices[keep_start:keep_end]
+        new_attention_mask[row, kept_indices] = True
+        kept_position_rows.append(position_ids[row, kept_indices])
+
+    trimmed_batch["attention_mask"] = new_attention_mask
+
+    parallel_info = get_megatron_parallel_info()
+    align_size = (
+        parallel_info.tp_size * parallel_info.cp_size * 2
+        if parallel_info.cp_size > 1
+        else parallel_info.tp_size
+    )
+    packed_layout = PackedBatchLayout.from_kept_position_rows(
+        kept_position_rows,
+        align_size=int(align_size),
+    )
+
+    state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=plan,
+        backend=get_backend_instance(ps_config),
+        packed_batch_layout=packed_layout,
+        parallel_info=parallel_info,
+    )
+
+    logger.info(
+        "[PS][prepare] PATH 6: sharing detected, plan=%s, layout=%s",
+        plan,
+        packed_layout,
+    )
+    return trimmed_batch, state
+
+
+# ═══════════════════════════════════════
+# Batch 格式适配（verl080 TensorDict/NestedTensor）
+# ═══════════════════════════════════════
+
+def _extract_2d_tensors_from_batch(
+    batch: Any,
+) -> tuple[Any, Any, Any]:
+    """从 verl batch 中提取 attention_mask, input_ids, position_ids 为 2D tensors。
+
+    - Plain 2D tensor (v070 / NPU): 直接返回
+    - NestedTensor (GPU THD): 转换为 2D + attention_mask (padding 无效位置)
+
+    返回 (attention_mask, input_ids, position_ids)，均为 2D tensor。
+    """
+    import torch
+
+    input_ids = batch["input_ids"]
+    position_ids = batch["position_ids"]
+
+    # NestedTensor (jagged layout) -> 转换为 2D + attention_mask
+    if _is_nested_tensor(input_ids):
+        input_ids_2d, attention_mask_2d = _nested_to_2d(input_ids)
+        position_ids_2d = (
+            _nested_to_2d_position(position_ids)
+            if _is_nested_tensor(position_ids)
+            else position_ids
+        )
+        return attention_mask_2d, input_ids_2d, position_ids_2d
+
+    # Plain 2D tensor (v070 path)
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is None:
+        # THD format without explicit attention_mask -> all positions valid
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
+        attention_mask = torch.ones(
+            batch_size, seq_len, dtype=torch.bool, device=input_ids.device
+        )
+    return attention_mask, input_ids, position_ids
+
+
+def _is_nested_tensor(tensor: Any) -> bool:
+    """安全检测 NestedTensor，避免在 NPU 上引用 torch.nested 模块。
+
+    NPU 不支持 torch.nested，直接 isinstance(tensor, torch.nested.NestedTensor)
+    会崩溃。使用 duck-typing: 有 offsets() 和 values() 方法即为 NestedTensor。
+    """
+    return (
+        hasattr(tensor, "offsets")
+        and callable(tensor.offsets)
+        and hasattr(tensor, "values")
+        and callable(tensor.values)
+    )
+
+
+def _nested_to_2d(nested_tensor: Any) -> tuple[Any, Any]:
+    """将 NestedTensor (jagged layout) 转换为 2D tensor + attention_mask。
+
+    Padding 短序列到 max_seqlen，attention_mask 标记有效位置。
+    """
+    import torch
+
+    offsets = nested_tensor.offsets()
+    values = nested_tensor.values()
+    lengths = offsets.diff().tolist()
+    max_seqlen = int(max(lengths))
+    batch_size = len(lengths)
+
+    padded = torch.zeros(
+        batch_size, max_seqlen,
+        dtype=values.dtype, device=values.device,
+    )
+    mask = torch.zeros(
+        batch_size, max_seqlen,
+        dtype=torch.bool, device=values.device,
+    )
+    for i in range(batch_size):
+        seq_len = int(lengths[i])
+        padded[i, :seq_len] = values[offsets[i]:offsets[i + 1]]
+        mask[i, :seq_len] = True
+
+    return padded, mask
+
+
+def _nested_to_2d_position(nested_tensor: Any) -> Any:
+    """将 position_ids NestedTensor 转换为 2D tensor（padding 用 0）。"""
+    import torch
+
+    offsets = nested_tensor.offsets()
+    values = nested_tensor.values()
+    lengths = offsets.diff().tolist()
+    max_seqlen = int(max(lengths))
+    batch_size = len(lengths)
+
+    padded = torch.zeros(
+        batch_size, max_seqlen,
+        dtype=values.dtype, device=values.device,
+    )
+    for i in range(batch_size):
+        seq_len = int(lengths[i])
+        padded[i, :seq_len] = values[offsets[i]:offsets[i + 1]]
+
+    return padded
