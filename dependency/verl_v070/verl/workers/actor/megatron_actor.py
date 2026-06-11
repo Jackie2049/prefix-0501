@@ -687,6 +687,16 @@ class MegatronPPOActor(BasePPOActor):
                         # )
                         entropy = vocab_parallel_entropy(logits)
                         ret["entropy"] = entropy
+                        ########## prefix-sharing logits/entropy dump ##########
+                        _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
+                        if _ps_dump_dir:
+                            os.makedirs(_ps_dump_dir, exist_ok=True)
+                            if torch.distributed.get_rank() == 0:
+                                tag = "old" if forward_only else "train"
+                                torch.save(logits.detach().clone(), os.path.join(_ps_dump_dir, f"logits_{tag}.pt"))
+                                torch.save(entropy.detach().clone(), os.path.join(_ps_dump_dir, f"entropy_{tag}.pt"))
+                                torch.save(label.detach().cpu().clone(), os.path.join(_ps_dump_dir, "label.pt"))
+                        ########## prefix-sharing logits/entropy dump ##########
                     else:
                         logits_bak = logits
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
