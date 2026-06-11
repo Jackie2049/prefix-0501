@@ -45,7 +45,8 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
             from verl.utils.megatron_utils import get_device_id
             batch = batch.to(get_device_id())
 
-            ps_state = build_prefix_sharing_micro_batch_verl080(self, batch, ps_config)
+            # 返回 (trimmed_batch, state) — 解包 tuple
+            batch, ps_state = build_prefix_sharing_micro_batch_verl080(self, batch, ps_config)
 
         # ── 构造修改后的 iterator 喂回原始 forward_step ──
         modified_iter = iter([batch])
