@@ -29,10 +29,14 @@ def maybe_run_prefix_sharing_attention(
     import logging
     prefix_log = logging.getLogger(__file__)
     prefix_log.warning("\n\n\nsuccess come into def maybe_run_prefix_sharing_attention\n\n\n")
+    print(f"[PS][HOOK] maybe_run_prefix_sharing_attention ENTER: "
+          f"q={tuple(query.shape)}, k={tuple(key.shape)}, v={tuple(value.shape)}",
+          flush=True)
 
     ctx = current_prefix_sharing_context()
     if ctx is None:
         prefix_log.warning("\n\n\nctx is None\n\n\n")
+        print("[PS][HOOK] ctx is None — no prefix_sharing_runtime_context active, returning None", flush=True)
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
