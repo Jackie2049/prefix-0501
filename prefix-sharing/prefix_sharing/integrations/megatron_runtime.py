@@ -201,12 +201,18 @@ def _apply_positioned_rope(
     # Build kwargs for apply_rotary_pos_emb.
     # Only include version-specific params when they're provided,
     # to maintain backward compat with v070 (mcore <= 0.15.x).
-    def _rope_kwargs(cu_seqlens: Any | None) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"config": attention_module.config, "cu_seqlens": cu_seqlens}
+    def _rope_kwargs(_unused_cu_seqlens: Any | None) -> dict[str, Any]:
+        """Build kwargs for apply_rotary_pos_emb.
+
+        NOTE: cu_seqlens is ALWAYS set to None here because we pre-selected the
+        correct frequencies via index_select(0, packed_position_ids) above.
+        Passing real cu_seqlens would trigger the THD RoPE path, which re-splits
+        sequences and calls torch.cat — unnecessary double work and breaks on
+        NPU (aclnnCat failure).
+        """
+        kwargs: dict[str, Any] = {"config": attention_module.config, "cu_seqlens": None}
         if mscale is not None and mscale != 1.0:
             kwargs["mscale"] = mscale
-        if cp_group is not None:
-            kwargs["cp_group"] = cp_group
         return kwargs
 
     if q_pos_emb is not None:
