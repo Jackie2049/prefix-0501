@@ -170,8 +170,6 @@ def _compare_2d(
 
     max_diff = diff[mask].max().item() if mask.any() else 0.0
     mean_diff = diff[mask].mean().item() if mask.any() else 0.0
-    # 每位置最大差异
-    per_pos = diff.max(dim=0) if diff.ndim > 1 else diff
 
     print(f"shape=({B}, {L})  active_tokens={active}")
     print(f"max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  mismatched={n_mismatch}")
@@ -196,10 +194,12 @@ def _compare_2d(
     # 汇总每行不匹配数
     per_row = (diff > atol).sum(dim=1)
     for b in range(B):
-        if per_row[b].item() > 0:
-            print(f"  row[{b}]: {per_row[b].item()} mismatches "
-                  f"(max_per_pos_diff={per_pos[:, b].max().item():.6e}"
-                  f" @ pos {per_pos[:, b].argmax().item()})")
+        n_row = per_row[b].item()
+        if n_row > 0:
+            row_max = diff[b].max().item()
+            row_max_pos = diff[b].argmax().item()
+            print(f"  row[{b}]: {int(n_row)} mismatches "
+                  f"(max_diff_in_row={row_max:.6e} @ col {row_max_pos})")
 
 
 def _compare_3d(
