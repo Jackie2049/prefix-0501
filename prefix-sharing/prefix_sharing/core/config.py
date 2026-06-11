@@ -80,6 +80,9 @@ class PrefixSharingConfig:
     def __post_init__(self) -> None:
         if _env_enables_prefix_sharing() and not self.enable_prefix_sharing:
             object.__setattr__(self, "enable_prefix_sharing", True)
+        _env_backend = os.getenv("PREFIX_SHARING_BACKEND")
+        if _env_backend and self.backend == "torch_ref":
+            object.__setattr__(self, "backend", _env_backend)
 
     @classmethod
     def from_raw(cls, raw: Any) -> "PrefixSharingConfig":
