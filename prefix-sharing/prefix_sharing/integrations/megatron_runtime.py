@@ -59,7 +59,14 @@ def maybe_run_prefix_sharing_attention(
     mscale = _get_yarn_mscale(attention_module)
     cp_group = _get_cp_group(attention_module)
 
-    q_pos_emb, k_pos_emb = rotary_pos_emb
+    # mcore 0.16.1: rotary_pos_emb 是单 tensor（Q/K 共用）
+    # mcore <= 0.15.x: rotary_pos_emb 是 (q_pos_emb, k_pos_emb) tuple
+    if isinstance(rotary_pos_emb, (tuple, list)) and len(rotary_pos_emb) == 2:
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+    else:
+        # 单 tensor 格式，Q/K 共用同一个频率嵌入
+        q_pos_emb = rotary_pos_emb
+        k_pos_emb = rotary_pos_emb
     query, key = _apply_positioned_rope(
         attention_module,
         query,
