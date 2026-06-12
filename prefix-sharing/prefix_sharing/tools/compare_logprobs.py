@@ -185,9 +185,11 @@ def _compute_2d_diff(t1: torch.Tensor, t2: torch.Tensor,
     """
     diff = (t1 - t2).abs()
     if compare_mask is not None:
-        mask = compare_mask.to(torch.bool) & (diff == diff)  # 排除 NaN
+        # 用 logical_and 而非 &：旧格式 tensor 可能导致 Python
+        # 运算符重载异常（"cannot be converted to Scalar"）
+        mask = torch.logical_and(compare_mask.to(torch.bool), (diff == diff))
     else:
-        mask = (t1 != 0) | (t2 != 0)
+        mask = torch.logical_or(t1 != 0, t2 != 0)
     return diff, mask
 
 
@@ -220,6 +222,28 @@ def _compute_pearson_r(t1: torch.Tensor, t2: torch.Tensor, mask: torch.Tensor) -
     if std_x == 0 or std_y == 0:
         return float("nan")
     return float(cov / (std_x * std_y))
+
+
+def _validate_no_zero_in_mask(tensor: torch.Tensor, mask: torch.Tensor,
+                               name: str, side: str) -> int:
+    """检查 mask 标记的有效位置中是否有值为 0 的元素。
+
+    label_mask 内所有位置都经过了 masked_fill 清零 + restore 注入，
+    理应全部非零。出现 0 说明拼接阶段（restore / masked_fill）就有 bug。
+    """
+    zero_mask = torch.logical_and(mask, (tensor == 0))
+    n_zero = int(zero_mask.sum().item())
+    if n_zero > 0:
+        print(f"  !! {name} [{side}]: {n_zero} 个 label_mask 内位置值为 0（拼接异常！）")
+        zero_positions = zero_mask.nonzero(as_tuple=False)
+        n_show = min(20, n_zero)
+        for idx in zero_positions[:n_show]:
+            b, p = idx[0].item(), idx[1].item()
+            print(f"      [{b:>4d},{p:>4d}] = 0.0")
+        if n_zero > n_show:
+            print(f"      ... 还有 {n_zero - n_show} 个")
+        print()
+    return n_zero
 
 
 # ──────────────────────────────────────────────
@@ -523,7 +547,10 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             # entropy: 用 label_mask（[-response_length-1:-1]）标记有效对比位置，
             # 纯结构信号，不依赖任何运行时数值。
             ent_compare_mask = load_label_mask(dir1)
-            if ent_compare_mask is None:
+            if ent_compare_mask is not None:
+                _validate_no_zero_in_mask(ent1, ent_compare_mask, f"entropy_{tag}", "ON")
+                _validate_no_zero_in_mask(ent2, ent_compare_mask, f"entropy_{tag}", "OFF")
+            else:
                 ent_compare_mask = (ent1 != 0)  # 兼容老 dump
             diff, mask = _compute_2d_diff(ent1, ent2, compare_mask=ent_compare_mask)
             r = CompareResult.from_2d_diff(f"entropy_{tag}", diff, mask, atol,
@@ -585,6 +612,9 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             # logprobs: label_mask 标记 [-response_length-1:-1]，
             # 两侧都通过 masked_fill(~label_mask, 0.0) 显式清零 prompt。
             lp_compare_mask = load_label_mask(dir1)
+            if lp_compare_mask is not None:
+                _validate_no_zero_in_mask(lp1, lp_compare_mask, "logprobs", "ON")
+                _validate_no_zero_in_mask(lp2, lp_compare_mask, "logprobs", "OFF")
             diff, mask = _compute_2d_diff(lp1, lp2, compare_mask=lp_compare_mask)
             r = CompareResult.from_2d_diff("logprobs", diff, mask, atol,
                                            t1=lp1, t2=lp2)
