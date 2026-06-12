@@ -2,7 +2,7 @@
 
 This module covers both v070 and v080 (verl 0.8.0 engine) paths:
 
-* v070: ``build_prefix_sharing_micro_batch`` and ``restore_suffix_first_log_probs_from_prefix``
+* v070: ``build_prefix_sharing_micro_batch_verl070`` and ``restore_suffix_first_log_probs_from_prefix``
   handle the invasive integration via ``megatron_actor.py``.
 * v080: ``build_prefix_sharing_micro_batch_verl080`` and ``read_ps_config_from_engine_config``
   handle the monkey-patch integration via ``setup/patches/``.
@@ -197,7 +197,7 @@ def prefix_sharing_enabled(
         handle.disable()
 
 
-def build_prefix_sharing_micro_batch(
+def build_prefix_sharing_micro_batch_verl070(
     batch: Any,
     actor_config: Any,
     model_config: Any,
@@ -468,7 +468,7 @@ def build_prefix_sharing_micro_batch_verl080(
 ) -> tuple[Any, PrefixSharingRuntimeState | None]:
     """verl 0.8.0 engine 架构下的 prefix-sharing micro-batch 构建。
 
-    与 v070 的 build_prefix_sharing_micro_batch 共用核心流程（PATH 1-6），
+    与 v070 的 build_prefix_sharing_micro_batch_verl070 共用核心流程（PATH 1-6），
     差异仅在 config 来源和 batch 格式适配。
 
     参数 ps_config 已由调用方通过 PrefixSharingConfig.from_raw() 解析完成，
@@ -487,7 +487,7 @@ def build_prefix_sharing_micro_batch_verl080(
     use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
     ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
 
-    # ── 阶段 2: fused kernels guard ──
+    # ── 阶段 2: 拒绝不支持的特性 ──
     try:
         from verl.utils import tensordict_utils as tu
         use_fused = tu.get_non_tensor_data(batch, "use_fused_kernels", default=False)
@@ -495,8 +495,6 @@ def build_prefix_sharing_micro_batch_verl080(
         use_fused = False
     if use_fused:
         raise RuntimeError("prefix sharing phase 1 requires fused kernels disabled")
-
-    # ── 阶段 2.5: dynamic CP guard ──
     if getattr(engine_self.engine_config, "dynamic_context_parallel", False):
         raise RuntimeError("prefix sharing phase 1 does not support dynamic context parallel")
 
@@ -505,11 +503,11 @@ def build_prefix_sharing_micro_batch_verl080(
     # Plain 2D → 从 attention_mask.nonzero() 提取
     # 同时保留 attention_mask_bool，供阶段 6 的 _collect_kept_position_rows 使用。
     input_ids = batch["input_ids"]
-    is_nested = _is_nested_tensor(input_ids)
+    is_nested_tensor = _is_nested_tensor(input_ids)
     attention_mask_bool_for_layout = None
 
-    if is_nested:
-        sequences = _extract_sequences_from_nested(input_ids)
+    if is_nested_tensor:
+        sequences = _extract_seq_from_nested_tensor(input_ids)
     else:
         # plain 2D tensor（需要 attention_mask）
         attention_mask = batch.get("attention_mask")
@@ -529,29 +527,26 @@ def build_prefix_sharing_micro_batch_verl080(
 
     # ── 阶段 4: 前缀共享规划 ──
     plan = PrefixSharingPlanner(ps_config).plan(sequences)
-
-    # ── PATH 5: no sharing found ──
     if not plan.has_sharing:
-        logger.info("[PS][prepare] PATH 5: no sharing detected")
+        logger.info("[PS][prepare] no prefix sharing detected")
         return batch, None
 
-    # ── 阶段 6: 物理裁剪 batch + layout + state ──
-    # 与 v070 的核心区别：v070 只改 attention_mask（Megatron 从 mask 动态重算 packed），
-    # v080 THD 路径用 preprocess_thd_engine(input_ids) 直接处理数据，
-    # 不看 attention_mask。因此必须物理裁剪 input_ids/position_ids。
-    is_nested = _is_nested_tensor(batch["input_ids"])
-
-    if is_nested:
+    # ── 阶段 5: 物理裁剪 batch ──
+    #   与 v070 的核心区别：v070 只改 attention_mask（Megatron 从 mask 动态重算 packed），
+    #   v080 THD 路径用 preprocess_thd_engine(input_ids) 直接处理数据，
+    #   不看 attention_mask。必须物理裁剪 input_ids/position_ids。
+    if is_nested_tensor:
         trimmed_batch = _trim_nested_batch(batch, plan)
     else:
         trimmed_batch = _trim_plain_batch_thd(batch, plan)
 
     # layout 计算：从 trimmed 后的实际 kept position rows 构建
     kept_position_rows = _collect_kept_position_rows(
-        trimmed_batch, plan, is_nested,
+        trimmed_batch, plan, is_nested_tensor,
         attention_mask_bool=attention_mask_bool_for_layout,
     )
 
+    # ── 阶段 6: 构建 layout ──
     parallel_info = get_megatron_parallel_info()
     align_size = (
         parallel_info.tp_size * parallel_info.cp_size * 2
@@ -563,6 +558,7 @@ def build_prefix_sharing_micro_batch_verl080(
         align_size=int(align_size),
     )
 
+    # ── 阶段 7: 构建 state ──
     state = PrefixSharingRuntimeState(
         prefix_sharing_plan=plan,
         backend=get_backend_instance(ps_config),
@@ -571,9 +567,7 @@ def build_prefix_sharing_micro_batch_verl080(
     )
 
     logger.info(
-        "[PS][prepare] PATH 6: sharing detected, plan=%s, layout=%s",
-        plan,
-        packed_layout,
+        f"[PS][prepare] PATH 6: sharing detected, plan={plan}, layout={packed_layout}"
     )
 
     return trimmed_batch, state
@@ -746,7 +740,7 @@ def _slice_2d_position_rows(
 def _collect_kept_position_rows(
     trimmed_batch: Any,
     plan: PrefixSharingPlan,
-    is_nested: bool,
+    is_nested_tensor: bool,
     attention_mask_bool: Any | None = None,
 ) -> list[Any]:
     """从裁剪后的 batch 中收集各序列的 kept position_ids（per-row 1D tensors）。
@@ -759,7 +753,7 @@ def _collect_kept_position_rows(
     """
     position_ids = trimmed_batch["position_ids"]
 
-    if is_nested or _is_nested_tensor(position_ids):
+    if is_nested_tensor or _is_nested_tensor(position_ids):
         offsets = position_ids.offsets()
         values = position_ids.values()
         return [values[offsets[i]:offsets[i + 1]] for i in range(len(plan.input_keep_ranges))]
@@ -793,7 +787,7 @@ def _is_nested_tensor(tensor: Any) -> bool:
     )
 
 
-def _extract_sequences_from_nested(nested_tensor: Any) -> list[list[int]]:
+def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
     """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。"""
     offsets = nested_tensor.offsets()
     values = nested_tensor.values()

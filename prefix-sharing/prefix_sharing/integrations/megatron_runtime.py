@@ -29,9 +29,8 @@ def prefix_attention(
     Returns ``None`` for the normal Megatron path. When active, this function
     owns RoPE, KV expansion, causal masking, and output projection.
     """
-
     logger.warning("\n\n\nsuccess come into def prefix_attention\n\n\n")
-    
+
     # 读取并校验前缀共享上下文 prefix_sharing_context
     prefix_sharing_context = current_prefix_sharing_context()
     if prefix_sharing_context is None:
