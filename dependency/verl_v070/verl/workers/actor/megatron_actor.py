@@ -751,11 +751,11 @@ class MegatronPPOActor(BasePPOActor):
                                            os.path.join(_ps_dump_dir, f"entropy_{tag}.pt"))
                             torch.save(label.detach().cpu().clone(),
                                        os.path.join(_ps_dump_dir, "label.pt"))
-                            # Purely structural mask of positions that matter
-                            # for loss: label_mask is True exactly on
-                            # [-response_length-1:-1], the same slice used by
-                            # both log_probs and entropy in loss_func.
-                            # Derived from attention_mask, no runtime values.
+                            # Canonical structural mask: pre-packing label_mask,
+                            # True on [-response_length-1:-1] (loss-effective slice).
+                            # Saved as reference; compare tool derives per-tensor mask
+                            # when tensor shape differs (e.g. log_probs may be packed
+                            # differently than entropy in ON mode).
                             torch.save(label_mask.cpu().clone(),
                                        os.path.join(_ps_dump_dir, "label_mask.pt"))
                     ########## prefix-sharing dump ##########

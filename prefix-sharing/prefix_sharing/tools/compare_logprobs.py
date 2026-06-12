@@ -59,17 +59,21 @@ def load_tensor(filepath: str, dtype: str | None = None) -> torch.Tensor:
 
 
 def load_label_mask(dir_path: str) -> torch.Tensor | None:
-    """加载结构掩码 label_mask.pt（若存在）。
+    """加载 canonical 结构掩码 label_mask.pt（若存在）。
 
-    label_mask 是 dump 时保存的 bool tensor [B, L]，恰好标记了
-    [-response_length-1:-1] 范围——即 log_probs 和 entropy 最终
-    参与 loss 的位置。它从 attention_mask 派生，是纯结构信号。
+    保存的是 pre-packing label_mask，shape 可能和实际 logprobs/entropy
+    tensor 不一致（ON 模式下 log_probs 可能被额外 pack 到不同长度）。
+    调用方需根据 tensor 实际 shape 决定使用 canonical mask 还是自行推导。
     """
     path = os.path.join(dir_path, "label_mask.pt")
     if not os.path.exists(path):
         return None
     t = torch.load(path, weights_only=True)
     return t.to(torch.bool)
+
+
+
+
 
 
 # ──────────────────────────────────────────────
@@ -544,14 +548,13 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             detail_data.append({"type": "shape_mismatch", "name": f"entropy_{tag}",
                                 "t1": ent1, "t2": ent2, "result": r})
         else:
-            # entropy: 用 label_mask（[-response_length-1:-1]）标记有效对比位置，
-            # 纯结构信号，不依赖任何运行时数值。
+            # entropy: 用 canonical label_mask（[-response_length-1:-1]），
+            # 纯结构信号，不依赖运行时熵值。
             ent_compare_mask = load_label_mask(dir1)
-            if ent_compare_mask is not None:
-                _validate_no_zero_in_mask(ent1, ent_compare_mask, f"entropy_{tag}", "ON")
-                _validate_no_zero_in_mask(ent2, ent_compare_mask, f"entropy_{tag}", "OFF")
-            else:
+            if ent_compare_mask is None:
                 ent_compare_mask = (ent1 != 0)  # 兼容老 dump
+            _validate_no_zero_in_mask(ent1, ent_compare_mask, f"entropy_{tag}", "ON")
+            _validate_no_zero_in_mask(ent2, ent_compare_mask, f"entropy_{tag}", "OFF")
             diff, mask = _compute_2d_diff(ent1, ent2, compare_mask=ent_compare_mask)
             r = CompareResult.from_2d_diff(f"entropy_{tag}", diff, mask, atol,
                                            t1=ent1, t2=ent2)
@@ -577,9 +580,9 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
                                 "t1": log1, "t2": log2, "result": r})
         else:
             # logits: label_mask 标记有效位置，扩展到 vocab 维。
-            label_mask_2d = load_label_mask(dir1)
-            if label_mask_2d is not None:
-                log_compare_mask = label_mask_2d.unsqueeze(-1).expand_as(log1)
+            canonical_mask = load_label_mask(dir1)
+            if canonical_mask is not None and canonical_mask.shape == log1.shape[:2]:
+                log_compare_mask = canonical_mask.unsqueeze(-1).expand_as(log1)
             else:
                 log_pos_valid = (log1.abs().max(dim=-1, keepdim=True).values > 1e-8)
                 log_compare_mask = log_pos_valid.expand_as(log1)
@@ -609,12 +612,12 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             detail_data.append({"type": "shape_mismatch", "name": "logprobs",
                                 "t1": lp1, "t2": lp2, "result": r})
         else:
-            # logprobs: label_mask 标记 [-response_length-1:-1]，
-            # 两侧都通过 masked_fill(~label_mask, 0.0) 显式清零 prompt。
-            lp_compare_mask = load_label_mask(dir1)
-            if lp_compare_mask is not None:
-                _validate_no_zero_in_mask(lp1, lp_compare_mask, "logprobs", "ON")
-                _validate_no_zero_in_mask(lp2, lp_compare_mask, "logprobs", "OFF")
+            # logprobs: 用 OFF (baseline) 的 log_probs != 0 做 mask，
+            # 因为 OFF 全量计算 + masked_fill(~label_mask, 0.0) 显式清零，
+            # shape 天生与 ON log_probs 一致，且 independent of ON 运行时值。
+            lp_compare_mask = (lp2 != 0)
+            _validate_no_zero_in_mask(lp1, lp_compare_mask, "logprobs", "ON")
+            _validate_no_zero_in_mask(lp2, lp_compare_mask, "logprobs", "OFF")
             diff, mask = _compute_2d_diff(lp1, lp2, compare_mask=lp_compare_mask)
             r = CompareResult.from_2d_diff("logprobs", diff, mask, atol,
                                            t1=lp1, t2=lp2)
