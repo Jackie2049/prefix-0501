@@ -50,26 +50,46 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# ═══════════════════════════════════════════════════════════════
-# 跨 patch 传递裁剪后的序列长度
-# ═══════════════════════════════════════════════════════════════
 
-_ps_trimmed_valid_lengths: list[int] | None = None
-"""no_padding_2_padding 补丁读取的裁剪后序列长度。不消费（被多次调用）。"""
+def adjust_attention_mask_for_prefix_sharing(
+    batch: Any,
+    plan: PrefixSharingPlan,
+) -> None:
+    """修改 batch["attention_mask"] 以反映 prefix-sharing 裁剪后的实际长度。
 
+    物理裁剪 input_ids 后，模型输出的 flatten token 数减少。
+    no_padding_2_padding 用外层 batch_td 的 attention_mask 计算
+    prompt_lens / response_lens，断言 sum == model_output_token_count。
+    裁剪后 sum(原始长度) > trimmed token 数 → 断言失败。
 
-def set_trimmed_valid_lengths(lengths: list[int]) -> None:
-    global _ps_trimmed_valid_lengths
-    _ps_trimmed_valid_lengths = lengths
+    此函数将 reuser 被裁掉的 prefix 位置在 attention_mask 中置为 False，
+    使 no_padding_2_padding 自然算出裁剪后的 prompt_lens，无需 patch
+    no_padding_2_padding 本身（losses.py 用 from ... import 直接引用，
+    monkey-patch module attribute 无法拦截）。
 
+    与 v070 的 build_prefix_sharing_micro_batch（lines 289-300）逻辑一致。
+    """
+    import torch
 
-def get_trimmed_valid_lengths() -> list[int] | None:
-    return _ps_trimmed_valid_lengths
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is None:
+        return
+    # 只处理 2D attention_mask（NestedTensor 不需要，no_padding_2_padding
+    # NestedTensor 路径用 offsets().diff()）
+    if attention_mask.dim() != 2:
+        return
 
+    attention_mask_bool = attention_mask.to(bool)
 
-def clear_trimmed_valid_lengths() -> None:
-    global _ps_trimmed_valid_lengths
-    _ps_trimmed_valid_lengths = None
+    # 全置 False，然后只把 kept 区段置 True
+    new_mask = torch.zeros_like(attention_mask_bool)
+    for row in range(attention_mask_bool.shape[0]):
+        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+        keep_start, keep_end = plan.input_keep_ranges[row]
+        kept_indices = indices[keep_start:keep_end]
+        new_mask[row, kept_indices] = True
+
+    batch["attention_mask"] = new_mask.to(attention_mask.dtype)
 
 
 @dataclass(frozen=True)
@@ -590,9 +610,6 @@ def build_prefix_sharing_micro_batch_verl080(
         plan,
         packed_layout,
     )
-
-    # 存入裁剪后的 valid_lengths，供 no_padding_2_padding patch 使用
-    set_trimmed_valid_lengths(packed_layout.valid_lengths)
 
     return trimmed_batch, state
 

@@ -323,3 +323,71 @@ def test_auto_activation_attempts_with_env_var_true(monkeypatch):
     importlib.reload(prefix_sharing)
     # 本地没有 verl/Megatron，版本不兼容，应安全回退
     assert prefix_sharing._patch_handle is None
+
+
+# ═══════════════════════════════════════
+# adjust_attention_mask_for_prefix_sharing
+# ═══════════════════════════════════════
+
+
+def test_adjust_attention_mask_reduces_prompt_lens():
+    """物理裁剪后 attention_mask 必须同步调整，否则
+    no_padding_2_padding 的 prompt_lens/response_lens 断言失败。
+
+    模拟场景：provider=[0,1,2,3,4], reuser=[0,1,2,5,6]
+    prefix=[0,1,2] 被裁掉，reuser 只保留 [5,6]（keep_range=(3,5)）。
+    adjust 后 reuser 行只有 suffix+response 位置的 mask 为 True。
+    """
+    import torch
+    from prefix_sharing.core.planner import PrefixSharingPlanner
+    from prefix_sharing.integrations.verl_mcore import adjust_attention_mask_for_prefix_sharing
+
+    # provider: 5 valid tokens (prompt=3 + response=2)
+    # reuser:   5 valid tokens (prompt=3 + response=2), prefix=[0,1,2] shared
+    sequences = [[10, 11, 12, 30, 31], [10, 11, 12, 40, 41]]
+    config = PrefixSharingConfig(enable_prefix_sharing=True, min_group_size=2)
+    plan = PrefixSharingPlanner(config).plan(sequences)
+    assert plan.has_sharing
+
+    # 构造模拟 attention_mask (2D, 2 rows × 5 cols, 全 True)
+    attention_mask = torch.ones(2, 5, dtype=torch.int32)
+    batch = {"attention_mask": attention_mask}
+
+    adjust_attention_mask_for_prefix_sharing(batch, plan)
+
+    # provider 行 (row=0): keep_range=(0, 5) → 全部保留
+    assert batch["attention_mask"][0].sum().item() == 5
+    # reuser 行 (row=1): keep_range=(3, 5) → 只保留 suffix+response (2 tokens)
+    assert batch["attention_mask"][1].sum().item() == 2
+
+    # 模拟 no_padding_2_padding 的 prompt_lens 计算
+    # 假设 prompt_ids.shape[1] = 3 (3 个 prompt token 列)
+    prompt_len = 3
+    prompt_lens = batch["attention_mask"][:, :prompt_len].sum(dim=1)
+    response_lens = batch["attention_mask"][:, prompt_len:].sum(dim=1)
+
+    # provider: prompt_lens=3 (unchanged), response_lens=2 (unchanged)
+    assert prompt_lens[0].item() == 3
+    assert response_lens[0].item() == 2
+    # reuser: prompt_lens=0 (prefix removed), response_lens=2 (unchanged)
+    assert prompt_lens[1].item() == 0
+    assert response_lens[1].item() == 2
+
+    # 模拟断言: sum(prompt_lens + response_lens) == trimmed token count
+    # provider: 3+2=5, reuser: 0+2=2, total=7
+    # 模型输出裁剪后应该是 7 tokens (provider 全量 5 + reuser suffix 2)
+    sequence_lens = prompt_lens + response_lens
+    assert sequence_lens.sum().item() == 7
+
+
+def test_adjust_attention_mask_no_op_when_missing():
+    """batch 没有 attention_mask 时不做任何修改。"""
+    from prefix_sharing.core.planner import PrefixSharingPlanner
+    from prefix_sharing.integrations.verl_mcore import adjust_attention_mask_for_prefix_sharing
+
+    sequences = [[1, 2, 3], [1, 2, 4]]
+    config = PrefixSharingConfig(enable_prefix_sharing=True, min_group_size=2)
+    plan = PrefixSharingPlanner(config).plan(sequences)
+    batch = {}
+    adjust_attention_mask_for_prefix_sharing(batch, plan)
+    assert "attention_mask" not in batch
