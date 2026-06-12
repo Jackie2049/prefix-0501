@@ -704,10 +704,11 @@ class Attention(MegatronModule, ABC):
                 batch_size = packed_seq_params.cu_seqlens_q_padded.shape[0] - 1
             else:
                 batch_size = query.shape[1]  # fallback for BSH path
-            dump_off(output, packed_seq_params, self.layer_number, batch_size)
+            dump_off(output, packed_seq_params, self.layer_number,
+                     batch_size, self.config.num_layers)
         except Exception as e:
             import logging
-            logging.getLogger(__file__).warning("first-attn dump (OFF) failed: %s", e)
+            logging.getLogger(__file__).warning("last-attn dump (OFF) failed: %s", e)
         # ---
 
         return output, bias

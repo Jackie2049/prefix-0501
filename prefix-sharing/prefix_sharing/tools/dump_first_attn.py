@@ -1,4 +1,8 @@
-"""Dump first-layer attention output for ON/OFF comparison.
+"""Dump last-layer attention output for ON/OFF comparison.
+
+Error accumulation will amplify systematic bugs by the last layer,
+while precision noise stays bounded.  Comparing the last layer
+therefore gives a stronger signal than the first layer.
 
 Usage:
     export PREFIX_SHARING_FIRST_ATTN_DUMP=/path/to/dump_dir
@@ -31,7 +35,7 @@ def _dump(
     packed_seq_params: Any,
     prefix_lens_list: list[int],
 ) -> None:
-    """Save attention output + metadata for the first layer.
+    """Save attention output + metadata for the last layer.
 
     Only saves on rank 0 (no distributed check needed for single-GPU).
     """
@@ -69,13 +73,14 @@ def dump_on(
     packed_seq_params: Any,
     prefix_sharing_plan: Any,
     layer_number: int,
+    num_layers: int,
 ) -> None:
     """Called from maybe_run_prefix_sharing_attention (ON mode).
 
-    Dumps first-layer (layer_number==1) attention output.
+    Dumps last-layer (layer_number==num_layers) attention output.
     Megatron layer_number is 1-indexed.
     """
-    if layer_number != 1:
+    if layer_number != num_layers:
         return
     _dump(output_tensor, packed_seq_params,
           list(prefix_sharing_plan.prefix_lens))
@@ -86,12 +91,13 @@ def dump_off(
     packed_seq_params: Any,
     layer_number: int,
     batch_size: int,
+    num_layers: int,
 ) -> None:
     """Called from attention.py forward normal path (OFF mode).
 
-    Dumps first-layer (layer_number==1) attention output.
+    Dumps last-layer (layer_number==num_layers) attention output.
     """
-    if layer_number != 1:
+    if layer_number != num_layers:
         return
     if packed_seq_params is None \
        or not hasattr(packed_seq_params, 'cu_seqlens_q_padded'):
