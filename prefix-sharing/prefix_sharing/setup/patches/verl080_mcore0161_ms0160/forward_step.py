@@ -25,9 +25,9 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         postprocess_micro_batch_func,
     ):
         # ── 消费 micro-batch ──
-        # batch_iter 来自外层 engine，batch 就是外层的 batch_td 本身。
-        # 我们必须保留对 original_batch 的引用，以便在裁剪后修改
-        # original_batch 的 attention_mask（no_padding_2_padding 会读它）。
+        # batch_iter 来自外层 engine 的 forward_step 调用方。
+        # 消费原始 batch，后续由 build_prefix_sharing_micro_batch_verl080
+        # 返回 trimmed_batch（物理裁剪后的 micro-batch）和 ps_state。
         original_batch = next(batch_iter)
 
         # ── prefix-sharing: 读 config → 构建状态 ──

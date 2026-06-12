@@ -51,47 +51,6 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-def adjust_attention_mask_for_prefix_sharing(
-    batch: Any,
-    plan: PrefixSharingPlan,
-) -> None:
-    """修改 batch["attention_mask"] 以反映 prefix-sharing 裁剪后的实际长度。
-
-    物理裁剪 input_ids 后，模型输出的 flatten token 数减少。
-    no_padding_2_padding 用外层 batch_td 的 attention_mask 计算
-    prompt_lens / response_lens，断言 sum == model_output_token_count。
-    裁剪后 sum(原始长度) > trimmed token 数 → 断言失败。
-
-    此函数将 reuser 被裁掉的 prefix 位置在 attention_mask 中置为 False，
-    使 no_padding_2_padding 自然算出裁剪后的 prompt_lens，无需 patch
-    no_padding_2_padding 本身（losses.py 用 from ... import 直接引用，
-    monkey-patch module attribute 无法拦截）。
-
-    与 v070 的 build_prefix_sharing_micro_batch（lines 289-300）逻辑一致。
-    """
-    import torch
-
-    attention_mask = batch.get("attention_mask")
-    if attention_mask is None:
-        return
-    # 只处理 2D attention_mask（NestedTensor 不需要，no_padding_2_padding
-    # NestedTensor 路径用 offsets().diff()）
-    if attention_mask.dim() != 2:
-        return
-
-    attention_mask_bool = attention_mask.to(bool)
-
-    # 全置 False，然后只把 kept 区段置 True
-    new_mask = torch.zeros_like(attention_mask_bool)
-    for row in range(attention_mask_bool.shape[0]):
-        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
-        keep_start, keep_end = plan.input_keep_ranges[row]
-        kept_indices = indices[keep_start:keep_end]
-        new_mask[row, kept_indices] = True
-
-    batch["attention_mask"] = new_mask.to(attention_mask.dtype)
-
-
 @dataclass(frozen=True)
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
@@ -544,8 +503,10 @@ def build_prefix_sharing_micro_batch_verl080(
     # ── 阶段 3: 从 batch 提取序列 ──
     # NestedTensor → 从 offsets/values 提取
     # Plain 2D → 从 attention_mask.nonzero() 提取
+    # 同时保留 attention_mask_bool，供阶段 6 的 _collect_kept_position_rows 使用。
     input_ids = batch["input_ids"]
     is_nested = _is_nested_tensor(input_ids)
+    attention_mask_bool_for_layout = None
 
     if is_nested:
         sequences = _extract_sequences_from_nested(input_ids)
@@ -556,6 +517,7 @@ def build_prefix_sharing_micro_batch_verl080(
             logger.info("[PS][prepare] PATH 4: plain 2D batch without attention_mask")
             return batch, None
         attention_mask_bool = attention_mask.to(bool)
+        attention_mask_bool_for_layout = attention_mask_bool  # 供阶段 6 使用
         valid_indices = [
             attention_mask_bool[row].nonzero(as_tuple=False).flatten()
             for row in range(input_ids.shape[0])
@@ -585,7 +547,10 @@ def build_prefix_sharing_micro_batch_verl080(
         trimmed_batch = _trim_plain_batch_thd(batch, plan)
 
     # layout 计算：从 trimmed 后的实际 kept position rows 构建
-    kept_position_rows = _collect_kept_position_rows(trimmed_batch, plan, is_nested)
+    kept_position_rows = _collect_kept_position_rows(
+        trimmed_batch, plan, is_nested,
+        attention_mask_bool=attention_mask_bool_for_layout,
+    )
 
     parallel_info = get_megatron_parallel_info()
     align_size = (
@@ -642,8 +607,24 @@ def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
         trimmed_pos_seqs = _slice_nested_sequences(position_ids, plan)
         new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
     else:
-        # position_ids 是 2D tensor → 需要按裁剪后的序列长度重新 padding
-        trimmed_pos_seqs = _slice_2d_position_rows(position_ids, plan)
+        # position_ids 是 2D tensor → 需要用 attention_mask 的
+        # valid_indices 切片（keep_range 是序列偏移，不是列索引）
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask_bool = attention_mask.to(bool)
+        else:
+            import torch
+            # NestedTensor batch 无 explicit attention_mask → 所有位置都 valid
+            # 这意味着 position_ids 每行的有效位置从列 0 开始，
+            # valid_indices 等于 range(seq_len)，keep_range 可以直接当列索引用。
+            # 但仍然走 nonzero 路径保持一致性。
+            attention_mask_bool = torch.ones(
+                position_ids.shape[0], position_ids.shape[1],
+                dtype=torch.bool, device=position_ids.device,
+            )
+        trimmed_pos_seqs = _slice_2d_position_rows(
+            position_ids, plan, attention_mask_bool,
+        )
         new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
     trimmed_batch["position_ids"] = new_position_ids
 
@@ -742,13 +723,23 @@ def _slice_nested_sequences(nested_tensor: Any, plan: PrefixSharingPlan) -> list
     return sliced
 
 
-def _slice_2d_position_rows(position_ids: Any, plan: PrefixSharingPlan) -> list[Any]:
-    """从 2D position_ids 中按 keep_ranges 提取每个 row 的 kept 区段。"""
+def _slice_2d_position_rows(
+    position_ids: Any,
+    plan: PrefixSharingPlan,
+    attention_mask_bool: Any,
+) -> list[Any]:
+    """从 2D position_ids 中按 keep_ranges 提取每个 row 的 kept 区段。
+
+    keep_range 指的是序列中第几个有效 token（在去掉 padding 后的偏移量），
+    不是 position_ids 张量的列索引。必须先通过 attention_mask 找到有效列索引，
+    再取子范围：kept_indices = valid_indices[keep_start:keep_end]。
+    """
     kept_rows = []
     for row in range(position_ids.shape[0]):
-        # position_ids 是 plain 2D，每个 row 的有效位置从 0 到 length-1
+        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
         keep_start, keep_end = plan.input_keep_ranges[row]
-        kept_rows.append(position_ids[row, keep_start:keep_end])
+        kept_indices = indices[keep_start:keep_end]
+        kept_rows.append(position_ids[row, kept_indices])
     return kept_rows
 
 
@@ -756,10 +747,15 @@ def _collect_kept_position_rows(
     trimmed_batch: Any,
     plan: PrefixSharingPlan,
     is_nested: bool,
+    attention_mask_bool: Any | None = None,
 ) -> list[Any]:
     """从裁剪后的 batch 中收集各序列的 kept position_ids（per-row 1D tensors）。
 
     用于 PackedBatchLayout.from_kept_position_rows 构建 layout。
+
+    当 position_ids 是 2D tensor 时，需要 attention_mask_bool 来定位有效列索引
+    （keep_range 是序列偏移，不是列索引）。当 position_ids 是 NestedTensor 时，
+    offsets/values 已包含裁剪后的正确数据，无需 attention_mask。
     """
     position_ids = trimmed_batch["position_ids"]
 
@@ -768,11 +764,18 @@ def _collect_kept_position_rows(
         values = position_ids.values()
         return [values[offsets[i]:offsets[i + 1]] for i in range(len(plan.input_keep_ranges))]
 
-    # 2D tensor — 从每个 row 提取 kept 区段
+    # 2D tensor — 用 attention_mask 的 valid_indices 切片
+    if attention_mask_bool is None:
+        raise ValueError(
+            "attention_mask_bool is required when position_ids is 2D tensor; "
+            "keep_range is a sequence offset, not a column index"
+        )
     rows = []
     for i in range(len(plan.input_keep_ranges)):
+        indices = attention_mask_bool[i].nonzero(as_tuple=False).flatten()
         keep_start, keep_end = plan.input_keep_ranges[i]
-        rows.append(position_ids[i, keep_start:keep_end])
+        kept_indices = indices[keep_start:keep_end]
+        rows.append(position_ids[i, kept_indices])
     return rows
 
 
