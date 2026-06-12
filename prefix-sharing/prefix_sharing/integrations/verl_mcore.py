@@ -42,7 +42,7 @@ from prefix_sharing.integrations.megatron_attention import IntegrationUnavailabl
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.patch_manager import PatchHandle
-from prefix_sharing.integrations.utils import ensure_global_packed_token_lengths
+from prefix_sharing.utils import ensure_global_packed_token_lengths
 
 import logging
 logger = logging.getLogger(__name__)

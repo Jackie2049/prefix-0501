@@ -293,17 +293,24 @@ def test_get_cp_group_returns_none_without_pg_collection():
 # ═══════════════════════════════════════
 
 
-def test_auto_activation_skips_without_env_var(monkeypatch):
-    """没有 ENABLE_PREFIX_SHARING 环境变量时，不触发 setup.install()。"""
+def test_auto_activation_always_attempts_and_handles_missing_env(monkeypatch):
+    """patch 始终尝试安装，本地无 verl/Megatron 时安全回退。
+
+    环境变量不影响是否安装 patch——无论 ENABLE_PREFIX_SHARING 未设置、
+    设为 0 还是 1，_auto_install_patches() 都尝试 setup.install()。
+    本地环境无 verl/Megatron 时 IncompatibleEnvironment 被捕获，
+    _patch_handle 保持 None，不影响训练。
+    """
     monkeypatch.delenv("ENABLE_PREFIX_SHARING", raising=False)
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
+    # 本地没有 verl/Megatron，版本不兼容，应安全回退
     assert prefix_sharing._patch_handle is None
 
 
-def test_auto_activation_skips_with_env_var_false(monkeypatch):
-    """ENABLE_PREFIX_SHARING=0 时，不触发 setup.install()。"""
+def test_auto_activation_handles_env_var_false(monkeypatch):
+    """ENABLE_PREFIX_SHARING=0 时仍尝试安装 patch，兼容性错误安全回退。"""
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", "0")
     import importlib
     import prefix_sharing
@@ -311,17 +318,13 @@ def test_auto_activation_skips_with_env_var_false(monkeypatch):
     assert prefix_sharing._patch_handle is None
 
 
-def test_auto_activation_attempts_with_env_var_true(monkeypatch):
-    """ENABLE_PREFIX_SHARING=1 时，尝试调用 setup.install()。
-
-    本地环境没有 verl/Megatron，install() 会因版本不兼容抛异常，
-    _auto_install_patches 应捕获异常并设 _patch_handle=None。
-    """
+def test_auto_activation_handles_env_var_true(monkeypatch):
+    """ENABLE_PREFIX_SHARING=1 时尝试安装 patch，兼容性错误安全回退。"""
     monkeypatch.setenv("ENABLE_PREFIX_SHARING", "1")
     import importlib
     import prefix_sharing
     importlib.reload(prefix_sharing)
-    # 本地没有 verl/Megatron，版本不兼容，应安全回退
+    assert prefix_sharing._patch_handle is None
     assert prefix_sharing._patch_handle is None
 
 

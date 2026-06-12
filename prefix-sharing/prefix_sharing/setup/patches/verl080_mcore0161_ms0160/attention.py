@@ -1,7 +1,7 @@
 """Patch: Attention.forward — thin wrapper
 
 无 context → 调用原始 forward
-有 context → QKV + THD squeeze → delegate to integrations.maybe_run_prefix_sharing_attention
+有 context → QKV + THD squeeze → delegate to integrations.prefix_attention
 
 业务逻辑（RoPE、KV expansion、attention 计算）全部由 integrations 层处理，
 本 patch 只负责 QKV 提取（attention module 交互）和 THD squeeze（格式适配）。
@@ -69,10 +69,10 @@ def patch_megatron_attention(original_forward: Any) -> Any:
 
         # delegate to verified integrations code
         from prefix_sharing.integrations.megatron_runtime import (
-            maybe_run_prefix_sharing_attention,
+            prefix_attention,
         )
 
-        result = maybe_run_prefix_sharing_attention(
+        result = prefix_attention(
             self,
             query,
             key,

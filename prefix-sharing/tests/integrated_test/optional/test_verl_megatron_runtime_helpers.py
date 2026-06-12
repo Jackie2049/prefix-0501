@@ -6,7 +6,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
-from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_attention
+from prefix_sharing.integrations.megatron_runtime import prefix_attention
 from prefix_sharing.integrations.verl_mcore import (
     build_prefix_sharing_micro_batch,
     restore_suffix_first_log_probs_from_prefix,
@@ -389,7 +389,7 @@ def test_attention_hook_rejects_sp_local_shard_token_length():
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
         with pytest.raises(RuntimeError, match="SP-local shard"):
-            maybe_run_prefix_sharing_attention(
+            prefix_attention(
                 attention_module,
                 query,
                 key,

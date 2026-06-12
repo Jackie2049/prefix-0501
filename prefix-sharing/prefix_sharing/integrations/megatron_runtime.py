@@ -8,10 +8,14 @@ import torch
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.integrations.context import current_prefix_sharing_context
-from prefix_sharing.integrations.utils import ensure_global_packed_token_lengths
+from prefix_sharing.utils import ensure_global_packed_token_lengths
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-def maybe_run_prefix_sharing_attention(
+def prefix_attention(
     attention_module: Any,
     query: Any,
     key: Any,
@@ -26,22 +30,22 @@ def maybe_run_prefix_sharing_attention(
     owns RoPE, KV expansion, causal masking, and output projection.
     """
 
-    import logging
-    prefix_log = logging.getLogger(__file__)
-    prefix_log.warning("\n\n\nsuccess come into def maybe_run_prefix_sharing_attention\n\n\n")
-
-    ctx = current_prefix_sharing_context()
-    if ctx is None:
-        prefix_log.warning("\n\n\nctx is None\n\n\n")
+    logger.warning("\n\n\nsuccess come into def prefix_attention\n\n\n")
+    
+    # 读取并校验前缀共享上下文 prefix_sharing_context
+    prefix_sharing_context = current_prefix_sharing_context()
+    if prefix_sharing_context is None:
+        logger.warning("\n\n\nprefix_sharing_context is None\n\n\n")
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
     if rotary_pos_emb is None:
         raise RuntimeError("prefix sharing phase 1 requires rotary_pos_emb")
-    if ctx.packed_batch_layout.packed_position_ids is None:
+    if prefix_sharing_context.packed_batch_layout.packed_position_ids is None:
         raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
-    packed_batch_layout = ctx.packed_batch_layout
+    # 确保 QKV 符合 THD packing格式
+    packed_batch_layout = prefix_sharing_context.packed_batch_layout
     ensure_global_packed_token_lengths(
         {
             "query_length": query.shape[0],
@@ -52,21 +56,17 @@ def maybe_run_prefix_sharing_attention(
         context="attention hook",
     )
 
-    # v0.16.1: extract cu_seqlens, mscale, cp_group from runtime objects.
-    # Returns None/defaults for v070 (mcore <= 0.15.x) — backward compatible.
+    # mcore v0.16.1 的 RoPE 需要 cu_seqlens, mscale, cp_group 等入参
+    # returns cu_seqlens for verl 0.8.0 (mcore 0.16.1)
+    # returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x) 
     cu_seqlens_q = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_q_padded", "cu_seqlens_q")
     cu_seqlens_kv = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_kv_padded", "cu_seqlens_kv")
     mscale = _get_yarn_mscale(attention_module)
     cp_group = _get_cp_group(attention_module)
 
-    # mcore 0.16.1: rotary_pos_emb 是单 tensor（Q/K 共用）
-    # mcore <= 0.15.x: rotary_pos_emb 是 (q_pos_emb, k_pos_emb) tuple
-    if isinstance(rotary_pos_emb, (tuple, list)) and len(rotary_pos_emb) == 2:
-        q_pos_emb, k_pos_emb = rotary_pos_emb
-    else:
-        # 单 tensor 格式，Q/K 共用同一个频率嵌入
-        q_pos_emb = rotary_pos_emb
-        k_pos_emb = rotary_pos_emb
+    q_pos_emb, k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
+
+    # QK位置编码
     query, key = _apply_positioned_rope(
         attention_module,
         query,
@@ -80,12 +80,12 @@ def maybe_run_prefix_sharing_attention(
         cp_group=cp_group,
     )
 
-    backend = ctx.backend or TorchReferenceBackend()
-    parallel_info = ctx.parallel_info
+    backend = prefix_sharing_context.backend or TorchReferenceBackend()
+    parallel_info = prefix_sharing_context.parallel_info
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
 
-    prefix_log.warning("\n\n\ntry to build kv\n\n\n")
-    prefix_log.warning(
+    logger.warning("\n\n\ntry to build kv\n\n\n")
+    logger.warning(
         "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
         "enter prefix-sharing path: "
         "sequence_parallel=%s query_token_length=%s total_padded_length=%s "
@@ -110,13 +110,13 @@ def maybe_run_prefix_sharing_attention(
     expanded_key, expanded_value = backend.build_kv(
         key,
         value,
-        ctx.store,
-        ctx.prefix_sharing_plan,
+        prefix_sharing_context.store,
+        prefix_sharing_context.prefix_sharing_plan,
         packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=parallel_info.tp_rank,
     )
-    prefix_log.warning(
+    logger.warning(
         "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
         "built expanded kv: "
         "expanded_key_shape=%s, expanded_value_shape=%s",
@@ -133,7 +133,7 @@ def maybe_run_prefix_sharing_attention(
         query,
         expanded_key,
         expanded_value,
-        ctx.prefix_sharing_plan,
+        prefix_sharing_context.prefix_sharing_plan,
         packed_batch_layout=packed_batch_layout,
         attention_mask=attention_mask,
     )
@@ -169,14 +169,15 @@ def _apply_positioned_rope(
     positions = packed_position_ids.to(device=query.device, dtype=torch.long)
     max_needed = positions.max().item() + 1
 
-    # Extend q_pos_emb / k_pos_emb when they are shorter than the largest
-    # position_id needed by packed_position_ids.  THD-mode generated pos_emb
-    # only covers positions 0 .. max_seqlen_q-1, which is too small because
-    # prefix-sharing preserves the original position_ids (e.g. suffix starts
-    # at position 75).
+    # 当 packed_position_ids 所需要的最大 position id 超过了 q_pos_emb / k_pos_emb 的当前长度时，
+    # 就需要对 q_pos_emb / k_pos_emb 进行扩展。
+    # THD 模式下生成的 pos_emb 仅覆盖 positions 0 .. max_seqlen_q-1 这段范围，
+    # 这个长度往往不够用，因为 prefix-sharing 会保留原始的 position_ids
+    #（例如后缀可能从 position 75 开始）。
     #
-    # RoPE is linear: freqs[p] = p * inv_freq.  The step (inv_freq) can be
-    # recovered from the pos_emb itself as pos_emb[1] - pos_emb[0].
+    # RoPE 具有线性性质：freqs[p] = p * inv_freq。
+    # 因此可以通过 pos_emb[1] - pos_emb[0] 恢复出 step（即 inv_freq），
+    # 从而生成缺失的高位置频率向量。
     if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
         dim_half = q_pos_emb.shape[-1] // 2
         step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
@@ -235,6 +236,18 @@ def _apply_positioned_rope(
 # ═══════════════════════════════════════
 # v0.16.1 API helpers (backward compatible with v070)
 # ═══════════════════════════════════════
+
+
+def _unpack_rotary_pos_emb(rotary_pos_emb: Any) -> tuple[Any, Any]:
+    """解包 rotary_pos_emb，兼容 mcore 版本差异。
+
+    mcore 0.12.1 ~ 0.15.x: (q_pos_emb, k_pos_emb) tuple
+    mcore 0.16.1+:             单 tensor（Q/K 共用）
+    """
+    if isinstance(rotary_pos_emb, (tuple, list)) and len(rotary_pos_emb) == 2:
+        return rotary_pos_emb[0], rotary_pos_emb[1]
+    return rotary_pos_emb, rotary_pos_emb
+
 
 def _extract_cu_seqlens(packed_seq_params: Any, primary_attr: str, fallback_attr: str) -> Any | None:
     """Extract cu_seqlens from packed_seq_params, preferring padded version.
