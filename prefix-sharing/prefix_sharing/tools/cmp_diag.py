@@ -370,8 +370,8 @@ def compare_2d_item(
     compare_mask = label_mask
     if compare_mask is None or compare_mask.shape != t1.shape:
         compare_mask = (t2 != 0)
-    diff, mask = (t1 - t2).abs(), torch.logical_and(
-        compare_mask.to(diff.device), diff == diff)
+    diff = (t1 - t2).abs()
+    mask = torch.logical_and(compare_mask.to(diff.device), diff == diff)
     return _make_2d_result(name, diff, mask, atol, t1=t1, t2=t2)
 
 
