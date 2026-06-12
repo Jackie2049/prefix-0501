@@ -56,17 +56,16 @@ def prefix_attention(
         context="attention hook",
     )
 
-    # mcore v0.16.1 的 RoPE 需要 cu_seqlens, mscale, cp_group 等入参
-    # returns cu_seqlens for verl 0.8.0 (mcore 0.16.1)
-    # returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x) 
+    # QK位置编码
+    #   mcore v0.16.1 的 RoPE 需要 cu_seqlens, mscale, cp_group 等入参
+    #       returns cu_seqlens for verl 0.8.0 (mcore 0.16.1)
+    #       returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x) 
     cu_seqlens_q = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_q_padded", "cu_seqlens_q")
     cu_seqlens_kv = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_kv_padded", "cu_seqlens_kv")
     mscale = _get_yarn_mscale(attention_module)
     cp_group = _get_cp_group(attention_module)
-
     q_pos_emb, k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
-
-    # QK位置编码
+    
     query, key = _apply_positioned_rope(
         attention_module,
         query,
@@ -80,7 +79,7 @@ def prefix_attention(
         cp_group=cp_group,
     )
 
-    backend = prefix_sharing_context.backend or TorchReferenceBackend()
+    attention_backend = prefix_sharing_context.attention_backend or TorchReferenceBackend()
     parallel_info = prefix_sharing_context.parallel_info
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
 
@@ -107,7 +106,7 @@ def prefix_attention(
         packed_batch_layout.padded_lengths,
         packed_batch_layout.cu_seqlens,
     )
-    expanded_key, expanded_value = backend.build_kv(
+    expanded_key, expanded_value = attention_backend.build_kv(
         key,
         value,
         prefix_sharing_context.store,
@@ -129,7 +128,7 @@ def prefix_attention(
         tuple(expanded_key.shape),
         tuple(expanded_value.shape),
     )
-    core_attn_out = backend.attention(
+    core_attn_out = attention_backend.attention(
         query,
         expanded_key,
         expanded_value,

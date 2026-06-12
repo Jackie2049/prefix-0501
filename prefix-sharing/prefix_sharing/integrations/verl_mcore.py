@@ -54,7 +54,7 @@ T = TypeVar("T")
 @dataclass(frozen=True)
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
-    backend: Any
+    attention_backend: Any
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
     kept_position_ids: Any | None = None
@@ -336,7 +336,7 @@ def build_prefix_sharing_micro_batch(
     )
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        backend=get_backend_instance(config, backend),
+        attention_backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
         parallel_info=parallel_info,
     )
