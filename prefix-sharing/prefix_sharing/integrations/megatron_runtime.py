@@ -105,9 +105,10 @@ def maybe_run_prefix_sharing_attention(
     # --- first-attn diagnostic dump (ON) ---
     try:
         from prefix_sharing.tools.dump_first_attn import dump_on
-        dump_on(output, packed_seq_params, ctx.prefix_sharing_plan, layer_id)
-    except Exception:
-        pass
+        dump_on(output, packed_seq_params, ctx.prefix_sharing_plan,
+                attention_module.layer_number)
+    except Exception as e:
+        prefix_log.debug(f"first-attn dump (ON) skipped: {e}")
     # ---
 
     return output

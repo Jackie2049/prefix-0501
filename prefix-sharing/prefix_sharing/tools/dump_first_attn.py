@@ -56,15 +56,15 @@ def dump_on(
     output_tensor: torch.Tensor,
     packed_seq_params: Any,
     prefix_sharing_plan: Any,
-    layer_id: int,
+    layer_number: int,
 ) -> None:
     """Called from maybe_run_prefix_sharing_attention (ON mode).
 
-    Dumps first-layer (layer_id==0) attention output.
+    Dumps first-layer (layer_number==1) attention output.
+    Megatron layer_number is 1-indexed.
     """
-    if layer_id != 0:
+    if layer_number != 1:
         return
-    batch_size = prefix_sharing_plan.batch_size
     _dump(output_tensor, packed_seq_params,
           list(prefix_sharing_plan.prefix_lens))
 
