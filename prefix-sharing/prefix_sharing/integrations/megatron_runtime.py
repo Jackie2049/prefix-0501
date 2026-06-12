@@ -100,7 +100,17 @@ def maybe_run_prefix_sharing_attention(
         attention_mask=attention_mask,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-    return attention_module.linear_proj(core_attn_out)
+    output = attention_module.linear_proj(core_attn_out)
+
+    # --- first-attn diagnostic dump (ON) ---
+    try:
+        from prefix_sharing.tools.dump_first_attn import dump_on
+        dump_on(output, packed_seq_params, ctx.prefix_sharing_plan, layer_id)
+    except Exception:
+        pass
+    # ---
+
+    return output
 
 
 def _apply_positioned_rope(

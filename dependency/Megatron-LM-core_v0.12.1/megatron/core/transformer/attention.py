@@ -696,6 +696,19 @@ class Attention(MegatronModule, ABC):
 
         output, bias = self.linear_proj(core_attn_out)
 
+        # --- first-attn diagnostic dump (OFF) ---
+        try:
+            from prefix_sharing.tools.dump_first_attn import dump_off
+            if packed_seq_params is not None \
+               and hasattr(packed_seq_params, 'cu_seqlens_q_padded'):
+                batch_size = packed_seq_params.cu_seqlens_q_padded.shape[0] - 1
+            else:
+                batch_size = query.shape[1]  # fallback for BSH path
+            dump_off(output, packed_seq_params, self.layer_number, batch_size)
+        except Exception:
+            pass
+        # ---
+
         return output, bias
 
 
