@@ -18,15 +18,11 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
     def patched_fn(logits, labels):
         log_probs = original_fn(logits, labels)
 
-        from prefix_sharing.integrations.context import (
-            current_prefix_sharing_context,
-        )
+        from prefix_sharing.integrations.context import current_prefix_sharing_context
 
-        ctx = current_prefix_sharing_context()
-        if ctx is not None and ctx.prefix_last_restore_indices:
-            from prefix_sharing.integrations.verl_mcore import (
-                restore_suffix_first_log_probs_from_prefix,
-            )
+        prefix_sharing_context = current_prefix_sharing_context()
+        if prefix_sharing_context is not None and prefix_sharing_context.prefix_last_restore_indices:
+            from prefix_sharing.integrations.verl_mcore import restore_suffix_first_log_probs_from_prefix
 
             log_probs = restore_suffix_first_log_probs_from_prefix(
                 logits, labels, log_probs, original_fn,
