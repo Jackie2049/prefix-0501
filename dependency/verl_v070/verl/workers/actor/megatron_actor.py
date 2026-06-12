@@ -710,22 +710,6 @@ class MegatronPPOActor(BasePPOActor):
                         )
                     ######### prefix-sharing #########
                     ret["log_probs"] = log_probs
-                    ########## prefix-sharing packed diagnostic ##########
-                    if calculate_entropy and "entropy" in ret:
-                        _e = ret["entropy"]
-                        # entropy in packed space: check if ALL packed entries are non-zero
-                        _e_nz = int((_e.abs() > 1e-8).sum())
-                        _e_total = _e.numel()
-                        import torch.distributed as _ps_dist
-                        if _ps_dist.is_initialized() and _ps_dist.get_rank() == 0:
-                            from verl.utils.logger import logger as _ps_logger
-                            _ps_logger.warning(
-                                f"[PS][DIAG][packed] entropy packed nonzero={_e_nz}/{_e_total} "
-                                f"shape={list(_e.shape)} "
-                                f"last10_mean={_e.view(-1)[-10:].mean().item():.6f} "
-                                f"label_mask_packed_nz={int(label_mask.sum())}/{label_mask.numel()}"
-                            )
-                    ########## prefix-sharing packed diagnostic ##########
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
@@ -754,41 +738,6 @@ class MegatronPPOActor(BasePPOActor):
                         output = write_restored_logprobs_to_2d(output)
                     if write_restored_entropy_to_2d is not None:
                         output = write_restored_entropy_to_2d(output)
-                    ########## prefix-sharing diagnostic ##########
-                    if forward_only:
-                        import torch.distributed as dist
-                        if dist.is_initialized() and dist.get_rank() == 0:
-                            _ps_lp = output.get("log_probs")
-                            _ps_ent = output.get("entropy")
-                            _am_sums = attention_mask.sum(dim=1).int().tolist()
-                            # Only check rows that are actual reusers (have suffix positions in trimmed mask)
-                            _valid_rows = [i for i, s in enumerate(_am_sums) if s > 0]
-                            if _valid_rows and _ps_ent is not None and _ps_ent.size(1) > 1091:
-                                # For each reuser row, check the LAST 20 suffix positions in 2D
-                                for _row in _valid_rows:
-                                    _ent_row = _ps_ent[_row]
-                                    _lp_row = _ps_lp[_row] if _ps_lp is not None else None
-                                    _am_row = attention_mask[_row]
-                                    _suffix_positions = _am_row.nonzero(as_tuple=True)[0].tolist()
-                                    if _suffix_positions:
-                                        _suffix_last20 = _suffix_positions[-20:]
-                                        _ent_vals = _ent_row[_suffix_last20].tolist()
-                                        _lp_vals = _lp_row[_suffix_last20].tolist() if _lp_row is not None else None
-                                        _ent_nz = sum(1 for v in _ent_vals if abs(v) > 1e-8)
-                                        _lp_nz = sum(1 for v in _lp_vals if abs(v) > 1e-8) if _lp_vals else -1
-                                        logger.warning(
-                                            f"[PS][DIAG] row={_row} suffix_len={len(_suffix_positions)} "
-                                            f"positions={_suffix_positions[:3]}...{_suffix_positions[-3:]} "
-                                            f"last20_entropy_nz={_ent_nz}/20 "
-                                            f"last20_logprob_nz={_lp_nz}/20 "
-                                            f"entropy_snip={_ent_vals[:3]}...{_ent_vals[-3:]}"
-                                        )
-                            else:
-                                logger.warning(
-                                    f"[PS][DIAG] NO_VALID_ROWS response_length={response_length} "
-                                    f"attn_mask_sums={_am_sums} batch_size={attention_mask.size(0)}"
-                                )
-                    ########## prefix-sharing diagnostic ##########
                     ########## prefix-sharing dump (2D space after all restores) ##########
                     _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
                     if _ps_dump_dir and forward_only:
