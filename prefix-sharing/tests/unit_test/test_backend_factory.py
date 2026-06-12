@@ -26,6 +26,13 @@ def test_factory_flash_atten_gpu() -> None:
     assert backend.capabilities.supports_flash_attention
 
 
+def test_factory_flash_atten_npu():
+    config = PrefixSharingConfig(enable_prefix_sharing=True, backend="flash_atten_npu")
+    backend = get_backend_instance(config)
+    assert isinstance(backend, NpuFlashAttentionBackend)
+    assert backend.capabilities.name == "flash_atten_npu"
+
+
 def test_factory_unknown_backend() -> None:
     config = PrefixSharingConfig(enable_prefix_sharing=True, backend="unknown")
     with pytest.raises(ValueError, match="Unknown backend"):
@@ -52,3 +59,10 @@ def test_config_validates_backends() -> None:
     bad_config = PrefixSharingConfig(enable_prefix_sharing=True, backend="not_real")
     with pytest.raises(Exception):
         bad_config.validate()
+
+
+def test_config_accepts_supported_backends():
+    for name in ("torch_ref", "flash_atten_gpu", "flash_atten_npu"):
+        cfg = PrefixSharingConfig(enable_prefix_sharing=True, backend=name)
+        cfg.validate()  # should not raise
+        
