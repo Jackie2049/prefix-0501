@@ -102,12 +102,12 @@ def maybe_run_prefix_sharing_attention(
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
     output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
 
-    # --- first-attn diagnostic dump (ON) ---
+    # --- diag dump (ON attention) ---
     try:
-        from prefix_sharing.tools.dump_first_attn import dump_on
-        dump_on(output[0], packed_seq_params, ctx.prefix_sharing_plan,
-                attention_module.layer_number,
-                attention_module.config.num_layers)
+        from prefix_sharing.tools.diagnostic_dump import dump_attn_on
+        dump_attn_on(output[0], packed_seq_params, ctx.prefix_sharing_plan,
+                     attention_module.layer_number,
+                     attention_module.config.num_layers)
     except Exception as e:
         prefix_log.warning(f"last-attn dump (ON) failed: {e}")
     # ---

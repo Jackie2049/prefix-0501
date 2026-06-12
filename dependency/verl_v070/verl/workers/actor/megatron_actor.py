@@ -292,14 +292,13 @@ class MegatronPPOActor(BasePPOActor):
                 log_probs = log_probs.to("cpu")
                 
 
-                ########## prefix-sharing logprob dump ##########
-                _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
-                if _ps_dump_dir:
-                    os.makedirs(_ps_dump_dir, exist_ok=True)
-                    if torch.distributed.get_rank() == 0:
-                        torch.save(log_probs.clone(), os.path.join(_ps_dump_dir, "logprobs.pt"))
-                        torch.save(input_ids.cpu().clone(), os.path.join(_ps_dump_dir, "input_ids.pt"))
-                ########## prefix-sharing logprob dump ##########
+                ########## prefix-sharing diag dump (legacy logprobs) ##########
+                try:
+                    from prefix_sharing.tools.diagnostic_dump import dump_logprobs_legacy
+                    dump_logprobs_legacy(log_probs, input_ids)
+                except Exception:
+                    pass
+                ########## prefix-sharing diag dump ##########
 
 
                 if calculate_entropy:
@@ -738,27 +737,21 @@ class MegatronPPOActor(BasePPOActor):
                         output = write_restored_logprobs_to_2d(output)
                     if write_restored_entropy_to_2d is not None:
                         output = write_restored_entropy_to_2d(output)
-                    ########## prefix-sharing dump (2D space after all restores) ##########
-                    _ps_dump_dir = os.environ.get("PREFIX_SHARING_DUMP_DIR")
-                    if _ps_dump_dir and forward_only:
-                        os.makedirs(_ps_dump_dir, exist_ok=True)
-                        if torch.distributed.get_rank() == 0:
-                            tag = "old" if forward_only else "train"
-                            torch.save(output["log_probs"].detach().clone(),
-                                       os.path.join(_ps_dump_dir, f"logprobs_{tag}.pt"))
-                            if "entropy" in output:
-                                torch.save(output["entropy"].detach().clone(),
-                                           os.path.join(_ps_dump_dir, f"entropy_{tag}.pt"))
-                            torch.save(label.detach().cpu().clone(),
-                                       os.path.join(_ps_dump_dir, "label.pt"))
-                            # Canonical structural mask: pre-packing label_mask,
-                            # True on [-response_length-1:-1] (loss-effective slice).
-                            # Saved as reference; compare tool derives per-tensor mask
-                            # when tensor shape differs (e.g. log_probs may be packed
-                            # differently than entropy in ON mode).
-                            torch.save(label_mask.cpu().clone(),
-                                       os.path.join(_ps_dump_dir, "label_mask.pt"))
-                    ########## prefix-sharing dump ##########
+                    ########## prefix-sharing diag dump (2D after restores) ##########
+                    try:
+                        from prefix_sharing.tools.diagnostic_dump import (
+                            dump_logprobs_2d, dump_entropy_2d,
+                            dump_label, dump_label_mask,
+                        )
+                        tag = "old" if forward_only else "train"
+                        dump_logprobs_2d(output["log_probs"], tag)
+                        if "entropy" in output:
+                            dump_entropy_2d(output["entropy"], tag)
+                        dump_label(label)
+                        dump_label_mask(label_mask)
+                    except Exception:
+                        pass
+                    ########## prefix-sharing diag dump ##########
                 ######### prefix-sharing #########
 
             if forward_only:
