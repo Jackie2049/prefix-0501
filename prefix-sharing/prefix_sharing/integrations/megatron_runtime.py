@@ -79,33 +79,21 @@ def prefix_attention(
         cp_group=cp_group,
     )
 
-    attention_backend = prefix_sharing_context.attention_backend or TorchReferenceBackend()
     parallel_info = prefix_sharing_context.parallel_info
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
-
     logger.warning("\n\n\ntry to build kv\n\n\n")
+    seq_parallel = getattr(getattr(attention_module, "config", None), "sequence_parallel", None)
     logger.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
-        "enter prefix-sharing path: "
-        "sequence_parallel=%s query_token_length=%s total_padded_length=%s "
-        "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
-        "padded_lengths=%s, cu_seqlens=%s",
-        parallel_info.global_rank,
-        parallel_info.tp_rank,
-        parallel_info.tp_size,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        layer_id,
-        getattr(getattr(attention_module, "config", None), "sequence_parallel", None),
-        query.shape[0],
-        packed_batch_layout.total_padded_length,
-        tuple(query.shape),
-        tuple(key.shape),
-        tuple(value.shape),
-        packed_batch_layout.valid_lengths,
-        packed_batch_layout.padded_lengths,
-        packed_batch_layout.cu_seqlens,
+        f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
+        f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
+        f"enter prefix-sharing path: query_token_length={query.shape[0]} "
+        f"total_padded_length={packed_batch_layout.total_padded_length} query_shape={tuple(query.shape)}, "
+        f"key_shape={tuple(key.shape)}, value_shape={tuple(value.shape)}, valid_lengths={packed_batch_layout.valid_lengths}, "
+        f"padded_lengths={packed_batch_layout.padded_lengths}, cu_seqlens={packed_batch_layout.cu_seqlens}"
     )
+
+    # 前缀共享：provider 存储激活值，reuser 拼接激活值
+    attention_backend = prefix_sharing_context.attention_backend or TorchReferenceBackend()
     expanded_key, expanded_value = attention_backend.build_kv(
         key,
         value,
@@ -116,18 +104,12 @@ def prefix_attention(
         tp_rank=parallel_info.tp_rank,
     )
     logger.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
-        "built expanded kv: "
-        "expanded_key_shape=%s, expanded_value_shape=%s",
-        parallel_info.global_rank,
-        parallel_info.tp_rank,
-        parallel_info.tp_size,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        layer_id,
-        tuple(expanded_key.shape),
-        tuple(expanded_value.shape),
+        f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
+        f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
+        f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"
     )
+
+    # 注意力计算
     core_attn_out = attention_backend.attention(
         query,
         expanded_key,

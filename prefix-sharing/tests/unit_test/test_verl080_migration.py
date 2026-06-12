@@ -81,7 +81,7 @@ def _make_runtime_state(kept_position_ids=None):
     )
     return PrefixSharingRuntimeState(
         prefix_sharing_plan=plan,
-        backend=None,
+        attention_backend=None,
         packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=kept_position_ids,
@@ -138,7 +138,7 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
 
     old_state = types.SimpleNamespace(
         prefix_sharing_plan=plan,
-        backend=None,
+        attention_backend=None,
         packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(),
     )
