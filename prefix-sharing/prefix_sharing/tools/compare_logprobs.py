@@ -162,17 +162,32 @@ class CompareResult:
         )
 
 
-def _compute_2d_diff(t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """计算 2D 张量的绝对差异和有效 mask。"""
+def _compute_2d_diff(t1: torch.Tensor, t2: torch.Tensor,
+                     compare_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """计算 2D 张量的绝对差异和有效 mask。
+
+    若提供 compare_mask，则用它限制比较范围；否则用 union 模式
+    ``(t1 != 0) | (t2 != 0)``（适用于两边都将无关位置显式置零的场景）。
+    """
     diff = (t1 - t2).abs()
-    mask = (t1 != 0) | (t2 != 0)
+    if compare_mask is not None:
+        mask = compare_mask.to(torch.bool) & (diff == diff)  # 排除 NaN
+    else:
+        mask = (t1 != 0) | (t2 != 0)
     return diff, mask
 
 
-def _compute_3d_diff(t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """计算 3D 张量的绝对差异和有效 mask（全量参与）。"""
+def _compute_3d_diff(t1: torch.Tensor, t2: torch.Tensor,
+                     compare_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """计算 3D 张量的绝对差异和有效 mask。
+
+    若提供 compare_mask，则用它限制比较范围；否则全量参与。
+    """
     diff = (t1 - t2).abs()
-    mask = torch.ones_like(diff, dtype=torch.bool)
+    if compare_mask is not None:
+        mask = compare_mask.to(torch.bool)
+    else:
+        mask = torch.ones_like(diff, dtype=torch.bool)
     return diff, mask
 
 
@@ -491,7 +506,10 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             detail_data.append({"type": "shape_mismatch", "name": f"entropy_{tag}",
                                 "t1": ent1, "t2": ent2, "result": r})
         else:
-            diff, mask = _compute_2d_diff(ent1, ent2)
+            # entropy: ON 仅计算 suffix+restore 位置，prompt 为 0
+            # 用 (ON != 0) 做 mask 只比较双方都计算过的位置
+            ent_compare_mask = (ent1 != 0)
+            diff, mask = _compute_2d_diff(ent1, ent2, compare_mask=ent_compare_mask)
             r = CompareResult.from_2d_diff(f"entropy_{tag}", diff, mask, atol,
                                            t1=ent1, t2=ent2)
             results.append(r)
@@ -515,7 +533,11 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             detail_data.append({"type": "shape_mismatch", "name": f"logits_{tag}",
                                 "t1": log1, "t2": log2, "result": r})
         else:
-            diff, mask = _compute_3d_diff(log1, log2)
+            # logits: ON 仅计算 suffix 位置的 logits，prompt 全 0
+            # 用 ON 非零位置做 3D mask，只比较双方都计算过的 token
+            log_pos_valid = (log1.abs().max(dim=-1, keepdim=True).values > 1e-8)
+            log_compare_mask = log_pos_valid.expand_as(log1)
+            diff, mask = _compute_3d_diff(log1, log2, compare_mask=log_compare_mask)
             r = CompareResult.from_3d_diff(f"logits_{tag}", diff, atol,
                                            t1=log1, t2=log2)
             results.append(r)
