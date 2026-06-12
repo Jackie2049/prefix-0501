@@ -35,21 +35,33 @@ def _dump(
 
     Only saves on rank 0 (no distributed check needed for single-GPU).
     """
+    import logging
+    _log = logging.getLogger(__name__)
+
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
 
-    # Save attention output: [packed_tokens, 1, hidden]
-    torch.save(output_tensor.detach().cpu().clone(),
-               os.path.join(dump_dir, "first_attn_output.pt"))
+    try:
+        torch.save(output_tensor.detach().cpu().clone(),
+                   os.path.join(dump_dir, "first_attn_output.pt"))
+        _log.warning("first_attn_output.pt saved (%s)", output_tensor.shape)
+    except Exception as e:
+        _log.warning("first_attn_output.pt save failed: %s", e)
 
-    # Save cu_seqlens from packed_seq_params
-    cu = packed_seq_params.cu_seqlens_q_padded.detach().cpu().clone()
-    torch.save(cu, os.path.join(dump_dir, "cu_seqlens_q.pt"))
+    try:
+        cu = packed_seq_params.cu_seqlens_q_padded.detach().cpu().clone()
+        torch.save(cu, os.path.join(dump_dir, "cu_seqlens_q.pt"))
+        _log.warning("cu_seqlens_q.pt saved (%s)", cu.shape)
+    except Exception as e:
+        _log.warning("cu_seqlens_q.pt save failed: %s", e)
 
-    # Save prefix_lens
-    pl = torch.tensor(prefix_lens_list, dtype=torch.int32)
-    torch.save(pl, os.path.join(dump_dir, "prefix_lens.pt"))
+    try:
+        pl = torch.tensor(prefix_lens_list, dtype=torch.int32)
+        torch.save(pl, os.path.join(dump_dir, "prefix_lens.pt"))
+        _log.warning("prefix_lens.pt saved (%s)", pl.shape)
+    except Exception as e:
+        _log.warning("prefix_lens.pt save failed: %s", e)
 
 
 def dump_on(

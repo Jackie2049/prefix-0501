@@ -100,15 +100,16 @@ def maybe_run_prefix_sharing_attention(
         attention_mask=attention_mask,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-    output = attention_module.linear_proj(core_attn_out)
+    output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
 
     # --- first-attn diagnostic dump (ON) ---
     try:
         from prefix_sharing.tools.dump_first_attn import dump_on
-        dump_on(output, packed_seq_params, ctx.prefix_sharing_plan,
+        # linear_proj returns (hidden, bias); dump only the hidden tensor
+        dump_on(output[0], packed_seq_params, ctx.prefix_sharing_plan,
                 attention_module.layer_number)
     except Exception as e:
-        prefix_log.debug(f"first-attn dump (ON) skipped: {e}")
+        prefix_log.warning(f"first-attn dump (ON) failed: {e}")
     # ---
 
     return output
