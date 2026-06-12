@@ -187,7 +187,7 @@ def _compute_2d_diff(t1: torch.Tensor, t2: torch.Tensor,
     if compare_mask is not None:
         # 用 logical_and 而非 &：旧格式 tensor 可能导致 Python
         # 运算符重载异常（"cannot be converted to Scalar"）
-        mask = torch.logical_and(compare_mask.to(torch.bool), (diff == diff))
+        mask = torch.logical_and(compare_mask.to(diff.device), (diff == diff))
     else:
         mask = torch.logical_or(t1 != 0, t2 != 0)
     return diff, mask
@@ -201,7 +201,7 @@ def _compute_3d_diff(t1: torch.Tensor, t2: torch.Tensor,
     """
     diff = (t1 - t2).abs()
     if compare_mask is not None:
-        mask = compare_mask.to(torch.bool)
+        mask = compare_mask.to(diff.device)
     else:
         mask = torch.ones_like(diff, dtype=torch.bool)
     return diff, mask
@@ -231,7 +231,7 @@ def _validate_no_zero_in_mask(tensor: torch.Tensor, mask: torch.Tensor,
     label_mask 内所有位置都经过了 masked_fill 清零 + restore 注入，
     理应全部非零。出现 0 说明拼接阶段（restore / masked_fill）就有 bug。
     """
-    zero_mask = torch.logical_and(mask, (tensor == 0))
+    zero_mask = torch.logical_and(mask.to(tensor.device), (tensor == 0))
     n_zero = int(zero_mask.sum().item())
     if n_zero > 0:
         print(f"  !! {name} [{side}]: {n_zero} 个 label_mask 内位置值为 0（拼接异常！）")
