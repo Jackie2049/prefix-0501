@@ -2,11 +2,12 @@
 端到端精度对比工具——对比开启/关闭 prefix-sharing 两遍独立运行的 dump。
 
 支持三种 dump 类型，通过 --tag 切换：
-  --tag old    : 对比 logits_old.pt + entropy_old.pt + label.pt  （推理前向，forward_only=True）
-  --tag train  : 对比 logits_train.pt + entropy_train.pt + label.pt（训练前向，forward_only=False）
+  --tag old    : 对比 logits_old.pt + entropy_old.pt + label.pt + logprobs_old.pt（推理前向）
+  --tag train  : 对比 logits_train.pt + entropy_train.pt + label.pt + logprobs_train.pt（训练前向）
   (不设 --tag) : 对比 logprobs.pt + input_ids.pt（legacy，向前兼容）
 
---tag 模式下若目录中存在 logprobs.pt，也会自动加载一并对比。
+--tag 模式下优先读取 logprobs_{tag}.pt（新 dump，完整 2D 含 restore），
+不存在时回退到 logprobs.pt（旧 dump，response-only 切片）。
 
 完整流程：
   # 第一遍：开启 prefix-sharing
@@ -596,34 +597,57 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
                 "label_ids": label, "result": r,
             })
 
-    # logprobs (legacy，如果存在就一起对比)
-    lp_path1 = os.path.join(dir1, "logprobs.pt")
-    lp_path2 = os.path.join(dir2, "logprobs.pt")
-    if os.path.exists(lp_path1) and os.path.exists(lp_path2):
-        lp1 = load_tensor(lp_path1)
-        lp2 = load_tensor(lp_path2)
+    # logprobs: 优先读新 dump (logprobs_{tag}.pt，完整 2D，已 restore)，
+    # 不存在则回退到旧 dump (logprobs.pt，response-only 切片)。
+    lp_tag_file = f"logprobs_{tag}.pt"
+    lp_tag_path1 = os.path.join(dir1, lp_tag_file)
+    lp_tag_path2 = os.path.join(dir2, lp_tag_file)
+    lp_legacy_path1 = os.path.join(dir1, "logprobs.pt")
+    lp_legacy_path2 = os.path.join(dir2, "logprobs.pt")
+
+    if os.path.exists(lp_tag_path1) and os.path.exists(lp_tag_path2):
+        # 新 dump：完整 2D (B, L)，与 entropy 同 shape，用 label_mask 做 compare mask
+        lp1 = load_tensor(lp_tag_path1, dtype)
+        lp2 = load_tensor(lp_tag_path2, dtype)
+        lp_name = f"logprobs_{tag}"
+        lp_is_full_2d = True
+    elif os.path.exists(lp_legacy_path1) and os.path.exists(lp_legacy_path2):
+        # 旧 dump：response-only 切片，用 OFF 非零做 mask
+        lp1 = load_tensor(lp_legacy_path1)
+        lp2 = load_tensor(lp_legacy_path2)
         if dtype:
             lp1 = cast_to_dtype(lp1, dtype)
             lp2 = cast_to_dtype(lp2, dtype)
+        lp_name = "logprobs"
+        lp_is_full_2d = False
+    else:
+        lp1 = lp2 = lp_name = lp_is_full_2d = None
+
+    if lp1 is not None:
         if lp1.shape != lp2.shape:
             r = CompareResult.shape_mismatch_result(
-                "logprobs", tuple(lp1.shape), tuple(lp2.shape))
+                lp_name, tuple(lp1.shape), tuple(lp2.shape))
             results.append(r)
-            detail_data.append({"type": "shape_mismatch", "name": "logprobs",
+            detail_data.append({"type": "shape_mismatch", "name": lp_name,
                                 "t1": lp1, "t2": lp2, "result": r})
         else:
-            # logprobs: 用 OFF (baseline) 的 log_probs != 0 做 mask，
-            # 因为 OFF 全量计算 + masked_fill(~label_mask, 0.0) 显式清零，
-            # shape 天生与 ON log_probs 一致，且 independent of ON 运行时值。
-            lp_compare_mask = (lp2 != 0)
-            _validate_no_zero_in_mask(lp1, lp_compare_mask, "logprobs", "ON")
-            _validate_no_zero_in_mask(lp2, lp_compare_mask, "logprobs", "OFF")
+            if lp_is_full_2d:
+                # 新 dump 完整 2D：用 canonical label_mask
+                # （[-response_length-1:-1]，与 entropy 一致）
+                lp_compare_mask = load_label_mask(dir1)
+                if lp_compare_mask is None or lp_compare_mask.shape != lp1.shape:
+                    lp_compare_mask = (lp2 != 0)
+            else:
+                # 旧 dump response-only：用 OFF 非零做 mask
+                lp_compare_mask = (lp2 != 0)
+            _validate_no_zero_in_mask(lp1, lp_compare_mask, lp_name, "ON")
+            _validate_no_zero_in_mask(lp2, lp_compare_mask, lp_name, "OFF")
             diff, mask = _compute_2d_diff(lp1, lp2, compare_mask=lp_compare_mask)
-            r = CompareResult.from_2d_diff("logprobs", diff, mask, atol,
+            r = CompareResult.from_2d_diff(lp_name, diff, mask, atol,
                                            t1=lp1, t2=lp2)
             results.append(r)
             detail_data.append({
-                "type": "2d", "name": "logprobs",
+                "type": "2d", "name": lp_name,
                 "t1": lp1, "t2": lp2, "diff": diff, "mask": mask, "atol": atol,
                 "label_ids": label, "result": r,
             })
