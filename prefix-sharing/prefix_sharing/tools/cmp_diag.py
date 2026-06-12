@@ -160,18 +160,29 @@ def compare_packed(
         if pf <= 0:
             continue
 
-        # Compute suffix lengths independently from each side's cu_seqlens
-        on_suffix_len = int(cu_on[i + 1] - cu_on[i])
+        # Compute suffix lengths independently from each side's cu_seqlens.
+        # ON cu_seqlens may be either suffix-only (prefix sharing) or
+        # full-sequence; auto-detect by checking bounds.
+        on_full_len = int(cu_on[i + 1] - cu_on[i])
+        on_start_raw = int(cu_on[i])
+        # First try suffix-only interpretation
+        on_suffix_len = on_full_len
+        on_start = on_start_raw
+        if on_start + on_suffix_len > on_out.shape[0]:
+            # Fallback: cu_seqlens is full-sequence, skip prefix portion
+            on_suffix_len = max(0, on_full_len - pf)
+            on_start = on_start_raw + pf
+            if on_suffix_len <= 0 or on_start + on_suffix_len > on_out.shape[0]:
+                print(f"[WARN] {name} row[{i}] prefix_len={pf}: "
+                      f"ON out of bounds (raw_len={on_full_len}, "
+                      f"adj_len={on_suffix_len}, tensor_len={on_out.shape[0]}), skip")
+                continue
+
+        # OFF: always full-sequence layout
         off_full_len = int(cu_off[i + 1] - cu_off[i])
         off_suffix_len = max(0, off_full_len - pf)
-
-        on_start = int(cu_on[i])
         off_start = int(cu_off[i]) + pf
 
-        # Validate ON bounds
-        if on_start < 0 or on_start + on_suffix_len > on_out.shape[0]:
-            print(f"[WARN] {name} row[{i}] prefix_len={pf}: ON out of bounds, skip")
-            continue
         # Validate OFF bounds
         if off_start < 0 or off_start + off_suffix_len > off_out.shape[0]:
             print(f"[WARN] {name} row[{i}] prefix_len={pf}: OFF out of bounds, skip")
@@ -286,7 +297,8 @@ def _pearson_r(t1: torch.Tensor, t2: torch.Tensor, mask: torch.Tensor) -> float:
 def _make_2d_result(name: str, diff: torch.Tensor, mask: torch.Tensor,
                     atol: float, t1: torch.Tensor | None = None,
                     t2: torch.Tensor | None = None) -> CompareResult:
-    n_mismatch = int((diff > atol).sum().item())
+    mismatched_mask = (diff > atol) & mask
+    n_mismatch = int(mismatched_mask.sum().item())
     max_diff = float(diff[mask].max().item()) if mask.any() else 0.0
     mean_diff = float(diff[mask].mean().item()) if mask.any() else 0.0
     n_total = int(mask.sum().item())
@@ -306,7 +318,8 @@ def _print_2d_detail(
 ):
     B, L = t1.shape
     active = int(mask.sum().item())
-    n_mismatch = int((diff > atol).sum().item())
+    mismatched_mask = (diff > atol) & mask
+    n_mismatch = int(mismatched_mask.sum().item())
     max_diff = float(diff[mask].max().item()) if mask.any() else 0.0
     mean_diff = float(diff[mask].mean().item()) if mask.any() else 0.0
     pr = _pearson_r(t1, t2, mask)
@@ -321,7 +334,7 @@ def _print_2d_detail(
         print()
         return
 
-    mismatch_pos = (diff > atol).nonzero(as_tuple=False)
+    mismatch_pos = mismatched_mask.nonzero(as_tuple=False)
     n_total_mismatch = mismatch_pos.size(0)
     mismatch_vals = diff[mismatch_pos[:, 0], mismatch_pos[:, 1]]
     sorted_order = mismatch_vals.argsort(descending=True)
@@ -341,15 +354,17 @@ def _print_2d_detail(
         rel = abs(d / max(abs(on_val), abs(off_val), 1e-8)) * 100
         print(f"  [{b:>4d},{p:>4d}]  {tok:>10s}  {on_val:>14.6f}  {off_val:>14.6f}  {d:>14.6e}  {rel:>9.2f}%")
 
-    per_row = (diff > atol).sum(dim=1)
+    per_row = mismatched_mask.sum(dim=1)
     print(f"\n  Row breakdown:")
     for b in range(B):
         n_row = int(per_row[b].item())
         if n_row > 0:
-            row_max = float(diff[b].max().item())
+            row_mask = mismatched_mask[b]
+            row_diffs = diff[b][row_mask]
+            row_max = float(row_diffs.max().item())
             row_max_pos = int(diff[b].argmax().item())
             lh = f" token={int(label[b, row_max_pos].item())}" if label is not None else ""
-            print(f"    row[{b}]: {n_row}/{L} mismatches  (max_diff={row_max:.6e} @ col={row_max_pos}{lh})")
+            print(f"    row[{b}]: {n_row}/{int(mask[b].sum().item())} mismatches  (max_diff={row_max:.6e} @ col={row_max_pos}{lh})")
     print()
 
 
