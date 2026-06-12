@@ -6,7 +6,8 @@ Supports two dump modes:
 1. Packed format (attention output / logits):
    - ``attn_output.pt``  — last-layer attention output  [N, 1, hidden] or [N, hidden]
    - ``logits.pt``       — model output logits            [N, vocab//tp]
-   - Metadata: ``cu_seqlens_q.pt``, ``prefix_lens.pt`` (shared, dedup)
+   - Metadata: ``cu_seqlens_q.pt`` (attn) / ``cu_seqlens_q_logits.pt`` (logits),
+     ``prefix_lens.pt`` (shared)
 
 2. 2D format (logprobs / entropy):
    - ``logprobs_{tag}.pt``  — 2D log probabilities  [B, L]
@@ -28,7 +29,7 @@ import torch
 
 # ── Internal state ──────────────────────────────────────────────
 _DUMP_DIR: str | None = None
-_META_SAVED: bool = False  # cu_seqlens + prefix_lens already written
+_META_SAVED: set[str] = set()  # set of saved metadata keys (per-run dedup per key)
 
 
 def _get_dump_dir() -> str | None:
@@ -71,29 +72,41 @@ def _save_tensor(name: str, tensor: torch.Tensor, dump_dir: str) -> None:
 
 def _save_meta(packed_seq_params: Any,
                prefix_lens_list: list[int],
-               dump_dir: str) -> None:
-    """Save cu_seqlens_q.pt + prefix_lens.pt (once per run)."""
+               dump_dir: str,
+               meta_key: str = "attn") -> None:
+    """Save cu_seqlens + prefix_lens (dedup per meta_key across one run).
+
+    meta_key determines the filename suffix:
+      - "attn"  → cu_seqlens_q_attn.pt
+      - "logits" → cu_seqlens_q_logits.pt
+    prefix_lens.pt is shared (same across dump types within a run).
+    """
     global _META_SAVED
-    if _META_SAVED:
-        return
+    cu_key = f"cu_{meta_key}"
+    pl_key = "pl"
     if not _rank0_only():
-        _META_SAVED = True
         return
     import logging
     _log = logging.getLogger(__name__)
-    try:
-        cu = packed_seq_params.cu_seqlens_q_padded.detach().cpu().clone()
-        torch.save(cu, os.path.join(dump_dir, "cu_seqlens_q.pt"))
-        _log.warning("cu_seqlens_q.pt saved (%s)", cu.shape)
-    except Exception as e:
-        _log.warning("cu_seqlens_q.pt save failed: %s", e)
-    try:
-        pl = torch.tensor(prefix_lens_list, dtype=torch.int32)
-        torch.save(pl, os.path.join(dump_dir, "prefix_lens.pt"))
-        _log.warning("prefix_lens.pt saved (%s)", pl.shape)
-    except Exception as e:
-        _log.warning("prefix_lens.pt save failed: %s", e)
-    _META_SAVED = True
+    # cu_seqlens (per dump-type, separate files)
+    if cu_key not in _META_SAVED:
+        try:
+            cu = packed_seq_params.cu_seqlens_q_padded.detach().cpu().clone()
+            cu_fname = f"cu_seqlens_q_{meta_key}.pt" if meta_key != "attn" else "cu_seqlens_q.pt"
+            torch.save(cu, os.path.join(dump_dir, cu_fname))
+            _log.warning("%s saved (%s)", cu_fname, cu.shape)
+            _META_SAVED.add(cu_key)
+        except Exception as e:
+            _log.warning("cu_seqlens (%s) save failed: %s", meta_key, e)
+    # prefix_lens (shared, once per run)
+    if pl_key not in _META_SAVED:
+        try:
+            pl = torch.tensor(prefix_lens_list, dtype=torch.int32)
+            torch.save(pl, os.path.join(dump_dir, "prefix_lens.pt"))
+            _log.warning("prefix_lens.pt saved (%s)", pl.shape)
+            _META_SAVED.add(pl_key)
+        except Exception as e:
+            _log.warning("prefix_lens.pt save failed: %s", e)
 
 
 # ── Packed format: attention output ────────────────────────────
@@ -113,7 +126,8 @@ def dump_attn_on(
         return
     _save_tensor("attn_output.pt", output_tensor, dump_dir)
     _save_meta(packed_seq_params,
-               list(prefix_sharing_plan.prefix_lens), dump_dir)
+               list(prefix_sharing_plan.prefix_lens), dump_dir,
+               meta_key="attn")
 
 
 def dump_attn_off(
@@ -133,7 +147,8 @@ def dump_attn_off(
     if dump_dir is None:
         return
     _save_tensor("attn_output.pt", output_tensor, dump_dir)
-    _save_meta(packed_seq_params, [0] * batch_size, dump_dir)
+    _save_meta(packed_seq_params, [0] * batch_size, dump_dir,
+               meta_key="attn")
 
 
 # ── Packed format: logits ──────────────────────────────────────
@@ -148,7 +163,8 @@ def dump_logits(
     if dump_dir is None:
         return
     _save_tensor("logits.pt", logits, dump_dir)
-    _save_meta(packed_seq_params, prefix_lens_list, dump_dir)
+    _save_meta(packed_seq_params, prefix_lens_list, dump_dir,
+               meta_key="logits")
 
 
 # ── 2D format: logprobs / entropy / label ──────────────────────

@@ -41,14 +41,25 @@ def _fmt_shape(s: tuple[int, ...]) -> str:
 
 # ── Packed: load & compare ─────────────────────────────────────
 
-def _load_packed(dir_path: str, output_file: str) -> dict | None:
-    """Load a packed-format dump. Returns None if file missing."""
+def _load_packed(dir_path: str, output_file: str,
+                 cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
+    """Load a packed-format dump. Returns None if file missing.
+
+    cu_fname: metadata filename (e.g. "cu_seqlens_q.pt" for attn,
+    "cu_seqlens_q_logits.pt" for logits). Falls back to "cu_seqlens_q.pt"
+    if the specific file is not found.
+    """
     fp = os.path.join(dir_path, output_file)
     if not os.path.exists(fp):
         return None
-    cu_fp = os.path.join(dir_path, "cu_seqlens_q.pt")
+    # Try specific cu_seqlens file, fallback to default
+    cu_fp = os.path.join(dir_path, cu_fname)
+    if not os.path.exists(cu_fp):
+        cu_fp = os.path.join(dir_path, "cu_seqlens_q.pt")
+        if not os.path.exists(cu_fp):
+            return None
     pl_fp = os.path.join(dir_path, "prefix_lens.pt")
-    if not os.path.exists(cu_fp) or not os.path.exists(pl_fp):
+    if not os.path.exists(pl_fp):
         return None
     return {
         "output": torch.load(fp, weights_only=True).float(),
@@ -123,8 +134,10 @@ def compare_packed(
     atol: float, rtol: float = 1e-5,
 ) -> dict | None:
     """Compare a packed-format dump (attn_output.pt or logits.pt)."""
-    on = _load_packed(dir_on, output_file)
-    off = _load_packed(dir_off, output_file)
+    # Use dump-type-specific cu_seqlens filename (with fallback)
+    cu_fname = "cu_seqlens_q_logits.pt" if name == "logits" else "cu_seqlens_q.pt"
+    on = _load_packed(dir_on, output_file, cu_fname)
+    off = _load_packed(dir_off, output_file, cu_fname)
     if on is None or off is None:
         return None
 
@@ -134,7 +147,7 @@ def compare_packed(
     cu_off = off["cu_seqlens"]
     pl = on["prefix_lens"]
 
-    batch = cu_on.shape[0] - 1
+    batch = min(cu_on.shape[0], cu_off.shape[0]) - 1
     is_attn = on_out.dim() == 3  # [N, 1, hidden]
 
     total_tokens = 0
@@ -147,24 +160,39 @@ def compare_packed(
         if pf <= 0:
             continue
 
-        on_start = int(cu_on[i])
-        on_len = int(cu_on[i + 1] - cu_on[i])
-        off_start = int(cu_off[i]) + pf
-        off_len_on = on_len
+        # Compute suffix lengths independently from each side's cu_seqlens
+        on_suffix_len = int(cu_on[i + 1] - cu_on[i])
+        off_full_len = int(cu_off[i + 1] - cu_off[i])
+        off_suffix_len = max(0, off_full_len - pf)
 
-        if off_start + off_len_on > off_out.shape[0]:
+        on_start = int(cu_on[i])
+        off_start = int(cu_off[i]) + pf
+
+        # Validate ON bounds
+        if on_start < 0 or on_start + on_suffix_len > on_out.shape[0]:
+            print(f"[WARN] {name} row[{i}] prefix_len={pf}: ON out of bounds, skip")
+            continue
+        # Validate OFF bounds
+        if off_start < 0 or off_start + off_suffix_len > off_out.shape[0]:
             print(f"[WARN] {name} row[{i}] prefix_len={pf}: OFF out of bounds, skip")
             continue
-        if off_len_on == 0:
+        # Validate suffix lengths match
+        if on_suffix_len != off_suffix_len:
+            print(f"[WARN] {name} row[{i}] prefix_len={pf}: "
+                  f"suffix len mismatch (ON={on_suffix_len}, OFF={off_suffix_len}), skip")
+            continue
+        if on_suffix_len == 0:
             print(f"[WARN] {name} row[{i}] prefix_len={pf}: zero suffix tokens, skip")
             continue
 
+        suffix_len = on_suffix_len
+
         if is_attn:
-            a = on_out[on_start:on_start + off_len_on, 0, :]
-            b = off_out[off_start:off_start + off_len_on, 0, :]
+            a = on_out[on_start:on_start + suffix_len, 0, :]
+            b = off_out[off_start:off_start + suffix_len, 0, :]
         else:
-            a = on_out[on_start:on_start + off_len_on, :]
-            b = off_out[off_start:off_start + off_len_on, :]
+            a = on_out[on_start:on_start + suffix_len, :]
+            b = off_out[off_start:off_start + suffix_len, :]
 
         diff_abs = (a - b).abs()
         row_max = diff_abs.max().item()
@@ -175,14 +203,14 @@ def compare_packed(
             fail_rows += 1
             global_max_diff = max(global_max_diff, row_max)
             print(f"row[{i}] prefix_len={pf}: "
-                  f"{n_mismatch}/{off_len_on} tokens exceed atol={atol}"
+                  f"{n_mismatch}/{suffix_len} tokens exceed atol={atol}"
                   f" (max_abs_diff={row_max:.6e})")
             _diagnose_packed(a, b, pf)
         else:
             ok_rows += 1
-            print(f"row[{i}] prefix_len={pf}: ALL MATCH ({off_len_on} tokens)")
+            print(f"row[{i}] prefix_len={pf}: ALL MATCH ({suffix_len} tokens)")
 
-        total_tokens += off_len_on
+        total_tokens += suffix_len
 
     print()
     print(_SEP_DOUBLE)
