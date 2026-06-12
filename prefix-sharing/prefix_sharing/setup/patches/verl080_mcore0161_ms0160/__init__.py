@@ -4,6 +4,7 @@ Patch 目标：
 1. MegatronEngineWithLMHead.forward_step → 微批次重组 + runtime context 注入
 2. Attention.forward                     → prefix-sharing attention 拦截
 3. vocab_parallel_log_probs_from_logits  → 自动 logprob restore
+4. no_padding_2_padding                  → PS 物理裁剪后修正序列长度
 
 所有业务逻辑由 integrations 层处理，本 patch set 只负责 thin wrapper 编排。
 """
@@ -12,6 +13,7 @@ from prefix_sharing.setup.registry import PatchSpec
 from .forward_step import patch_verl_forward_step
 from .attention import patch_megatron_attention
 from .vocab_logprobs import patch_megatron_vocab
+from .nopadding import patch_no_padding_2_padding
 
 PATCH_SET: list[PatchSpec] = [
     PatchSpec(
@@ -35,5 +37,11 @@ PATCH_SET: list[PatchSpec] = [
         target_getter=lambda mod: (mod, "vocab_parallel_log_probs_from_logits"),
         patch_factory=patch_megatron_vocab,
         description="vocab_parallel_log_probs → auto logprob restore (verl 0.8.0)",
+    ),
+    PatchSpec(
+        module_name="verl.workers.utils.padding",
+        target_getter=lambda mod: (mod, "no_padding_2_padding"),
+        patch_factory=patch_no_padding_2_padding,
+        description="no_padding_2_padding → PS trimming-aware sequence lengths",
     ),
 ]

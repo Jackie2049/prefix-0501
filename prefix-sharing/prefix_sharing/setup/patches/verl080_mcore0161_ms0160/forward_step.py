@@ -36,7 +36,6 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         from prefix_sharing.integrations.verl_mcore import (
             read_ps_config_from_engine_config,
             build_prefix_sharing_micro_batch_verl080,
-            adjust_attention_mask_for_prefix_sharing,
         )
         from prefix_sharing.core.config import PrefixSharingConfig
 
@@ -54,17 +53,6 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
             # 返回 (trimmed_batch, state) — 解包 tuple
             batch_for_forward, ps_state = build_prefix_sharing_micro_batch_verl080(
                 self, batch_on_device, ps_config,
-            )
-
-            # ── 关键步骤：修改 original_batch 的 attention_mask ──
-            # no_padding_2_padding 读的是外层 batch_td（= original_batch）的
-            # attention_mask 计算 prompt_lens/response_lens，断言
-            # sum(prompt_lens + response_lens) == model_output_token_count。
-            # 物理裁剪后 model output token 数减少，必须同步调整 mask。
-            # 不能用 monkey-patch no_padding_2_padding，因为 losses.py 用
-            # from ... import 直接引用，绕过了 module-level patch。
-            adjust_attention_mask_for_prefix_sharing(
-                original_batch, ps_state.prefix_sharing_plan,
             )
 
         # ── 构造修改后的 iterator 喂回原始 forward_step ──
