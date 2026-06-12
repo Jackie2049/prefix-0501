@@ -58,6 +58,20 @@ def load_tensor(filepath: str, dtype: str | None = None) -> torch.Tensor:
     return t.float()
 
 
+def load_label_mask(dir_path: str) -> torch.Tensor | None:
+    """加载结构掩码 label_mask.pt（若存在）。
+
+    label_mask 是 dump 时保存的 bool tensor [B, L]，恰好标记了
+    [-response_length-1:-1] 范围——即 log_probs 和 entropy 最终
+    参与 loss 的位置。它从 attention_mask 派生，是纯结构信号。
+    """
+    path = os.path.join(dir_path, "label_mask.pt")
+    if not os.path.exists(path):
+        return None
+    t = torch.load(path, weights_only=True)
+    return t.to(torch.bool)
+
+
 # ──────────────────────────────────────────────
 # Legacy: logprobs.pt + input_ids.pt
 # ──────────────────────────────────────────────
@@ -506,9 +520,11 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             detail_data.append({"type": "shape_mismatch", "name": f"entropy_{tag}",
                                 "t1": ent1, "t2": ent2, "result": r})
         else:
-            # entropy: ON 仅计算 suffix+restore 位置，prompt 为 0
-            # 用 (ON != 0) 做 mask 只比较双方都计算过的位置
-            ent_compare_mask = (ent1 != 0)
+            # entropy: 用 label_mask（[-response_length-1:-1]）标记有效对比位置，
+            # 纯结构信号，不依赖任何运行时数值。
+            ent_compare_mask = load_label_mask(dir1)
+            if ent_compare_mask is None:
+                ent_compare_mask = (ent1 != 0)  # 兼容老 dump
             diff, mask = _compute_2d_diff(ent1, ent2, compare_mask=ent_compare_mask)
             r = CompareResult.from_2d_diff(f"entropy_{tag}", diff, mask, atol,
                                            t1=ent1, t2=ent2)
@@ -533,10 +549,13 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             detail_data.append({"type": "shape_mismatch", "name": f"logits_{tag}",
                                 "t1": log1, "t2": log2, "result": r})
         else:
-            # logits: ON 仅计算 suffix 位置的 logits，prompt 全 0
-            # 用 ON 非零位置做 3D mask，只比较双方都计算过的 token
-            log_pos_valid = (log1.abs().max(dim=-1, keepdim=True).values > 1e-8)
-            log_compare_mask = log_pos_valid.expand_as(log1)
+            # logits: label_mask 标记有效位置，扩展到 vocab 维。
+            label_mask_2d = load_label_mask(dir1)
+            if label_mask_2d is not None:
+                log_compare_mask = label_mask_2d.unsqueeze(-1).expand_as(log1)
+            else:
+                log_pos_valid = (log1.abs().max(dim=-1, keepdim=True).values > 1e-8)
+                log_compare_mask = log_pos_valid.expand_as(log1)
             diff, mask = _compute_3d_diff(log1, log2, compare_mask=log_compare_mask)
             r = CompareResult.from_3d_diff(f"logits_{tag}", diff, atol,
                                            t1=log1, t2=log2)
@@ -563,7 +582,10 @@ def compare_tagged(dir1: str, dir2: str, tag: str, atol: float, dtype: str | Non
             detail_data.append({"type": "shape_mismatch", "name": "logprobs",
                                 "t1": lp1, "t2": lp2, "result": r})
         else:
-            diff, mask = _compute_2d_diff(lp1, lp2)
+            # logprobs: label_mask 标记 [-response_length-1:-1]，
+            # 两侧都通过 masked_fill(~label_mask, 0.0) 显式清零 prompt。
+            lp_compare_mask = load_label_mask(dir1)
+            diff, mask = _compute_2d_diff(lp1, lp2, compare_mask=lp_compare_mask)
             r = CompareResult.from_2d_diff("logprobs", diff, mask, atol,
                                            t1=lp1, t2=lp2)
             results.append(r)
