@@ -704,7 +704,10 @@ class MegatronPPOActor(BasePPOActor):
                         if ctx is not None and ctx.prefix_last_restore_indices:
                             for index in ctx.prefix_last_restore_indices:
                                 if not index.is_interior_response:
-                                    saved = logits[
+                                    # logits may be [N, V//tp] or [1, N, V//tp];
+                                    # flatten then slice on dim 0 to get [1, V//tp].
+                                    logits_flat = logits.view(-1, logits.size(-1))
+                                    saved = logits_flat[
                                         index.provider_1d_pos:index.provider_1d_pos + 1,
                                         :,
                                     ].clone()
