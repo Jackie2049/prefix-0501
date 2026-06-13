@@ -62,19 +62,16 @@ from verl.workers.actor import BasePPOActor
 # 当 prefix-sharing 模块存在时启用功能，不存在时保持原行为（设为 None 作为 guard）
 from contextlib import nullcontext
 try:
-    from prefix_sharing.integrations.context import prefix_sharing_runtime_context
+    from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
     from prefix_sharing.integrations.verl_mcore import (
         build_prefix_sharing_micro_batch,
-        restore_suffix_first_log_probs_from_prefix,
-        write_restored_logprobs_to_2d,
-        write_restored_entropy_to_2d,
+        restore_reuser_prefix_columns_2d,
     )
 except ModuleNotFoundError:
+    current_prefix_sharing_context = None
     prefix_sharing_runtime_context = None
     build_prefix_sharing_micro_batch = None
-    restore_suffix_first_log_probs_from_prefix = None
-    write_restored_logprobs_to_2d = None
-    write_restored_entropy_to_2d = None
+    restore_reuser_prefix_columns_2d = None
 ######### prefix-sharing #########
 
 __all__ = ["MegatronPPOActor"]
@@ -697,16 +694,23 @@ class MegatronPPOActor(BasePPOActor):
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ######### prefix-sharing #########
-                    # prefix-sharing 的 One-Forward 方案会跳过前缀 token 的 logits 计算，
-                    # 需要在 logits_processor 中恢复这些位置的 log_probs 以保证训练语义正确性
-                    if restore_suffix_first_log_probs_from_prefix is not None:
-                        log_probs = restore_suffix_first_log_probs_from_prefix(
-                            logits_bak,
-                            label,
-                            log_probs,
-                            vocab_parallel_log_probs_from_logits,
-                            vocab_parallel_entropy if calculate_entropy else None,
-                        )
+                    # Save provider prefix-last packed logits for 2D recompute.
+                    # logprob/entropy restore is deferred entirely to the 2D
+                    # postprocess stage (restore_reuser_prefix_columns_2d).
+                    # Only prefix-last specs need saved logits; interior
+                    # specs copy directly from the provider's 2D row.
+                    if restore_reuser_prefix_columns_2d is not None:
+                        ctx = current_prefix_sharing_context()
+                        if ctx is not None and ctx.prefix_last_restore_indices:
+                            for index in ctx.prefix_last_restore_indices:
+                                if not index.is_interior_response:
+                                    saved = logits[
+                                        index.provider_1d_pos:index.provider_1d_pos + 1,
+                                        :,
+                                    ].clone()
+                                    ctx.prefix_last_logits_saved[
+                                        (index.reuse_idx_in_batch, index.target_2d_pos)
+                                    ] = saved
                     ######### prefix-sharing #########
                     ret["log_probs"] = log_probs
                     return ret
@@ -727,16 +731,20 @@ class MegatronPPOActor(BasePPOActor):
                         logits_processor_args=logits_processor_args,
                         data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                     )
-                    # Drain logprob/entropy restore caches into 2D output.
-                    # All restores (interior-response + prefix-last) are
-                    # computed and cached during the logits_processor stage
-                    # (packed 1D). After postprocess_packed_seqs converts
-                    # back to [B, L] shape, write each cached scalar to the
-                    # correct 2D position so loss_func sees complete rows.
-                    if write_restored_logprobs_to_2d is not None:
-                        output = write_restored_logprobs_to_2d(output)
-                    if write_restored_entropy_to_2d is not None:
-                        output = write_restored_entropy_to_2d(output)
+                    # Restore reuser prefix columns in 2D space.
+                    # All logprob/entropy restoration (interior + prefix-last)
+                    # happens here after postprocess_packed_seqs has produced
+                    # the 2D [B, L] output.  Interior: direct 2D copy from
+                    # provider.  Prefix-last: entropy copied from provider
+                    # (same logits), logprob recomputed from saved provider
+                    # logits with reuser's own label.
+                    if restore_reuser_prefix_columns_2d is not None:
+                        output = restore_reuser_prefix_columns_2d(
+                            output,
+                            label,                                     # 2D label [B, L]
+                            vocab_parallel_log_probs_from_logits,
+                            vocab_parallel_entropy if calculate_entropy else None,
+                        )
                     ########## prefix-sharing diag dump (2D after restores) ##########
                     try:
                         from prefix_sharing.tools.diagnostic_dump import (

@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
 from prefix_sharing.integrations.verl_mcore import (
     build_prefix_sharing_micro_batch,
-    restore_suffix_first_log_probs_from_prefix,
+    restore_reuser_prefix_columns_2d,
 )
 
 
@@ -128,14 +128,12 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
-def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path():
-    # THD compact format: [1, total_kept_tokens, V]
-    # row0 (provider) all 5 tokens, row1 (reuser) suffix 2 tokens (positions 3,4)
-    # total = 5 + 2 = 7, align_size=1 so no padding
-    # vocab_size must be >= max(input_ids)+1 = 22 to accommodate label_value=20/21
-    logits = torch.randn(1, 7, 32, requires_grad=True)
-    labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
-    log_probs = torch.zeros(1, 7, requires_grad=True)
+def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
+    # prefix-last-only case (no interior response).
+    # input: [[1,2,3,10,11], [1,2,3,20,21]] → prefix_len=3, prompt_len=3
+    # Only prefix-last spec: provider_prefix_last_pos=2, target_2d_pos=2.
+    # Reuser's first suffix token at target_2d_pos=2 differs from provider's,
+    # so logprob must be recomputed from saved provider logits.
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
@@ -163,12 +161,27 @@ def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path
         ).squeeze(-1)
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
-        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 1
-        # Restored logprob is cached keyed by (reuse_idx_in_batch, target_2d_pos).
-        # Reuser index 1, prefix-last at position 2 (prefix_len-1).
-        cached_logprob = ctx.logprob_restore_cache[(1, 2)]
+        assert len(ctx.prefix_last_restore_indices) == 1
+        index = ctx.prefix_last_restore_indices[0]
+        assert not index.is_interior_response
 
-    cached_logprob.backward()
-    assert logits.grad is not None
-    assert logits.grad[0, 2].abs().sum() > 0
+        # Simulate 2D postprocess: output dict with [B, L] log_probs.
+        log_probs_2d = torch.zeros(2, 5)
+        output = {"log_probs": log_probs_2d}
+
+        # 2D label: label[p] = token at p+1 (verl convention).
+        label_2d = torch.tensor([[0, 0, 0, 10, 11], [0, 0, 0, 20, 21]])
+
+        # Saved provider packed logits for prefix-last recompute.
+        saved_logits = torch.randn(1, 32, requires_grad=True)
+        ctx.prefix_last_logits_saved[(index.reuse_idx_in_batch, index.target_2d_pos)] = saved_logits
+
+        output = restore_reuser_prefix_columns_2d(output, label_2d, gather_fn)
+        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 1
+
+        restored_val = output["log_probs"][index.reuse_idx_in_batch, index.target_2d_pos]
+
+    # Gradient must flow through saved_logits.
+    restored_val.backward()
+    assert saved_logits.grad is not None
+    assert saved_logits.grad.abs().sum() > 0

@@ -16,7 +16,7 @@ from prefix_sharing.integrations.verl_mcore import (
     enable_prefix_sharing,
     prefix_sharing_enabled,
     build_prefix_sharing_micro_batch,
-    restore_suffix_first_log_probs_from_prefix,
+    restore_reuser_prefix_columns_2d,
 )
 
 __all__ = [
@@ -34,5 +34,5 @@ __all__ = [
     "prefix_sharing_runtime_context",
     "prefix_sharing_enabled",
     "build_prefix_sharing_micro_batch",
-    "restore_suffix_first_log_probs_from_prefix",
+    "restore_reuser_prefix_columns_2d",
 ]

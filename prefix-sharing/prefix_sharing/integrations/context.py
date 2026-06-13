@@ -42,19 +42,15 @@ class PrefixSharingRuntimeContext:
     store: PrefixKVStore
     backend: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
-    logprob_restore_cache: dict[tuple[int, int], Any] = field(default_factory=dict)
-    """Cache for restored logprob scalars keyed by (batch_idx, target_2d_pos).
+    prefix_last_logits_saved: dict[tuple[int, int], Any] = field(default_factory=dict)
+    """Saved provider packed logits for prefix-last logprob recompute in 2D space.
 
-    Populated during packed 1D logits_processor stage with non-detached tensors
-    and drained to 2D output after postprocess_packed_seqs.
-    Holds both interior-response and prefix-last restore entries.
-    """
-    entropy_restore_cache: dict[tuple[int, int], Any] = field(default_factory=dict)
-    """Cache for restored entropy scalars keyed by (batch_idx, target_2d_pos).
+    Keyed by (reuse_idx_in_batch, target_2d_pos). Each value is [1, V//tp]
+    cloned from packed logits after temperature scaling, before any
+    in-place modification by entropy/logprob computation.
 
-    Same pattern as logprob_restore_cache: populated during packed 1D
-    logits_processor stage and drained to 2D output after
-    postprocess_packed_seqs.
+    Only populated for non-interior (prefix-last) restore specs.
+    Interior specs use direct 2D copy instead.
     """
     stats: PrefixSharingStats | None = None
 

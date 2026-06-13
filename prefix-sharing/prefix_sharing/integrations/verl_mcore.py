@@ -383,142 +383,91 @@ def _read_megatron_parallel_state() -> tuple[int | str, int, int, int, int]:
     return global_rank, tp_rank, tp_size, cp_rank, cp_size
 
 
-def restore_suffix_first_log_probs_from_prefix(
-    logits: Any,
-    labels: Any,
-    log_probs: Any,
+def restore_reuser_prefix_columns_2d(
+    output: dict[str, Any],
+    label_2d: Any,
     vocab_parallel_log_probs_fn: Any,
     vocab_parallel_entropy_fn: Any = None,
-) -> Any:
-    """Compute restore logprobs and cache for later 2D injection.
+) -> dict[str, Any]:
+    """Restore reuser prefix columns in 2D space after postprocess_packed_seqs.
 
-    All restore entries (interior-response and prefix-last) are handled
-    uniformly:
+    All prefix-column restoration happens purely in 2D [B, L] space,
+    consolidating the previous three-phase approach (packed compute →
+    cache → 2D inject) into a single post-forward step.
 
-    - Compute logprob from provider logits at ``provider_1d_pos``:
-      * Interior: label from provider packed labels (shared prefix token).
-      * Prefix-last: label from ``index.label_value`` (reuser's first
-        suffix token, NOT available in trimmed packed labels).
-    - Cache as non-detached scalar tensor keyed by
-      ``(reuse_idx_in_batch, target_2d_pos)``.
-    - **Never write to the 1D packed log_probs tensor** because reuser
-      packed regions have no slots for trimmed positions and the label
-      position in 1D packed does not correspond to the correct 2D
-      position.
+    For each :class:`PackedPrefixLastRestoreIndex` in the runtime context:
 
-    The cache is drained after ``postprocess_packed_seqs`` by
-    :func:`write_restored_logprobs_to_2d`.
+    - **Interior response** (shared-prefix token): logprob and entropy
+      are identical between provider and reuser because the label is the
+      same shared token and the logits are the same (same KV).  Directly
+      copy from the provider's 2D row.
+
+    - **Prefix-last token**: entropy is still the same (same logits),
+      so copy from provider's 2D row.  Logprob depends on the label
+      which differs (reuser's first suffix token ≠ provider's), so
+      recompute from saved provider packed logits + reuser's 2D label.
+
+    Must be called while ``prefix_sharing_runtime_context`` is still
+    active (i.e. before the context manager exits), and after
+    ``postprocess_packed_seqs`` has produced the 2D output dict.
+
+    Args:
+        output: Output dict from forward, with ``log_probs`` [B, L] and
+            optionally ``entropy`` [B, L] in 2D space.
+        label_2d: Original 2D label [B, L] (from ``forward_step``, before
+            packed preprocessing).  In verl convention,
+            ``label[p] = token at p+1``.
+        vocab_parallel_log_probs_fn: Function to compute logprob from
+            packed logits [1, 1, V//tp] and label [1, 1] → scalar.
+            Typically :func:`verl.utils.megatron.tensor_parallel.vocab_parallel_log_probs_from_logits`.
+        vocab_parallel_entropy_fn: Optional function to compute entropy
+            from packed logits [1, V//tp] → scalar.
+
+    Returns:
+        ``output`` with ``log_probs`` and ``entropy`` mutated in-place.
     """
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
-        return log_probs
-
-    non_interior_count = sum(1 for idx in ctx.prefix_last_restore_indices if not idx.is_interior_response)
-    if ctx.stats is not None:
-        ctx.stats.record_restore(non_interior_count)
-
-    for index in ctx.prefix_last_restore_indices:
-        provider_logits = logits[
-            0:1,
-            index.provider_1d_pos : index.provider_1d_pos + 1,
-            :,
-        ].clone()
-
-        if index.is_interior_response:
-            # Interior: label is in shared prefix, available at
-            # provider_1d_pos in the provider's packed labels.
-            # In verl convention, label[p] = token at p+1.
-            # provider_1d_pos maps to interior_pos - 1 (logits position),
-            # so labels[provider_1d_pos] = token at interior_pos.
-            provider_label = labels[
-                0:1,
-                index.provider_1d_pos : index.provider_1d_pos + 1,
-            ]
-        else:
-            # Prefix-last: label is the reuser's first suffix token,
-            # which is NOT in the reuser's trimmed packed labels.
-            # Use the explicit label_value from planning metadata.
-            import torch
-            provider_label = torch.tensor(
-                [[index.label_value]],
-                device=logits.device,
-                dtype=labels.dtype,
-            )
-
-        restored_logprob = vocab_parallel_log_probs_fn(provider_logits, provider_label).reshape(())
-        ctx.logprob_restore_cache[(index.reuse_idx_in_batch, index.target_2d_pos)] = restored_logprob
-
-        # Compute entropy from the same provider logits for trimmed-prefix restoration.
-        # provider_logits has shape [1, 1, V//tp]; squeeze to [1, V//tp] for entropy fn.
-        if vocab_parallel_entropy_fn is not None:
-            provider_logits_2d = provider_logits.squeeze(0)
-            restored_entropy = vocab_parallel_entropy_fn(provider_logits_2d).reshape(())
-            ctx.entropy_restore_cache[(index.reuse_idx_in_batch, index.target_2d_pos)] = restored_entropy
-
-    # Return log_probs unchanged — all restores are cached for 2D injection.
-    return log_probs
-
-
-def write_restored_logprobs_to_2d(
-    output: dict[str, Any],
-) -> dict[str, Any]:
-    """Drain the logprob restore cache into the 2D output tensor.
-
-    Called after ``postprocess_packed_seqs`` has converted packed log_probs
-    back to [B, L] shape. Iterates
-    :attr:`PrefixSharingRuntimeContext.logprob_restore_cache` and writes
-    each non-detached scalar tensor to ``output["log_probs"][batch_idx, target_2d_pos]``.
-
-    Must be called while ``prefix_sharing_runtime_context`` is still active
-    (i.e. before the context manager exits).
-
-    Returns:
-        ``output`` with ``log_probs`` mutated in-place.
-    """
-
-    ctx = current_prefix_sharing_context()
-    if ctx is None or not ctx.logprob_restore_cache:
         return output
 
     log_probs = output.get("log_probs")
     if log_probs is None:
         return output
-
-    for (batch_idx, target_2d_pos), logprob in ctx.logprob_restore_cache.items():
-        log_probs[batch_idx, target_2d_pos] = logprob
-
-    return output
-
-
-def write_restored_entropy_to_2d(
-    output: dict[str, Any],
-) -> dict[str, Any]:
-    """Drain the entropy restore cache into the 2D output tensor.
-
-    Called after ``postprocess_packed_seqs`` has converted packed entropy
-    back to [B, L] shape. Iterates
-    :attr:`PrefixSharingRuntimeContext.entropy_restore_cache` and writes
-    each non-detached scalar tensor to ``output["entropy"][batch_idx, target_2d_pos]``.
-
-    Must be called while ``prefix_sharing_runtime_context`` is still active
-    (i.e. before the context manager exits).
-
-    Returns:
-        ``output`` with ``entropy`` mutated in-place.
-    """
-
-    ctx = current_prefix_sharing_context()
-    if ctx is None or not ctx.entropy_restore_cache:
-        return output
-
     entropy = output.get("entropy")
-    if entropy is None:
-        return output
 
-    for (batch_idx, target_2d_pos), ent_val in ctx.entropy_restore_cache.items():
-        entropy[batch_idx, target_2d_pos] = ent_val
+    non_interior_count = 0
+    for index in ctx.prefix_last_restore_indices:
+        reuser_row = index.reuse_idx_in_batch
+        provider_row = index.provider_idx_in_batch
+        col = index.target_2d_pos
 
+        if index.is_interior_response:
+            # Interior: token is in shared prefix → logprob and entropy
+            # are identical to the provider's (same label, same logits).
+            log_probs[reuser_row, col] = log_probs[provider_row, col]
+            if entropy is not None:
+                entropy[reuser_row, col] = entropy[provider_row, col]
+        else:
+            # Prefix-last: entropy is the same (same logits), so copy
+            # from provider's 2D row.  Logprob differs because reuser's
+            # first suffix token ≠ provider's.
+            non_interior_count += 1
+            if entropy is not None:
+                entropy[reuser_row, col] = entropy[provider_row, col]
+
+            # Recompute logprob from saved provider packed logits
+            # with reuser's own label.
+            saved_key = (reuser_row, col)
+            provider_logits = ctx.prefix_last_logits_saved[saved_key]  # [1, V//tp]
+            reuser_label = label_2d[reuser_row:reuser_row + 1, col:col + 1]  # [1, 1]
+            log_probs[reuser_row, col] = vocab_parallel_log_probs_fn(
+                provider_logits.unsqueeze(0),  # [1, 1, V//tp]
+                reuser_label,
+            ).reshape(())
+
+    if ctx.stats is not None:
+        ctx.stats.record_restore(non_interior_count)
     return output
 
 
