@@ -24,8 +24,8 @@ def test_prefix_last_restore_inserts_reuse_first_suffix_logprob():
         [0.21, 0.22],  # reuser: slot 0 is the second suffix token (21), not 20
     ]
     # Per-spec restore logprobs: one value per PrefixLastRestoreSpec in plan order.
-    # Here there is exactly one spec (prefix-last for reuser index 1).
-    restore_logprobs = [0.20]
+    # prefix_len=3 → interior positions 1,2 (2 specs) + prefix-last (1 spec) = 3 specs.
+    restore_logprobs = [0.01, 0.02, 0.20]
 
     restored = restore_prefix_last_logprobs(
         suffix_logprobs,
@@ -35,7 +35,7 @@ def test_prefix_last_restore_inserts_reuse_first_suffix_logprob():
 
     assert restored == [
         [0.10, 0.11, 0.12, 0.13, 0.14],
-        [0.20, 0.21, 0.22],  # 0.20 prepended to match full-sequence causal LM logprobs
+        [0.01, 0.02, 0.20, 0.21, 0.22],  # interior + prefix-last prepended
     ]
 
 
@@ -45,9 +45,9 @@ def test_build_provider_prefix_last_values_uses_restore_specs():
         [["p0", "p1", "p_last", "s0"], ["unused"]],
         prefix_sharing_plan,
     )
-    # Per-spec list: one value per PrefixLastRestoreSpec.
-    # The single spec gathers p_last at provider_prefix_last_pos=2.
-    assert values == ["p_last"]
+    # Per-spec list: 3 values for 3 specs (interior pos 1,2 + prefix-last).
+    # provider_prefix_last_pos=0,1,2.
+    assert values == ["p0", "p1", "p_last"]
 
 
 def test_restore_logprobs_with_interior_response_tokens():
@@ -64,8 +64,9 @@ def test_restore_logprobs_with_interior_response_tokens():
         micro_batch_id=1,
     )
 
-    # Two specs: interior (A) at slot 0, prefix-last at slot 1
-    assert len(plan.prefix_last_restore) == 2
+    # Interior restore covers all prefix columns 1..prefix_len-1:
+    # interior pos1,2,3 (3 specs) + prefix-last (1 spec) = 4 specs.
+    assert len(plan.prefix_last_restore) == 4
 
     # Suffix forward yields logprobs for kept Q positions.
     # For the reuser: forward produces [logprob(C_wrong_position)].
@@ -74,10 +75,11 @@ def test_restore_logprobs_with_interior_response_tokens():
         [0.16],                             # reuser: logprob(C) from wrong logits position
     ]
 
-    # Per-spec restore logprobs:
-    #   spec[0]: interior-response for A (from provider logits[2] + label=A)
-    #   spec[1]: prefix-last for C (from provider logits[3] + label=C)
-    restore_logprobs = [0.04, 0.16]
+    # Per-spec restore logprobs: 4 values for 4 specs.
+    #   spec[0]: interior pos1, spec[1]: interior pos2,
+    #   spec[2]: interior-response for A (from provider logits[2] + label=A)
+    #   spec[3]: prefix-last for C (from provider logits[3] + label=C)
+    restore_logprobs = [0.01, 0.02, 0.04, 0.16]
 
     restored = restore_prefix_last_logprobs(
         suffix_logprobs,
@@ -87,11 +89,8 @@ def test_restore_logprobs_with_interior_response_tokens():
 
     # Provider row unchanged
     assert restored[0] == [0.10, 0.11, 0.12, 0.13, 0.14]
-    # Reuser: interior A inserted at slot 0, prefix-last C inserted at slot 1.
-    # Note: the current insert-based restore keeps the forward's "wrong"
-    # first-suffix logprob as a tail entry. This is a known artifact —
-    # downstream mask/trim would need to discard it.
-    assert restored[1] == [0.04, 0.16, 0.16]
+    # Reuser: 3 interior + 1 prefix-last inserted.
+    assert restored[1] == [0.01, 0.02, 0.04, 0.16, 0.16]
 
 
 def test_build_provider_prefix_last_values_with_interior_specs():
@@ -113,4 +112,4 @@ def test_build_provider_prefix_last_values_with_interior_specs():
         [provider_row, ["unused"] * 6],
         plan,
     )
-    assert values == ["lp_2", "lp_3"]  # per-spec ordering
+    assert values == ["lp_0", "lp_1", "lp_2", "lp_3"]  # per-spec: 4 values for 4 specs

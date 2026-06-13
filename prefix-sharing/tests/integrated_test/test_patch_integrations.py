@@ -102,7 +102,7 @@ def test_verl_mcore_batch_adapter_uses_mapping_for_preprocess_and_restore():
     )
     assert restored == [
         [-1.0, -1.1, -1.2, -1.3, -1.4],
-        [-2.0, -2.1, -2.2],
+        [-2.0, -2.0, -2.0, -2.1, -2.2],  # 3 specs (2 interior + 1 prefix-last), all reuse_idx_in_batch=1 → -2.0
         [-9.0, -9.1],
     ]
 

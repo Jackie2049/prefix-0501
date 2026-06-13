@@ -25,7 +25,10 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.prefix_sharing_plan is prefix_sharing_runtime_state.prefix_sharing_plan
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
+        # 3 restore specs: 2 interior (provider_prefix_last_pos=0,1) + 1 prefix-last (pos=2)
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel: no slot in reuser packed region
         assert ctx.stats.original_tokens == 11
         assert ctx.stats.kept_valid_tokens == 8
@@ -55,6 +58,9 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
     )
 
     with prefix_sharing_runtime_context(runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
+        # 3 restore specs: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel: no slot in reuser packed region
         assert ctx.stats.kept_padded_tokens == 8

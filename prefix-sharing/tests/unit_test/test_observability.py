@@ -33,7 +33,7 @@ def test_prefix_sharing_stats_from_plan_records_expected_reuse_summary():
     assert stats.sharing_group_count == 1
     assert stats.expected_reused_counts_per_layer == 1
     assert stats.expected_reused_prefix_tokens_per_layer == 3
-    assert stats.expected_restore_count == 1
+    assert stats.expected_restore_count == 3
     assert stats.actual_restore_count == 0
 
 
@@ -61,7 +61,7 @@ def test_prefix_sharing_stats_records_layer_runtime_and_expected_match():
         valid_q_tokens=7,
         padded_q_tokens=7,
     )
-    stats.record_restore(1)
+    stats.record_restore(3)
 
     layer = stats.layers[7]
     assert layer.store_count == 2
@@ -73,5 +73,5 @@ def test_prefix_sharing_stats_records_layer_runtime_and_expected_match():
     assert layer.expanded_kv_tokens == 10
     assert layer.valid_q_tokens == 7
     assert layer.padded_q_tokens == 7
-    assert stats.actual_restore_count == 1
+    assert stats.actual_restore_count == 3
     assert stats.layer_matches_expected(7)

@@ -195,7 +195,7 @@ def compare_packed(
             # Fallback: cu_seqlens is full-sequence, skip prefix portion
             on_suffix_len = max(0, on_full_len - pf)
             on_start = on_start_raw + pf
-            if on_suffix_len <= 0 or on_start + on_suffix_len > on_out.shape[0]:
+            if on_suffix_len < 0 or on_start + on_suffix_len > on_out.shape[0]:
                 print(f"[WARN] {name} row[{i}] prefix_len={pf}: "
                       f"ON out of bounds (raw_len={on_full_len}, "
                       f"adj_len={on_suffix_len}, tensor_len={on_out.shape[0]}), skip")
@@ -215,10 +215,6 @@ def compare_packed(
             print(f"[WARN] {name} row[{i}] prefix_len={pf}: "
                   f"suffix len mismatch (ON={on_suffix_len}, OFF={off_suffix_len}), skip")
             continue
-        if on_suffix_len == 0:
-            print(f"[WARN] {name} row[{i}] prefix_len={pf}: zero suffix tokens, skip")
-            continue
-
         suffix_len = on_suffix_len
 
         if is_attn:

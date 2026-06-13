@@ -469,7 +469,7 @@ def restore_reuser_prefix_columns_2d(
             ).reshape(())
 
     if ctx.stats is not None:
-        ctx.stats.record_restore(non_interior_count)
+        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
     return output
 
 

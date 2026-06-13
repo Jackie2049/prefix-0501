@@ -47,7 +47,10 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
+        # 3 restore indices: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
     assert current_prefix_sharing_context() is None
 
@@ -124,7 +127,10 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
     assert layout.packed_position_ids.tolist() == expected_positions
     assert layout.valid_token_mask.tolist() == expected_mask
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
+        # 3 restore indices: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
         assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
@@ -161,8 +167,9 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
         ).squeeze(-1)
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert len(ctx.prefix_last_restore_indices) == 1
-        index = ctx.prefix_last_restore_indices[0]
+        # 3 restore specs: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        index = ctx.prefix_last_restore_indices[2]  # prefix-last spec
         assert not index.is_interior_response
 
         # Simulate 2D postprocess: output dict with [B, L] log_probs.
@@ -177,7 +184,7 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
         ctx.prefix_last_logits_saved[(index.reuse_idx_in_batch, index.target_2d_pos)] = saved_logits
 
         output = restore_reuser_prefix_columns_2d(output, label_2d, gather_fn)
-        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 1
+        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 3
 
         restored_val = output["log_probs"][index.reuse_idx_in_batch, index.target_2d_pos]
 

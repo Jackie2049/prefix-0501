@@ -284,37 +284,35 @@ class PrefixSharingPlanner:
 
                 # --- Interior-prefix response token restore ---
                 # Response tokens inside the shared prefix (positions
-                # prompt_len .. prefix_len-1) are trimmed from the Q path but
+                # 1 .. prefix_len-1) are trimmed from the Q path but
                 # still need logprob entries for PPO loss. Their labels are
                 # inside the shared prefix so the logprob is identical for
                 # provider and reuser: compute once from provider logits,
                 # store as a non-detached scalar tensor.
-                if prompt_lens is not None:
-                    prompt_len = prompt_lens[index]
-                    interior_slot = 0
-                    for interior_pos in range(prompt_len, prefix_len):
-                        if interior_pos >= 1:
-                            # Interior response token logprob: computed from
-                            # logits[interior_pos-1] predicting token at
-                            # interior_pos. Writes to 2D position
-                            # interior_pos - 1 (the label position).
-                            restore_specs.append(
-                                PrefixLastRestoreSpec(
-                                    reuse_idx_in_batch=index,
-                                    provider_idx_in_batch=provider_index[index],
-                                    provider_prefix_last_pos=interior_pos - 1,
-                                    reuse_first_suffix_label_pos=interior_pos,
-                                    output_slot=interior_slot,
-                                    group_id=group_ids[index],
-                                    is_interior_response=True,
-                                    target_2d_pos=interior_pos - 1,
-                                    label_value=input_ids[index][interior_pos],
-                                )
-                            )
-                            interior_slot += 1
-                    first_suffix_slot = interior_slot
-                else:
-                    first_suffix_slot = 0
+                # Note: prompt positions (0..prompt_len-1) may also be
+                # restored, but their label_mask is False so they don't
+                # affect loss — waste-free simplicity over prompt_lens.
+                interior_slot = 0
+                for interior_pos in range(1, prefix_len):
+                    # Interior response token logprob: computed from
+                    # logits[interior_pos-1] predicting token at
+                    # interior_pos. Writes to 2D position
+                    # interior_pos - 1 (the label position).
+                    restore_specs.append(
+                        PrefixLastRestoreSpec(
+                            reuse_idx_in_batch=index,
+                            provider_idx_in_batch=provider_index[index],
+                            provider_prefix_last_pos=interior_pos - 1,
+                            reuse_first_suffix_label_pos=interior_pos,
+                            output_slot=interior_slot,
+                            group_id=group_ids[index],
+                            is_interior_response=True,
+                            target_2d_pos=interior_pos - 1,
+                            label_value=input_ids[index][interior_pos],
+                        )
+                    )
+                    interior_slot += 1
+                first_suffix_slot = interior_slot
 
                 # --- Prefix-last restore (first suffix token) ---
                 # The logits at position prefix_len-1 predict the first suffix

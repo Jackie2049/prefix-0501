@@ -33,8 +33,8 @@ def test_phase_one_core_system_flow_without_framework_dependencies():
         [-9.1, -9.2],
     ]
     # Per-spec restore logprobs: one value per PrefixLastRestoreSpec.
-    # Here there is exactly one spec (prefix-last for reuser index 1).
-    restore_logprobs = [-3.0]
+    # prefix_len=3 → interior positions 1,2 (2 specs) + prefix-last (1 spec) = 3 specs.
+    restore_logprobs = [-0.1, -0.2, -3.0]
 
     restored = restore_prefix_last_logprobs(
         suffix_logprobs,
@@ -43,5 +43,5 @@ def test_phase_one_core_system_flow_without_framework_dependencies():
     )
 
     assert restored[0] == [-1.0, -1.1, -1.2, -1.3, -1.4]
-    assert restored[1] == [-3.0, -3.1, -3.2]
+    assert restored[1] == [-0.1, -0.2, -3.0, -3.1, -3.2]
     assert restored[2] == [-9.1, -9.2]
