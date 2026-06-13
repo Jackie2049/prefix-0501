@@ -458,12 +458,14 @@ def restore_reuser_prefix_columns_2d(
 
             # Recompute logprob from saved provider packed logits
             # with reuser's own label.
+            # vocab_parallel_log_probs_from_logits expects:
+            #   logits: [N, V//tp]   labels: [N]
             saved_key = (reuser_row, col)
             provider_logits = ctx.prefix_last_logits_saved[saved_key]  # [1, V//tp]
-            reuser_label = label_2d[reuser_row:reuser_row + 1, col:col + 1]  # [1, 1]
+            reuser_label = label_2d[reuser_row:reuser_row + 1, col:col + 1].view(1)  # [1]
             log_probs[reuser_row, col] = vocab_parallel_log_probs_fn(
-                provider_logits.unsqueeze(0),  # [1, 1, V//tp]
-                reuser_label,
+                provider_logits,  # [1, V//tp]
+                reuser_label,    # [1]
             ).reshape(())
 
     if ctx.stats is not None:
