@@ -734,6 +734,24 @@ class MegatronPPOActor(BasePPOActor):
                         logits_processor_args=logits_processor_args,
                         data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                     )
+                    ########## prefix-sharing diag: pre-restore snapshot ##########
+                    # Dump 2D logprobs/entropy BEFORE any prefix-column
+                    # restoration, so we can verify that the restore
+                    # actually changes the right positions.  (ON/OFF comparison
+                    # alone can't distinguish "restore did nothing" from
+                    # "restore happened correctly".)
+                    try:
+                        from prefix_sharing.tools.diagnostic_dump import (
+                            dump_logprobs_2d, dump_entropy_2d,
+                            dump_label, dump_label_mask,
+                        )
+                        dump_logprobs_2d(output["log_probs"], "before_restore")
+                        if "entropy" in output:
+                            dump_entropy_2d(output["entropy"], "before_restore")
+                    except Exception:
+                        pass
+                    ########## prefix-sharing diag: pre-restore snapshot ##########
+
                     # Restore reuser prefix columns in 2D space.
                     # All logprob/entropy restoration (interior + prefix-last)
                     # happens here after postprocess_packed_seqs has produced
@@ -750,10 +768,7 @@ class MegatronPPOActor(BasePPOActor):
                         )
                     ########## prefix-sharing diag dump (2D after restores) ##########
                     try:
-                        from prefix_sharing.tools.diagnostic_dump import (
-                            dump_logprobs_2d, dump_entropy_2d,
-                            dump_label, dump_label_mask,
-                        )
+                        # re-import or use already-imported names
                         tag = "old" if forward_only else "train"
                         dump_logprobs_2d(output["log_probs"], tag)
                         if "entropy" in output:

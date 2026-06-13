@@ -11,7 +11,9 @@ Auto-detects available dump files and selects the right comparison strategy:
 
 Usage:
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag train
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
+        --tag-on before_restore --tag-off old
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --output report.json
 """
 
@@ -372,10 +374,15 @@ def compare_2d_item(
     dir_on: str, dir_off: str, filename: str, name: str,
     atol: float, label_mask: torch.Tensor | None,
     label: torch.Tensor | None,
+    filename_off: str | None = None,
 ) -> CompareResult | None:
-    """Compare a single 2D tensor file between on/off dumps."""
+    """Compare a single 2D tensor file between on/off dumps.
+
+    When ``filename_off`` is provided, it is used for the OFF file;
+    otherwise ``filename`` is used for both.
+    """
     t1 = _load_2d_tensor(dir_on, filename)
-    t2 = _load_2d_tensor(dir_off, filename)
+    t2 = _load_2d_tensor(dir_off, filename_off or filename)
     if t1 is None or t2 is None:
         return None
     if t1.shape != t2.shape:
@@ -391,9 +398,18 @@ def compare_2d_item(
 
 
 def compare_2d(
-    dir_on: str, dir_off: str, tag: str, atol: float,
+    dir_on: str, dir_off: str, tag_on: str, atol: float,
+    tag_off: str | None = None,
 ) -> tuple[list[CompareResult], dict]:
-    """Compare all 2D dumps with the given tag."""
+    """Compare all 2D dumps with the given tags.
+
+    Args:
+        tag_on: Tag for ON directory files (e.g. ``logprobs_{tag_on}.pt``).
+        tag_off: Tag for OFF directory files; defaults to ``tag_on`` when None.
+    """
+    if tag_off is None:
+        tag_off = tag_on
+
     results: list[CompareResult] = []
     detail_data: list[dict] = []
 
@@ -404,51 +420,62 @@ def compare_2d(
         print()
 
     # entropy
-    r = compare_2d_item(dir_on, dir_off, f"entropy_{tag}.pt",
-                        f"entropy_{tag}", atol, label_mask, label)
+    fn_on = f"entropy_{tag_on}.pt"
+    fn_off = f"entropy_{tag_off}.pt"
+    r = compare_2d_item(dir_on, dir_off, fn_on,
+                        f"entropy_{tag_on} vs entropy_{tag_off}",
+                        atol, label_mask, label,
+                        filename_off=fn_off)
     if r is not None:
         results.append(r)
         if not r.shape_mismatch:
-            t1 = _load_2d_tensor(dir_on, f"entropy_{tag}.pt")
-            t2 = _load_2d_tensor(dir_off, f"entropy_{tag}.pt")
+            t1 = _load_2d_tensor(dir_on, fn_on)
+            t2 = _load_2d_tensor(dir_off, fn_off)
             cm = label_mask if label_mask is not None and label_mask.shape == t1.shape else (t2 != 0)
             diff, mask = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
-            detail_data.append({"type": "2d", "name": f"entropy_{tag}",
+            detail_data.append({"type": "2d", "name": f"entropy_{tag_on}_vs_{tag_off}",
                                 "t1": t1, "t2": t2, "diff": diff, "mask": mask,
                                 "atol": atol, "label": label, "result": r})
 
     # logprobs
-    r = compare_2d_item(dir_on, dir_off, f"logprobs_{tag}.pt",
-                        f"logprobs_{tag}", atol, label_mask, label)
+    fn_on = f"logprobs_{tag_on}.pt"
+    fn_off = f"logprobs_{tag_off}.pt"
+    r = compare_2d_item(dir_on, dir_off, fn_on,
+                        f"logprobs_{tag_on} vs logprobs_{tag_off}",
+                        atol, label_mask, label,
+                        filename_off=fn_off)
     if r is None:
         r = compare_2d_item(dir_on, dir_off, "logprobs.pt",
                             "logprobs", atol, label_mask, label)
     if r is not None:
         results.append(r)
         if not r.shape_mismatch:
-            fp = f"logprobs_{tag}.pt" if os.path.exists(os.path.join(dir_on, f"logprobs_{tag}.pt")) else "logprobs.pt"
-            t1 = _load_2d_tensor(dir_on, fp)
-            t2 = _load_2d_tensor(dir_off, fp)
+            fp_on = fn_on if os.path.exists(os.path.join(dir_on, fn_on)) else "logprobs.pt"
+            fp_off = fn_off if os.path.exists(os.path.join(dir_off, fn_off)) else "logprobs.pt"
+            t1 = _load_2d_tensor(dir_on, fp_on)
+            t2 = _load_2d_tensor(dir_off, fp_off)
             cm = label_mask if label_mask is not None and label_mask.shape == t1.shape else (t2 != 0)
             diff, mask = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
-            detail_data.append({"type": "2d", "name": fp.replace(".pt",""),
+            detail_data.append({"type": "2d", "name": fp_on.replace(".pt","") + "_vs_" + fp_off.replace(".pt",""),
                                 "t1": t1, "t2": t2, "diff": diff, "mask": mask,
                                 "atol": atol, "label": label, "result": r})
 
-    # logits (3D)
-    t1 = _load_2d_tensor(dir_on, f"logits_{tag}.pt")
-    t2 = _load_2d_tensor(dir_off, f"logits_{tag}.pt")
+    # logits (3D) — tag_off defaults to tag_on for logits
+    logits_off_tag = tag_off if (tag_off == tag_on or 
+        os.path.exists(os.path.join(dir_off, f"logits_{tag_off}.pt"))) else tag_on
+    t1 = _load_2d_tensor(dir_on, f"logits_{tag_on}.pt")
+    t2 = _load_2d_tensor(dir_off, f"logits_{logits_off_tag}.pt")
     if t1 is not None and t2 is not None and t1.dim() == 3:
         if t1.shape != t2.shape:
-            r = CompareResult(name=f"logits_{tag}", shape_on=tuple(t1.shape),
+            r = CompareResult(name=f"logits_{tag_on}", shape_on=tuple(t1.shape),
                               shape_off=tuple(t2.shape))
         else:
             diff = (t1 - t2).abs()
             mask = torch.ones_like(diff, dtype=torch.bool)
-            r = _make_2d_result(f"logits_{tag}", diff, mask, atol,
+            r = _make_2d_result(f"logits_{tag_on}", diff, mask, atol,
                                 t1=t1, t2=t2)
             delta_per_pos = diff.max(dim=-1).values
-            detail_data.append({"type": "3d", "name": f"logits_{tag}",
+            detail_data.append({"type": "3d", "name": f"logits_{tag_on}",
                                 "t1": t1, "t2": t2, "diff": diff,
                                 "diff_per_pos": delta_per_pos, "mask": mask,
                                 "atol": atol, "label": label, "result": r})
@@ -565,8 +592,12 @@ def main():
     )
     ap.add_argument("--dir-on", required=True, help="ON dump directory")
     ap.add_argument("--dir-off", required=True, help="OFF dump directory")
-    ap.add_argument("--tag", choices=["old", "train"], default=None,
-                    help="Dump tag for 2D files (old = forward_only, train = training)")
+    ap.add_argument("--tag", choices=["old", "train", "before_restore"], default=None,
+                    help="Dump tag for both ON and OFF 2D files (shortcut for --tag-on/--tag-off)")
+    ap.add_argument("--tag-on", default=None,
+                    help="Dump tag for ON 2D files (overrides --tag for ON)")
+    ap.add_argument("--tag-off", default=None,
+                    help="Dump tag for OFF 2D files (overrides --tag for OFF)")
     ap.add_argument("--atol", type=float, default=1e-3,
                     help="Absolute tolerance (default: 1e-3 for packed, 1e-5 for 2D)")
     ap.add_argument("--rtol", type=float, default=1e-5,
@@ -577,13 +608,17 @@ def main():
 
     dir_on = args.dir_on
     dir_off = args.dir_off
+    # Resolve tags: --tag-on / --tag-off override --tag
+    tag_on = args.tag_on or args.tag
+    tag_off = args.tag_off or args.tag
 
     print(_SEP_DOUBLE)
     print(f"  Prefix-Sharing Diag Report")
     print(f"  ON : {dir_on}")
     print(f"  OFF: {dir_off}")
-    if args.tag:
-        print(f"  TAG: {args.tag}")
+    if tag_on:
+        tag_str = f"TAG_ON={tag_on}" + (f" TAG_OFF={tag_off}" if tag_off != tag_on else "")
+        print(f"  TAG: {tag_str}")
     print(_SEP_DOUBLE)
     print()
 
@@ -598,8 +633,9 @@ def main():
             all_results.append(r)
 
     # 2. Try 2D dumps with --tag
-    if args.tag:
-        results_2d, meta = compare_2d(dir_on, dir_off, args.tag, args.atol)
+    if tag_on:
+        results_2d, meta = compare_2d(dir_on, dir_off, tag_on, args.atol,
+                                       tag_off=tag_off)
         detail_2d = meta
         for r in results_2d:
             all_results.append({
