@@ -479,7 +479,9 @@ def compare_2d(
     # Load both masks: suffix_mask from ON, response_mask from OFF.
     label_mask_on = _load_label_mask(dir_on)   # suffix_mask (prefix-sharing side)
     label_mask_off = _load_label_mask(dir_off) # response_mask (ground truth)
-    label = _load_label(dir_off) or _load_label(dir_on)
+    label = _load_label(dir_off)
+    if label is None:
+        label = _load_label(dir_on)
     if label is not None:
         print(f"label  shape={_fmt_shape(tuple(label.shape))}")
         print()
