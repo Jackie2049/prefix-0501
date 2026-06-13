@@ -217,6 +217,10 @@ def compare_packed(
             continue
         suffix_len = on_suffix_len
 
+        if suffix_len == 0:
+            print(f"row[{i}] prefix_len={pf} (pure-reuser): suffix_len=0, skip")
+            continue
+
         if is_attn:
             a = on_out[on_start:on_start + suffix_len, 0, :]
             b = off_out[off_start:off_start + suffix_len, 0, :]
