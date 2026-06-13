@@ -59,21 +59,29 @@ def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
     return _current_context.get()
 
 
-def _resolve_root_provider(
+def _resolve_provider_for_position(
     plan: PrefixSharingPlan,
     provider_idx: int,
+    target_pos: int,
 ) -> int:
-    """Walk up the provider chain to find the root provider (non-reuser).
+    """Walk up the provider chain to find the nearest ancestor whose
+    packed layout contains ``target_pos`` (absolute original position).
 
     In chain-reuse scenarios (row 0 → row 1 → row 2), intermediate
-    providers are themselves reusers and their packed layout only
-    contains suffix tokens — prefix interior positions don't exist
-    there.  Resolving to the root provider ensures the full sequence
-    is available in packed layout.
+    providers are reusers with truncated packed layouts.  The root
+    provider may also be shorter than the reuser's prefix — in that
+    case intermediate providers contribute the extended range.
     """
-    while plan.is_reuser(provider_idx):
-        provider_idx = plan.provider_index[provider_idx]
-    return provider_idx
+    while True:
+        keep_start, keep_end = plan.input_keep_ranges[provider_idx]
+        if keep_start <= target_pos < keep_end:
+            return provider_idx
+        if plan.is_reuser(provider_idx):
+            provider_idx = plan.provider_index[provider_idx]
+        else:
+            # Can't walk further; return current (should not happen
+            # with valid detection, but guard)
+            return provider_idx
 
 
 def _build_prefix_last_restore_indices(
@@ -83,32 +91,29 @@ def _build_prefix_last_restore_indices(
     indices = []
     for spec in prefix_sharing_plan.prefix_last_restore:
         reuse_idx = spec.reuse_idx_in_batch
-        # Resolve through chain reuse to root provider whose packed
-        # layout contains the full (untrimmed) sequence.
-        root_provider_idx = _resolve_root_provider(
-            prefix_sharing_plan, spec.provider_idx_in_batch
+        # Resolve through chain reuse to the nearest provider whose
+        # packed layout contains provider_prefix_last_pos.
+        target_pos = spec.provider_prefix_last_pos
+        resolved_provider = _resolve_provider_for_position(
+            prefix_sharing_plan, spec.provider_idx_in_batch, target_pos
         )
         provider_offset = (
-            spec.provider_prefix_last_pos
-            - prefix_sharing_plan.input_keep_ranges[root_provider_idx][0]
+            target_pos - prefix_sharing_plan.input_keep_ranges[resolved_provider][0]
         )
         # compute provider_1d_pos: packed index for the provider's logits position
-        provider_1d = packed_batch_layout.packed_index(root_provider_idx, provider_offset)
+        provider_1d = packed_batch_layout.packed_index(resolved_provider, provider_offset)
 
-        if spec.is_interior_response:
-            # Interior: label is in shared prefix, available in root
-            # provider's packed labels at provider_1d_pos.
-            reuse_1d = -1  # sentinel: no slot in reuser packed region
-        else:
-            # Prefix-last: label (reuser's first suffix token) is NOT in
-            # the reuser's trimmed packed labels. We use spec.label_value
-            # directly instead. reuse_1d is a sentinel.
-            reuse_1d = -1
+        # Interior: provider and reuser share the same prefix tokens,
+        # so the logprob at target_pos is identical — just copy.
+        # This holds even when resolved_provider is an intermediate
+        # reuser in a chain (the resolution already guarantees
+        # target_pos falls within its packed layout).
+        reuse_1d = -1  # sentinel: no slot in reuser packed region
 
         indices.append(
             PackedPrefixLastRestoreIndex(
                 reuse_idx_in_batch=reuse_idx,
-                provider_idx_in_batch=root_provider_idx,
+                provider_idx_in_batch=resolved_provider,
                 provider_1d_pos=provider_1d,
                 reuse_1d_pos=reuse_1d,
                 is_interior_response=spec.is_interior_response,
