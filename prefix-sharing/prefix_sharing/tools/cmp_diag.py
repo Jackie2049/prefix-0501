@@ -9,12 +9,27 @@ Auto-detects available dump files and selects the right comparison strategy:
 
 - 3D (logits_{tag}.pt): element-wise + per-position max-over-vocab diff.
 
+Mask modes (--mask):
+  off  (default)   compare only response tokens, using OFF label_mask
+  on               use ON (prefix-sharing side) label_mask
+  all              compare ALL [B,L] positions — prompt + suffix; use
+                   for same-dir pre-vs-post restore checks
+
 Usage:
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off
+    # ON vs OFF (response only — standard check)
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old
+
+    # ON-pre vs OFF (response only)
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag-on before_restore --tag-off old
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --output report.json
+
+    # ON-pre vs ON-post (ALL positions — check restore actually writes)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_on \\
+        --tag-on before_restore --tag-off old --mask all
+
+    # JSON output
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
+        --tag old -o report.json
 """
 
 from __future__ import annotations
@@ -143,6 +158,12 @@ def compare_packed(
     if on is None or off is None:
         return None
 
+    # Section header
+    print(_SEP_SINGLE)
+    print(f"  [Packed]  {name}  —  ON vs OFF")
+    print(_SEP_SINGLE)
+    print()
+
     on_out = on["output"]
     off_out = off["output"]
     cu_on = on["cu_seqlens"]
@@ -231,6 +252,8 @@ def compare_packed(
     print(f"  TOTAL_SUFFIX_TOKENS: {total_tokens}")
     print(f"  MAX_ABS_DIFF: {global_max_diff:.6e}")
     print(_SEP_DOUBLE)
+    print()
+    print()
 
     return {
         "name": name, "ok_rows": ok_rows, "fail_rows": fail_rows,
@@ -370,16 +393,52 @@ def _print_2d_detail(
     print()
 
 
+_MASK_ALL = "all"          # compare every [B, L] position (for pre-vs-post restore check)
+_MASK_OFF = "off"          # use OFF (no prefix-sharing) label_mask  — default
+_MASK_ON  = "on"           # use ON  (prefix-sharing)   label_mask
+
+
+def _resolve_compare_mask(
+    mask_mode: str,
+    label_mask_on: torch.Tensor | None,
+    label_mask_off: torch.Tensor | None,
+    shape: torch.Size,
+    fallback_tensor: torch.Tensor,
+) -> tuple[torch.Tensor | None, str]:
+    """Resolve the effective comparison mask and a human-readable label.
+
+    Returns (mask_tensor_or_none, mask_description).
+    """
+    if mask_mode == _MASK_ALL:
+        return None, "all (full [B,L], no filtering)"
+    # off / on
+    chosen = label_mask_off if mask_mode == _MASK_OFF else label_mask_on
+    chosen_label = "response_mask (OFF)" if mask_mode == _MASK_OFF else "suffix_mask (ON)"
+    if chosen is not None and chosen.shape == shape:
+        return chosen, f"{chosen_label}, {int(chosen.sum().item())} active"
+    # fallback
+    fb = fallback_tensor != 0
+    return fb, f"t2!=0 (fallback, {int(fb.sum().item())} active)"
+
+
 def compare_2d_item(
     dir_on: str, dir_off: str, filename: str, name: str,
-    atol: float, label_mask: torch.Tensor | None,
+    atol: float,
+    label_mask_on: torch.Tensor | None,
+    label_mask_off: torch.Tensor | None,
     label: torch.Tensor | None,
     filename_off: str | None = None,
+    mask_mode: str = _MASK_OFF,
 ) -> CompareResult | None:
     """Compare a single 2D tensor file between on/off dumps.
 
     When ``filename_off`` is provided, it is used for the OFF file;
     otherwise ``filename`` is used for both.
+
+    ``mask_mode`` controls which positions are compared:
+      - "off" (default): OFF label_mask (response tokens only)
+      - "on":            ON  label_mask
+      - "all":           every [B, L] position
     """
     t1 = _load_2d_tensor(dir_on, filename)
     t2 = _load_2d_tensor(dir_off, filename_off or filename)
@@ -389,9 +448,11 @@ def compare_2d_item(
         return CompareResult(name=name, shape_on=tuple(t1.shape),
                              shape_off=tuple(t2.shape))
 
-    compare_mask = label_mask
-    if compare_mask is None or compare_mask.shape != t1.shape:
-        compare_mask = (t2 != 0)
+    compare_mask, _mask_desc = _resolve_compare_mask(
+        mask_mode, label_mask_on, label_mask_off, t1.shape, t2,
+    )
+    if compare_mask is None:
+        compare_mask = torch.ones(t1.shape, dtype=torch.bool, device=t1.device)
     diff = (t1 - t2).abs()
     mask = torch.logical_and(compare_mask.to(diff.device), diff == diff)
     return _make_2d_result(name, diff, mask, atol, t1=t1, t2=t2)
@@ -400,12 +461,14 @@ def compare_2d_item(
 def compare_2d(
     dir_on: str, dir_off: str, tag_on: str, atol: float,
     tag_off: str | None = None,
+    mask_mode: str = _MASK_OFF,
 ) -> tuple[list[CompareResult], dict]:
     """Compare all 2D dumps with the given tags.
 
     Args:
         tag_on: Tag for ON directory files (e.g. ``logprobs_{tag_on}.pt``).
         tag_off: Tag for OFF directory files; defaults to ``tag_on`` when None.
+        mask_mode: ``"off"`` | ``"on"`` | ``"all"`` — which label_mask to use.
     """
     if tag_off is None:
         tag_off = tag_on
@@ -413,28 +476,59 @@ def compare_2d(
     results: list[CompareResult] = []
     detail_data: list[dict] = []
 
-    label_mask = _load_label_mask(dir_on)
-    label = _load_label(dir_on)
+    # Load both masks: suffix_mask from ON, response_mask from OFF.
+    label_mask_on = _load_label_mask(dir_on)   # suffix_mask (prefix-sharing side)
+    label_mask_off = _load_label_mask(dir_off) # response_mask (ground truth)
+    label = _load_label(dir_off) or _load_label(dir_on)
     if label is not None:
         print(f"label  shape={_fmt_shape(tuple(label.shape))}")
         print()
+
+    # Build effective mask and description for the comparison header.
+    _sample_tensor = _load_2d_tensor(dir_on, f"logprobs_{tag_on}.pt")
+    if _sample_tensor is not None:
+        _, mask_desc = _resolve_compare_mask(
+            mask_mode, label_mask_on, label_mask_off,
+            _sample_tensor.shape, _sample_tensor,
+        )
+    else:
+        mask_desc = "—"
+
+    # Section header
+    print(_SEP_DOUBLE)
+    print(f"  [2D]  ON  [{dir_on}]  ({tag_on})")
+    print(f"        OFF [{dir_off}]  ({tag_off})")
+    print(f"        mask: {mask_desc}")
+    print(_SEP_DOUBLE)
+    print()
+
+    # Helper: pick the right mask and make a detail entry
+    def _mask_for(tensor_for_mask: torch.Tensor) -> torch.Tensor | None:
+        c, _ = _resolve_compare_mask(
+            mask_mode, label_mask_on, label_mask_off,
+            tensor_for_mask.shape, tensor_for_mask,
+        )
+        return c
 
     # entropy
     fn_on = f"entropy_{tag_on}.pt"
     fn_off = f"entropy_{tag_off}.pt"
     r = compare_2d_item(dir_on, dir_off, fn_on,
                         f"entropy_{tag_on} vs entropy_{tag_off}",
-                        atol, label_mask, label,
-                        filename_off=fn_off)
+                        atol, label_mask_on, label_mask_off, label,
+                        filename_off=fn_off,
+                        mask_mode=mask_mode)
     if r is not None:
         results.append(r)
         if not r.shape_mismatch:
             t1 = _load_2d_tensor(dir_on, fn_on)
             t2 = _load_2d_tensor(dir_off, fn_off)
-            cm = label_mask if label_mask is not None and label_mask.shape == t1.shape else (t2 != 0)
-            diff, mask = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
-            detail_data.append({"type": "2d", "name": f"entropy_{tag_on}_vs_{tag_off}",
-                                "t1": t1, "t2": t2, "diff": diff, "mask": mask,
+            cm = _mask_for(t1)
+            if cm is None:
+                cm = torch.ones(t1.shape, dtype=torch.bool, device=t1.device)
+            diff, mk = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
+            detail_data.append({"type": "2d", "name": r.name,
+                                "t1": t1, "t2": t2, "diff": diff, "mask": mk,
                                 "atol": atol, "label": label, "result": r})
 
     # logprobs
@@ -442,11 +536,13 @@ def compare_2d(
     fn_off = f"logprobs_{tag_off}.pt"
     r = compare_2d_item(dir_on, dir_off, fn_on,
                         f"logprobs_{tag_on} vs logprobs_{tag_off}",
-                        atol, label_mask, label,
-                        filename_off=fn_off)
+                        atol, label_mask_on, label_mask_off, label,
+                        filename_off=fn_off,
+                        mask_mode=mask_mode)
     if r is None:
+        # Legacy fallback
         r = compare_2d_item(dir_on, dir_off, "logprobs.pt",
-                            "logprobs", atol, label_mask, label)
+                            "logprobs", atol, label_mask_on, label_mask_off, label)
     if r is not None:
         results.append(r)
         if not r.shape_mismatch:
@@ -454,10 +550,12 @@ def compare_2d(
             fp_off = fn_off if os.path.exists(os.path.join(dir_off, fn_off)) else "logprobs.pt"
             t1 = _load_2d_tensor(dir_on, fp_on)
             t2 = _load_2d_tensor(dir_off, fp_off)
-            cm = label_mask if label_mask is not None and label_mask.shape == t1.shape else (t2 != 0)
-            diff, mask = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
-            detail_data.append({"type": "2d", "name": fp_on.replace(".pt","") + "_vs_" + fp_off.replace(".pt",""),
-                                "t1": t1, "t2": t2, "diff": diff, "mask": mask,
+            cm = _mask_for(t1)
+            if cm is None:
+                cm = torch.ones(t1.shape, dtype=torch.bool, device=t1.device)
+            diff, mk = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
+            detail_data.append({"type": "2d", "name": r.name,
+                                "t1": t1, "t2": t2, "diff": diff, "mask": mk,
                                 "atol": atol, "label": label, "result": r})
 
     # logits (3D) — tag_off defaults to tag_on for logits
@@ -541,6 +639,7 @@ def _print_3d_detail(
 
 def _print_summary(all_results: list[dict], atol: float):
     """Print a unified summary table from all comparison results."""
+    print()
     print(_SEP_DOUBLE)
     print(f"  SUMMARY (atol={atol:.1e})")
     print(_SEP_DOUBLE)
@@ -604,6 +703,10 @@ def main():
                     help="Relative tolerance (packed only)")
     ap.add_argument("--output", "-o", type=str, default=None,
                     help="Save report as JSON")
+    ap.add_argument("--mask", choices=["off", "on", "all"], default="off",
+                    help="Comparison mask mode: off=OFF label_mask (default, "
+                         "response tokens only), on=ON label_mask, "
+                         "all=full [B,L] (for pre-vs-post restore checks)")
     args = ap.parse_args()
 
     dir_on = args.dir_on
@@ -619,6 +722,7 @@ def main():
     if tag_on:
         tag_str = f"TAG_ON={tag_on}" + (f" TAG_OFF={tag_off}" if tag_off != tag_on else "")
         print(f"  TAG: {tag_str}")
+    print(f"  mask: {args.mask}")
     print(_SEP_DOUBLE)
     print()
 
@@ -635,7 +739,8 @@ def main():
     # 2. Try 2D dumps with --tag
     if tag_on:
         results_2d, meta = compare_2d(dir_on, dir_off, tag_on, args.atol,
-                                       tag_off=tag_off)
+                                       tag_off=tag_off,
+                                       mask_mode=args.mask)
         detail_2d = meta
         for r in results_2d:
             all_results.append({
@@ -655,8 +760,10 @@ def main():
         fp = os.path.join(dir_on, "logprobs.pt")
         if os.path.exists(fp):
             tag = "legacy"
+            label_mask_on_legacy = _load_label_mask(dir_on)
+            label_mask_off_legacy = _load_label_mask(dir_off)
             r = compare_2d_item(dir_on, dir_off, "logprobs.pt", "logprobs",
-                                args.atol, None, None)
+                                args.atol, label_mask_on_legacy, label_mask_off_legacy, None)
             if r is not None:
                 all_results.append({
                     "name": r.name,
@@ -675,7 +782,7 @@ def main():
                     r = compare_2d_item(dir_on, dir_off,
                                         f"logprobs_{try_tag}.pt",
                                         f"logprobs_{try_tag}",
-                                        args.atol, None, None)
+                                        args.atol, label_mask_on_legacy, label_mask_off_legacy, None)
                     if r is not None:
                         all_results.append({
                             "name": r.name,
