@@ -74,10 +74,16 @@ def _resolve_provider_for_position(
     providers are reusers with truncated packed layouts.  The root
     provider may also be shorter than the reuser's prefix — in that
     case intermediate providers contribute the extended range.
+
+    The range is extended left by one position (keep_start - 1) for
+    reusers: that position holds the logprob for the token at
+    keep_start which is still inside the shared prefix.  Its value was
+    computed via prefix-last recompute with the correct shared label
+    and is safe to copy from.
     """
     while True:
         keep_start, keep_end = plan.input_keep_ranges[provider_idx]
-        if keep_start <= target_pos < keep_end:
+        if keep_start - 1 <= target_pos < keep_end:
             return provider_idx
         if plan.is_reuser(provider_idx):
             provider_idx = plan.provider_index[provider_idx]
@@ -100,17 +106,22 @@ def _build_prefix_last_restore_indices(
         resolved_provider = _resolve_provider_for_position(
             prefix_sharing_plan, spec.provider_idx_in_batch, target_pos
         )
-        provider_offset = (
-            target_pos - prefix_sharing_plan.input_keep_ranges[resolved_provider][0]
-        )
-        # compute provider_1d_pos: packed index for the provider's logits position
-        provider_1d = packed_batch_layout.packed_index(resolved_provider, provider_offset)
 
         # Interior: provider and reuser share the same prefix tokens,
         # so the logprob at target_pos is identical — just copy.
-        # This holds even when resolved_provider is an intermediate
-        # reuser in a chain (the resolution already guarantees
-        # target_pos falls within its packed layout).
+        # 2D restore uses provider_idx_in_batch + valid_indices mapping,
+        # no packed-index lookup needed.  provider_1d_pos is only used
+        # for prefix-last entries to fetch saved provider logits.
+        # When keep_start-1 resolves to an intermediate reuser, offset
+        # can be negative — skip packed_index and use sentinel -1.
+        provider_offset = (
+            target_pos - prefix_sharing_plan.input_keep_ranges[resolved_provider][0]
+        )
+        if provider_offset >= 0:
+            provider_1d = packed_batch_layout.packed_index(resolved_provider, provider_offset)
+        else:
+            provider_1d = -1  # keep_start-1 of intermediate provider, no packed slot
+
         reuse_1d = -1  # sentinel: no slot in reuser packed region
 
         indices.append(
