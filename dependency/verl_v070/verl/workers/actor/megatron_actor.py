@@ -643,6 +643,14 @@ class MegatronPPOActor(BasePPOActor):
             label_mask = attention_mask.clone()
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
+            ######### prefix-sharing #########
+            # Reuser rows may have all-False attention_mask after PS
+            # pack (suffix_len=0), but their response positions still
+            # count towards loss.  Ensure response cols are True so
+            # interior-restored log_probs survive the 2D masked_fill.
+            if _prefix_sharing:
+                label_mask[:, -response_length - 1 : -1] = True
+            ######### prefix-sharing #########
 
             if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
