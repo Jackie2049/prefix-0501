@@ -644,6 +644,11 @@ class MegatronPPOActor(BasePPOActor):
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
             ######### prefix-sharing #########
+            try:
+                from prefix_sharing.tools.diagnostic_dump import dump_label_mask
+                dump_label_mask(label_mask)  # unmodified label_mask before PS patch
+            except Exception:
+                pass
             # Reuser rows may have all-False attention_mask after PS
             # pack (suffix_len=0), but their response positions still
             # count towards loss.  Ensure response cols are True so
@@ -800,7 +805,7 @@ class MegatronPPOActor(BasePPOActor):
                         if "entropy" in output:
                             dump_entropy_2d(output["entropy"], tag)
                         dump_label(label)
-                        dump_label_mask(label_mask)
+                        # label_mask already dumped before PS patch
                     except Exception:
                         pass
                     ########## prefix-sharing diag dump ##########
