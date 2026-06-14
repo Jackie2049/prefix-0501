@@ -52,6 +52,9 @@ class PrefixSharingRuntimeContext:
     Only populated for non-interior (prefix-last) restore specs.
     Interior specs use direct 2D copy instead.
     """
+    valid_indices: list | None = None
+    """Per-row tensor positions of valid tokens in the original 2D tensors.
+    Used to map planner's valid-space target_2d_pos to tensor-space columns."""
     stats: PrefixSharingStats | None = None
 
 
@@ -142,6 +145,7 @@ def prefix_sharing_runtime_context(
             prefix_sharing_runtime_state.prefix_sharing_plan,
             prefix_sharing_runtime_state.packed_batch_layout,
         ),
+        valid_indices=prefix_sharing_runtime_state.valid_indices,
         stats=PrefixSharingStats.from_plan(
             prefix_sharing_runtime_state.prefix_sharing_plan,
             prefix_sharing_runtime_state.packed_batch_layout,

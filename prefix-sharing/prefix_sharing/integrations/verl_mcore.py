@@ -46,6 +46,10 @@ class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
     packed_batch_layout: PackedBatchLayout
+    valid_indices: list | None = None
+    """Per-row tensor positions of valid (non-padding) tokens in the
+    original 2D tensors.  Used to map planner's valid-space target_2d_pos
+    to tensor-space columns (needed when sequences have left padding)."""
 
 
 @dataclass(frozen=True)
@@ -344,6 +348,7 @@ def build_prefix_sharing_micro_batch(
         prefix_sharing_plan=prefix_sharing_plan,
         backend=backend or TorchReferenceBackend(),
         packed_batch_layout=packed_batch_layout,
+        valid_indices=valid_indices,
     )
     logger.warning(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
@@ -435,6 +440,18 @@ def restore_reuser_prefix_columns_2d(
     if log_probs is None:
         return output
     entropy = output.get("entropy")
+    # Map planner's valid-space target_2d_pos (0-based within valid content)
+    # to tensor-space 2D columns.  postprocess_packed_seqs places tokens at
+    # their ORIGINAL attention_mask positions, so a valid-space position p
+    # maps to valid_indices[row][p] in the [B, L] output.
+    valid_indices = ctx.valid_indices
+
+    def _map_2d_col(row: int, valid_pos: int) -> int:
+        if valid_indices is not None:
+            vi = valid_indices[row]
+            if vi is not None and 0 <= valid_pos < len(vi):
+                return int(vi[valid_pos].item())
+        return valid_pos
 
     # === DIAGNOSTIC: dump all reuse info before restore ===
     _diag_indices = ctx.prefix_last_restore_indices
@@ -474,12 +491,14 @@ def restore_reuser_prefix_columns_2d(
     # sample before values
     if _diag_interior_entries:
         _sample = _diag_interior_entries[0]
+        _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
+        _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
         logger.warning(
             f"[RESTORE_DIAG] sample before restore: "
-            f"reuser_row={_sample.reuse_idx_in_batch} col={_sample.target_2d_pos} "
-            f"provider_row={_sample.provider_idx_in_batch} "
-            f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _sample.target_2d_pos].item():.6f} "
-            f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _sample.target_2d_pos].item():.6f}"
+            f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
+            f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
+            f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
+            f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
         )
     # === END DIAGNOSTIC ===
 
@@ -487,30 +506,35 @@ def restore_reuser_prefix_columns_2d(
     for index in ctx.prefix_last_restore_indices:
         reuser_row = index.reuse_idx_in_batch
         provider_row = index.provider_idx_in_batch
-        col = index.target_2d_pos
+        valid_col = index.target_2d_pos
+        # Map valid-space col to per-row tensor-space columns:
+        # postprocess_packed_seqs places tokens at original
+        # attention_mask positions, which may differ between rows.
+        provider_col = _map_2d_col(provider_row, valid_col)
+        reuser_col = _map_2d_col(reuser_row, valid_col)
 
         if index.is_interior_response:
             # Interior: token is in shared prefix → logprob and entropy
             # are identical to the provider's (same label, same logits).
-            log_probs[reuser_row, col] = log_probs[provider_row, col]
+            log_probs[reuser_row, reuser_col] = log_probs[provider_row, provider_col]
             if entropy is not None:
-                entropy[reuser_row, col] = entropy[provider_row, col]
+                entropy[reuser_row, reuser_col] = entropy[provider_row, provider_col]
         else:
             # Prefix-last: entropy is the same (same logits), so copy
             # from provider's 2D row.  Logprob differs because reuser's
             # first suffix token ≠ provider's.
             non_interior_count += 1
             if entropy is not None:
-                entropy[reuser_row, col] = entropy[provider_row, col]
+                entropy[reuser_row, reuser_col] = entropy[provider_row, provider_col]
 
             # Recompute logprob from saved provider packed logits
             # with reuser's own label.
             # vocab_parallel_log_probs_from_logits expects:
             #   logits: [N, V//tp]   labels: [N]
-            saved_key = (reuser_row, col)
+            saved_key = (reuser_row, valid_col)
             provider_logits = ctx.prefix_last_logits_saved[saved_key]  # [1, V//tp]
-            reuser_label = label_2d[reuser_row:reuser_row + 1, col:col + 1].view(1)  # [1]
-            log_probs[reuser_row, col] = vocab_parallel_log_probs_fn(
+            reuser_label = label_2d[reuser_row:reuser_row + 1, reuser_col:reuser_col + 1].view(1)  # [1]
+            log_probs[reuser_row, reuser_col] = vocab_parallel_log_probs_fn(
                 provider_logits,  # [1, V//tp]
                 reuser_label,    # [1]
             ).reshape(())
@@ -521,20 +545,26 @@ def restore_reuser_prefix_columns_2d(
         _diag_interior = [e for e in _diag_entries if e.is_interior_response]
         if _diag_interior:
             _sample = _diag_interior[0]
+            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
+            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
             logger.warning(
                 f"[RESTORE_DIAG] sample after restore: "
-                f"reuser_row={_sample.reuse_idx_in_batch} col={_sample.target_2d_pos} "
-                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _sample.target_2d_pos].item():.6f} "
-                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _sample.target_2d_pos].item():.6f}"
+                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
+                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
             )
         _diag_plast = [e for e in _diag_entries if not e.is_interior_response]
         if _diag_plast:
             _sample = _diag_plast[0]
+            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
+            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
             logger.warning(
                 f"[RESTORE_DIAG] sample after restore (prefix-last): "
-                f"reuser_row={_sample.reuse_idx_in_batch} col={_sample.target_2d_pos} "
-                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _sample.target_2d_pos].item():.6f} "
-                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _sample.target_2d_pos].item():.6f}"
+                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
+                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
             )
     # === END DIAGNOSTIC ===
 
