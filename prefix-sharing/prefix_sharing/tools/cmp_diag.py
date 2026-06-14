@@ -10,10 +10,13 @@ Auto-detects available dump files and selects the right comparison strategy:
 - 3D (logits_{tag}.pt): element-wise + per-position max-over-vocab diff.
 
 Mask modes (--mask):
-  off  (default)   compare only response tokens, using OFF label_mask
-  on               use ON (prefix-sharing side) label_mask
-  all              compare ALL [B,L] positions — prompt + suffix; use
-                   for same-dir pre-vs-post restore checks
+  off    (default) compare only response tokens, using OFF label_mask
+  on              use ON (prefix-sharing side) label_mask
+  all             compare ALL [B,L] positions — prompt + suffix; use
+                  for same-dir pre-vs-post restore checks
+  prefix          isolate prefix region: OFF_response_mask & ~ON_suffix_mask;
+                  compares only the shared prefix positions (ON treats these
+                  differently from OFF) — use to verify interior restore
 
 Usage:
     # ON vs OFF (response only — standard check)
@@ -380,22 +383,27 @@ def _print_2d_detail(
         print(f"  [{b:>4d},{p:>4d}]  {tok:>10s}  {on_val:>14.6f}  {off_val:>14.6f}  {d:>14.6e}  {rel:>9.2f}%")
 
     per_row = mismatched_mask.sum(dim=1)
+    n_active_per_row = mask.sum(dim=1)
     print(f"\n  Row breakdown:")
     for b in range(B):
         n_row = int(per_row[b].item())
+        n_active = int(n_active_per_row[b].item())
         if n_row > 0:
             row_mask = mismatched_mask[b]
             row_diffs = diff[b][row_mask]
             row_max = float(row_diffs.max().item())
             row_max_pos = int(diff[b].argmax().item())
             lh = f" token={int(label[b, row_max_pos].item())}" if label is not None else ""
-            print(f"    row[{b}]: {n_row}/{int(mask[b].sum().item())} mismatches  (max_diff={row_max:.6e} @ col={row_max_pos}{lh})")
+            print(f"    row[{b}]: {n_row}/{n_active} mismatches  (max_diff={row_max:.6e} @ col={row_max_pos}{lh})")
+        else:
+            print(f"    row[{b}]: ALL MATCH ({n_active} active tokens)")
     print()
 
 
 _MASK_ALL = "all"          # compare every [B, L] position (for pre-vs-post restore check)
 _MASK_OFF = "off"          # use OFF (no prefix-sharing) label_mask  — default
 _MASK_ON  = "on"           # use ON  (prefix-sharing)   label_mask
+_MASK_PREFIX = "prefix"    # use OFF_mask & ~ON_mask — isolate prefix region
 
 
 def _resolve_compare_mask(
@@ -411,6 +419,16 @@ def _resolve_compare_mask(
     """
     if mask_mode == _MASK_ALL:
         return None, "all (full [B,L], no filtering)"
+    if mask_mode == _MASK_PREFIX:
+        # OFF response_mask MINUS ON suffix_mask = prefix-only region
+        if label_mask_off is not None and label_mask_on is not None and label_mask_off.shape == label_mask_on.shape == shape:
+            prefix_mask = label_mask_off & (~label_mask_on)
+            return prefix_mask, f"prefix_mask (OFF & ~ON), {int(prefix_mask.sum().item())} active"
+        # Fallback: try OFF mask then fallback to t2!=0
+        if label_mask_off is not None and label_mask_off.shape == shape:
+            return label_mask_off, f"prefix_mask (OFF fallback, ON mask unavailable), {int(label_mask_off.sum().item())} active"
+        fb = fallback_tensor != 0
+        return fb, f"prefix_mask (t2!=0 fallback), {int(fb.sum().item())} active"
     # off / on
     chosen = label_mask_off if mask_mode == _MASK_OFF else label_mask_on
     chosen_label = "response_mask (OFF)" if mask_mode == _MASK_OFF else "suffix_mask (ON)"
@@ -705,7 +723,7 @@ def main():
                     help="Relative tolerance (packed only)")
     ap.add_argument("--output", "-o", type=str, default=None,
                     help="Save report as JSON")
-    ap.add_argument("--mask", choices=["off", "on", "all"], default="off",
+    ap.add_argument("--mask", choices=["off", "on", "all", "prefix"], default="off",
                     help="Comparison mask mode: off=OFF label_mask (default, "
                          "response tokens only), on=ON label_mask, "
                          "all=full [B,L] (for pre-vs-post restore checks)")
