@@ -610,6 +610,7 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 logger.warning(f"\n\n\nbuild_prefix_sharing_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
             else: logger.warning("\n\n\nbuild_prefix_sharing_micro_batch is None\n\n\n")
+            _prefix_sharing = prefix_sharing_runtime_state is not None
             ######### prefix-sharing #########
 
             input_ids = batch["input_ids"]
@@ -632,6 +633,13 @@ class MegatronPPOActor(BasePPOActor):
             response_length = responses.size(1)
             label = position_ids.clone()
             label[:, -response_length - 1 : -1] = responses
+            ######### prefix-sharing #########
+            if _prefix_sharing:
+                # Fix prompt-position labels: use actual next-token (from input_ids)
+                # instead of position_ids, so provider prompt log_probs are meaningful
+                # and can be copied to reuser interior positions.
+                label[:, : -response_length - 1] = input_ids[:, 1 : -response_length]
+            ######### prefix-sharing #########
             label_mask = attention_mask.clone()
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
@@ -692,14 +700,19 @@ class MegatronPPOActor(BasePPOActor):
                     else:
                         logits_bak = logits
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
-                    log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ######### prefix-sharing #########
+                    # Defer label masking to 2D space after
+                    # restore_reuser_prefix_columns_2d, so provider
+                    # prompt log_probs survive packed→2D postprocessing
+                    # and can be copied to reuser interior positions.
+                    if not _prefix_sharing:
+                        log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     # Save provider prefix-last packed logits for 2D recompute.
                     # logprob/entropy restore is deferred entirely to the 2D
                     # postprocess stage (restore_reuser_prefix_columns_2d).
                     # Only prefix-last specs need saved logits; interior
                     # specs copy directly from the provider's 2D row.
-                    if restore_reuser_prefix_columns_2d is not None:
+                    if _prefix_sharing:
                         ctx = current_prefix_sharing_context()
                         if ctx is not None and ctx.prefix_last_restore_indices:
                             for index in ctx.prefix_last_restore_indices:
@@ -759,13 +772,18 @@ class MegatronPPOActor(BasePPOActor):
                     # provider.  Prefix-last: entropy copied from provider
                     # (same logits), logprob recomputed from saved provider
                     # logits with reuser's own label.
-                    if restore_reuser_prefix_columns_2d is not None:
+                    if _prefix_sharing:
                         output = restore_reuser_prefix_columns_2d(
                             output,
                             label,                                     # 2D label [B, L]
                             vocab_parallel_log_probs_from_logits,
                             vocab_parallel_entropy if calculate_entropy else None,
                         )
+                        # Apply deferred label_mask in 2D space after
+                        # interior/prefix-last restore, so all positions
+                        # (including reuser interior cols) get masked
+                        # consistently.
+                        output["log_probs"] = output["log_probs"].masked_fill(~label_mask, 0.0)
                     ########## prefix-sharing diag dump (2D after restores) ##########
                     try:
                         # re-import or use already-imported names
