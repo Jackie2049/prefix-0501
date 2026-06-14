@@ -436,6 +436,53 @@ def restore_reuser_prefix_columns_2d(
         return output
     entropy = output.get("entropy")
 
+    # === DIAGNOSTIC: dump all reuse info before restore ===
+    _diag_indices = ctx.prefix_last_restore_indices
+    _diag_interior_entries = [e for e in _diag_indices if e.is_interior_response]
+    _diag_prefix_last_entries = [e for e in _diag_indices if not e.is_interior_response]
+    _diag_reuser_rows = sorted(set(e.reuse_idx_in_batch for e in _diag_indices))
+    logger.warning(
+        f"[RESTORE_DIAG] total_entries={len(_diag_indices)} "
+        f"interior={len(_diag_interior_entries)} prefix_last={len(_diag_prefix_last_entries)} "
+        f"reuser_rows={len(_diag_reuser_rows)}"
+    )
+    for _rr in _diag_reuser_rows:
+        _rr_entries = [e for e in _diag_indices if e.reuse_idx_in_batch == _rr]
+        _rr_interior_cols = [e.target_2d_pos for e in _rr_entries if e.is_interior_response]
+        _rr_prefix_last_cols = [e.target_2d_pos for e in _rr_entries if not e.is_interior_response]
+        # group by provider
+        _rr_providers = sorted(set(e.provider_idx_in_batch for e in _rr_entries))
+        _rr_parts = []
+        for _prov in _rr_providers:
+            _prov_interior = [e.target_2d_pos for e in _rr_entries
+                              if e.provider_idx_in_batch == _prov and e.is_interior_response]
+            _prov_plast = [e.target_2d_pos for e in _rr_entries
+                           if e.provider_idx_in_batch == _prov and not e.is_interior_response]
+            _prov_parts_str = []
+            if _prov_interior:
+                _prov_parts_str.append(f"interior_cols={_prov_interior}")
+            if _prov_plast:
+                _prov_parts_str.append(f"prefix_last_cols={_prov_plast}")
+            _rr_parts.append(f"  provider_row={_prov} " + " ".join(_prov_parts_str))
+        logger.warning(
+            f"[RESTORE_DIAG] reuser_row={_rr} "
+            f"interior_cols={_rr_interior_cols} "
+            f"prefix_last_cols={_rr_prefix_last_cols}"
+        )
+        for _p in _rr_parts:
+            logger.warning(f"[RESTORE_DIAG]   {_p}")
+    # sample before values
+    if _diag_interior_entries:
+        _sample = _diag_interior_entries[0]
+        logger.warning(
+            f"[RESTORE_DIAG] sample before restore: "
+            f"reuser_row={_sample.reuse_idx_in_batch} col={_sample.target_2d_pos} "
+            f"provider_row={_sample.provider_idx_in_batch} "
+            f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _sample.target_2d_pos].item():.6f} "
+            f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _sample.target_2d_pos].item():.6f}"
+        )
+    # === END DIAGNOSTIC ===
+
     non_interior_count = 0
     for index in ctx.prefix_last_restore_indices:
         reuser_row = index.reuse_idx_in_batch
@@ -467,6 +514,29 @@ def restore_reuser_prefix_columns_2d(
                 provider_logits,  # [1, V//tp]
                 reuser_label,    # [1]
             ).reshape(())
+
+    # === DIAGNOSTIC: sample after restore ===
+    if ctx.prefix_last_restore_indices:
+        _diag_entries = ctx.prefix_last_restore_indices
+        _diag_interior = [e for e in _diag_entries if e.is_interior_response]
+        if _diag_interior:
+            _sample = _diag_interior[0]
+            logger.warning(
+                f"[RESTORE_DIAG] sample after restore: "
+                f"reuser_row={_sample.reuse_idx_in_batch} col={_sample.target_2d_pos} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _sample.target_2d_pos].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _sample.target_2d_pos].item():.6f}"
+            )
+        _diag_plast = [e for e in _diag_entries if not e.is_interior_response]
+        if _diag_plast:
+            _sample = _diag_plast[0]
+            logger.warning(
+                f"[RESTORE_DIAG] sample after restore (prefix-last): "
+                f"reuser_row={_sample.reuse_idx_in_batch} col={_sample.target_2d_pos} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _sample.target_2d_pos].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _sample.target_2d_pos].item():.6f}"
+            )
+    # === END DIAGNOSTIC ===
 
     if ctx.stats is not None:
         ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
