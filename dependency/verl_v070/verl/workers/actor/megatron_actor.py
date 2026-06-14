@@ -633,28 +633,25 @@ class MegatronPPOActor(BasePPOActor):
             response_length = responses.size(1)
             label = position_ids.clone()
             label[:, -response_length - 1 : -1] = responses
-            ######### prefix-sharing #########
-            if _prefix_sharing:
-                # Fix prompt-position labels: use actual next-token (from input_ids)
-                # instead of position_ids, so provider prompt log_probs are meaningful
-                # and can be copied to reuser interior positions.
-                label[:, : -response_length - 1] = input_ids[:, 1 : -response_length]
-            ######### prefix-sharing #########
             label_mask = attention_mask.clone()
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
             ######### prefix-sharing #########
             try:
                 from prefix_sharing.tools.diagnostic_dump import dump_label_mask
-                dump_label_mask(label_mask)  # unmodified label_mask before PS patch
+                dump_label_mask(label_mask)
             except Exception:
                 pass
-            # Reuser rows may have all-False attention_mask after PS
-            # pack (suffix_len=0), but their response positions still
-            # count towards loss.  Ensure response cols are True so
-            # interior-restored log_probs survive the 2D masked_fill.
             if _prefix_sharing:
-                label_mask[:, -response_length - 1 : -1] = True
+                # Fix prompt-position labels: use actual next-token (from input_ids)
+                # instead of position_ids, so provider prompt log_probs are meaningful
+                # and can be copied to reuser interior positions.
+                label[:, : -response_length - 1] = input_ids[:, 1 : -response_length]
+                # Loss uses response_mask, not label_mask; label_mask only
+                # controls log_probs zeroing via masked_fill.  Set all True so
+                # full log_probs survive restore_reuser_prefix_columns_2d
+                # without special-casing.
+                label_mask = torch.ones_like(attention_mask, dtype=torch.bool)
             ######### prefix-sharing #########
 
             if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
@@ -713,13 +710,7 @@ class MegatronPPOActor(BasePPOActor):
                     else:
                         logits_bak = logits
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
-                    ######### prefix-sharing #########
-                    # Defer label masking to 2D space after
-                    # restore_reuser_prefix_columns_2d, so provider
-                    # prompt log_probs survive packed→2D postprocessing
-                    # and can be copied to reuser interior positions.
-                    if not _prefix_sharing:
-                        log_probs = log_probs.masked_fill(~label_mask, 0.0)
+                    log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     # Save provider prefix-last packed logits for 2D recompute.
                     # logprob/entropy restore is deferred entirely to the 2D
                     # postprocess stage (restore_reuser_prefix_columns_2d).
@@ -792,11 +783,7 @@ class MegatronPPOActor(BasePPOActor):
                             vocab_parallel_log_probs_from_logits,
                             vocab_parallel_entropy if calculate_entropy else None,
                         )
-                        # Apply deferred label_mask in 2D space after
-                        # interior/prefix-last restore, so all positions
-                        # (including reuser interior cols) get masked
-                        # consistently.
-                        output["log_probs"] = output["log_probs"].masked_fill(~label_mask, 0.0)
+
                     ########## prefix-sharing diag dump (2D after restores) ##########
                     try:
                         # re-import or use already-imported names
