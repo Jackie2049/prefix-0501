@@ -76,6 +76,11 @@ class PrefixSharingConfig:
     integrate_mode: str = "verl_megatron_actor"
     model_type: str = "text_only_causal_lm"  # Model type identifier; phase 1 only supports text-only causal LM
 
+    def __post_init__(self) -> None:
+        _env_backend = os.getenv("PREFIX_SHARING_BACKEND")
+        if _env_backend and self.backend == "torch_ref":
+            object.__setattr__(self, "backend", _env_backend)
+
     @classmethod
     def from_raw(cls, raw: Any) -> "PrefixSharingConfig":
         """Build config from bool/mapping/object input and environment overrides.
