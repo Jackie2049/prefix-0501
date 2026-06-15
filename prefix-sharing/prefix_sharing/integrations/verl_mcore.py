@@ -122,7 +122,7 @@ class VerlMCoreBatchAdapter:
 
         runtime_state = PrefixSharingRuntimeState(
             prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
-            backend=get_backend_instance(self.config),
+            attention_backend=get_backend_instance(self.config),
             packed_batch_layout=PackedBatchLayout.from_valid_lengths(
                 prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
             ),
@@ -561,7 +561,7 @@ def build_prefix_sharing_micro_batch_verl080(
     # ── 阶段 7: 构建 state ──
     state = PrefixSharingRuntimeState(
         prefix_sharing_plan=plan,
-        backend=get_backend_instance(ps_config),
+        attention_backend=get_backend_instance(ps_config),
         packed_batch_layout=packed_layout,
         parallel_info=parallel_info,
     )
