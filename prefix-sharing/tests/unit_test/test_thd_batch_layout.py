@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import ThdBatchLayout
 
 
 @pytest.mark.parametrize(
@@ -31,14 +31,14 @@ from prefix_sharing.backends.packed_layout import PackedBatchLayout
         ),
     ],
 )
-def test_packed_batch_layout_aligns_valid_rows_for_common_tensor_parallel_sizes(
+def test_batch_runtime_layout_aligns_valid_rows_for_common_tensor_parallel_sizes(
     tp_size,
     expected_padded_lengths,
     expected_cu_seqlens,
     expected_positions,
     expected_mask,
 ):
-    layout = PackedBatchLayout.from_kept_position_rows(
+    layout = ThdBatchLayout.construct_from_kept_position_ids(
         [
             torch.tensor([0, 1, 2, 3, 4]),
             torch.tensor([3, 4]),
@@ -52,16 +52,16 @@ def test_packed_batch_layout_aligns_valid_rows_for_common_tensor_parallel_sizes(
     assert layout.max_seqlen == max(expected_padded_lengths)
     assert layout.total_valid_length == 7
     assert layout.total_padded_length == expected_cu_seqlens[-1]
-    assert layout.packed_position_ids.tolist() == expected_positions
+    assert layout.position_ids.tolist() == expected_positions
     assert layout.valid_token_mask.tolist() == expected_mask
-    assert layout.packed_index(1, 0) == expected_cu_seqlens[1]
+    assert layout.token_index(1, 0) == expected_cu_seqlens[1]
 
 
-def test_packed_batch_layout_rejects_padding_slot_as_valid_index():
-    layout = PackedBatchLayout.from_kept_position_rows(
+def test_batch_runtime_layout_rejects_padding_slot_as_valid_index():
+    layout = ThdBatchLayout.construct_from_kept_position_ids(
         [torch.tensor([0, 1, 2])],
         align_size=2,
     )
 
     with pytest.raises(IndexError):
-        layout.packed_index(0, 3)
+        layout.token_index(0, 3)

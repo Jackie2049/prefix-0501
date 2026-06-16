@@ -14,7 +14,7 @@ from prefix_sharing.backends.flash_atten_base import (
     FlashAttentionMixin,
     FlashBackendValidationError,
 )
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import BshdBatchLayout, ThdBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 
@@ -161,7 +161,7 @@ def test_strip_tp_padding_no_layout_returns_none():
 def test_strip_tp_padding_layout_without_padding_returns_none():
     mixin = _mixin()
     q = torch.randn(8, 2, 64)  # total_valid = 8
-    layout = PackedBatchLayout.from_valid_lengths([5, 3])  # no padding
+    layout = ThdBatchLayout.construct_from_valid_lengths([5, 3])  # no padding
     q_out, layout_out = mixin._strip_tp_padding(q, layout)
     assert torch.equal(q_out, q)
     assert layout_out is None
@@ -170,7 +170,7 @@ def test_strip_tp_padding_layout_without_padding_returns_none():
 def test_strip_tp_padding_shape_mismatch_raises():
     mixin = _mixin()
     rows = [torch.zeros(5, dtype=torch.long), torch.zeros(3, dtype=torch.long)]
-    layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=4)
+    layout = ThdBatchLayout.construct_from_kept_position_ids(rows, align_size=4)
     # layout.total_padded_length = 12 (8+4)
     q_wrong = torch.randn(10, 2, 64)  # 10 != 12
     with pytest.raises(FlashBackendValidationError, match="does not match"):
@@ -180,7 +180,7 @@ def test_strip_tp_padding_shape_mismatch_raises():
 def test_strip_tp_padding_unpads_correctly():
     mixin = _mixin()
     rows = [torch.zeros(5, dtype=torch.long), torch.zeros(3, dtype=torch.long)]
-    layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=4)
+    layout = ThdBatchLayout.construct_from_kept_position_ids(rows, align_size=4)
     # padded_lengths: [8, 4]; valid_lengths: [5, 3]; total_padded = 12
 
     q_padded = torch.randn(12, 2, 64)
@@ -198,7 +198,7 @@ def test_strip_tp_padding_unpads_correctly():
 def test_strip_tp_padding_non_packedbatchlayout_type_returns_none():
     mixin = _mixin()
     q = torch.randn(10, 2, 64)
-    # Pass a dict instead of PackedBatchLayout — isinstance check fails
+    # Pass a dict instead of ThdBatchLayout — isinstance check fails
     q_out, layout_out = mixin._strip_tp_padding(q, {"invalid": True})
     assert torch.equal(q_out, q)
     assert layout_out is None
@@ -212,7 +212,7 @@ def test_strip_tp_padding_non_packedbatchlayout_type_returns_none():
 def test_prepare_flash_inputs_no_padding():
     mixin = _mixin()
     plan = _make_plan([6, 5], [0, 3])
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
 
     total_q = sum(plan.kept_lengths_q)
     total_kv = sum(plan.expanded_lengths_kv)
@@ -222,7 +222,7 @@ def test_prepare_flash_inputs_no_padding():
     k = torch.randn(total_kv, num_heads, head_dim)
     v = torch.randn(total_kv, num_heads, head_dim)
 
-    result = mixin._prepare_flash_inputs(q, k, v, plan, packed_batch_layout=layout)
+    result = mixin._prepare_flash_inputs(q, k, v, plan, batch_runtime_layout=layout)
     q_out, k_out, v_out, cu_q, cu_kv, max_q, max_kv, pad_layout = result
 
     # Q should be unchanged (no padding to strip)
@@ -242,7 +242,7 @@ def test_prepare_flash_inputs_with_tp_padding():
     plan = _make_plan([6, 5], [0, 3])
     rows = [torch.zeros(plan.kept_lengths_q[i], dtype=torch.long)
             for i in range(plan.batch_size)]
-    layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=4)
+    layout = ThdBatchLayout.construct_from_kept_position_ids(rows, align_size=4)
 
     total_q = layout.total_padded_length
     total_kv = sum(plan.expanded_lengths_kv)
@@ -252,7 +252,7 @@ def test_prepare_flash_inputs_with_tp_padding():
     k = torch.randn(total_kv, num_heads, head_dim)
     v = torch.randn(total_kv, num_heads, head_dim)
 
-    result = mixin._prepare_flash_inputs(q, k, v, plan, packed_batch_layout=layout)
+    result = mixin._prepare_flash_inputs(q, k, v, plan, batch_runtime_layout=layout)
     q_out, k_out, v_out, cu_q, cu_kv, max_q, max_kv, pad_layout = result
 
     # Q should be unpadded
@@ -261,7 +261,7 @@ def test_prepare_flash_inputs_with_tp_padding():
     # K/V unchanged (already de-padded by build_kv)
     assert torch.equal(k_out, k)
     assert torch.equal(v_out, v)
-    # pad_layout should be the PackedBatchLayout
+    # pad_layout should be the ThdBatchLayout
     assert pad_layout is layout
 
 
@@ -273,7 +273,7 @@ def test_prepare_flash_inputs_with_tp_padding():
 def test_repad_output_delegates_to_layout():
     mixin = _mixin()
     rows = [torch.zeros(5, dtype=torch.long), torch.zeros(3, dtype=torch.long)]
-    layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=4)
+    layout = ThdBatchLayout.construct_from_kept_position_ids(rows, align_size=4)
 
     # Create an unpadded output tensor
     unpadded = torch.randn(8, 2, 4)  # 5+3=8 total valid
@@ -284,3 +284,88 @@ def test_repad_output_delegates_to_layout():
     # Valid portions match
     assert torch.equal(repadded[:5], unpadded[:5])
     assert torch.equal(repadded[8:11], unpadded[5:8])
+
+
+# ------------------------------------------------------------------
+# BSHD helper path
+# ------------------------------------------------------------------
+
+
+def test_prepare_bshd_varlen_flash_inputs_extracts_valid_q_and_concats_kv_rows():
+    mixin = _mixin()
+    plan = _make_plan([6, 5], [0, 3])
+    valid_mask = torch.tensor(
+        [
+            [True, True, True, True, True, True],
+            [False, False, False, True, True, False],
+        ]
+    )
+    layout = BshdBatchLayout.from_valid_token_mask(valid_mask)
+    query = torch.arange(2 * 6 * 2 * 4, dtype=torch.float32).reshape(2, 6, 2, 4)
+    key_rows = [
+        torch.randn(6, 2, 4),
+        torch.randn(5, 2, 4),
+    ]
+    value_rows = [
+        torch.randn(6, 2, 4),
+        torch.randn(5, 2, 4),
+    ]
+
+    q, k, v, cu_q, cu_kv, max_q, max_kv = mixin._prepare_bshd_varlen_flash_inputs(
+        query,
+        key_rows,
+        value_rows,
+        plan,
+        layout,
+    )
+
+    assert q.shape == (8, 2, 4)
+    assert torch.equal(q[:6], query[0])
+    assert torch.equal(q[6:8], query[1, 3:5])
+    assert k.shape == (11, 2, 4)
+    assert v.shape == (11, 2, 4)
+    assert cu_q.tolist() == plan.cu_seqlens_q
+    assert cu_kv.tolist() == plan.cu_seqlens_kv
+    assert max_q == plan.max_seqlen_q
+    assert max_kv == plan.max_seqlen_kv
+
+
+def test_prepare_bshd_varlen_flash_inputs_rejects_packed_kv_tensor():
+    mixin = _mixin()
+    plan = _make_plan([6, 5], [0, 3])
+    layout = BshdBatchLayout.from_valid_token_mask(
+        torch.tensor(
+            [
+                [True, True, True, True, True, True],
+                [False, False, False, True, True, False],
+            ]
+        )
+    )
+    query = torch.randn(2, 6, 2, 4)
+    packed_key = torch.randn(11, 2, 4)
+    packed_value = torch.randn(11, 2, 4)
+
+    with pytest.raises(FlashBackendValidationError, match="per-row key/value lists"):
+        mixin._prepare_bshd_varlen_flash_inputs(query, packed_key, packed_value, plan, layout)
+
+
+def test_scatter_bshd_varlen_output_writes_only_valid_tokens():
+    mixin = _mixin()
+    valid_mask = torch.tensor(
+        [
+            [True, True, True, False],
+            [False, True, True, False],
+        ]
+    )
+    layout = BshdBatchLayout.from_valid_token_mask(valid_mask)
+    query = torch.randn(2, 4, 2, 4)
+    valid_output = torch.ones(5, 2, 4)
+
+    dense_output = mixin._scatter_bshd_varlen_output(valid_output, query, layout)
+
+    assert dense_output.shape == query.shape
+    assert torch.equal(dense_output[0, :3], torch.ones(3, 2, 4))
+    assert torch.equal(dense_output[1, 1:3], torch.ones(2, 2, 4))
+    assert dense_output[0, 3].abs().sum().item() == 0
+    assert dense_output[1, 0].abs().sum().item() == 0
+    assert dense_output[1, 3].abs().sum().item() == 0

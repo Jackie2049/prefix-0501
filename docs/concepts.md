@@ -155,7 +155,7 @@
 - 包含三个核心字段：
   - `prefix_sharing_plan`: 前缀共享计划（哪些序列共享、保留范围、恢复点映射）
   - `backend`: 后端执行引擎（如 `TorchReferenceBackend`），负责 KV 缓存的存储与检索
-  - `packed_batch_layout`: 真实 packed batch 布局，包含 valid/padded lengths、packed position ids 和 valid token mask
+  - `batch_runtime_layout`: 真实 packed batch 布局，包含 valid/padded lengths、packed position ids 和 valid token mask
 - 通过 `prefix_sharing_runtime_context` context manager 注入执行上下文，使 attention 层无需修改函数签名即可获取状态
 - 采用 `contextvars` 机制实现跨层隐式传递，避免在 verl actor 和 Megatron attention 之间显式传递参数
 
@@ -172,7 +172,7 @@
 **相关代码**：
 - `PrefixSharingRuntimeState` 数据类定义：`prefix_sharing/integrations/verl_mcore.py`
 - 构建逻辑：`build_prefix_sharing_micro_batch()` in `prefix_sharing/integrations/verl_mcore.py:194-340`
-- packed layout：`prefix_sharing/backends/packed_layout.py`
+- Runtime layout：`prefix_sharing/backends/batch_layout.py`，包含 `ThdBatchLayout` / `BshdBatchLayout`
 - 上下文管理器：`prefix_sharing_runtime_context()` in `prefix_sharing/integrations/context.py`
 
 ---
@@ -201,8 +201,8 @@
 | 复用关系 | `PrefixReuseSpec` | `reuse_specs` | - |
 | 前缀组 | `PrefixGroup` | `groups`, `member_indices` | - |
 | 前缀长度 | `prefix_len` | `prefix_lens` | - |
-| Packed batch 布局 | `PackedBatchLayout` | `valid_lengths`, `padded_lengths`, `packed_position_ids`, `valid_token_mask` | - |
-| 前缀共享运行时状态 | `PrefixSharingRuntimeState` | `prefix_sharing_plan`, `backend`, `packed_batch_layout` | - |
+| THD batch 布局 | `ThdBatchLayout` | `valid_lengths`, `padded_lengths`, `position_ids`, `valid_token_mask` | - |
+| 前缀共享运行时状态 | `PrefixSharingRuntimeState` | `prefix_sharing_plan`, `backend`, `batch_runtime_layout` | - |
 
 ### 文档命名
 

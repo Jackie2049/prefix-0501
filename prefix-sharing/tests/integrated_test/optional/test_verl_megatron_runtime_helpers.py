@@ -72,16 +72,16 @@ def test_build_prefix_sharing_micro_batch_verl070_trims_reuser_mask_and_context_
         [True, True, True, True, True],
         [False, False, False, True, True],
     ]
-    layout = prefix_sharing_runtime_state.packed_batch_layout
+    layout = prefix_sharing_runtime_state.batch_runtime_layout
     assert layout.valid_lengths == [5, 2]
     assert layout.padded_lengths == [5, 2]
     assert layout.cu_seqlens == [0, 5, 7]
-    assert layout.packed_position_ids.tolist() == [0, 1, 2, 3, 4, 3, 4]
+    assert layout.position_ids.tolist() == [0, 1, 2, 3, 4, 3, 4]
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
+        assert ctx.prefix_last_restore_indices[0].provider_token_index == 2
+        assert ctx.prefix_last_restore_indices[0].reuse_token_index == 5
     assert current_prefix_sharing_context() is None
 
 
@@ -143,15 +143,15 @@ def test_build_prefix_sharing_micro_batch_verl070_builds_common_tp_padded_layout
 
     _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
-    layout = prefix_sharing_runtime_state.packed_batch_layout
+    layout = prefix_sharing_runtime_state.batch_runtime_layout
     assert layout.valid_lengths == [5, 2]
     assert layout.padded_lengths == expected_padded_lengths
     assert layout.cu_seqlens == expected_cu_seqlens
-    assert layout.packed_position_ids.tolist() == expected_positions
+    assert layout.position_ids.tolist() == expected_positions
     assert layout.valid_token_mask.tolist() == expected_mask
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == expected_cu_seqlens[1]
+        assert ctx.prefix_last_restore_indices[0].provider_token_index == 2
+        assert ctx.prefix_last_restore_indices[0].reuse_token_index == expected_cu_seqlens[1]
 
 
 @pytest.mark.parametrize(
@@ -192,14 +192,14 @@ def test_build_prefix_sharing_micro_batch_verl070_keeps_global_layout_with_seque
 
     _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
-    layout = prefix_sharing_runtime_state.packed_batch_layout
+    layout = prefix_sharing_runtime_state.batch_runtime_layout
     assert layout.valid_lengths == [5, 2]
     assert layout.padded_lengths == expected_padded_lengths
     assert layout.cu_seqlens == expected_cu_seqlens
     assert layout.total_padded_length == expected_cu_seqlens[-1]
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == expected_cu_seqlens[1]
+        assert ctx.prefix_last_restore_indices[0].provider_token_index == 2
+        assert ctx.prefix_last_restore_indices[0].reuse_token_index == expected_cu_seqlens[1]
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
@@ -234,7 +234,7 @@ def test_build_prefix_sharing_micro_batch_verl070_records_physical_pipeline_para
     assert parallel_info.pp_rank == pp_rank
     assert parallel_info.is_pipeline_first_stage is False
     assert parallel_info.is_pipeline_last_stage is True
-    assert prefix_sharing_runtime_state.packed_batch_layout.cu_seqlens == [0, 5, 7]
+    assert prefix_sharing_runtime_state.batch_runtime_layout.cu_seqlens == [0, 5, 7]
 
 
 @pytest.mark.parametrize(
@@ -276,9 +276,9 @@ def test_build_prefix_sharing_micro_batch_verl070_combines_tp_padding_with_physi
 
     assert prefix_sharing_runtime_state.parallel_info.tp_size == tp_size
     assert prefix_sharing_runtime_state.parallel_info.pp_size == pp_size
-    assert prefix_sharing_runtime_state.packed_batch_layout.cu_seqlens == expected_cu_seqlens
+    assert prefix_sharing_runtime_state.batch_runtime_layout.cu_seqlens == expected_cu_seqlens
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == expected_cu_seqlens[1]
+        assert ctx.prefix_last_restore_indices[0].reuse_token_index == expected_cu_seqlens[1]
 
 
 def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path():

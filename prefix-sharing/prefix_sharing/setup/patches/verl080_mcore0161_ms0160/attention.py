@@ -53,7 +53,8 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             )
 
         # ── prefix-sharing path ──
-        # phase 1: training, THD, no fusion, no output gate
+        # phase 1: training, no fusion, no output gate. Runtime context decides
+        # whether tensors are dense BSHD or packed THD.
 
         # QKV extraction — attention module interaction, not business logic
         query, key, value = self.get_query_key_value_tensors(
@@ -62,7 +63,8 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             split_qkv=True,
             output_gate=False,
         )
-        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+        layout_kind = getattr(ctx.batch_runtime_layout, "layout_kind", None)
+        if layout_kind == "thd" and packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)

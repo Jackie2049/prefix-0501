@@ -27,7 +27,7 @@ try:
 except (RuntimeError, ImportError):
     _HAS_NPU_KERNEL = False
 
-from prefix_sharing.backends.packed_layout import PackedBatchLayout  # noqa: E402
+from prefix_sharing.backends.batch_layout import BshdBatchLayout, ThdBatchLayout  # noqa: E402
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend  # noqa: E402
 from prefix_sharing.core.config import PrefixSharingConfig  # noqa: E402
 from prefix_sharing.core.planner import PrefixSharingPlanner  # noqa: E402
@@ -98,14 +98,21 @@ def _make_plan(batch_sizes: list[int], prefix_lens: list[int]) -> Any:
     object.__setattr__(plan, "prefix_last_restore", [])
     return plan
 
-def _make_layout(kept_lengths_q: list[int]) -> PackedBatchLayout:
-    """Create a PackedBatchLayout with no padding (TP=1).
+def _make_layout(kept_lengths_q: list[int]) -> ThdBatchLayout:
+    """Create a ThdBatchLayout with no padding (TP=1).
 
-    The NPU backend requires ``packed_batch_layout`` for all attention
+    The NPU backend requires ``batch_runtime_layout`` for all attention
     calls because it uses the layout to split THD tensors into per-sample
     rows for the BSHD conversion.
     """
-    return PackedBatchLayout.from_valid_lengths(kept_lengths_q)
+    return ThdBatchLayout.construct_from_valid_lengths(kept_lengths_q)
+
+def _make_bshd_layout(kept_lengths_q: list[int]) -> BshdBatchLayout:
+    max_len = max(kept_lengths_q, default=0)
+    mask = torch.zeros(len(kept_lengths_q), max_len, dtype=torch.bool, device=DEVICE)
+    for batch_index, valid_length in enumerate(kept_lengths_q):
+        mask[batch_index, :valid_length] = True
+    return BshdBatchLayout.from_valid_token_mask(mask)
 
 def _random_qkv(
     total_q: int,
@@ -121,6 +128,34 @@ def _random_qkv(
     k = torch.randn(total_kv, num_kv_heads, head_dim, dtype=dtype, device=DEVICE) * 0.02
     v = torch.randn(total_kv, num_kv_heads, head_dim, dtype=dtype, device=DEVICE) * 0.02
     return q, k, v
+
+def _random_bshd_q_and_kv_rows(
+    plan: Any,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float16,
+    seed: int = 42,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], BshdBatchLayout]:
+    torch.manual_seed(seed)
+    layout = _make_bshd_layout(plan.kept_lengths_q)
+    query = torch.randn(
+        plan.batch_size,
+        layout.max_seqlen,
+        num_heads,
+        head_dim,
+        dtype=dtype,
+        device=DEVICE,
+    ) * 0.02
+    key_rows = [
+        torch.randn(length, num_kv_heads, head_dim, dtype=dtype, device=DEVICE) * 0.02
+        for length in plan.expanded_lengths_kv
+    ]
+    value_rows = [
+        torch.randn(length, num_kv_heads, head_dim, dtype=dtype, device=DEVICE) * 0.02
+        for length in plan.expanded_lengths_kv
+    ]
+    return query, key_rows, value_rows, layout
 
 # ------------------------------------------------------------------
 # Shared assertion helpers
@@ -150,6 +185,20 @@ def _assert_grads_close(
         max_diff = (g_fa - g_ref).abs().max().item()
         assert max_diff < atol, f"{name}.grad max_diff={max_diff} >= {atol}"
 
+def _assert_bshd_grads_close(
+    grads_fa: dict[str, Any],
+    grads_ref: dict[str, Any],
+    atol: float = _ATOL_GRAD_FP16,
+) -> None:
+    max_q_diff = (grads_fa["q"] - grads_ref["q"]).abs().max().item()
+    assert max_q_diff < atol, f"q.grad max_diff={max_q_diff} >= {atol}"
+    for name in ("k", "v"):
+        for row_index, (g_fa, g_ref) in enumerate(zip(grads_fa[name], grads_ref[name])):
+            assert g_fa is not None, f"FA {name}[{row_index}].grad is None"
+            assert g_ref is not None, f"ref {name}[{row_index}].grad is None"
+            max_diff = (g_fa - g_ref).abs().max().item()
+            assert max_diff < atol, f"{name}[{row_index}].grad max_diff={max_diff} >= {atol}"
+
 def _run_forward_backward(
     backend,
     q: torch.Tensor,
@@ -157,15 +206,36 @@ def _run_forward_backward(
     v: torch.Tensor,
     plan,
     *,
-    packed_batch_layout: Any | None = None,
+    batch_runtime_layout: Any | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
     """Run attention + sum().backward() and return output + grads."""
     q = q.clone().detach().requires_grad_(True)
     k = k.clone().detach().requires_grad_(True)
     v = v.clone().detach().requires_grad_(True)
-    out = backend.attention(q, k, v, plan, packed_batch_layout=packed_batch_layout)
+    out = backend.attention(q, k, v, plan, batch_runtime_layout=batch_runtime_layout)
     out.sum().backward()
     return out, {"q": q.grad, "k": k.grad, "v": v.grad}
+
+def _run_bshd_forward_backward(
+    backend,
+    q: torch.Tensor,
+    k_rows: list[torch.Tensor],
+    v_rows: list[torch.Tensor],
+    plan,
+    *,
+    batch_runtime_layout: Any,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Run BSHD attention + sum().backward() and return output + grads."""
+    q = q.clone().detach().requires_grad_(True)
+    k_rows = [row.clone().detach().requires_grad_(True) for row in k_rows]
+    v_rows = [row.clone().detach().requires_grad_(True) for row in v_rows]
+    out = backend.attention(q, k_rows, v_rows, plan, batch_runtime_layout=batch_runtime_layout)
+    out.sum().backward()
+    return out, {
+        "q": q.grad,
+        "k": [row.grad for row in k_rows],
+        "v": [row.grad for row in v_rows],
+    }
 
 # ==================================================================
 # Forward tests
@@ -182,11 +252,68 @@ def test_flash_atten_npu_same_q_kv_lengths(
     q, k, v = _random_qkv(
         total_q=10, total_kv=10, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
     assert out_fa.shape == q.shape
     assert out_fa.device == q.device
     _assert_outputs_close(out_fa, out_ref)
+
+@pytest.mark.skipif(not _HAS_NPU, reason="requires NPU device + mindspeed")
+@pytest.mark.parametrize(
+    ("batch_sizes", "prefix_lens", "num_heads", "num_kv_heads"),
+    [
+        ([4, 6], [0, 0], 2, 2),
+        ([8, 8], [0, 4], 2, 2),
+        ([10, 10, 10], [0, 3, 5], 2, 2),
+        ([5, 9, 7], [0, 2, 0], 4, 2),
+    ],
+)
+def test_flash_atten_npu_bshd_forward_vs_torch_ref(
+    backend: NpuFlashAttentionBackend,
+    ref_backend: TorchReferenceBackend,
+    batch_sizes: list[int],
+    prefix_lens: list[int],
+    num_heads: int,
+    num_kv_heads: int,
+) -> None:
+    plan = _make_plan(batch_sizes=batch_sizes, prefix_lens=prefix_lens)
+    q, k_rows, v_rows, layout = _random_bshd_q_and_kv_rows(
+        plan,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=64,
+        dtype=torch.float16,
+    )
+
+    out_fa = backend.attention(q, k_rows, v_rows, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k_rows, v_rows, plan, batch_runtime_layout=layout)
+
+    assert out_fa.shape == out_ref.shape == q.shape
+    _assert_outputs_close(out_fa, out_ref)
+
+@pytest.mark.skipif(not _HAS_NPU, reason="requires NPU device + mindspeed")
+def test_flash_atten_npu_bshd_backward_vs_torch_ref(
+    backend: NpuFlashAttentionBackend,
+    ref_backend: TorchReferenceBackend,
+) -> None:
+    plan = _make_plan(batch_sizes=[8, 8], prefix_lens=[0, 4])
+    q, k_rows, v_rows, layout = _random_bshd_q_and_kv_rows(
+        plan,
+        num_heads=2,
+        num_kv_heads=2,
+        head_dim=64,
+        dtype=torch.float16,
+    )
+
+    out_fa, grads_fa = _run_bshd_forward_backward(
+        backend, q, k_rows, v_rows, plan, batch_runtime_layout=layout,
+    )
+    out_ref, grads_ref = _run_bshd_forward_backward(
+        ref_backend, q, k_rows, v_rows, plan, batch_runtime_layout=layout,
+    )
+
+    _assert_outputs_close(out_fa, out_ref)
+    _assert_bshd_grads_close(grads_fa, grads_ref)
 
 @pytest.mark.skipif(not _HAS_NPU, reason="requires NPU device + mindspeed")
 def test_flash_atten_npu_vs_torch_ref(
@@ -202,8 +329,8 @@ def test_flash_atten_npu_vs_torch_ref(
         total_q=12, total_kv=16, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
 
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     assert out_fa.shape == out_ref.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
@@ -219,8 +346,8 @@ def test_flash_atten_npu_gqa(
     q, k, v = _random_qkv(
         total_q=8, total_kv=10, num_heads=4, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
     assert out_fa.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
 
@@ -236,7 +363,7 @@ def test_flash_atten_npu_backward_smoke(backend: NpuFlashAttentionBackend) -> No
     k.requires_grad_(True)
     v.requires_grad_(True)
 
-    out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
     loss = out.sum()
     loss.backward()
 
@@ -259,8 +386,8 @@ def test_flash_atten_npu_backward_vs_torch_ref(
         total_q=12, total_kv=16, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
 
-    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, packed_batch_layout=layout)
-    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, packed_batch_layout=layout)
+    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, batch_runtime_layout=layout)
+    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, batch_runtime_layout=layout)
 
     _assert_outputs_close(out_fa, out_ref)
     _assert_grads_close(grads_fa, grads_ref)
@@ -278,8 +405,8 @@ def test_flash_atten_npu_multi_reusers(
     q, k, v = _random_qkv(
         total_q=22, total_kv=30, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
     assert out_fa.shape == q.shape
     assert out_fa.device == q.device
     _assert_outputs_close(out_fa, out_ref)
@@ -296,8 +423,8 @@ def test_flash_atten_npu_gqa_vs_torch_ref(
         total_q=12, total_kv=16, num_heads=4, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
 
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     assert out_fa.shape == out_ref.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
@@ -315,8 +442,8 @@ def test_flash_atten_npu_mixed_lengths(
     q, k, v = _random_qkv(
         total_q=19, total_kv=24, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
     assert out_fa.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
 
@@ -333,8 +460,8 @@ def test_flash_atten_npu_various_head_dims(
     q, k, v = _random_qkv(
         total_q=12, total_kv=16, num_heads=2, num_kv_heads=2, head_dim=head_dim, dtype=torch.float16
     )
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
     _assert_outputs_close(out_fa, out_ref)
 
 # ==================================================================
@@ -352,8 +479,8 @@ def test_flash_atten_npu_multi_reusers_backward(
     q, k, v = _random_qkv(
         total_q=22, total_kv=30, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
-    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, packed_batch_layout=layout)
-    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, packed_batch_layout=layout)
+    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, batch_runtime_layout=layout)
+    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, batch_runtime_layout=layout)
     _assert_outputs_close(out_fa, out_ref)
     _assert_grads_close(grads_fa, grads_ref)
 
@@ -368,8 +495,8 @@ def test_flash_atten_npu_mixed_lengths_backward(
     q, k, v = _random_qkv(
         total_q=19, total_kv=24, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
-    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, packed_batch_layout=layout)
-    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, packed_batch_layout=layout)
+    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, batch_runtime_layout=layout)
+    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, batch_runtime_layout=layout)
     _assert_outputs_close(out_fa, out_ref)
     _assert_grads_close(grads_fa, grads_ref)
 
@@ -386,8 +513,8 @@ def test_flash_atten_npu_various_head_dims_backward(
     q, k, v = _random_qkv(
         total_q=12, total_kv=16, num_heads=2, num_kv_heads=2, head_dim=head_dim, dtype=torch.float16
     )
-    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, packed_batch_layout=layout)
-    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, packed_batch_layout=layout)
+    out_fa, grads_fa = _run_forward_backward(backend, q, k, v, plan, batch_runtime_layout=layout)
+    out_ref, grads_ref = _run_forward_backward(ref_backend, q, k, v, plan, batch_runtime_layout=layout)
     _assert_outputs_close(out_fa, out_ref)
     _assert_grads_close(grads_fa, grads_ref)
 
@@ -395,17 +522,17 @@ def test_flash_atten_npu_various_head_dims_backward(
 # Helpers for TP-padding test scenarios
 # ------------------------------------------------------------------
 
-def _make_packed_layout_with_padding(
+def _make_thd_layout_with_padding(
     kept_lengths_q: list[int], align_size: int
-) -> PackedBatchLayout:
-    """Create a PackedBatchLayout with TP-style padding.
+) -> ThdBatchLayout:
+    """Create a ThdBatchLayout with TP-style padding.
 
     Under TP>1 Megatron pads each row's token count to a multiple of
     *align_size* (``tp_size`` or ``tp_size * cp_size * 2``).  This
-    helper mirrors :meth:`PackedBatchLayout.from_kept_position_rows`.
+    helper mirrors :meth:`ThdBatchLayout.construct_from_kept_position_ids`.
     """
     rows = [torch.zeros(length, dtype=torch.long) for length in kept_lengths_q]
-    return PackedBatchLayout.from_kept_position_rows(rows, align_size=align_size)
+    return ThdBatchLayout.construct_from_kept_position_ids(rows, align_size=align_size)
 
 # ------------------------------------------------------------------
 # TP > 1: Q tensor is padded, K/V tensors are unpadded (after build_kv)
@@ -427,7 +554,7 @@ def test_flash_atten_npu_tp_padding_forward(
     # kept_lengths_q: provider keeps full 99, reuser keeps 81-40=41
     # padded to align_size=4: [100, 44]
     plan = _make_plan(batch_sizes=original_lengths, prefix_lens=prefix_lens)
-    layout = _make_packed_layout_with_padding(plan.kept_lengths_q, align_size=4)
+    layout = _make_thd_layout_with_padding(plan.kept_lengths_q, align_size=4)
 
     total_q = layout.total_padded_length  # 100 + 44 = 144
     total_kv = sum(plan.expanded_lengths_kv)  # 99 + 81 = 180
@@ -437,8 +564,8 @@ def test_flash_atten_npu_tp_padding_forward(
         num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16,
     )
 
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     assert out_fa.shape == out_ref.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
@@ -452,7 +579,7 @@ def test_flash_atten_npu_tp_padding_backward(
     original_lengths = [99, 81]
     prefix_lens = [0, 40]
     plan = _make_plan(batch_sizes=original_lengths, prefix_lens=prefix_lens)
-    layout = _make_packed_layout_with_padding(plan.kept_lengths_q, align_size=4)
+    layout = _make_thd_layout_with_padding(plan.kept_lengths_q, align_size=4)
 
     total_q = layout.total_padded_length
     total_kv = sum(plan.expanded_lengths_kv)
@@ -463,10 +590,10 @@ def test_flash_atten_npu_tp_padding_backward(
     )
 
     out_fa, grads_fa = _run_forward_backward(
-        backend, q, k, v, plan, packed_batch_layout=layout,
+        backend, q, k, v, plan, batch_runtime_layout=layout,
     )
     out_ref, grads_ref = _run_forward_backward(
-        ref_backend, q, k, v, plan, packed_batch_layout=layout,
+        ref_backend, q, k, v, plan, batch_runtime_layout=layout,
     )
 
     _assert_outputs_close(out_fa, out_ref)
@@ -481,7 +608,7 @@ def test_flash_atten_npu_tp_padding_gqa(
     original_lengths = [50, 70]
     prefix_lens = [0, 30]
     plan = _make_plan(batch_sizes=original_lengths, prefix_lens=prefix_lens)
-    layout = _make_packed_layout_with_padding(plan.kept_lengths_q, align_size=8)
+    layout = _make_thd_layout_with_padding(plan.kept_lengths_q, align_size=8)
 
     total_q = layout.total_padded_length
     total_kv = sum(plan.expanded_lengths_kv)
@@ -491,8 +618,8 @@ def test_flash_atten_npu_tp_padding_gqa(
         num_heads=4, num_kv_heads=2, head_dim=64, dtype=torch.float16,
     )
 
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     assert out_fa.shape == out_ref.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
@@ -506,7 +633,7 @@ def test_flash_atten_npu_tp_padding_multi_reusers(
     original_lengths = [50, 50, 50]
     prefix_lens = [0, 20, 35]
     plan = _make_plan(batch_sizes=original_lengths, prefix_lens=prefix_lens)
-    layout = _make_packed_layout_with_padding(plan.kept_lengths_q, align_size=4)
+    layout = _make_thd_layout_with_padding(plan.kept_lengths_q, align_size=4)
 
     total_q = layout.total_padded_length
     total_kv = sum(plan.expanded_lengths_kv)
@@ -516,8 +643,8 @@ def test_flash_atten_npu_tp_padding_multi_reusers(
         num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16,
     )
 
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     assert out_fa.shape == out_ref.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
@@ -531,7 +658,7 @@ def test_flash_atten_npu_tp_padding_no_sharing(
     original_lengths = [35, 67, 42]
     prefix_lens = [0, 0, 0]
     plan = _make_plan(batch_sizes=original_lengths, prefix_lens=prefix_lens)
-    layout = _make_packed_layout_with_padding(plan.kept_lengths_q, align_size=4)
+    layout = _make_thd_layout_with_padding(plan.kept_lengths_q, align_size=4)
 
     total_q = layout.total_padded_length
     total_kv = sum(plan.expanded_lengths_kv)
@@ -541,8 +668,8 @@ def test_flash_atten_npu_tp_padding_no_sharing(
         num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16,
     )
 
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     assert out_fa.shape == out_ref.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
@@ -557,7 +684,7 @@ def test_flash_atten_npu_tp1_no_padding_still_works(
     prefix_lens = [0, 4]
     plan = _make_plan(batch_sizes=original_lengths, prefix_lens=prefix_lens)
     # align_size=1 never introduces padding
-    layout = _make_packed_layout_with_padding(plan.kept_lengths_q, align_size=1)
+    layout = _make_thd_layout_with_padding(plan.kept_lengths_q, align_size=1)
 
     total_q = layout.total_padded_length  # equals sum(kept_lengths_q)
     total_kv = sum(plan.expanded_lengths_kv)
@@ -567,8 +694,8 @@ def test_flash_atten_npu_tp1_no_padding_still_works(
         num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16,
     )
 
-    out_fa = backend.attention(q, k, v, plan, packed_batch_layout=layout)
-    out_ref = ref_backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out_fa = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
+    out_ref = ref_backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     assert out_fa.shape == out_ref.shape == q.shape
     _assert_outputs_close(out_fa, out_ref)
@@ -585,16 +712,15 @@ def test_flash_atten_npu_validate_checks_import() -> None:
     backend.validate(config)
 
 @pytest.mark.skipif(not _HAS_NPU, reason="requires NPU device + mindspeed")
-def test_flash_atten_npu_requires_packed_batch_layout(
+def test_flash_atten_npu_requires_batch_runtime_layout(
     backend: NpuFlashAttentionBackend,
 ) -> None:
-    """NPU backend must raise when packed_batch_layout is not provided."""
+    """NPU backend must raise when batch_runtime_layout is not provided."""
     plan = _make_plan(batch_sizes=[4, 6], prefix_lens=[0, 0])
     q, k, v = _random_qkv(
         total_q=10, total_kv=10, num_heads=2, num_kv_heads=2, head_dim=64, dtype=torch.float16
     )
     from prefix_sharing.backends.flash_atten_base import FlashBackendValidationError
-    with pytest.raises(FlashBackendValidationError, match="requires packed_batch_layout"):
+    with pytest.raises(FlashBackendValidationError, match="requires batch_runtime_layout"):
         backend.attention(q, k, v, plan)
-
 

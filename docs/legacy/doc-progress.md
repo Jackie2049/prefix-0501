@@ -13,8 +13,8 @@
 ### 完成事项
 
 1. 保留 `PrefixSharingPlan.prefix_last_restore` 作为唯一逻辑 restore spec。
-2. 将 `PrefixSharingRuntimeState.prefix_last_restore_slots` 替换为 `packed_cu_seqlens`，只保存当前 forward 的 packed layout 原料。
-3. 新增 `PackedPrefixLastRestoreIndex`，由 `prefix_sharing_runtime_context()` 根据 plan + packed layout 派生。
+2. 将 `PrefixSharingRuntimeState.prefix_last_restore_slots` 替换为 `packed_cu_seqlens`，只保存当前 forward 的 THD layout 原料。
+3. 新增 `PackedPrefixLastRestoreIndex`，由 `prefix_sharing_runtime_context()` 根据 plan + THD layout 派生。
 4. 将 `PrefixSharingRuntimeContext.prefix_last_restore_slots` 重命名为 `prefix_last_restore_indices`。
 5. 删除 `PackedPackedPrefixLastRestoreSlot`，同步更新 restore 函数、测试和设计 / overview 文档。
 

@@ -36,17 +36,18 @@ Shape = ``(batch_size, 1, max_q, max_kv)`` — per-sample, prefix-aware:
 
 from __future__ import annotations
 
+import importlib
 import math
 from functools import lru_cache
 from typing import Any, List
-import importlib
+
+import torch
 
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.backends.flash_atten_base import (
     FlashAttentionMixin,
     FlashBackendValidationError,
 )
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
@@ -72,14 +73,6 @@ def _import_npu_fusion_attention():
     ) from last_err
 
 
-def _torch() -> Any:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("NpuFlashAttentionBackend requires PyTorch") from exc
-    return torch
-
-
 # ---------------------------------------------------------------------------
 # Per-sample pad-mask builder
 # ---------------------------------------------------------------------------
@@ -99,7 +92,6 @@ def _build_per_sample_mask(
     per-sample sub-tensor.  Padding rows/cols outside valid ranges stay
     ``True`` (hidden).
     """
-    torch = _torch()
     batch_size = plan.batch_size
     mask = torch.ones(batch_size, 1, max_q, max_kv, dtype=torch.bool, device=device)
 
@@ -177,7 +169,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         store: Any,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
-        packed_batch_layout: Any | None = None,
+        batch_runtime_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
@@ -193,7 +185,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
             value,
             store,
             prefix_sharing_plan,
-            packed_batch_layout=packed_batch_layout,
+            batch_runtime_layout=batch_runtime_layout,
             layer_id=layer_id,
             tp_rank=tp_rank,
         )
@@ -223,30 +215,43 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         print(
             f"[PS][backend] flash_atten_npu attention: "
             f"layer={getattr(prefix_sharing_plan, 'layer_id', '?')}, "
-            f"q_shape={tuple(query.shape)}, k_shape={tuple(key.shape)}, "
-            f"v_shape={tuple(value.shape)}"
+            f"q_shape={_shape_for_log(query)}, k_shape={_shape_for_log(key)}, "
+            f"v_shape={_shape_for_log(value)}"
         )
 
-        torch = _torch()
         npu_fusion_attention = _import_npu_fusion_attention()
+        batch_runtime_layout = kwargs.get("batch_runtime_layout")
+        if batch_runtime_layout is None:
+            raise FlashBackendValidationError(
+                "flash_atten_npu.attention requires batch_runtime_layout kwarg."
+            )
+        layout_kind = getattr(batch_runtime_layout, "layout_kind", None)
+        if layout_kind == "bshd":
+            return self._attention_bshd(
+                query,
+                key,
+                value,
+                prefix_sharing_plan,
+                batch_runtime_layout,
+                npu_fusion_attention,
+                **kwargs,
+            )
+        if layout_kind != "thd":
+            raise FlashBackendValidationError(
+                f"flash_atten_npu.attention does not support layout_kind={layout_kind!r}"
+            )
 
         q = self._ensure_3d_thd(query, "query")        # [T_q, n_heads, d]
         k = self._ensure_3d_thd(key, "key")              # [T_kv, n_kv_heads, d]
         v = self._ensure_3d_thd(value, "value")          # [T_kv, n_kv_heads, d]
 
-        packed_layout: PackedBatchLayout = kwargs.get("packed_batch_layout")
-        if packed_layout is None:
-            raise FlashBackendValidationError(
-                "flash_atten_npu.attention requires packed_batch_layout kwarg."
-            )
-
         plan = prefix_sharing_plan
         batch_size = plan.batch_size
 
         # --- metadata ---
-        q_cus = packed_layout.cu_seqlens                      # cumulative padded
+        q_cus = batch_runtime_layout.cu_seqlens               # cumulative padded
         kv_cus = plan.cu_seqlens_kv                            # cumulative expanded
-        valid_lens = packed_layout.valid_lengths               # per-sample valid Q
+        valid_lens = batch_runtime_layout.valid_lengths        # per-sample valid Q
         kv_lens = plan.expanded_lengths_kv                     # per-sample expanded KV
 
         total_q = q_cus[-1]
@@ -271,7 +276,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         hidden_kv = num_kv_heads * head_dim
 
         # --- Step 1: split THD → per-sample rows ---
-        q_rows = _split_packed(q, packed_layout.padded_lengths)
+        q_rows = _split_packed(q, batch_runtime_layout.padded_lengths)
         k_rows = _split_packed(k, kv_lens)
         v_rows = _split_packed(v, kv_lens)
 
@@ -339,6 +344,105 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
 
         return output_thd
 
+    def _attention_bshd(
+        self,
+        query: Any,
+        key_rows: Any,
+        value_rows: Any,
+        prefix_sharing_plan: PrefixSharingPlan,
+        batch_runtime_layout: Any,
+        npu_fusion_attention: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run NPU FA when the runtime hook receives dense BSHD tensors."""
+        if not isinstance(key_rows, list) or not isinstance(value_rows, list):
+            raise FlashBackendValidationError("BSHD NPU Flash Attention expects per-row key/value lists")
+
+        plan = prefix_sharing_plan
+        batch_size = plan.batch_size
+        valid_lens = batch_runtime_layout.valid_lengths
+        kv_lens = plan.expanded_lengths_kv
+        q_rows = [
+            batch_runtime_layout.valid_tokens(query, seq_idx_in_batch)
+            for seq_idx_in_batch in range(batch_size)
+        ]
+        self._validate_bshd_row_lengths(q_rows, valid_lens, "query")
+        self._validate_bshd_row_lengths(key_rows, kv_lens, "key")
+        self._validate_bshd_row_lengths(value_rows, kv_lens, "value")
+
+        if batch_size == 0 or max(valid_lens, default=0) == 0 or max(kv_lens, default=0) == 0:
+            return torch.zeros_like(query)
+
+        first_q = next(row for row in q_rows if row.shape[0] > 0)
+        first_k = next(row for row in key_rows if row.shape[0] > 0)
+        first_v = next(row for row in value_rows if row.shape[0] > 0)
+        num_q_heads = first_q.shape[1]
+        num_kv_heads = first_k.shape[1]
+        head_dim = first_q.shape[-1]
+        hidden_q = num_q_heads * head_dim
+        hidden_kv = num_kv_heads * head_dim
+        max_q = max(valid_lens)
+        max_kv = max(kv_lens)
+
+        q_bsh = torch.zeros(batch_size, max_q, hidden_q, dtype=first_q.dtype, device=first_q.device)
+        k_bsh = torch.zeros(batch_size, max_kv, hidden_kv, dtype=first_k.dtype, device=first_k.device)
+        v_bsh = torch.zeros(batch_size, max_kv, hidden_kv, dtype=first_v.dtype, device=first_v.device)
+
+        for batch_index in range(batch_size):
+            q_len = valid_lens[batch_index]
+            kv_len = kv_lens[batch_index]
+            if q_len > 0:
+                q_bsh[batch_index, :q_len, :] = q_rows[batch_index].reshape(q_len, hidden_q)
+            if kv_len > 0:
+                k_bsh[batch_index, :kv_len, :] = key_rows[batch_index].reshape(kv_len, hidden_kv)
+                v_bsh[batch_index, :kv_len, :] = value_rows[batch_index].reshape(kv_len, hidden_kv)
+
+        atten_mask = _build_per_sample_mask(
+            plan,
+            valid_lens,
+            kv_lens,
+            max_q,
+            max_kv,
+            first_q.device,
+        )
+
+        scale = kwargs.get("softmax_scale") or (1.0 / math.sqrt(head_dim))
+        dropout_p = kwargs.get("dropout_p", 0.0)
+        keep_prob = kwargs.get("keep_prob", 1.0 - dropout_p)
+
+        try:
+            result = npu_fusion_attention(
+                q_bsh,
+                k_bsh,
+                v_bsh,
+                num_q_heads,
+                "BSH",
+                atten_mask=atten_mask,
+                scale=scale,
+                keep_prob=keep_prob,
+                sparse_mode=1,
+            )
+        except Exception as exc:
+            raise FlashBackendValidationError(
+                f"npu_fusion_attention (BSHD input via BSH) failed: q={tuple(q_bsh.shape)}, "
+                f"k={tuple(k_bsh.shape)}, v={tuple(v_bsh.shape)}, "
+                f"mask={tuple(atten_mask.shape)}, batch_size={batch_size}, "
+                f"max_q={max_q}, max_kv={max_kv}"
+            ) from exc
+
+        output_bsh = result[0] if isinstance(result, (tuple, list)) else result
+        dense_output = torch.zeros_like(query)
+        for batch_index, valid_length in enumerate(valid_lens):
+            if valid_length == 0:
+                continue
+            valid_output = output_bsh[batch_index, :valid_length, :].reshape(
+                valid_length,
+                num_q_heads,
+                head_dim,
+            )
+            batch_runtime_layout.write_valid_tokens(dense_output, batch_index, valid_output)
+        return dense_output
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -352,3 +456,9 @@ def _split_packed(tensor: Any, lengths: List[int]) -> List[Any]:
         rows.append(tensor[offset:offset + length])
         offset += length
     return rows
+
+
+def _shape_for_log(value: Any) -> Any:
+    if isinstance(value, list):
+        return [tuple(item.shape) for item in value]
+    return tuple(value.shape)

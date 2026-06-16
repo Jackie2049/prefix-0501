@@ -16,15 +16,21 @@ from dataclasses import dataclass
 
 import pytest
 
+torch = pytest.importorskip("torch")
+
+from prefix_sharing.backends.batch_layout import BshdTokenIndex
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import ThdBatchLayout
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import (
     current_prefix_sharing_context,
     prefix_sharing_runtime_context,
 )
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
-from prefix_sharing.integrations.verl_mcore import PrefixSharingRuntimeState
+from prefix_sharing.integrations.verl_mcore import (
+    PrefixSharingRuntimeState,
+    build_prefix_sharing_micro_batch_verl080,
+)
 
 
 # ═══════════════════════════════════════
@@ -43,10 +49,9 @@ def test_validate_for_engine_accepts_remove_padding_true():
     config.validate_for_engine(use_remove_padding=True)
 
 
-def test_validate_for_engine_rejects_remove_padding_false():
+def test_validate_for_engine_accepts_remove_padding_false_for_bshd():
     config = PrefixSharingConfig(enable_prefix_sharing=True)
-    with pytest.raises(PrefixSharingConfigError, match="use_remove_padding"):
-        config.validate_for_engine(use_remove_padding=False)
+    config.validate_for_engine(use_remove_padding=False)
 
 
 @pytest.mark.parametrize(
@@ -82,7 +87,7 @@ def _make_runtime_state(kept_position_ids=None):
     return PrefixSharingRuntimeState(
         prefix_sharing_plan=plan,
         attention_backend=None,
-        packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
+        batch_runtime_layout=ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(),
         kept_position_ids=kept_position_ids,
     )
@@ -139,11 +144,60 @@ def test_context_kept_position_ids_none_when_state_has_no_attr():
     old_state = types.SimpleNamespace(
         prefix_sharing_plan=plan,
         attention_backend=None,
-        packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
+        batch_runtime_layout=ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(),
     )
     with prefix_sharing_runtime_context(old_state) as ctx:
         assert ctx.kept_position_ids is None
+
+
+def test_build_prefix_sharing_micro_batch_verl080_builds_bshd_layout_without_remove_padding():
+    engine = type(
+        "Engine",
+        (),
+        {
+            "engine_config": type(
+                "EngineConfig",
+                (),
+                {
+                    "use_remove_padding": False,
+                    "dynamic_context_parallel": False,
+                },
+            )()
+        },
+    )()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11, 0], [1, 2, 3, 20, 21, 0]]),
+        "attention_mask": torch.tensor(
+            [
+                [True, True, True, True, True, False],
+                [True, True, True, True, True, False],
+            ]
+        ),
+        "position_ids": torch.arange(6).repeat(2, 1),
+    }
+    config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
+
+    trimmed_batch, runtime_state = build_prefix_sharing_micro_batch_verl080(
+        engine,
+        batch,
+        config,
+    )
+
+    assert runtime_state is not None
+    assert trimmed_batch["input_ids"].shape == batch["input_ids"].shape
+    assert trimmed_batch["attention_mask"].tolist() == [
+        [True, True, True, True, True, False],
+        [False, False, False, True, True, False],
+    ]
+    layout = runtime_state.batch_runtime_layout
+    assert layout.layout_kind == "bshd"
+    assert layout.valid_lengths == [5, 2]
+    assert layout.max_seqlen == 6
+    with prefix_sharing_runtime_context(runtime_state) as ctx:
+        restore_index = ctx.prefix_last_restore_indices[0]
+        assert restore_index.provider_token_index == BshdTokenIndex(0, 2)
+        assert restore_index.reuse_token_index == BshdTokenIndex(1, 3)
 
 
 # ═══════════════════════════════════════
@@ -326,5 +380,3 @@ def test_auto_activation_handles_env_var_true(monkeypatch):
     importlib.reload(prefix_sharing)
     assert prefix_sharing._patch_handle is None
     assert prefix_sharing._patch_handle is None
-
-

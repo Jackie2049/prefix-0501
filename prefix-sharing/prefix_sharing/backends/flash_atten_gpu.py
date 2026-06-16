@@ -88,13 +88,13 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         store: Any,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
-        packed_batch_layout: Any | None = None,
+        batch_runtime_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
     ) -> tuple[Any, Any]:
         return self._torch_ref.build_kv(
             key, value, store, prefix_sharing_plan,
-            packed_batch_layout=packed_batch_layout,
+            batch_runtime_layout=batch_runtime_layout,
             layer_id=layer_id, tp_rank=tp_rank,
         )
 
@@ -108,16 +108,33 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         value: Any,
         prefix_sharing_plan: PrefixSharingPlan,
         *,
-        packed_batch_layout: Any | None = None,
+        batch_runtime_layout: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, pad_layout = (
-            self._prepare_flash_inputs(
-                query, key, value, prefix_sharing_plan,
-                attention_mask=kwargs.get("attention_mask"),
-                packed_batch_layout=packed_batch_layout,
+        layout_kind = getattr(batch_runtime_layout, "layout_kind", "thd")
+        if layout_kind == "thd":
+            q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, pad_layout = (
+                self._prepare_flash_inputs(
+                    query, key, value, prefix_sharing_plan,
+                    attention_mask=kwargs.get("attention_mask"),
+                    batch_runtime_layout=batch_runtime_layout,
+                )
             )
-        )
+        elif layout_kind == "bshd":
+            q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = (
+                self._prepare_bshd_varlen_flash_inputs(
+                    query,
+                    key,
+                    value,
+                    prefix_sharing_plan,
+                    batch_runtime_layout,
+                )
+            )
+            pad_layout = None
+        else:
+            raise FlashBackendValidationError(
+                f"flash_atten_gpu.attention does not support layout_kind={layout_kind!r}"
+            )
 
         flash_attn_varlen_func = _import_flash_attn_varlen()
 
@@ -150,5 +167,8 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         # the output shape matches the original (padded) query tensor.
         if pad_layout is not None:
             out = self._repad_output(out, pad_layout)
+
+        if layout_kind == "bshd":
+            out = self._scatter_bshd_varlen_output(out, query, batch_runtime_layout)
 
         return out

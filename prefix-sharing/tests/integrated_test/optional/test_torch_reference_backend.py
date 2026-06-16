@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import ThdBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.logprob import (
@@ -126,7 +126,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
         forward_id=3,
         micro_batch_id=1,
     )
-    layout = PackedBatchLayout(
+    layout = ThdBatchLayout(
         valid_lengths=[5, 2],
         padded_lengths=padded_lengths,
         cu_seqlens=cu_seqlens,
@@ -143,7 +143,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
         value,
         store,
         prefix_sharing_plan,
-        packed_batch_layout=layout,
+        batch_runtime_layout=layout,
         layer_id=0,
     )
     output = backend.attention(
@@ -151,7 +151,7 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
         expanded_key,
         expanded_value,
         prefix_sharing_plan,
-        packed_batch_layout=layout,
+        batch_runtime_layout=layout,
     )
 
     provider_slot_id = PrefixActivationSlotId(
@@ -281,7 +281,7 @@ def test_torch_reference_backend_deltanet_states_ignore_padding_slots(tp_size, p
         forward_id=6,
         micro_batch_id=1,
     )
-    layout = PackedBatchLayout(
+    layout = ThdBatchLayout(
         valid_lengths=[3, 1],
         padded_lengths=padded_lengths,
         cu_seqlens=cu_seqlens,
@@ -295,19 +295,19 @@ def test_torch_reference_backend_deltanet_states_ignore_padding_slots(tp_size, p
         state_update,
         store,
         prefix_sharing_plan,
-        packed_batch_layout=layout,
+        batch_runtime_layout=layout,
         layer_id=0,
         tp_rank=tp_size,
     )
 
     assert output.shape == state_update.shape
-    assert layout.valid_slice(0, output).abs().sum() > 0
-    assert layout.valid_slice(1, output).abs().sum() > 0
+    assert layout.valid_tokens(output, 0).abs().sum() > 0
+    assert layout.valid_tokens(output, 1).abs().sum() > 0
     for batch_index, padded_length in enumerate(layout.padded_lengths):
         valid_length = layout.valid_lengths[batch_index]
         if valid_length < padded_length:
-            row_start = layout.row_start(batch_index)
-            assert output[row_start + valid_length : row_start + padded_length].abs().sum().item() == 0
+            seq_start = layout.seq_start(batch_index)
+            assert output[seq_start + valid_length : seq_start + padded_length].abs().sum().item() == 0
 
 
 def test_prefix_last_restore_tensor_keeps_autograd_path():

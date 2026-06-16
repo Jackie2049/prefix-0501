@@ -231,10 +231,5 @@ class PrefixSharingConfig:
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
 
-        # THD packed layout 需要 use_remove_padding
-        if not use_remove_padding:
-            raise PrefixSharingConfigError(
-                "[Config Error] Phase 1 THD 路径要求 use_remove_padding=True。"
-                "BSHD 路径 (use_remove_padding=False) 尚未在当前 patch 中支持，"
-                "请启用 use_remove_padding 或使用 BSHD 专用 patch set。"
-            )
+        # verl080 monkey patch supports both engine layouts:
+        # use_remove_padding=True -> THD, use_remove_padding=False -> BSHD.

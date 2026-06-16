@@ -1,4 +1,4 @@
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import ThdBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
@@ -16,7 +16,7 @@ def _prefix_sharing_runtime_state():
     return PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         attention_backend=None,
-        packed_batch_layout=PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q),
+        batch_runtime_layout=ThdBatchLayout.construct_from_valid_lengths(prefix_sharing_plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(pp_rank=1, pp_size=2, is_pipeline_first_stage=False),
     )
 
@@ -30,8 +30,8 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
         assert ctx.parallel_info is prefix_sharing_runtime_state.parallel_info
         assert ctx.parallel_info.pp_rank == 1
         assert ctx.parallel_info.pp_size == 2
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
+        assert ctx.prefix_last_restore_indices[0].provider_token_index == 2
+        assert ctx.prefix_last_restore_indices[0].reuse_token_index == 5
         assert not ctx.store.closed
     assert current_prefix_sharing_context() is None
     assert ctx.store.closed
@@ -47,7 +47,7 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
     runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         attention_backend=None,
-        packed_batch_layout=PackedBatchLayout(
+        batch_runtime_layout=ThdBatchLayout(
             valid_lengths=[5, 2],
             padded_lengths=[6, 2],
             cu_seqlens=[0, 6, 8],
@@ -57,5 +57,5 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
     )
 
     with prefix_sharing_runtime_context(runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 6
+        assert ctx.prefix_last_restore_indices[0].provider_token_index == 2
+        assert ctx.prefix_last_restore_indices[0].reuse_token_index == 6

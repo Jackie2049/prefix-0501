@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, Sequence, TypeVar
 
 from prefix_sharing.backends.factory import get_backend_instance
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import BshdBatchLayout
+from prefix_sharing.backends.batch_layout import BshdTokenIndex
+from prefix_sharing.backends.batch_layout import ThdBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.batch_trim import (
     TrimmedBatch,
@@ -55,7 +57,7 @@ T = TypeVar("T")
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     attention_backend: Any
-    packed_batch_layout: PackedBatchLayout
+    batch_runtime_layout: Any
     parallel_info: MegatronParallelInfo
     kept_position_ids: Any | None = None
 
@@ -123,7 +125,7 @@ class VerlMCoreBatchAdapter:
         runtime_state = PrefixSharingRuntimeState(
             prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
             attention_backend=get_backend_instance(self.config),
-            packed_batch_layout=PackedBatchLayout.from_valid_lengths(
+            batch_runtime_layout=ThdBatchLayout.construct_from_valid_lengths(
                 prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
             ),
             parallel_info=get_megatron_parallel_info(),
@@ -309,13 +311,13 @@ def build_prefix_sharing_micro_batch_verl070(
         if parallel_info.cp_size > 1
         else parallel_info.tp_size
     )
-    packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
+    batch_runtime_layout = ThdBatchLayout.construct_from_kept_position_ids(
         kept_position_rows,
         align_size=int(align_size),
     )
     logger.warning(
         "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s "
-        "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] packed_batch_layout: "
+        "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] thd_batch_layout: "
         "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
         "total_valid=%s, total_padded=%s",
         parallel_info.global_rank,
@@ -327,17 +329,17 @@ def build_prefix_sharing_micro_batch_verl070(
         parallel_info.pp_size,
         parallel_info.is_pipeline_first_stage,
         parallel_info.is_pipeline_last_stage,
-        packed_batch_layout.valid_lengths,
-        packed_batch_layout.padded_lengths,
-        packed_batch_layout.cu_seqlens,
-        packed_batch_layout.max_seqlen,
-        packed_batch_layout.total_valid_length,
-        packed_batch_layout.total_padded_length,
+        batch_runtime_layout.valid_lengths,
+        batch_runtime_layout.padded_lengths,
+        batch_runtime_layout.cu_seqlens,
+        batch_runtime_layout.max_seqlen,
+        batch_runtime_layout.total_valid_length,
+        batch_runtime_layout.total_padded_length,
     )
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
         attention_backend=get_backend_instance(config, backend),
-        packed_batch_layout=packed_batch_layout,
+        batch_runtime_layout=batch_runtime_layout,
         parallel_info=parallel_info,
     )
     logger.warning(
@@ -362,53 +364,181 @@ def restore_suffix_first_log_probs_from_prefix(
     if not parallel_info.is_pipeline_last_stage:
         logger.warning(
             "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-            "skip prefix-last restore on non-last PP stage: restore_indices=%s "
-            "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
+            "skip prefix-last restore on non-last PP stage: restore_indices=%s",
             parallel_info.global_rank,
             parallel_info.pp_rank,
             parallel_info.pp_size,
             parallel_info.is_pipeline_last_stage,
             len(ctx.prefix_last_restore_indices),
-            logits.shape[1],
-            log_probs.shape[1],
-            ctx.packed_batch_layout.total_padded_length,
         )
         return log_probs
-    ensure_global_packed_token_lengths(
-        {
-            "logits_token_length": logits.shape[1],
-            "log_probs_token_length": log_probs.shape[1],
-        },
-        total_padded_length=ctx.packed_batch_layout.total_padded_length,
-        context="prefix-last restore",
-    )
     logger.warning(
         "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-        "running prefix-last restore: restore_indices=%s "
-        "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
+        "running prefix-last restore: restore_indices=%s",
         parallel_info.global_rank,
         parallel_info.pp_rank,
         parallel_info.pp_size,
         parallel_info.is_pipeline_last_stage,
         len(ctx.prefix_last_restore_indices),
-        logits.shape[1],
-        log_probs.shape[1],
-        ctx.packed_batch_layout.total_padded_length,
     )
     restored = log_probs.clone()
+    layout = ctx.batch_runtime_layout
+    if layout.layout_kind == "thd":
+        ensure_global_packed_token_lengths(
+            {
+                "logits_token_length": logits.shape[1],
+                "log_probs_token_length": log_probs.shape[1],
+            },
+            total_padded_length=layout.total_padded_length,
+            context="prefix-last restore",
+        )
     for index in ctx.prefix_last_restore_indices:
-        provider_logits = logits[
-            0:1,
-            index.provider_1d_pos : index.provider_1d_pos + 1,
-            :,
-        ].clone()
-        reuse_label = labels[
-            0:1,
-            index.reuse_1d_pos : index.reuse_1d_pos + 1,
-        ]
-        restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-        restored[0, index.reuse_1d_pos] = restored_value.reshape(())
+        if layout.layout_kind == "thd":
+            provider_pos = int(index.provider_token_index)
+            reuse_pos = int(index.reuse_token_index)
+            provider_logits = logits[0:1, provider_pos : provider_pos + 1, :].clone()
+            reuse_label = labels[0:1, reuse_pos : reuse_pos + 1]
+            restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
+            restored[0, reuse_pos] = restored_value.reshape(())
+            continue
+        if layout.layout_kind == "bshd":
+            provider_pos = index.provider_token_index
+            reuse_pos = index.reuse_token_index
+            if not isinstance(provider_pos, BshdTokenIndex) or not isinstance(reuse_pos, BshdTokenIndex):
+                raise TypeError("BSHD prefix-last restore requires BshdTokenIndex values")
+            provider_logits = _take_bshd_restore_token(logits, layout, provider_pos, keep_vocab_dim=True).clone()
+            reuse_label = _take_bshd_restore_token(labels, layout, reuse_pos, keep_vocab_dim=False)
+            _ensure_non_empty_bshd_restore_token(
+                provider_logits=provider_logits,
+                reuse_label=reuse_label,
+                logits=logits,
+                labels=labels,
+                log_probs=log_probs,
+                layout=layout,
+                provider_pos=provider_pos,
+                reuse_pos=reuse_pos,
+            )
+            restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
+            _write_bshd_restore_token(restored, layout, reuse_pos, restored_value.reshape(()))
+            continue
+        raise ValueError(f"unsupported batch runtime layout: {layout.layout_kind}")
     return restored
+
+
+def _take_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: BshdTokenIndex, *, keep_vocab_dim: bool) -> Any:
+    valid_offset = _bshd_valid_offset(layout, token_index)
+    if _is_compact_bshd_tensor(tensor, layout):
+        compact_pos = sum(layout.valid_lengths[: token_index.seq_idx_in_batch]) + valid_offset
+        if keep_vocab_dim:
+            return tensor[compact_pos : compact_pos + 1].unsqueeze(0)
+        return tensor[compact_pos : compact_pos + 1].unsqueeze(0)
+    if _is_padded_sbh_tensor(tensor, layout):
+        if keep_vocab_dim:
+            return tensor[valid_offset : valid_offset + 1, token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, :]
+        return tensor[valid_offset : valid_offset + 1, token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1]
+    if _is_kept_padded_bsh_tensor(tensor, layout):
+        if keep_vocab_dim:
+            return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, valid_offset : valid_offset + 1, :]
+        return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, valid_offset : valid_offset + 1]
+    if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
+        flat_pos = valid_offset * layout.batch_size + token_index.seq_idx_in_batch
+        return tensor[:, flat_pos : flat_pos + 1, :] if keep_vocab_dim else tensor[:, flat_pos : flat_pos + 1]
+    if _is_flattened_full_bshd_tensor(tensor, layout):
+        flat_pos = token_index.seq_idx_in_batch * layout.max_seqlen + token_index.token_idx_in_seq
+        return tensor[:, flat_pos : flat_pos + 1, :] if keep_vocab_dim else tensor[:, flat_pos : flat_pos + 1]
+    if keep_vocab_dim:
+        return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, token_index.token_idx_in_seq : token_index.token_idx_in_seq + 1, :]
+    return tensor[token_index.seq_idx_in_batch : token_index.seq_idx_in_batch + 1, token_index.token_idx_in_seq : token_index.token_idx_in_seq + 1]
+
+
+def _write_bshd_restore_token(tensor: Any, layout: BshdBatchLayout, token_index: BshdTokenIndex, value: Any) -> None:
+    valid_offset = _bshd_valid_offset(layout, token_index)
+    if _is_compact_bshd_tensor(tensor, layout):
+        compact_pos = sum(layout.valid_lengths[: token_index.seq_idx_in_batch]) + valid_offset
+        tensor[compact_pos] = value
+        return
+    if _is_padded_sbh_tensor(tensor, layout):
+        tensor[valid_offset, token_index.seq_idx_in_batch] = value
+        return
+    if _is_kept_padded_bsh_tensor(tensor, layout):
+        tensor[token_index.seq_idx_in_batch, valid_offset] = value
+        return
+    if _is_flattened_kept_padded_bshd_tensor(tensor, layout):
+        flat_pos = valid_offset * layout.batch_size + token_index.seq_idx_in_batch
+        tensor[:, flat_pos] = value
+        return
+    if _is_flattened_full_bshd_tensor(tensor, layout):
+        flat_pos = token_index.seq_idx_in_batch * layout.max_seqlen + token_index.token_idx_in_seq
+        tensor[:, flat_pos] = value
+        return
+    tensor[token_index.seq_idx_in_batch, token_index.token_idx_in_seq] = value
+
+
+def _ensure_non_empty_bshd_restore_token(
+    *,
+    provider_logits: Any,
+    reuse_label: Any,
+    logits: Any,
+    labels: Any,
+    log_probs: Any,
+    layout: BshdBatchLayout,
+    provider_pos: BshdTokenIndex,
+    reuse_pos: BshdTokenIndex,
+) -> None:
+    if provider_logits.numel() > 0 and reuse_label.numel() > 0:
+        return
+    raise RuntimeError(
+        "prefix sharing BSHD restore selected an empty token: "
+        f"logits_shape={tuple(logits.shape)}, labels_shape={tuple(labels.shape)}, "
+        f"log_probs_shape={tuple(log_probs.shape)}, provider_pos={provider_pos}, "
+        f"reuse_pos={reuse_pos}, provider_valid_offset={_bshd_valid_offset(layout, provider_pos)}, "
+        f"reuse_valid_offset={_bshd_valid_offset(layout, reuse_pos)}, "
+        f"valid_lengths={layout.valid_lengths}, max_seqlen={layout.max_seqlen}"
+    )
+
+
+def _bshd_valid_offset(layout: BshdBatchLayout, token_index: BshdTokenIndex) -> int:
+    row_mask = layout.valid_token_mask[token_index.seq_idx_in_batch]
+    preceding = row_mask[: token_index.token_idx_in_seq].sum()
+    if not bool(row_mask[token_index.token_idx_in_seq]):
+        raise IndexError("BshdTokenIndex points to a non-valid token")
+    return int(preceding.detach().cpu().item())
+
+
+def _is_compact_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    return tensor.dim() >= 1 and int(tensor.shape[0]) == layout.total_valid_length
+
+
+def _is_padded_sbh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    max_valid_length = max(layout.valid_lengths, default=0)
+    return (
+        tensor.dim() >= 2
+        and int(tensor.shape[0]) >= max_valid_length
+        and int(tensor.shape[1]) == layout.batch_size
+    )
+
+
+def _is_kept_padded_bsh_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    max_valid_length = max(layout.valid_lengths, default=0)
+    return (
+        tensor.dim() >= 2
+        and int(tensor.shape[0]) == layout.batch_size
+        and int(tensor.shape[1]) >= max_valid_length
+        and max_valid_length != layout.max_seqlen
+        and int(tensor.shape[1]) != layout.max_seqlen
+    )
+
+
+def _is_flattened_kept_padded_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    return (
+        tensor.dim() >= 2
+        and int(tensor.shape[0]) == 1
+        and int(tensor.shape[1]) == max(layout.valid_lengths, default=0) * layout.batch_size
+    )
+
+
+def _is_flattened_full_bshd_tensor(tensor: Any, layout: BshdBatchLayout) -> bool:
+    return tensor.dim() >= 2 and int(tensor.shape[0]) == 1 and int(tensor.shape[1]) == layout.batch_size * layout.max_seqlen
 
 
 def _clone_batch(batch: Any) -> Any:
@@ -531,43 +661,53 @@ def build_prefix_sharing_micro_batch_verl080(
         logger.info("[PS][prepare] no prefix sharing detected")
         return batch, None
 
-    # ── 阶段 5: 物理裁剪 batch ──
-    #   与 v070 的核心区别：v070 只改 attention_mask（Megatron 从 mask 动态重算 packed），
-    #   v080 THD 路径用 preprocess_thd_engine(input_ids) 直接处理数据，
-    #   不看 attention_mask。必须物理裁剪 input_ids/position_ids。
-    if is_nested_tensor:
-        trimmed_batch = _trim_nested_batch(batch, plan)
+    # ── 阶段 5: 根据 verl layout 裁剪 batch ──
+    # use_remove_padding=True: THD preprocess reads input_ids directly, so the
+    # removed prefix tokens must be physically absent.
+    # use_remove_padding=False: BSHD keeps dense tensors and uses attention_mask
+    # to expose only kept tokens.
+    if use_remove_padding:
+        if is_nested_tensor:
+            trimmed_batch = _trim_nested_batch(batch, plan)
+        else:
+            trimmed_batch = _trim_plain_batch_thd(batch, plan)
     else:
-        trimmed_batch = _trim_plain_batch_thd(batch, plan)
-
-    # layout 计算：从 trimmed 后的实际 kept position rows 构建
-    kept_position_rows = _collect_kept_position_rows(
-        trimmed_batch, plan, is_nested_tensor,
-        attention_mask_bool=attention_mask_bool_for_layout,
-    )
+        if is_nested_tensor:
+            raise RuntimeError("prefix sharing BSHD path expects dense 2D input_ids")
+        trimmed_batch = _trim_plain_batch_bshd(batch, plan, attention_mask_bool_for_layout)
 
     # ── 阶段 6: 构建 layout ──
     parallel_info = get_megatron_parallel_info()
-    align_size = (
-        parallel_info.tp_size * parallel_info.cp_size * 2
-        if parallel_info.cp_size > 1
-        else parallel_info.tp_size
-    )
-    packed_layout = PackedBatchLayout.from_kept_position_rows(
-        kept_position_rows,
-        align_size=int(align_size),
-    )
+    if use_remove_padding:
+        kept_position_rows = _collect_kept_position_rows(
+            trimmed_batch, plan, is_nested_tensor,
+            attention_mask_bool=attention_mask_bool_for_layout,
+        )
+        align_size = (
+            parallel_info.tp_size * parallel_info.cp_size * 2
+            if parallel_info.cp_size > 1
+            else parallel_info.tp_size
+        )
+        batch_runtime_layout = ThdBatchLayout.construct_from_kept_position_ids(
+            kept_position_rows,
+            align_size=int(align_size),
+        )
+    else:
+        batch_runtime_layout = BshdBatchLayout.from_valid_token_mask(
+            trimmed_batch["attention_mask"].to(bool),
+            position_ids=trimmed_batch["position_ids"],
+        )
 
     # ── 阶段 7: 构建 state ──
     state = PrefixSharingRuntimeState(
         prefix_sharing_plan=plan,
         attention_backend=get_backend_instance(ps_config),
-        packed_batch_layout=packed_layout,
+        batch_runtime_layout=batch_runtime_layout,
         parallel_info=parallel_info,
     )
 
     logger.info(
-        f"[PS][prepare] PATH 6: sharing detected, plan={plan}, layout={packed_layout}"
+        f"[PS][prepare] PATH 6: sharing detected, plan={plan}, layout={batch_runtime_layout}"
     )
 
     return trimmed_batch, state
@@ -699,6 +839,24 @@ def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
     return trimmed_batch
 
 
+def _trim_plain_batch_bshd(batch: Any, plan: PrefixSharingPlan, attention_mask_bool: Any) -> Any:
+    """Mask-trim a dense BSHD batch without changing tensor shapes."""
+
+    trimmed_batch = _clone_batch(batch)
+    new_attention_mask = attention_mask_bool.clone()
+    new_attention_mask[:] = False
+    valid_indices = [
+        attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+        for row in range(attention_mask_bool.shape[0])
+    ]
+    for row, indices in enumerate(valid_indices):
+        keep_start, keep_end = plan.input_keep_ranges[row]
+        kept_indices = indices[keep_start:keep_end]
+        new_attention_mask[row, kept_indices] = True
+    trimmed_batch["attention_mask"] = new_attention_mask
+    return trimmed_batch
+
+
 def _slice_nested_sequences(nested_tensor: Any, plan: PrefixSharingPlan) -> list[Any]:
     """从 NestedTensor 中按 keep_ranges 切片每个序列。
 
@@ -745,7 +903,7 @@ def _collect_kept_position_rows(
 ) -> list[Any]:
     """从裁剪后的 batch 中收集各序列的 kept position_ids（per-row 1D tensors）。
 
-    用于 PackedBatchLayout.from_kept_position_rows 构建 layout。
+    用于 ThdBatchLayout.construct_from_kept_position_ids 构建 layout。
 
     当 position_ids 是 2D tensor 时，需要 attention_mask_bool 来定位有效列索引
     （keep_range 是序列偏移，不是列索引）。当 position_ids 是 NestedTensor 时，

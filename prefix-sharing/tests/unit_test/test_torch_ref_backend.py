@@ -11,7 +11,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
+from prefix_sharing.backends.batch_layout import ThdBatchLayout
 from prefix_sharing.backends.torch_ref import (
     TorchReferenceBackend,
     _attention_row,
@@ -98,7 +98,7 @@ def test_apply_rope_with_fn_delegates():
 def test_build_kv_provider_stores_and_reuser_concatenates_prefix():
     """Core KV assembly: provider publishes valid KV, reuser concatenates prefix."""
     plan = _make_plan([6, 5], [0, 3])  # provider len=6, reuser prefix=3+suffix=2
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
     store = PrefixAttentionStore()
 
@@ -110,7 +110,7 @@ def test_build_kv_provider_stores_and_reuser_concatenates_prefix():
 
     expanded_k, expanded_v = backend.build_kv(
         key, value, store, plan,
-        packed_batch_layout=layout, layer_id=0, tp_rank=0,
+        batch_runtime_layout=layout, layer_id=0, tp_rank=0,
     )
 
     # Expanded KV should follow plan.expanded_lengths_kv
@@ -133,7 +133,7 @@ def test_build_kv_with_padding_strips_to_valid():
     align_size = 4
     rows = [torch.zeros(plan.kept_lengths_q[i], dtype=torch.long)
             for i in range(plan.batch_size)]
-    layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=align_size)
+    layout = ThdBatchLayout.construct_from_kept_position_ids(rows, align_size=align_size)
 
     backend = TorchReferenceBackend()
     store = PrefixAttentionStore()
@@ -145,7 +145,7 @@ def test_build_kv_with_padding_strips_to_valid():
 
     expanded_k, expanded_v = backend.build_kv(
         key, value, store, plan,
-        packed_batch_layout=layout, layer_id=0, tp_rank=0,
+        batch_runtime_layout=layout, layer_id=0, tp_rank=0,
     )
 
     # Expanded length must follow semantic lengths, not padded lengths
@@ -162,7 +162,7 @@ def test_build_kv_transitive_reuse():
     #   row1: len=7, prefix=3 (reuse from row0)
     #   row2: len=6, prefix=5 (reuse from row1's expanded)
     plan = _make_plan([8, 7, 6], [0, 3, 5])
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
     store = PrefixAttentionStore()
 
@@ -173,7 +173,7 @@ def test_build_kv_transitive_reuse():
 
     expanded_k, expanded_v = backend.build_kv(
         key, value, store, plan,
-        packed_batch_layout=layout, layer_id=0, tp_rank=0,
+        batch_runtime_layout=layout, layer_id=0, tp_rank=0,
     )
 
     # Verify expanded lengths match plan
@@ -190,7 +190,7 @@ def test_build_kv_transitive_reuse():
 def test_attention_provider_only_matches_manual():
     """Provider-only attention: output matches manual scaled-dot-product."""
     plan = _make_plan([4], [0])
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
 
     num_heads, head_dim = 2, 8
@@ -201,7 +201,7 @@ def test_attention_provider_only_matches_manual():
     k = torch.randn(kv_len, num_heads, head_dim)
     v = torch.randn(kv_len, num_heads, head_dim)
 
-    out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     # Manual reference: standard causal attention
     scale = head_dim ** 0.5
@@ -217,7 +217,7 @@ def test_attention_provider_only_matches_manual():
 def test_attention_reuser_sees_full_prefix():
     """Reuser Q[0] must attend to all prefix KV + suffix KV[0]."""
     plan = _make_plan([6, 5], [0, 3])
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
 
     num_heads, head_dim = 2, 8
@@ -228,7 +228,7 @@ def test_attention_reuser_sees_full_prefix():
     k = torch.randn(total_kv, num_heads, head_dim)
     v = torch.randn(total_kv, num_heads, head_dim)
 
-    out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     # Reuser row output should exist and be non-zero
     reuser_q_len = plan.kept_lengths_q[1]
@@ -248,7 +248,7 @@ def test_attention_padding_slots_are_zeroed():
     """When layout has padding, output at padding positions must be zero."""
     plan = _make_plan([5], [0])
     rows = [torch.zeros(5, dtype=torch.long)]
-    layout = PackedBatchLayout.from_kept_position_rows(rows, align_size=8)
+    layout = ThdBatchLayout.construct_from_kept_position_ids(rows, align_size=8)
 
     backend = TorchReferenceBackend()
 
@@ -260,7 +260,7 @@ def test_attention_padding_slots_are_zeroed():
     k = torch.randn(kv_len, num_heads, head_dim)
     v = torch.randn(kv_len, num_heads, head_dim)
 
-    out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    out = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
 
     # Padding positions (indices 5..7) must be zero
     assert torch.all(out[5:] == 0)
@@ -272,7 +272,7 @@ def test_attention_valid_length_zero_produces_zero_output():
     """When a row has valid_length=0, output should be all zeros."""
     # This is an edge case — we construct a plan where one row has zero kept length.
     # Use a layout with valid_lengths containing 0.
-    layout = PackedBatchLayout(
+    layout = ThdBatchLayout(
         valid_lengths=[4, 0, 3],
         padded_lengths=[4, 4, 4],
         cu_seqlens=[0, 4, 8, 12],
@@ -429,7 +429,7 @@ def test_split_packed_empty_lengths_returns_empty():
 def test_gated_attention_correct_output():
     """gated_attention = attention_output * sigmoid(gate)."""
     plan = _make_plan([4], [0])
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
 
     num_heads, head_dim = 2, 8
@@ -441,10 +441,10 @@ def test_gated_attention_correct_output():
     v = torch.randn(kv_len, num_heads, head_dim)
     gate = torch.randn(q_len, num_heads, head_dim)
 
-    out = backend.gated_attention(q, k, v, gate, plan, packed_batch_layout=layout)
+    out = backend.gated_attention(q, k, v, gate, plan, batch_runtime_layout=layout)
 
     # Compute attention output separately
-    attn_out = backend.attention(q, k, v, plan, packed_batch_layout=layout)
+    attn_out = backend.attention(q, k, v, plan, batch_runtime_layout=layout)
     expected = attn_out * torch.sigmoid(gate)
     assert torch.allclose(out, expected, atol=1e-5)
 
@@ -476,7 +476,7 @@ def test_gated_attention_shape_mismatch_raises():
 def test_build_deltanet_provider_trajectory_is_cumsum():
     """Provider deltanet trajectory should be cumsum of valid state updates."""
     plan = _make_plan([4], [0])
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
     store = PrefixDeltanetStore()
 
@@ -486,7 +486,7 @@ def test_build_deltanet_provider_trajectory_is_cumsum():
 
     out = backend.build_deltanet_states(
         state_update, store, plan,
-        packed_batch_layout=layout, layer_id=0, tp_rank=0,
+        batch_runtime_layout=layout, layer_id=0, tp_rank=0,
     )
 
     # Provider output = cumsum of valid tokens
@@ -498,7 +498,7 @@ def test_build_deltanet_provider_trajectory_is_cumsum():
 def test_build_deltanet_reuser_starts_from_provider_boundary():
     """Reuser suffix trajectory starts from provider's state at prefix boundary."""
     plan = _make_plan([6, 5], [0, 3])
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
     store = PrefixDeltanetStore()
 
@@ -508,7 +508,7 @@ def test_build_deltanet_reuser_starts_from_provider_boundary():
 
     out = backend.build_deltanet_states(
         state_update, store, plan,
-        packed_batch_layout=layout, layer_id=0, tp_rank=0,
+        batch_runtime_layout=layout, layer_id=0, tp_rank=0,
     )
 
     # Provider trajectory stored; reuser should load prefix boundary state
@@ -539,14 +539,14 @@ def test_build_deltanet_prefix_len_zero_edge_case():
     # In this plan, row 1 has prefix_len=0, so it's a provider (not a reuser)
     # We need a real reuser with prefix_len=0, which is degenerate but valid
     # Let's test the code path directly
-    layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
+    layout = ThdBatchLayout.construct_from_valid_lengths(plan.kept_lengths_q)
     backend = TorchReferenceBackend()
     store = PrefixDeltanetStore()
 
     state_update = torch.randn(layout.total_padded_length, 2, 8)
     out = backend.build_deltanet_states(
         state_update, store, plan,
-        packed_batch_layout=layout, layer_id=0, tp_rank=0,
+        batch_runtime_layout=layout, layer_id=0, tp_rank=0,
     )
 
     # Both rows are providers, so each should be cumsum

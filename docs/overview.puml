@@ -62,13 +62,13 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
     
     class "verl_mcore.py\nPrefixSharingRuntimeState" as RuntimeState #FFCC80 {
         运行时状态容器
-        封装执行计划、backend实例、packed runtime layout和Megatron并行信息
+        封装执行计划、backend实例、batch runtime layout和Megatron并行信息
         +prefix_sharing_plan: PrefixSharingPlan
         .. 执行计划，包含 reuse_specs、裁剪范围、restore specs 等 ..
-        +backend: Any
+        +attention_backend: Any
         .. attention backend 实例，如 TorchReferenceBackend ..
-        +packed_batch_layout: PackedBatchLayout
-        .. 当前 forward 的真实 packed batch 布局，用于 RoPE、KV split 和 restore index ..
+        +batch_runtime_layout: BatchRuntimeLayout
+        .. 当前 forward 的 THD/BSHD runtime 布局，用于 RoPE、KV split 和 restore index ..
         +parallel_info: MegatronParallelInfo
         .. 当前并行信息；Megatron 场景中为 Megatron TP/CP/PP rank-size 快照 ..
     }
@@ -88,13 +88,13 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
         +virtual_pp_size: int | None
     }
 
-    class "context.py\nPackedPrefixLastRestoreIndex" as PackedRestoreIndex #FFCC80 {
-        Packed恢复索引
-        在packed THD格式中定位prefix-last恢复位置
+    class "context.py\nPrefixLastRestoreIndex" as PackedRestoreIndex #FFCC80 {
+        Prefix-Last恢复索引
+        由 plan + runtime layout 派生；THD 为 1D index，BSHD 为 batch/seq index
         +reuse_idx_in_batch: int
         +provider_idx_in_batch: int
-        +provider_1d_pos: int
-        +reuse_1d_pos: int
+        +provider_token_index: Any
+        +reuse_token_index: Any
     }
     
     class "megatron_runtime.py" as MegatronRuntime #FFCC80 {
@@ -110,7 +110,7 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
         运行时上下文管理器
         提供上下文管理器管理RuntimeContext生命周期
         +PrefixSharingRuntimeContext()
-        .. 运行时上下文数据类，存储执行计划、PackedBatchLayout、KV Store、backend 和 restore index ..
+        .. 运行时上下文数据类，存储执行计划、ThdBatchLayout、KV Store、backend 和 restore index ..
         +prefix_sharing_runtime_context()
         .. 上下文管理器：创建 RuntimeContext → 设置 ContextVar → yield → 清理 store ..
         +current_prefix_sharing_context()
@@ -368,19 +368,17 @@ package "prefix-sharing/backends/ (硬件执行层)" as BackendsLayer #E8F5E9 {
         .. Gated DeltaNet参考路径：provider发布prefix state，reuser从prefix边界继续suffix ..
     }
 
-    class "packed_layout.py\nPackedBatchLayout" as PackedLayout #A5D6A7 {
-        Packed batch 布局
-        描述 attention backend 看到的 packed tensor 坐标，不绑定 prefix-sharing 语义
+    class "batch_layout.py\nBatchRuntimeLayout" as PackedLayout #A5D6A7 {
+        Batch runtime 布局
+        描述 attention backend 看到的 THD/BSHD tensor 坐标，不绑定 prefix-sharing 语义
         +valid_lengths: list[int]
-        +padded_lengths: list[int]
-        +cu_seqlens: list[int]
         +max_seqlen: int
-        +packed_position_ids: Any
+        +position_ids: Any
         +valid_token_mask: Any
-        +from_valid_lengths()
-        +from_kept_position_rows()
-        +packed_index()
-        +valid_slice()
+        +token_index()
+        +valid_tokens()
+        +padded_tokens()
+        +write_valid_tokens()
     }
     
     class "cuda_ref.py\nCudaReferenceBackend" as CudaRef #A5D6A7 {
@@ -412,7 +410,7 @@ SelfAttention ..> MegatronRuntime : 调用 maybe_run_prefix_sharing_attention()
 VerlMcore ..> RuntimeState : 创建运行时状态
 Context ..> RuntimeState : 使用构造 PrefixSharingRuntimeContext
 RuntimeState *-- Plan : 持有执行计划
-RuntimeState *-- PackedLayout : 持有 packed runtime 坐标
+RuntimeState *-- PackedLayout : 持有 THD runtime 坐标
 
 ' ==================== Integration -> Core 调用 ====================
 VerlMcore ..> Config : 读取/解析配置
@@ -421,7 +419,7 @@ VerlMcore ..> Plan : 创建 PrefixSharingPlan
 VerlMcore ..> BatchTrim : 裁剪 batch
 VerlMcore ..> Logprob : 恢复 logprob
 MegatronRuntime ..> Context : 获取 KV Store 和 Plan
-MegatronRuntime ..> PackedLayout : 读取 packed_position_ids
+MegatronRuntime ..> PackedLayout : 读取 position_ids
 MegatronRuntime ..> TorchRef : 执行 build_kv 和 attention
 
 ' ==================== Core 内部依赖 ====================
@@ -472,7 +470,7 @@ endnote
 note bottom of Context
   **PrefixSharingRuntimeContext:**
   - prefix_sharing_plan: PrefixSharingPlan
-  - packed_batch_layout: PackedBatchLayout
+  - batch_runtime_layout: ThdBatchLayout
   - parallel_info: MegatronParallelInfo
   - store: PrefixAttentionStore
   - backend: Any
