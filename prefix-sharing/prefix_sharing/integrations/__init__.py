@@ -10,9 +10,7 @@ from prefix_sharing.integrations.patch_manager import PatchHandle, PatchManager
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.integrations.verl_mcore import (
     PrefixSharingRuntimeState,
-    VerlMCoreBatchAdapter,
     VerlMCoreIntegration,
-    VerlMCorePrefixSharingBatch,
     enable_prefix_sharing,
     prefix_sharing_enabled,
     build_prefix_sharing_micro_batch,
@@ -26,9 +24,7 @@ __all__ = [
     "PackedPrefixLastRestoreIndex",
     "PrefixSharingRuntimeContext",
     "PrefixSharingRuntimeState",
-    "VerlMCoreBatchAdapter",
     "VerlMCoreIntegration",
-    "VerlMCorePrefixSharingBatch",
     "current_prefix_sharing_context",
     "enable_prefix_sharing",
     "prefix_sharing_runtime_context",

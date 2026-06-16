@@ -6,12 +6,9 @@
 
 ### 2026-06-05：prefix-interior-grad — packed tensor 路径的 interior-response logprob 插入
 
-**问题**：`prefix-interior-grad` 分支已实现 planner/logprob/context 层对前缀中 response token（interior-prefix logprob）的恢复规格生成和 Python-list 路径的 logprob 组装。但 verl 的 packed 1D tensor 路径（`restore_suffix_first_log_probs_from_prefix`）中，reuser 的 packed log_probs tensor 只包含 suffix 位置的条目，没有 interior-response token 的 slot。
+**状态**：已由 PR #16 的 2D 后注入方案解决。
 
-**进度**：
-1. **Python-list / 测试路径**（已完成）：planner 生成 interior `PrefixLastRestoreSpec`，`restore_prefix_last_logprobs` 按 `output_slot` 插入，计算图通过 provider logits 的 non-detached 连接保持完整。
-2. **Packed tensor 路径 — logprob 计算与缓存**（已完成）：`restore_suffix_first_log_probs_from_prefix` 对 interior spec 从 provider logits + provider label 计算 logprob（通过 `vocab_parallel_log_probs_fn`），非 detach 缓存到 `ctx.interior_logprob_cache[(reuse_idx_in_batch, output_slot)]`。
-3. **Packed tensor 路径 — per-row 插入**（TODO）：需要在 verl actor 的 logprob 组装阶段（packed → 2D 转换后）对 reuser 行做 interior logprob 的 `torch.cat` 前置插入。具体方案需结合 verl 的 `vocab_parallel_log_probs_from_logits` 调用点和后续的 reshape/mask 逻辑设计。
+**历史背景**：`prefix-interior-grad` 分支早期通过 planner 生成 interior `PrefixLastRestoreSpec`，并提供 Python-list 路径（`restore_prefix_last_logprobs`）和 packed-1D tensor 路径（`restore_suffix_first_log_probs_from_prefix`）两种 logprob 恢复方式。PR #16 将两条路径统一替换为 **2D 后注入**：`restore_reuser_prefix_columns_2d` 在 `postprocess_packed_seqs` 产出的 2D `[B, L]` 空间直接恢复 reuser 的 prefix 列，不再使用 packed-1D 注入或 Python-list 组装。旧的 Python-list 路径（`core/logprob.py`）及其配套的 `VerlMCoreBatchAdapter` 已作为死代码删除。
 
 ### 2026-06-04：prefix-sharing 可观测性日志分级与耗时拆分
 

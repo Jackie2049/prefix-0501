@@ -2,9 +2,10 @@
 
 This module has two layers:
 
-* ``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
-  verl-style micro-batch payload into prefix-sharing metadata plus trimmed
-  inputs/labels/masks, and it assembles restored logprobs after forward.
+* ``build_prefix_sharing_micro_batch`` / ``restore_reuser_prefix_columns_2d``
+  are the production entry points consumed by the verl Megatron actor. They
+  prepare a trimmed micro-batch and restore reuser prefix columns in 2D space
+  after forward.
 * ``VerlMCoreIntegration`` installs the Megatron attention patch. The real
   Megatron QKV rewiring still requires the framework runtime and remains guarded
   by optional integration tests.
@@ -14,31 +15,20 @@ from __future__ import annotations
 
 import importlib
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, Sequence, TypeVar
+from dataclasses import dataclass
+from typing import Any, Iterator, Mapping, Sequence
 
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.batch_trim import (
-    TrimmedBatch,
-    trim_inputs,
-    trim_labels,
-    trim_loss_masks,
-)
-from prefix_sharing.core.logprob import restore_prefix_last_logprobs
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
-from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.patch_manager import PatchHandle
 
 import logging
 logger = logging.getLogger(__name__)
-
-
-T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -52,125 +42,10 @@ class PrefixSharingRuntimeState:
     to tensor-space columns (needed when sequences have left padding)."""
 
 
-@dataclass(frozen=True)
-class VerlMCorePrefixSharingBatch:
-    """Framework-independent materialization of one verl actor micro-batch."""
-
-    prefix_sharing_plan: PrefixSharingPlan
-    input_ids: TrimmedBatch[int]
-    labels: TrimmedBatch[Any] | None = None
-    loss_masks: TrimmedBatch[Any] | None = None
-
-
-@dataclass
-class VerlMCoreBatchAdapter:
-    """Prepare and restore verl Megatron actor micro-batches.
-
-    The adapter is intentionally tensor-agnostic for Phase 1 local tests. A real
-    verl integration can map the returned ``TrimmedBatch.flattened`` and
-    ``prefix_sharing_plan.cu_seqlens_q`` fields to torch tensors without changing core
-    semantics.
-    """
-
-    config: PrefixSharingConfig
-    planner: PrefixSharingPlanner | None = None
-
-    def __post_init__(self) -> None:
-        if self.planner is None:
-            self.planner = PrefixSharingPlanner(self.config)
-
-    def prepare_micro_batch(
-        self,
-        input_ids: Sequence[Sequence[int]],
-        *,
-        labels: Sequence[Sequence[T]] | None = None,
-        loss_masks: Sequence[Sequence[T]] | None = None,
-        forward_id: int | None = None,
-        micro_batch_id: int | None = None,
-    ) -> VerlMCorePrefixSharingBatch:
-        """Plan prefix sharing and trim a micro-batch."""
-
-        assert self.planner is not None
-        prefix_sharing_plan = self.planner.plan(
-            input_ids,
-            forward_id=forward_id,
-            micro_batch_id=micro_batch_id,
-        )
-        trimmed_inputs = trim_inputs(input_ids, prefix_sharing_plan)
-        trimmed_labels = trim_labels(labels, prefix_sharing_plan) if labels is not None else None
-        trimmed_loss_masks = trim_loss_masks(loss_masks, prefix_sharing_plan) if loss_masks is not None else None
-        return VerlMCorePrefixSharingBatch(
-            prefix_sharing_plan=prefix_sharing_plan,
-            input_ids=trimmed_inputs,
-            labels=trimmed_labels,
-            loss_masks=trimmed_loss_masks,
-        )
-
-    def prefix_sharing_runtime_context(
-        self,
-        prefix_sharing_batch: VerlMCorePrefixSharingBatch,
-    ) -> Iterator[Any]:
-        """Open the runtime context consumed by patched attention."""
-
-        runtime_state = PrefixSharingRuntimeState(
-            prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
-            backend=TorchReferenceBackend(),
-            packed_batch_layout=PackedBatchLayout.from_valid_lengths(
-                prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
-            ),
-        )
-        return _prefix_sharing_runtime_context(runtime_state)
-
-    def restore_logprobs(
-        self,
-        suffix_logprobs: Sequence[Sequence[float]],
-        provider_prefix_last_logprobs: Sequence[float],
-        prefix_sharing_plan: PrefixSharingPlan,
-    ) -> list[list[float]]:
-        """Assemble per-row logprobs with Prefix-Last Restore.
-
-        ``provider_prefix_last_logprobs`` is indexed by batch position;
-        each interior-prefix response spec maps to its reuser's entry
-        (the logprob is the same for provider and reuser since the
-        label is in the shared prefix).
-        """
-
-        # Build per-spec restore logprobs from per-batch input.
-        # For prefix-last specs: use the directly provided value.
-        # For interior-response specs: the logprob is the same for
-        # provider and reuser because the label is in the shared
-        # prefix, so we use the provider's own logprob at that
-        # position (which equals the reuser's copy).
-        restore_logprobs: list[float] = []
-        for spec in prefix_sharing_plan.prefix_last_restore:
-            if spec.is_interior_response:
-                # Interior logprob: use the provider's (reuser's would
-                # equal it since the label is shared). The caller
-                # provides these in provider_prefix_last_logprobs
-                # keyed by reuse_idx_in_batch.
-                restore_logprobs.append(
-                    provider_prefix_last_logprobs[spec.reuse_idx_in_batch]
-                )
-            else:
-                restore_logprobs.append(
-                    provider_prefix_last_logprobs[spec.reuse_idx_in_batch]
-                )
-
-        return restore_prefix_last_logprobs(
-            suffix_logprobs,
-            restore_logprobs,
-            prefix_sharing_plan,
-        )
-
-
 @dataclass
 class VerlMCoreIntegration:
     config: PrefixSharingConfig
     backend: Any | None = None
-    batch_adapter: VerlMCoreBatchAdapter = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.batch_adapter = VerlMCoreBatchAdapter(self.config)
 
     def install(self, model_config: Any | None = None) -> PatchHandle:
         self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")

@@ -5,11 +5,6 @@ torch = pytest.importorskip("torch")
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.logprob import (
-    compute_token_logprobs_from_logits,
-    gather_provider_prefix_last_logits,
-    restore_prefix_last_logprobs_tensor,
-)
 from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore
@@ -172,27 +167,6 @@ def test_torch_reference_backend_uses_padded_layout_without_storing_padding_kv(
     assert output.shape == query.shape
     for padding_index in padding_indices:
         assert output[padding_index].abs().sum().item() == 0
-
-
-def test_prefix_last_restore_tensor_keeps_autograd_path():
-    prefix_sharing_plan = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)).plan(
-        [[1, 2, 10], [1, 2, 20, 21]],
-        forward_id=1,
-        micro_batch_id=1,
-    )
-    logits = torch.randn(2, 4, 8, requires_grad=True)
-    restored_logits = gather_provider_prefix_last_logits(logits, prefix_sharing_plan)
-    labels = torch.tensor([0, 3])
-    first_suffix_logprobs = compute_token_logprobs_from_logits(restored_logits, labels)
-    suffix_logprobs = torch.randn(2, 4, requires_grad=True)
-
-    restored = restore_prefix_last_logprobs_tensor(suffix_logprobs, first_suffix_logprobs, prefix_sharing_plan)
-    loss = restored[1, 0] + restored[1, 1]
-    loss.backward()
-
-    assert logits.grad is not None
-    assert suffix_logprobs.grad is not None
-    assert logits.grad[0, 1].abs().sum() > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available locally")
