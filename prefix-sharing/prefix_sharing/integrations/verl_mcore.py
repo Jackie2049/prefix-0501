@@ -322,8 +322,8 @@ def restore_reuser_prefix_columns_2d(
         provider_col = _map_2d_col(provider_row, valid_col)
         reuser_col = _map_2d_col(reuser_row, valid_col)
 
-        if index.is_interior_response:
-            # Interior: token is in shared prefix → logprob and entropy
+        if index.is_shared_prefix_interior:
+            # Shared-prefix interior: token is in shared prefix → logprob and entropy
             # are identical to the provider's (same label, same logits).
             log_probs[reuser_row, reuser_col] = log_probs[provider_row, provider_col]
             if entropy is not None:
@@ -351,7 +351,7 @@ def restore_reuser_prefix_columns_2d(
     # === DIAGNOSTIC: sample after restore ===
     if ctx.prefix_last_restore_indices:
         _diag_entries = ctx.prefix_last_restore_indices
-        _diag_interior = [e for e in _diag_entries if e.is_interior_response]
+        _diag_interior = [e for e in _diag_entries if e.is_shared_prefix_interior]
         if _diag_interior:
             _sample = _diag_interior[0]
             _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
@@ -363,7 +363,7 @@ def restore_reuser_prefix_columns_2d(
                 f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
                 f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
             )
-        _diag_plast = [e for e in _diag_entries if not e.is_interior_response]
+        _diag_plast = [e for e in _diag_entries if not e.is_shared_prefix_interior]
         if _diag_plast:
             _sample = _diag_plast[0]
             _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)

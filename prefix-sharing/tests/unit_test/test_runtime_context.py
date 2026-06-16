@@ -27,7 +27,7 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.prefix_sharing_plan is prefix_sharing_runtime_state.prefix_sharing_plan
-        # 3 restore specs: 2 interior (provider_prefix_last_pos=0,1) + 1 prefix-last (pos=2)
+        # 3 restore specs: 2 interior (provider_predict_pos=0,1) + 1 prefix-last (pos=2)
         assert len(ctx.prefix_last_restore_indices) == 3
         assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
         assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last

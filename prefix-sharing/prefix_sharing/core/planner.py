@@ -65,14 +65,14 @@ class PrefixLastRestoreSpec:
 
     Two kinds of restore exist:
 
-    * **Prefix-last restore** (``is_interior_response=False``, default): the
+    * **Prefix-last restore** (``is_shared_prefix_interior=False``, default): the
       reuser's first suffix token is predicted from the shared prefix-last
       position. Since different reusers may have different first suffix labels,
       the provider's full logits at ``prefix_len - 1`` must be stored and the
       logprob computed per reuser using that reuser's label.
 
-    * **Interior-prefix response restore** (``is_interior_response=True``):
-      a response token that lives entirely inside the shared prefix. Its
+    * **Shared-prefix interior restore** (``is_shared_prefix_interior=True``):
+      a token that lives strictly inside the shared prefix. Its
       logprob is ``log_softmax(logits[pos-1])[label=pos]``, where both the
       logits position and the label belong to the shared prefix. The logprob
       is therefore **identical for all reusers** and can be computed once from
@@ -82,23 +82,27 @@ class PrefixLastRestoreSpec:
 
     reuse_idx_in_batch: int
     provider_idx_in_batch: int
-    provider_prefix_last_pos: int
+    provider_predict_pos: int
+    """Logits position in provider used for this restore (logits[p] predicts
+    token at p+1). Equals ``target_2d_pos`` numerically; kept as a separate
+    field to document the provider-side lookup semantic and to drive provider
+    chain resolution in ``context.py``."""
     reuse_first_suffix_label_pos: int
     output_slot: int
     group_id: int
-    is_interior_response: bool = False
+    is_shared_prefix_interior: bool = False
     target_2d_pos: int = -1
     """Absolute 2D position in output tensor where restored logprob belongs.
     
     This is the label position in the original (untrimmed) sequence:
       log_probs[i] = log_softmax(logits[i])[label[i]]
-    For interior response: ``target_2d_pos = interior_pos - 1`` (label index).
+    For shared-prefix interior: ``target_2d_pos = prefix_label_pos - 1`` (label index).
     For prefix-last:    ``target_2d_pos = prefix_len - 1`` (first-suffix label index).
     """
     label_value: int = -1
     """The actual token ID used as label for logprob computation.
     
-    For interior: token at ``interior_pos`` (shared prefix, same for provider/reuser).
+    For shared-prefix interior: token at ``prefix_label_pos`` (shared prefix, same for provider/reuser).
     For prefix-last: token at ``prefix_len`` (reuser's first suffix token).
     This value is needed because trimmed packed labels don't contain these positions.
     """
@@ -282,7 +286,7 @@ class PrefixSharingPlanner:
                 kept_len = suffix_len
                 q_offset = prefix_len
 
-                # --- Interior-prefix response token restore ---
+                # --- Shared-prefix interior token restore ---
                 # Response tokens inside the shared prefix (positions
                 # 1 .. prefix_len-1) are trimmed from the Q path but
                 # still need logprob entries for PPO loss. Their labels are
@@ -293,22 +297,22 @@ class PrefixSharingPlanner:
                 # restored, but their label_mask is False so they don't
                 # affect loss — waste-free simplicity over prompt_lens.
                 interior_slot = 0
-                for interior_pos in range(1, prefix_len):
-                    # Interior response token logprob: computed from
-                    # logits[interior_pos-1] predicting token at
-                    # interior_pos. Writes to 2D position
-                    # interior_pos - 1 (the label position).
+                for prefix_label_pos in range(1, prefix_len):
+                    # Shared-prefix interior token logprob: computed from
+                    # logits[prefix_label_pos-1] predicting token at
+                    # prefix_label_pos. Writes to 2D position
+                    # prefix_label_pos - 1 (the label position).
                     restore_specs.append(
                         PrefixLastRestoreSpec(
                             reuse_idx_in_batch=index,
                             provider_idx_in_batch=provider_index[index],
-                            provider_prefix_last_pos=interior_pos - 1,
-                            reuse_first_suffix_label_pos=interior_pos,
+                            provider_predict_pos=prefix_label_pos - 1,
+                            reuse_first_suffix_label_pos=prefix_label_pos,
                             output_slot=interior_slot,
                             group_id=group_ids[index],
-                            is_interior_response=True,
-                            target_2d_pos=interior_pos - 1,
-                            label_value=input_ids[index][interior_pos],
+                            is_shared_prefix_interior=True,
+                            target_2d_pos=prefix_label_pos - 1,
+                            label_value=input_ids[index][prefix_label_pos],
                         )
                     )
                     interior_slot += 1
@@ -324,7 +328,7 @@ class PrefixSharingPlanner:
                         PrefixLastRestoreSpec(
                             reuse_idx_in_batch=index,
                             provider_idx_in_batch=provider_index[index],
-                            provider_prefix_last_pos=prefix_len - 1,
+                            provider_predict_pos=prefix_len - 1,
                             reuse_first_suffix_label_pos=prefix_len,
                             output_slot=first_suffix_slot,
                             group_id=group_ids[index],

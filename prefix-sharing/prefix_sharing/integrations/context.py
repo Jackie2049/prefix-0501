@@ -28,7 +28,7 @@ class PackedPrefixLastRestoreIndex:
     provider_idx_in_batch: int
     provider_1d_pos: int
     reuse_1d_pos: int
-    is_interior_response: bool = False
+    is_shared_prefix_interior: bool = False
     output_slot: int = 0
     target_2d_pos: int = -1
     """Absolute 2D position in output where restored logprob is written."""
@@ -134,8 +134,8 @@ def _build_prefix_last_restore_indices(
     for spec in prefix_sharing_plan.prefix_last_restore:
         reuse_idx = spec.reuse_idx_in_batch
         # Resolve through chain reuse to the nearest provider whose
-        # packed layout contains provider_prefix_last_pos.
-        target_pos = spec.provider_prefix_last_pos
+        # packed layout contains provider_predict_pos.
+        target_pos = spec.provider_predict_pos
         resolved_provider = _resolve_provider_for_position(
             prefix_sharing_plan, spec.provider_idx_in_batch, target_pos
         )
@@ -163,7 +163,7 @@ def _build_prefix_last_restore_indices(
                 provider_idx_in_batch=resolved_provider,
                 provider_1d_pos=pos_1d_in_provider,
                 reuse_1d_pos=reuse_1d,
-                is_interior_response=spec.is_interior_response,
+                is_shared_prefix_interior=spec.is_shared_prefix_interior,
                 output_slot=spec.output_slot,
                 target_2d_pos=spec.target_2d_pos,
                 label_value=spec.label_value,
