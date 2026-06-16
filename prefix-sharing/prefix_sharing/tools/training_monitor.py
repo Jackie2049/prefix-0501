@@ -61,9 +61,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Iterator, Literal
 
-import logging
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ContextVar – 无需修改函数签名即可在嵌套调用链中访问 mon / sw
@@ -155,7 +152,7 @@ class MemoryMonitor:
         ... forward + backward ...
         mon.stop()
         s = mon.summary()
-        logger.warning(
+        print(
             f"Peak  allocated={s['peak_allocated_gib']:.1f} GiB  "
             f"reserved={s['peak_reserved_gib']:.1f} GiB"
         )
@@ -242,7 +239,7 @@ class MemoryMonitor:
             writer.writerow(["timestamp", "allocated_gb", "reserved_gb"])
             for s in self._samples:
                 writer.writerow([s.timestamp, s.allocated_gb, s.reserved_gb])
-        logger.info("[MemoryMonitor] Saved %d samples to %s", len(self._samples), path)
+        print(f"[MemoryMonitor] Saved {len(self._samples)} samples to {path}")
 
     # ------------------------------------------------------------------
     # internal
@@ -379,7 +376,7 @@ class Stopwatch:
         """
         start = self._running.pop(name, None)
         if start is None:
-            logger.warning("Stopwatch.stop('%s'): timer was never started", name)
+            print(f"Stopwatch.stop('{name}'): timer was never started")
             return 0.0
         elapsed = time.perf_counter() - start
         self._samples.setdefault(name, [])
@@ -487,5 +484,4 @@ class Stopwatch:
                 step_ids = self._sample_step_ids.get(phase, [None] * len(durations))
                 for idx, (d, sid) in enumerate(zip(durations, step_ids)):
                     writer.writerow([sid if sid is not None else "", phase, idx, round(d, 6)])
-        logger.info("[Stopwatch] Saved %d phase samples to %s",
-                     sum(len(v) for v in self._samples.values()), path)
+        print(f"[Stopwatch] Saved {sum(len(v) for v in self._samples.values())} phase samples to {path}")

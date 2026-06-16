@@ -10,14 +10,11 @@
 from __future__ import annotations
 
 import builtins
-import logging
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from prefix_sharing.setup.logged_patch import LoggedPatchManager, PatchHandle, PatchRecord
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,19 +60,17 @@ class PatchRegistry:
                     original = getattr(target_obj, attr_name)
                     patched = spec.patch_factory(original)
                     mgr.patch_attr(target_obj, attr_name, patched)
-                    logger.info(
-                        "[PS] Immediately patched %s (module already loaded)",
-                        spec.description,
+                    print(
+                        f"[PS] Immediately patched {spec.description} (module already loaded)"
                     )
                 except (AttributeError, KeyError):
                     # 模块已加载但目标不存在——
                     # 可能是模块正在 import 中，类定义尚未完成。
                     # 加入 pending，等模块完全加载后再 patch。
                     pending.append(spec)
-                    logger.info(
-                        "[PS] Target not yet defined in %s, "
-                        "deferring patch: %s",
-                        spec.module_name, spec.description,
+                    print(
+                        f"[PS] Target not yet defined in {spec.module_name}, "
+                        f"deferring patch: {spec.description}"
                     )
             else:
                 pending.append(spec)
@@ -105,7 +100,7 @@ def _activate_import_hook(
     global _original_import
 
     if _original_import is not None:
-        logger.info("[PS] Import hook already active, skipping re-activation")
+        print("[PS] Import hook already active, skipping re-activation")
         return
 
     lookup = {spec.module_name: spec for spec in pending_specs}
@@ -134,31 +129,26 @@ def _activate_import_hook(
                         replacement=patched,
                     )
                 )
-                logger.info(
-                    "[PS] Auto-patched %s on import of %s",
-                    spec.description, name,
+                print(
+                    f"[PS] Auto-patched {spec.description} on import of {name}"
                 )
             except (AttributeError, KeyError):
                 # 模块已加载但目标仍未定义——
                 # 这种情况极少发生，通常是模块结构异常。
-                logger.warning(
-                    "[PS] Could not resolve target for %s "
-                    "after import of %s; skipping this patch. "
-                    "The patch target may not exist in this module version.",
-                    spec.description, name,
+                print(
+                    f"[PS] Could not resolve target for {spec.description} "
+                    f"after import of {name}; skipping this patch. "
+                    f"The patch target may not exist in this module version."
                 )
 
             if not lookup:
                 builtins.__import__ = _original_import
                 _original_import = None
-                logger.info(
-                    "[PS] All import hooks resolved, __import__ restored"
-                )
+                print("[PS] All import hooks resolved, __import__ restored")
 
         return module
 
     builtins.__import__ = hooked_import
-    logger.info(
-        "[PS] Import hook activated for %d modules: %s",
-        len(lookup), list(lookup.keys()),
+    print(
+        f"[PS] Import hook activated for {len(lookup)} modules: {list(lookup.keys())}"
     )

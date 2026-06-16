@@ -8,10 +8,7 @@ thin wrapper：消费 batch → 读 config → 构建状态 → 设 context → 
 
 from __future__ import annotations
 
-import logging
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 
 def patch_verl_forward_step(original_forward_step: Any) -> Any:

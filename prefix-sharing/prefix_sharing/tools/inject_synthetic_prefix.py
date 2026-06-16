@@ -20,11 +20,8 @@ Usage:
 """
 
 import json
-import logging
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 
 def _load_base_tokens(json_path: str) -> list[int]:
@@ -92,7 +89,7 @@ def _build_synthetic_batch(
             f"Reduce batch_size or increase max lengths."
         )
 
-    logger.info("[SyntheticPrefix] bs=%d seg_size=%d total=%d", batch_size, S, total_needed)
+    print(f"[SyntheticPrefix] bs={batch_size} seg_size={S} total={total_needed}")
     tokens = base_tokens[:total_needed]
     segs = [tokens[i * S:(i + 1) * S] for i in range(n_seg)]
 
@@ -184,17 +181,16 @@ def patch_synthetic_prefix(
     if rem:
         pad_size = num_workers - rem
         fixed_data.padding(pad_size, "last")
-        logger.warning("[SyntheticPrefix] Padded %d -> %d (divisible by %d)", n, n + pad_size, num_workers)
+        print(f"[SyntheticPrefix] Padded {n} -> {n + pad_size} (divisible by {num_workers})")
 
     def _patched(batch, **kwargs):
-        logger.warning("[SyntheticPrefix] Returning synthetic prefix data (bs=%d, P=%d, R=%d).",
-                       batch_size, max_prompt_length, max_response_length)
+        print(f"[SyntheticPrefix] Returning synthetic prefix data (bs={batch_size}, P={max_prompt_length}, R={max_response_length}).")
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
     trainer.actor_rollout_wg.generate_sequences = _patched
-    logger.warning("[SyntheticPrefix] Patched actor_rollout_wg.generate_sequences.")
+    print("[SyntheticPrefix] Patched actor_rollout_wg.generate_sequences.")
 
     if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
         trainer.async_rollout_manager.generate_sequences = _patched
-        logger.warning("[SyntheticPrefix] Patched async_rollout_manager.generate_sequences.")
+        print("[SyntheticPrefix] Patched async_rollout_manager.generate_sequences.")

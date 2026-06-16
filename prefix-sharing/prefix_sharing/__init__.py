@@ -20,41 +20,12 @@ Monkey-patch activation:
     无需修改 verl/Megatron 源码。
 """
 
-import logging
-import sys
-
-
-def _ensure_logging_visible() -> None:
-    """确保 prefix_sharing namespace 的 INFO 日志对用户可见。
-
-    verl 等训练框架的 root logger 通常设为 WARNING，
-    会导致 prefix_sharing 的 INFO 日志被过滤。
-    通过在 prefix_sharing namespace 上配置专属 handler + INFO 级别 + propagate=False，
-    所有子模块（setup.registry, patches.forward_step, integrations.context 等）
-    的 INFO 日志都能经由 propagate 链到达此 namespace logger 并输出到 stderr，
-    不再受 root logger 级别限制。
-    用户已自行配置 handler 时，不干预。
-    """
-    ns_logger = logging.getLogger("prefix_sharing")
-    if ns_logger.handlers:
-        return  # 用户已自行配置，不干预
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    ns_logger.addHandler(handler)
-    ns_logger.setLevel(logging.INFO)
-    ns_logger.propagate = False
-
-
-_ensure_logging_visible()
-
 
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec, TriePrefixDetector
 from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
 from prefix_sharing.integrations.verl_mcore import enable_prefix_sharing, prefix_sharing_enabled
 
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "PrefixSharingPlan",
@@ -98,20 +69,19 @@ def _auto_install_patches() -> None:
     global _patch_handle
 
     if _patch_handle is not None:
-        logger.info("[PS] Patches already installed, skipping.")
+        print("[PS] Patches already installed, skipping.")
         return
 
     try:
         from prefix_sharing.setup import install
         _patch_handle = install()
-        logger.info("[PS] Auto-activation succeeded: %s", _patch_handle.describe())
+        print(f"[PS] Auto-activation succeeded: {_patch_handle.describe()}")
     except Exception as exc:
         # IncompatibleEnvironment or import errors — log and continue
         # Training proceeds normally without prefix-sharing patches.
-        logger.warning(
-            "[PS] Auto-activation skipped: %s. "
-            "Training will proceed without prefix-sharing patches.",
-            exc,
+        print(
+            f"[PS] Auto-activation skipped: {exc}. "
+            f"Training will proceed without prefix-sharing patches."
         )
 
 

@@ -10,14 +10,10 @@
 from __future__ import annotations
 
 import importlib
-import logging
-
 from prefix_sharing.setup.version_guard import detect_versions, DetectedVersions
 from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry
 from prefix_sharing.setup.registry import PatchSpec, PatchRegistry
 from prefix_sharing.setup.logged_patch import PatchHandle
-
-logger = logging.getLogger(__name__)
 
 
 class IncompatibleEnvironment(RuntimeError):
@@ -39,12 +35,9 @@ def check() -> DetectedVersions:
             f"mindspeed={versions.mindspeed}。\n"
             + _format_compat_matrix()
         )
-    logger.info(
-        "[PS] Version check: verl=%s, megatron_core=%s, "
-        "mindspeed=%s → compatible (patch_set=%s)",
-        versions.verl, versions.megatron_core,
-        versions.mindspeed,
-        entry.patch_set_id,
+    print(
+        f"[PS] Version check: verl={versions.verl}, megatron_core={versions.megatron_core}, "
+        f"mindspeed={versions.mindspeed} → compatible (patch_set={entry.patch_set_id})"
     )
     return versions
 
@@ -64,9 +57,8 @@ def install() -> PatchHandle:
 
     handle = PatchRegistry.install_all()
 
-    logger.info(
-        "[PS] install() complete. %d patches active. patch_set=%s",
-        len(patch_set), entry.patch_set_id,
+    print(
+        f"[PS] install() complete. {len(patch_set)} patches active. patch_set={entry.patch_set_id}"
     )
     return handle
 

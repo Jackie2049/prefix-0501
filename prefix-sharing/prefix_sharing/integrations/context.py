@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-import logging
 from typing import Any, Iterator
 
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
@@ -19,7 +18,6 @@ _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
     "prefix_sharing_context",
     default=None,
 )
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -196,64 +194,27 @@ def _log_prefix_sharing_audit(ctx: PrefixSharingRuntimeContext) -> None:
     if stats is None:
         return
     global_rank, tp_rank, tp_size = _read_parallel_rank_info()
-    logger.warning(
-        "[PS][audit][global_rank=%s tp_rank=%s/tp_size=%s] summary: "
-        "forward_id=%s micro_batch_id=%s batch_size=%s "
-        "original_tokens=%s kept_valid_tokens=%s kept_padded_tokens=%s "
-        "reused_valid_tokens=%s reused_valid_token_ratio=%.4f "
-        "provider_count=%s reuser_count=%s sharing_group_count=%s "
-        "expected_reused_counts_per_layer=%s expected_reused_prefix_tokens_per_layer=%s "
-        "expected_restore_count=%s actual_restore_count=%s",
-        global_rank,
-        tp_rank,
-        tp_size,
-        stats.forward_id,
-        stats.micro_batch_id,
-        stats.batch_size,
-        stats.original_tokens,
-        stats.kept_valid_tokens,
-        stats.kept_padded_tokens,
-        stats.reused_valid_tokens,
-        stats.reused_valid_token_ratio,
-        stats.provider_count,
-        stats.reuser_count,
-        stats.sharing_group_count,
-        stats.expected_reused_counts_per_layer,
-        stats.expected_reused_prefix_tokens_per_layer,
-        stats.expected_restore_count,
-        stats.actual_restore_count,
+    print(
+        f"[PS][audit][global_rank={global_rank} tp_rank={tp_rank}/tp_size={tp_size}] summary: "
+        f"forward_id={stats.forward_id} micro_batch_id={stats.micro_batch_id} batch_size={stats.batch_size} "
+        f"original_tokens={stats.original_tokens} kept_valid_tokens={stats.kept_valid_tokens} kept_padded_tokens={stats.kept_padded_tokens} "
+        f"reused_valid_tokens={stats.reused_valid_tokens} reused_valid_token_ratio={stats.reused_valid_token_ratio:.4f} "
+        f"provider_count={stats.provider_count} reuser_count={stats.reuser_count} sharing_group_count={stats.sharing_group_count} "
+        f"expected_reused_counts_per_layer={stats.expected_reused_counts_per_layer} expected_reused_prefix_tokens_per_layer={stats.expected_reused_prefix_tokens_per_layer} "
+        f"expected_restore_count={stats.expected_restore_count} actual_restore_count={stats.actual_restore_count}"
     )
     if not stats.layers and stats.expected_reused_counts_per_layer > 0:
-        logger.warning(
-            "[PS][audit][global_rank=%s tp_rank=%s/tp_size=%s] runtime_missing: "
-            "expected_reused_counts_per_layer=%s expected_reused_prefix_tokens_per_layer=%s",
-            global_rank,
-            tp_rank,
-            tp_size,
-            stats.expected_reused_counts_per_layer,
-            stats.expected_reused_prefix_tokens_per_layer,
+        print(
+            f"[PS][audit][global_rank={global_rank} tp_rank={tp_rank}/tp_size={tp_size}] runtime_missing: "
+            f"expected_reused_counts_per_layer={stats.expected_reused_counts_per_layer} expected_reused_prefix_tokens_per_layer={stats.expected_reused_prefix_tokens_per_layer}"
         )
     for layer_id in sorted(stats.layers):
         layer = stats.layers[layer_id]
-        logger.warning(
-            "[PS][audit][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] runtime: "
-            "store_count=%s reuse_count=%s reuse_hit_count=%s reuse_miss_count=%s "
-            "stored_tokens=%s reused_prefix_tokens=%s expanded_kv_tokens=%s "
-            "valid_q_tokens=%s padded_q_tokens=%s matches_expected=%s",
-            global_rank,
-            tp_rank,
-            tp_size,
-            layer_id,
-            layer.store_count,
-            layer.reuse_count,
-            layer.reuse_hit_count,
-            layer.reuse_miss_count,
-            layer.stored_tokens,
-            layer.reused_prefix_tokens,
-            layer.expanded_kv_tokens,
-            layer.valid_q_tokens,
-            layer.padded_q_tokens,
-            stats.layer_matches_expected(layer_id),
+        print(
+            f"[PS][audit][global_rank={global_rank} tp_rank={tp_rank}/tp_size={tp_size} layer={layer_id}] runtime: "
+            f"store_count={layer.store_count} reuse_count={layer.reuse_count} reuse_hit_count={layer.reuse_hit_count} reuse_miss_count={layer.reuse_miss_count} "
+            f"stored_tokens={layer.stored_tokens} reused_prefix_tokens={layer.reused_prefix_tokens} expanded_kv_tokens={layer.expanded_kv_tokens} "
+            f"valid_q_tokens={layer.valid_q_tokens} padded_q_tokens={layer.padded_q_tokens} matches_expected={stats.layer_matches_expected(layer_id)}"
         )
 
 

@@ -10,9 +10,6 @@ from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.utils import ensure_global_packed_token_lengths
 
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 def prefix_attention(
@@ -29,12 +26,12 @@ def prefix_attention(
     Returns ``None`` for the normal Megatron path. When active, this function
     owns RoPE, KV expansion, causal masking, and output projection.
     """
-    logger.warning("\n\n\nsuccess come into def prefix_attention\n\n\n")
+    print("\n\n\nsuccess come into def prefix_attention\n\n\n")
 
     # 读取并校验前缀共享上下文 prefix_sharing_context
     prefix_sharing_context = current_prefix_sharing_context()
     if prefix_sharing_context is None:
-        logger.warning("\n\n\nprefix_sharing_context is None\n\n\n")
+        print("\n\n\nprefix_sharing_context is None\n\n\n")
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
@@ -80,9 +77,9 @@ def prefix_attention(
 
     parallel_info = prefix_sharing_context.parallel_info
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
-    logger.warning("\n\n\ntry to build kv\n\n\n")
+    print("\n\n\ntry to build kv\n\n\n")
     seq_parallel = getattr(getattr(attention_module, "config", None), "sequence_parallel", None)
-    logger.warning(
+    print(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
         f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
         f"enter prefix-sharing path: query_token_length={query.shape[0]} "
@@ -103,7 +100,7 @@ def prefix_attention(
         tp_rank=parallel_info.tp_rank,
         stats=ctx.stats,
     )
-    logger.warning(
+    print(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
         f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
         f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"

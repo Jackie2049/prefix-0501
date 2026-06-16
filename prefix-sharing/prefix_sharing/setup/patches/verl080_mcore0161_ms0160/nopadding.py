@@ -19,15 +19,12 @@ from...import 引用此函数。每个模块的局部引用都需要被 patch。
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
 from verl.utils import tensordict_utils as tu
-
-logger = logging.getLogger(__name__)
 
 # 缓存真正的原始函数，避免多次 patch 时链式包装（patched-of-patched）。
 # 第一次 patch_factory 调用时缓存 original；后续调用直接复用同一个 wrapper。
@@ -93,15 +90,12 @@ def _make_wrapper(original_func: Any) -> Any:
                 trimmed_prompt_lens = trimmed_seq_lens - response_lens
                 sequence_lens = trimmed_prompt_lens + response_lens
                 sequence_offsets = sequence_lens.cumsum(dim=0)
-                logger.info(
-                    "[PS][nopadding] trimming detected: "
-                    "expected_total=%s actual_total=%s "
-                    "original_prompt_lens=%s trimmed_prompt_lens=%s "
-                    "response_lens=%s",
-                    expected_total, actual_total,
-                    prompt_lens.tolist(),
-                    trimmed_prompt_lens.tolist(),
-                    response_lens.tolist(),
+                print(
+                    f"[PS][nopadding] trimming detected: "
+                    f"expected_total={expected_total} actual_total={actual_total} "
+                    f"original_prompt_lens={prompt_lens.tolist()} "
+                    f"trimmed_prompt_lens={trimmed_prompt_lens.tolist()} "
+                    f"response_lens={response_lens.tolist()}"
                 )
                 # PS path: 不匹配时直接走自己的实现
                 # (避免原函数的 assert 再次失败)
