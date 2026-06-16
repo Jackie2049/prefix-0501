@@ -18,14 +18,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
 
+from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
-from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
+from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
+from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.patch_manager import PatchHandle
+from prefix_sharing.integrations.utils import ensure_global_packed_token_lengths
 
 import logging
 logger = logging.getLogger(__name__)
@@ -36,6 +39,7 @@ class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
     packed_batch_layout: PackedBatchLayout
+    parallel_info: MegatronParallelInfo
     valid_indices: list | None = None
     """Per-row tensor positions of valid (non-padding) tokens in the
     original 2D tensors.  Used to map planner's valid-space target_2d_pos
@@ -50,7 +54,7 @@ class VerlMCoreIntegration:
     def install(self, model_config: Any | None = None) -> PatchHandle:
         self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
         self._ensure_verl_importable()
-        backend = self.backend or TorchReferenceBackend()
+        backend = get_backend_instance(self.config, self.backend)
         return MegatronAttentionIntegration(config=self.config, backend=backend).install(
             model_config=model_config
         )
@@ -197,21 +201,30 @@ def build_prefix_sharing_micro_batch(
     trimmed_micro_batch["attention_mask"] = new_attention_mask
     trimmed_micro_batch["position_ids"] = new_position_ids
 
-    global_rank, tp_rank, tp_size, cp_rank, cp_size = _read_megatron_parallel_state()
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    parallel_info = get_megatron_parallel_info()
+    align_size = (
+        parallel_info.tp_size * parallel_info.cp_size * 2
+        if parallel_info.cp_size > 1
+        else parallel_info.tp_size
+    )
     packed_batch_layout = PackedBatchLayout.from_kept_position_rows(
         kept_position_rows,
         align_size=int(align_size),
     )
     logger.warning(
-        "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s] packed_batch_layout: "
+        "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s "
+        "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] packed_batch_layout: "
         "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
         "total_valid=%s, total_padded=%s",
-        global_rank,
-        tp_rank,
-        tp_size,
-        cp_rank,
-        cp_size,
+        parallel_info.global_rank,
+        parallel_info.tp_rank,
+        parallel_info.tp_size,
+        parallel_info.cp_rank,
+        parallel_info.cp_size,
+        parallel_info.pp_rank,
+        parallel_info.pp_size,
+        parallel_info.is_pipeline_first_stage,
+        parallel_info.is_pipeline_last_stage,
         packed_batch_layout.valid_lengths,
         packed_batch_layout.padded_lengths,
         packed_batch_layout.cu_seqlens,
@@ -221,8 +234,9 @@ def build_prefix_sharing_micro_batch(
     )
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        backend=backend or TorchReferenceBackend(),
+        backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
+        parallel_info=parallel_info,
         valid_indices=valid_indices,
     )
     logger.warning(
@@ -230,37 +244,6 @@ def build_prefix_sharing_micro_batch(
         f"prefix_sharing_runtime_state) with keep_ranges={prefix_sharing_plan.input_keep_ranges}"
     )
     return trimmed_micro_batch, prefix_sharing_runtime_state
-
-
-def _read_megatron_parallel_state() -> tuple[int | str, int, int, int, int]:
-    global_rank: int | str = "unknown"
-    tp_rank = 0
-    tp_size = 1
-    cp_rank = 0
-    cp_size = 1
-
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            global_rank = int(dist.get_rank())
-    except Exception:
-        pass
-
-    try:
-        from megatron.core import parallel_state as mpu
-
-        tp_size = int(mpu.get_tensor_model_parallel_world_size())
-        if hasattr(mpu, "get_tensor_model_parallel_rank"):
-            tp_rank = int(mpu.get_tensor_model_parallel_rank())
-        if hasattr(mpu, "get_context_parallel_world_size"):
-            cp_size = int(mpu.get_context_parallel_world_size())
-        if hasattr(mpu, "get_context_parallel_rank"):
-            cp_rank = int(mpu.get_context_parallel_rank())
-    except (ImportError, RuntimeError, AssertionError, AttributeError):
-        pass
-
-    return global_rank, tp_rank, tp_size, cp_rank, cp_size
 
 
 def restore_reuser_prefix_columns_2d(
@@ -327,55 +310,6 @@ def restore_reuser_prefix_columns_2d(
             if vi is not None and 0 <= valid_pos < len(vi):
                 return int(vi[valid_pos].item())
         return valid_pos
-
-    # === DIAGNOSTIC: dump all reuse info before restore ===
-    _diag_indices = ctx.prefix_last_restore_indices
-    _diag_interior_entries = [e for e in _diag_indices if e.is_interior_response]
-    _diag_prefix_last_entries = [e for e in _diag_indices if not e.is_interior_response]
-    _diag_reuser_rows = sorted(set(e.reuse_idx_in_batch for e in _diag_indices))
-    logger.warning(
-        f"[RESTORE_DIAG] total_entries={len(_diag_indices)} "
-        f"interior={len(_diag_interior_entries)} prefix_last={len(_diag_prefix_last_entries)} "
-        f"reuser_rows={len(_diag_reuser_rows)}"
-    )
-    for _rr in _diag_reuser_rows:
-        _rr_entries = [e for e in _diag_indices if e.reuse_idx_in_batch == _rr]
-        _rr_interior_cols = [e.target_2d_pos for e in _rr_entries if e.is_interior_response]
-        _rr_prefix_last_cols = [e.target_2d_pos for e in _rr_entries if not e.is_interior_response]
-        # group by provider
-        _rr_providers = sorted(set(e.provider_idx_in_batch for e in _rr_entries))
-        _rr_parts = []
-        for _prov in _rr_providers:
-            _prov_interior = [e.target_2d_pos for e in _rr_entries
-                              if e.provider_idx_in_batch == _prov and e.is_interior_response]
-            _prov_plast = [e.target_2d_pos for e in _rr_entries
-                           if e.provider_idx_in_batch == _prov and not e.is_interior_response]
-            _prov_parts_str = []
-            if _prov_interior:
-                _prov_parts_str.append(f"interior_cols={_prov_interior}")
-            if _prov_plast:
-                _prov_parts_str.append(f"prefix_last_cols={_prov_plast}")
-            _rr_parts.append(f"  provider_row={_prov} " + " ".join(_prov_parts_str))
-        logger.warning(
-            f"[RESTORE_DIAG] reuser_row={_rr} "
-            f"interior_cols={_rr_interior_cols} "
-            f"prefix_last_cols={_rr_prefix_last_cols}"
-        )
-        for _p in _rr_parts:
-            logger.warning(f"[RESTORE_DIAG]   {_p}")
-    # sample before values
-    if _diag_interior_entries:
-        _sample = _diag_interior_entries[0]
-        _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
-        _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
-        logger.warning(
-            f"[RESTORE_DIAG] sample before restore: "
-            f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
-            f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
-            f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
-            f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
-        )
-    # === END DIAGNOSTIC ===
 
     non_interior_count = 0
     for index in ctx.prefix_last_restore_indices:

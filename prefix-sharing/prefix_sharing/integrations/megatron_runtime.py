@@ -8,6 +8,7 @@ import torch
 
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.integrations.context import current_prefix_sharing_context
+from prefix_sharing.integrations.utils import ensure_global_packed_token_lengths
 
 
 def maybe_run_prefix_sharing_attention(
@@ -40,8 +41,18 @@ def maybe_run_prefix_sharing_attention(
     if ctx.packed_batch_layout.packed_position_ids is None:
         raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
-    q_pos_emb, k_pos_emb = rotary_pos_emb
     packed_batch_layout = ctx.packed_batch_layout
+    ensure_global_packed_token_lengths(
+        {
+            "query_length": query.shape[0],
+            "key_length": key.shape[0],
+            "value_length": value.shape[0],
+        },
+        total_padded_length=packed_batch_layout.total_padded_length,
+        context="attention hook",
+    )
+
+    q_pos_emb, k_pos_emb = rotary_pos_emb
     query, key = _apply_positioned_rope(
         attention_module,
         query,
@@ -52,18 +63,25 @@ def maybe_run_prefix_sharing_attention(
     )
 
     backend = ctx.backend or TorchReferenceBackend()
-    global_rank, tp_rank, tp_size = _read_parallel_rank_info()
+    parallel_info = ctx.parallel_info
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
 
     prefix_log.warning("\n\n\ntry to build kv\n\n\n")
     prefix_log.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] enter prefix-sharing path: "
+        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
+        "enter prefix-sharing path: "
+        "sequence_parallel=%s query_token_length=%s total_padded_length=%s "
         "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
         "padded_lengths=%s, cu_seqlens=%s",
-        global_rank,
-        tp_rank,
-        tp_size,
+        parallel_info.global_rank,
+        parallel_info.tp_rank,
+        parallel_info.tp_size,
+        parallel_info.pp_rank,
+        parallel_info.pp_size,
         layer_id,
+        getattr(getattr(attention_module, "config", None), "sequence_parallel", None),
+        query.shape[0],
+        packed_batch_layout.total_padded_length,
         tuple(query.shape),
         tuple(key.shape),
         tuple(value.shape),
@@ -78,15 +96,18 @@ def maybe_run_prefix_sharing_attention(
         ctx.prefix_sharing_plan,
         packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
-        tp_rank=tp_rank,
+        tp_rank=parallel_info.tp_rank,
         stats=ctx.stats,
     )
     prefix_log.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s layer=%s] built expanded kv: "
+        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
+        "built expanded kv: "
         "expanded_key_shape=%s, expanded_value_shape=%s",
-        global_rank,
-        tp_rank,
-        tp_size,
+        parallel_info.global_rank,
+        parallel_info.tp_rank,
+        parallel_info.tp_size,
+        parallel_info.pp_rank,
+        parallel_info.pp_size,
         layer_id,
         tuple(expanded_key.shape),
         tuple(expanded_value.shape),
@@ -176,28 +197,3 @@ def _apply_positioned_rope(
             cu_seqlens=None,
         ).squeeze(1)
     return query, key
-
-
-def _read_parallel_rank_info() -> tuple[int | str, int, int]:
-    global_rank: int | str = "unknown"
-    tp_rank = 0
-    tp_size = 1
-
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            global_rank = int(dist.get_rank())
-    except Exception:
-        pass
-
-    try:
-        from megatron.core import parallel_state
-
-        tp_size = int(parallel_state.get_tensor_model_parallel_world_size())
-        if hasattr(parallel_state, "get_tensor_model_parallel_rank"):
-            tp_rank = int(parallel_state.get_tensor_model_parallel_rank())
-    except Exception:
-        pass
-
-    return global_rank, tp_rank, tp_size

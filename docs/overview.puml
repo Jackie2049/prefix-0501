@@ -20,7 +20,7 @@ package "dependency/ (外部框架 - 侵入式修改)" as DependencyLayer #E3F2F
             +forward_step(): Line 631-632 判断是否启用fused kernels
             ..当前不兼容融合算子，需要跑异常 ..
             +forward_step(): Line 680-681 插入 prefix_sharing_runtime_context()
-            .. 为核心的forward_fn建立PrefixSharingRuntimeContext，传递PrefixSharingPlan、PrefixKVStore、LastRestoreSlots等 ..
+            .. 为核心的forward_fn建立PrefixSharingRuntimeContext，传递PrefixSharingPlan、PrefixAttentionStore、LastRestoreSlots等 ..
             +forward_step()/logits_processor(): Line 669-675 插入 restore_suffix_first_log_probs_from_prefix()
             .. 用于logits_processor中 恢复 suffix第一个token的 logprob ..
         }
@@ -62,13 +62,30 @@ package "prefix-sharing/integrations/ (框架适配层)" as IntegrationLayer #FF
     
     class "verl_mcore.py\nPrefixSharingRuntimeState" as RuntimeState #FFCC80 {
         运行时状态容器
-        封装执行计划、backend实例、packed runtime layout等运行时数据
+        封装执行计划、backend实例、packed runtime layout和Megatron并行信息
         +prefix_sharing_plan: PrefixSharingPlan
         .. 执行计划，包含 reuse_specs、裁剪范围、restore specs 等 ..
         +backend: Any
         .. attention backend 实例，如 TorchReferenceBackend ..
         +packed_batch_layout: PackedBatchLayout
         .. 当前 forward 的真实 packed batch 布局，用于 RoPE、KV split 和 restore index ..
+        +parallel_info: MegatronParallelInfo
+        .. 当前并行信息；Megatron 场景中为 Megatron TP/CP/PP rank-size 快照 ..
+    }
+
+    class "parallel_info.py\nMegatronParallelInfo" as ParallelInfo #FFCC80 {
+        Megatron并行信息
+        从 Megatron parallel_state 读取当前rank的TP/CP/PP语义
+        +global_rank: int | str
+        +tp_rank: int
+        +tp_size: int
+        +cp_rank: int
+        +cp_size: int
+        +pp_rank: int
+        +pp_size: int
+        +is_pipeline_first_stage: bool
+        +is_pipeline_last_stage: bool
+        +virtual_pp_size: int | None
     }
 
     class "context.py\nPackedPrefixLastRestoreIndex" as PackedRestoreIndex #FFCC80 {
@@ -113,7 +130,6 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         +min_prefix_len: int
         +min_group_size: int
         +boundary_strategy: str = "prefix_last_restore"
-        +supported_pp_size: int = 1
         +supported_cp_size: int = 1
         +supported_rope_fusion: bool = False
         +supported_fused_qkv_rope: bool = False
@@ -255,17 +271,18 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         .. 收集每个 reuse 样本的 provider prefix-last logits ..
     }
     
-    class "prefix_store.py\nPrefixKVSlotId" as KVSlotId #CE93D8 {
-        KV存储槽位标识
-        唯一定位某层某样本的prefix KV缓存位置
+    class "prefix_store.py\nPrefixActivationSlotId" as ActivationSlotId #CE93D8 {
+        Prefix activation槽位标识
+        唯一定位某层某样本的prefix activation缓存位置
         +forward_id: int
         +micro_batch_id: int
         +layer_id: int
         +sample_idx_in_batch: int
+        +prefix_state_type: str
         +tp_rank: int
     }
     
-    class "prefix_store.py\nStoredPrefixKV" as StoredKV #CE93D8 {
+    class "prefix_store.py\nStoredAttentionKV" as StoredKV #CE93D8 {
         存储的Prefix KV
         包含key/value张量及prefix长度的存储单元
         +key_tensor: Any
@@ -273,8 +290,18 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         +prefix_len: int
     }
     
-    class "prefix_store.py\nPrefixKVStore" as PrefixStore #CE93D8 {
-        KV存储管理器
+    class "prefix_store.py\nPrefixActivationStore" as ActivationStore #CE93D8 {
+        Prefix activation基础存储
+        统一生命周期、隔离、close/clear行为
+        +store_entry()
+        +load_entry()
+        +contains()
+        +clear()
+        +close()
+    }
+
+    class "prefix_store.py\nPrefixAttentionStore" as PrefixStore #CE93D8 {
+        Attention KV存储管理器
         管理provider的prefix KV写入和reuser的读取
         +store()
         .. 写入 provider 的 prefix KV，按复合 key 索引 ..
@@ -284,6 +311,21 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         +clear()
         +close()
         .. 清理 KV cache，释放资源 ..
+    }
+
+    class "prefix_store.py\nStoredDeltanetState" as StoredActivation #CE93D8 {
+        存储的Gated DeltaNet Prefix Activation
+        包含recurrent/conv state及prefix长度
+        +recurrent_state: Any
+        +prefix_len: int
+        +conv_state: Any | None
+    }
+
+    class "prefix_store.py\nPrefixDeltanetStore" as DeltanetStore #CE93D8 {
+        Gated DeltaNet存储管理器
+        管理Gated DeltaNet的prefix state复用
+        +store()
+        +load()
     }
 }
 
@@ -298,6 +340,14 @@ package "prefix-sharing/backends/ (硬件执行层)" as BackendsLayer #E8F5E9 {
         +apply_rope()
         +build_kv()
         +attention()
+        +gated_attention()
+    }
+
+    class "base.py\nPrefixDeltanetBackend (Protocol)" as DeltanetBackendProtocol #A5D6A7 {
+        Gated DeltaNet Backend协议
+        定义backend必须实现的DeltaNet state复用接口
+        +capabilities: BackendCapabilities
+        +build_deltanet_states()
     }
     
     class "torch_ref.py\nTorchReferenceBackend" as TorchRef #A5D6A7 {
@@ -312,6 +362,10 @@ package "prefix-sharing/backends/ (硬件执行层)" as BackendsLayer #E8F5E9 {
         .. provider 写入 KV 到 store，reuser 读取并拼接 prefix/suffix KV ..
         +attention()
         .. PyTorch 参考 attention 计算，保留 autograd 计算图支持梯度回传 ..
+        +gated_attention()
+        .. Qwen3.5 full gated attention参考路径：attention输出后应用当前token gate ..
+        +build_deltanet_states()
+        .. Gated DeltaNet参考路径：provider发布prefix state，reuser从prefix边界继续suffix ..
     }
 
     class "packed_layout.py\nPackedBatchLayout" as PackedLayout #A5D6A7 {
@@ -345,6 +399,7 @@ package "prefix-sharing/backends/ (硬件执行层)" as BackendsLayer #E8F5E9 {
 ' ==================== 类继承关系 ====================
 Detector <|-- TrieDetector : 实现
 BackendProtocol <|.. TorchRef : 实现
+DeltanetBackendProtocol <|.. TorchRef : 实现
 TorchRef <|-- CudaRef : 继承
 TorchRef <|-- CannRef : 继承
 
@@ -381,14 +436,18 @@ Plan *-- RestoreSpec : prefix_last_restore
 BatchTrim ..> Plan : 使用裁剪范围
 BatchTrim ..> TrimmedBatch : 返回裁剪结果
 Logprob ..> Plan : 使用恢复位置
-Context *-- PrefixStore : 持有 store
+Context *-- PrefixStore : 持有 attention store
+ActivationStore ..> ActivationSlotId : 作为 key 使用
+PrefixStore --|> ActivationStore : 继承
 PrefixStore *-- StoredKV : entries 存储
-PrefixStore ..> KVSlotId : 作为 key 使用
+DeltanetStore --|> ActivationStore : 继承
+DeltanetStore *-- StoredActivation : entries 存储
 
 ' ==================== Backend 依赖 ====================
 TorchRef ..> Plan : 读取执行计划
 TorchRef ..> PackedLayout : 按 padded/valid length 拆分 tensor
 TorchRef ..> PrefixStore : 读写 KV
+TorchRef ..> DeltanetStore : 读写 Gated DeltaNet prefix state
 
 ' ==================== 关键调用流程注释 ====================
 note right of MegatronPPOActor
@@ -414,9 +473,11 @@ note bottom of Context
   **PrefixSharingRuntimeContext:**
   - prefix_sharing_plan: PrefixSharingPlan
   - packed_batch_layout: PackedBatchLayout
-  - store: PrefixKVStore
+  - parallel_info: MegatronParallelInfo
+  - store: PrefixAttentionStore
   - backend: Any
   - prefix_last_restore_indices: packed 读写索引
+  - Prefix-Last Restore 只在 last PP stage 执行
   
   主入口是 prefix_sharing_runtime_context()
 endnote

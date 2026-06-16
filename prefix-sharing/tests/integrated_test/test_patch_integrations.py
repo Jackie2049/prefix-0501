@@ -45,14 +45,36 @@ def test_patch_manager_context_manager_restores_original():
     assert target.method() == "original"
 
 
-def test_megatron_integration_reports_missing_dependency_cleanly():
+def test_megatron_integration_reports_missing_dependency_cleanly(monkeypatch):
+    import importlib
+
+    _original_import = importlib.import_module
+
+    def _mock_import(name, package=None):
+        if name == "megatron.core.transformer.attention":
+            raise ModuleNotFoundError("No module named 'megatron'")
+        return _original_import(name, package=package)
+
+    monkeypatch.setattr(importlib, "import_module", _mock_import)
+
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
     with pytest.raises(IntegrationUnavailable, match="Megatron"):
         integration.install(model_config={})
 
 
-def test_verl_integration_reports_missing_dependency_cleanly():
+def test_verl_integration_reports_missing_dependency_cleanly(monkeypatch):
+    import importlib
+
+    _original_import = importlib.import_module
+
+    def _mock_import(name, package=None):
+        if name == "verl":
+            raise ModuleNotFoundError("No module named 'verl'")
+        return _original_import(name, package=package)
+
+    monkeypatch.setattr(importlib, "import_module", _mock_import)
+
     config = PrefixSharingConfig(enable_prefix_sharing=True)
     integration = VerlMCoreIntegration(config=config)
     with pytest.raises(IntegrationUnavailable, match="verl"):

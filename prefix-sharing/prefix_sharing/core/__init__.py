@@ -4,14 +4,27 @@ from prefix_sharing.core.batch_trim import TrimmedBatch, trim_batch, trim_inputs
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.observability import PrefixSharingLayerStats, PrefixSharingStats
 from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReuseSpec, TriePrefixDetector
-from prefix_sharing.core.prefix_store import PrefixKVSlotId, PrefixKVStore, StoredPrefixKV
+from prefix_sharing.core.prefix_store import (
+    PREFIX_STATE_TYPE_ATTENTION_KV,
+    PREFIX_STATE_TYPE_DELTANET_STATE,
+    PrefixActivationSlotId,
+    PrefixActivationStore,
+    PrefixAttentionStore,
+    PrefixDeltanetStore,
+    StoredAttentionKV,
+    StoredDeltanetState,
+)
 from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
 
 __all__ = [
     "PrefixDetectionResult",
     "PrefixReuseSpec",
-    "PrefixKVSlotId",
-    "PrefixKVStore",
+    "PREFIX_STATE_TYPE_ATTENTION_KV",
+    "PREFIX_STATE_TYPE_DELTANET_STATE",
+    "PrefixActivationSlotId",
+    "PrefixActivationStore",
+    "PrefixAttentionStore",
+    "PrefixDeltanetStore",
     "PrefixSharingLayerStats",
     "PrefixSharingPlan",
     "PrefixSharingStats",
@@ -19,7 +32,8 @@ __all__ = [
     "PrefixSharingConfigError",
     "PrefixLastRestoreSpec",
     "PrefixSharingPlanner",
-    "StoredPrefixKV",
+    "StoredAttentionKV",
+    "StoredDeltanetState",
     "TrimmedBatch",
     "TriePrefixDetector",
     "trim_batch",

@@ -8,9 +8,16 @@ planner 的理论复用收益和 runtime 的真实 KV 复用行为。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.planner import PrefixSharingPlan
+
+if TYPE_CHECKING:
+    # PackedBatchLayout is used only for type annotations (kept_padded_tokens
+    # is read via duck-typing at runtime). Importing it eagerly would create a
+    # circular import: observability -> backends.packed_layout ->
+    # backends.__init__ -> torch_ref -> core.observability.
+    from prefix_sharing.backends.packed_layout import PackedBatchLayout
 
 
 @dataclass
@@ -18,7 +25,7 @@ class PrefixSharingLayerStats:
     """单个 attention layer 的真实 KV 复用统计。"""
 
     layer_id: int
-    # 本层写入 PrefixKVStore 的 KV 条目数，包括 provider 原始 KV 和 reuser 扩展后的 KV。
+    # 本层写入 PrefixAttentionStore 的 KV 条目数，包括 provider 原始 KV 和 reuser 扩展后的 KV。
     store_count: int = 0
     # 本层尝试复用 provider KV 的次数；正常应等于本层 reuser 数。
     reuse_count: int = 0
@@ -26,7 +33,7 @@ class PrefixSharingLayerStats:
     reuse_hit_count: int = 0
     # 本层复用 provider KV 失败的次数；非 0 通常表示 provider 顺序或 store key 有问题。
     reuse_miss_count: int = 0
-    # 本层写入 PrefixKVStore 的 KV token 总数，只统计有效 token，不统计 TP/CP padding。
+    # 本层写入 PrefixAttentionStore 的 KV token 总数，只统计有效 token，不统计 TP/CP padding。
     stored_tokens: int = 0
     # 本层实际从 provider KV 中复用的 prefix token 总数，是判断复用是否真的发生的核心指标。
     reused_prefix_tokens: int = 0

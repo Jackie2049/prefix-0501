@@ -100,6 +100,11 @@ class PackedBatchLayout:
         return len(self.valid_lengths)
 
     @property
+    def has_padding(self) -> bool:
+        """True when at least one row has a pad token (``padded > valid``)."""
+        return self.valid_lengths != self.padded_lengths
+
+    @property
     def total_padded_length(self) -> int:
         return self.cu_seqlens[-1]
 
@@ -119,6 +124,43 @@ class PackedBatchLayout:
         start = self.row_start(row)
         end = start + self.valid_lengths[row]
         return tensor[start:end]
+
+    def unpad(self, tensor: Any) -> Any:
+        """Strip TP padding from a packed tensor, keeping only valid tokens.
+
+        When the layout has no padding this is a no-op that returns *tensor*
+        unchanged.
+        """
+        if not self.has_padding:
+            return tensor
+        torch = _torch()
+        rows = list(torch.split(tensor, self.padded_lengths, dim=0))
+        return torch.cat(
+            [row[:vl] for row, vl in zip(rows, self.valid_lengths)], dim=0,
+        )
+
+    def repad(self, tensor: Any) -> Any:
+        """Re-apply TP padding to a valid-only tensor.
+
+        *tensor* must be packed along dim 0 following :attr:`valid_lengths`;
+        the returned tensor follows :attr:`padded_lengths`.  When the layout
+        has no padding this is a no-op.
+        """
+        if not self.has_padding:
+            return tensor
+        torch = _torch()
+        rows = list(torch.split(tensor, self.valid_lengths, dim=0))
+        repadded: list[Any] = []
+        for row, padded_len, valid_len in zip(rows, self.padded_lengths, self.valid_lengths):
+            if valid_len == padded_len:
+                repadded.append(row)
+                continue
+            pad_len = padded_len - valid_len
+            pad_tensor = torch.zeros(
+                pad_len, *row.shape[1:], dtype=row.dtype, device=row.device,
+            )
+            repadded.append(torch.cat([row, pad_tensor], dim=0))
+        return torch.cat(repadded, dim=0)
 
 
 def _pad_to_multiple(length: int, align_size: int) -> int:

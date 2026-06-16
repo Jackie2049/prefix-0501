@@ -7,14 +7,39 @@
 在已有前置环境（Python、PyTorch、CUDA/Ascend 等）的基础上，进入各依赖目录执行安装：
 
 ```bash
-# 按顺序安装
+# Qwen2.5 旧配套（v0.12.1 系列）
 cd dependency/mbridge-main && pip install --no-deps -v -e . && cd ../..
 cd dependency/Megatron-LM-core_v0.12.1 && pip install --no-deps -v -e . && cd ../..
 cd dependency/MindSpeed-v2.2.0_core_r0.12.1 && pip install --no-deps -v -e . && cd ../..
 cd dependency/verl_v070 && pip install --no-deps -v -e . && cd ../..
+
+# Qwen3.5 新配套（v0.16.1 系列）
+cd dependency/Megatron-Bridge_de93536e && pip install --no-deps -v -e . && cd ../..
+cd dependency/Megatron-LM-core_v0.16.1 && pip install --no-deps -v -e . && cd ../..
+cd dependency/MindSpeed_core_r0.16.0 && pip install --no-deps -v -e . && cd ../..
+cd dependency/verl_cdd9014f && pip install --no-deps -v -e . && cd ../..
 ```
 
 使用 `--no-deps` 避免依赖冲突，各包的运行时依赖需由前置环境提供。
+
+> **版本配套说明**
+>
+> - **Qwen2.5 系列**：verl_v070 + Megatron-LM core_v0.12.1 + MindSpeed core_r0.12.1 + mbridge-main
+> - **Qwen3.5 系列**：verl_cdd9014f + Megatron-LM core_v0.16.1 + MindSpeed core_r0.16.0 + Megatron-Bridge de93536e
+>   - verl、mindspeed、megatron、megatron-bridge四大依赖的配套版本选用参考自 [verl Qwen3.5 NPU 教程](https://verl.readthedocs.io/en/latest/ascend_tutorial/model_support/examples/qwen3_5_122b_npu.html) 
+>   - 其他运行时依赖推荐使用以下版本（出自 [官方 Dockerfile](dependency/verl_cdd9014f/docker/ascend/Dockerfile.ascend_8.5.2_a2_qwen3-5) ），或直接使用云道上的zzf-verl080-qwen35镜像：
+>
+>     | 组件 | 版本 | 说明 |
+>     |------|------|------|
+>     | CANN | 8.5.2 | toolkit + 芯片 ops + nnal/ATB |
+>     | Python | 3.11 | |
+>     | torch / torch_npu | 2.9.0 / 2.9.0 | 版本必须匹配 |
+>     | torchvision | 0.24.0 | |
+>     | vLLM | 0.18.0 | rollout 推理后端 |
+>     | vllm-ascend | commit `54879467` | 与 vLLM 0.18.0 配套，NPU 专用 |
+>     | transformers | 较新版本（推荐 5.10.2） | 需支持 `qwen3_5` / `qwen3_5_moe`；见第 4 节 |
+>     | triton-ascend | 3.2.0 | verl `requirements-npu.txt` 要求 |
+>     | numpy | < 2.0.0 | verl `requirements-npu.txt` 要求 |
 
 ## 2. 启动训练
 
@@ -30,6 +55,7 @@ export ENABLE_PREFIX_SHARING=1        # 启用 prefix sharing
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     --config-name='ppo_megatron_trainer' \
+    algorithm.adv_estimator=grpo \
     data.train_files=/path/to/data/512_gsm8k/train.parquet \
     data.val_files=/path/to/data/512_gsm8k/test.parquet \
     data.train_batch_size=8 \
@@ -39,6 +65,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.use_kl_loss=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
@@ -48,9 +75,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.ref.megatron.override_transformer_config.use_flash_attn=True \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    critic.optim.lr=1e-5 \
-    critic.model.path=/path/to/Qwen2.5-0.5B \
-    critic.ppo_micro_batch_size_per_gpu=1 \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.logger=console \
     trainer.val_before_train=False \
@@ -72,6 +96,7 @@ export ENABLE_PREFIX_SHARING=1          # 启用 prefix sharing
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     --config-name='ppo_megatron_trainer' \
+    algorithm.adv_estimator=grpo \
     data.train_files=/path/to/data/512_gsm8k/train.parquet \
     data.val_files=/path/to/data/512_gsm8k/test.parquet \
     data.train_batch_size=8 \
@@ -81,6 +106,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -88,9 +114,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    critic.optim.lr=1e-5 \
-    critic.model.path=/path/to/Qwen2.5-0.5B \
-    critic.ppo_micro_batch_size_per_gpu=1 \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.logger=console \
     trainer.val_before_train=False \
@@ -103,14 +126,63 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     2>&1 | tee log/verl_prefix_demo.log
 ```
 
-### Phase 1 约束
+### 当前功能约束
 
-- 仅支持 TP（tensor parallel），不支持 PP（pipeline parallel）和 CP（context parallel）
-- 必须开启 `use_remove_padding=True`
+- 支持 TP、物理 PP、Megatron TP-bound SP；不支持 CP、virtual PP
+- Qwen2.5 必须开启 `use_remove_padding=True`；Qwen3.5 GDN linear attention 当前不支持 packed THD 格式，需设置 `use_remove_padding=False`（bshd 格式）
 - 必须关闭 `use_fused_kernels=False`
 - NPU 需设置 `VLLM_ASCEND_ENABLE_NZ=0` 并通过 `override_transformer_config.use_flash_attn=True` 启用 flash attention
 
 ## 3. 进阶场景
+
+### 开启 Flash Attention
+
+Flash Attention 在两个层面起作用：**训练引擎**（Megatron/MindSpeed 的 attention 计算）和 **prefix-sharing 后端**（共享前缀的 attention 调度）。两者的配置方式不同，需分别设置。
+
+#### 训练引擎层面
+
+训练引擎的 flash attention 通过 Megatron 的 `use_flash_attn` 参数控制：
+
+**NPU 环境**（必须开启）
+
+NPU 不支持 `flash-attn` pip 包，而是通过 MindSpeed/CANN 的 `npu_fusion_attention` 融合算子实现 flash attention。需在启动命令中通过 `override_transformer_config` 为 actor 和 ref 分别开启：
+
+```bash
+export VLLM_ASCEND_ENABLE_NZ=0
+
+# 在启动命令中追加：
++actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
++actor_rollout_ref.ref.megatron.override_transformer_config.use_flash_attn=True \
+```
+
+> 注意：使用 MindSpeed 作为训练后端时，flash attention **必须开启**。NPU 的 flash attention 为非确定性计算，与 `--make-vocab-size-divisible-by` 的确定性模式不兼容。
+
+**GPU 环境**（默认已支持）
+
+GPU 环境通过 verl 前置安装脚本安装 `flash-attn` 包。Megatron core 会自动检测并使用 `flash-attn`，通常无需额外配置。如需显式开启：
+
+```bash
++actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
++actor_rollout_ref.ref.megatron.override_transformer_config.use_flash_attn=True \
+```
+
+#### Prefix-Sharing 后端层面
+
+prefix-sharing 的 attention 计算通过 `backend` 参数选择后端实现，当前支持：
+
+| 后端 | 硬件 | 说明 |
+|------|------|------|
+| `torch_ref`（默认） | GPU + NPU | 纯 PyTorch 实现，兼容性最好 |
+| `flash_atten_gpu` | 仅 GPU | 基于 `flash-attn` 包的 `flash_attn_varlen_func`，性能更优 |
+| `flash_atten_npu` | NPU | 占位符，暂未实现 |
+
+如需在 GPU 上使用 flash attention 加速 prefix-sharing 路径，在启动命令中追加：
+
+```bash
++actor_rollout_ref.actor.prefix_sharing_config.backend=flash_atten_gpu \
+```
+
+> 注意：`flash_atten_gpu` 后端要求输入为 THD（varlen）格式，需确保 `use_remove_padding=True`。NPU 环境目前只能使用 `torch_ref` 后端，`flash_atten_npu` 尚在开发中。
 
 ### 并行策略
 
@@ -133,6 +205,15 @@ actor_rollout_ref.rollout.tensor_model_parallel_size=1
 ```
 
 第一轮建议先保持 `actor_rollout_ref.rollout.tensor_model_parallel_size=1`，只验证 Megatron actor/ref 的 TP=2 prefix-sharing 路径。若需要同时验证 rollout TP，再单独改为 `2`。
+
+当前已支持 Megatron actor/ref 的物理 PP 和 Megatron TP-bound SP。启用 PP 时可按资源覆盖 `pipeline_model_parallel_size`；启用 SP 时在 TP 配置基础上追加：
+
+```bash
+actor_rollout_ref.actor.megatron.sequence_parallel=True \
+actor_rollout_ref.ref.megatron.sequence_parallel=True
+```
+
+SP 支持范围为 Megatron `sequence_parallel=True` 且 prefix-sharing attention hook / prefix-last restore 仍使用 global packed THD token 坐标；若未来训练引擎把 hook 输入改为 SP-local shard，运行时 guard 会显式报错，需要单独适配 local/global 坐标映射。
 
 建议测试顺序：
 
@@ -159,7 +240,141 @@ actor_rollout_ref.rollout.tensor_model_parallel_size=1
 
 ## 4. 前置环境安装
 
-### verl 依赖
+### Qwen3.5 配套（推荐）
+
+参照 [verl Qwen3.5 NPU 教程](https://verl.readthedocs.io/en/latest/ascend_tutorial/model_support/examples/qwen3_5_122b_npu.html)。NPU 环境推荐使用 verl 官方预构建镜像，或基于本仓库 Dockerfile 自行构建。
+
+#### NPU 运行 Qwen3.5 注意事项
+
+在 NPU 上运行 Qwen3.5 时，需要注意以下配置：
+
+| 配置项 | 推荐值 | 说明 |
+|--------|--------|------|
+| 模型权重 | `Qwen3.5-0.8B` | 推荐使用 Qwen3.5-0.8B 进行测试 |
+| vanilla_mbridge | `False` | NPU 必须使用 megatron-bridge 而非 mbridge |
+| nvidia-modelopt | 推荐 0.44.0 | NPU 运行依赖包，需确保已安装 |
+| total_training_steps | `1` | 建议只跑 1 个 step 进行验证 |
+
+**关键配置说明**：
+
+1. **必须使用 megatron-bridge**：NPU 环境需要将 `vanilla_mbridge` 设为 `False`，让 NPU 走 megatron-bridge 而非 mbridge。在启动命令中添加：
+   ```bash
+   actor_rollout_ref.model.megatron.vanilla_mbridge=False
+   ```
+
+2. **必须安装 nvidia-modelopt**（推荐 0.44.0）：
+   ```bash
+   pip install nvidia-modelopt==0.44.0
+   ```
+
+3. **推荐模型和训练步数**：使用 Qwen3.5-0.8B 权重，并设置 `trainer.total_training_steps=1` 进行快速验证。
+
+#### 官方 Docker 镜像
+
+```bash
+# A3（Atlas 800T A3，推荐）
+docker pull quay.io/ascend/verl:verl-8.5.2-a3-ubuntu22.04-py3.11-qwen3-5
+
+# A2（Atlas 200T A2 Box16 / Atlas 900 A2 PODc，910B）
+docker pull quay.io/ascend/verl:verl-8.5.2-910b-ubuntu22.04-py3.11-qwen3-5
+```
+
+镜像由 `dependency/verl_cdd9014f/docker/ascend/Dockerfile.ascend_8.5.2_a{2,3}_qwen3-5` 构建，职责是提供 **CANN + vLLM rollout + verl + Qwen3.5 transformers** 的运行底座；**不包含** Megatron-LM、MindSpeed、Megatron-Bridge 和 prefix-sharing，这些需在第 1 节另行安装。
+
+镜像内已对齐的版本：
+
+| 组件 | 版本 |
+|------|------|
+| 操作系统 | Ubuntu 22.04 |
+| Python | 3.11 |
+| CANN | 8.5.2（toolkit + 芯片 ops + nnal） |
+| vLLM | 0.18.0 |
+| vllm-ascend | commit `54879467` |
+| transformers | commit `cc7ab9be`（源码安装，含 Qwen3.5 模型定义） |
+| torch / torch_npu | 2.9.0 / 2.9.0 |
+| torchvision | 0.24.0 |
+| accelerate | 1.13.0 |
+| verl（镜像内） | commit `4045d670` |
+
+> GPU 场景 Megatron + Qwen3.5 可参考 `dependency/verl_cdd9014f/examples/grpo_trainer/run_qwen3_5_122b_a10b_megatron.sh`，使用 `verlai/verl:vllm017.latest` 镜像（vLLM 0.17.x）并额外 `pip install --upgrade transformers`。
+
+#### 从 Dockerfile 自行构建
+
+```bash
+cd dependency/verl_cdd9014f/docker/ascend
+
+# A2（910B）
+docker build -f Dockerfile.ascend_8.5.2_a2_qwen3-5 -t verl-ascend:8.5.2-a2-qwen3-5 .
+
+# A3
+docker build -f Dockerfile.ascend_8.5.2_a3_qwen3-5 -t verl-ascend:8.5.2-a3-qwen3-5 .
+```
+
+构建会编译 vllm-ascend custom kernel，耗时较长；A2/A3 仅底层芯片 ops 包不同，上层软件版本一致。
+
+#### 启动容器
+
+```bash
+docker run -dit \
+    --ipc=host \
+    --network host \
+    --name prefix-qwen35-npu \
+    --privileged \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /usr/sbin:/usr/sbin \
+    -v /home:/home \
+    -v /data:/data \
+    -v /path/to/prefix-0501:/workspace/prefix-0501 \
+    quay.io/ascend/verl:verl-8.5.2-a3-ubuntu22.04-py3.11-qwen3-5 \
+    /bin/bash
+
+docker exec -it prefix-qwen35-npu bash
+```
+
+进入容器后加载昇腾环境：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+```
+
+#### 容器内补充安装
+
+镜像可能缺少 Megatron 训练相关依赖，在容器内执行：
+
+```bash
+# Megatron 训练栈 + 本项目 verl 快照（覆盖镜像内 verl）
+cd /workspace/prefix-0501
+cd dependency/Megatron-Bridge_de93536e && pip install --no-deps -v -e . && cd ../..
+cd dependency/Megatron-LM-core_v0.16.1 && pip install --no-deps -v -e . && cd ../..
+cd dependency/MindSpeed_core_r0.16.0 && pip install --no-deps -v -e . && cd ../..
+cd dependency/verl_cdd9014f && pip install --no-deps -v -e . && cd ../..
+
+# 其他可能缺失的依赖（viztracer 推荐 1.1.1，nvidia-modelopt 推荐 0.44.0）
+pip install viztracer==1.1.1 flash-linear-attention nvidia-modelopt==0.44.0 nvidia-ml-py nvidia-resiliency-ext megatron-energon
+```
+
+**transformers**：Qwen3.5 需要较新版本（推荐 5.10.2）以支持 `qwen3_5` / `qwen3_5_moe` 模型类型：
+
+```bash
+pip install --upgrade transformers
+# 或指定版本
+pip install transformers==5.10.2
+```
+
+若未使用官方镜像、需手动安装 vLLM rollout 栈：
+
+```bash
+pip install vllm==0.18.0
+git clone https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend && git checkout 54879467c41784a446aa5b486a391d9bfbf488fa
+pip install -r requirements.txt
+export COMPILE_CUSTOM_KERNELS=1 && pip install -v -e . --no-build-isolation
+```
+
+### Qwen2.5 配套（旧版）
 
 参照 [verl 官方安装文档](https://verl.org.cn/en/latest/start/install.html#install-from-custom-environment)，使用 verl 提供的脚本安装推理框架和基础依赖：
 
@@ -168,7 +383,7 @@ cd dependency/verl_v070
 bash scripts/install_vllm_sglang_mcore.sh
 ```
 
-该脚本会安装 vLLM、SGLang、FlashAttention、TransformerEngine 等依赖。注意脚本中默认安装的 Megatron-LM 版本与本项目不同，本项目使用 `dependency/Megatron-LM-core_v0.12.1` 的快照版本，需在第 1 步单独安装覆盖。
+该脚本会安装 vLLM、SGLang、FlashAttention、TransformerEngine 等依赖。注意脚本中默认安装的 Megatron-LM 版本与本项目不同，本项目使用 `dependency/Megatron-LM-core_v0.12.1` 的快照版本，需在第 1 节单独安装覆盖。
 
 ### MindSpeed（NPU）
 

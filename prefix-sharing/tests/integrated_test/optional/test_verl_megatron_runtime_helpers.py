@@ -6,10 +6,41 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
+from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_attention
 from prefix_sharing.integrations.verl_mcore import (
     build_prefix_sharing_micro_batch,
     restore_reuser_prefix_columns_2d,
 )
+
+
+def _install_megatron_parallel_state(
+    monkeypatch,
+    *,
+    tp_size=1,
+    tp_rank=0,
+    pp_size=1,
+    pp_rank=0,
+    cp_size=1,
+    cp_rank=0,
+    virtual_pp_size=None,
+):
+    parallel_state = ModuleType("megatron.core.parallel_state")
+    parallel_state.get_tensor_model_parallel_world_size = lambda: tp_size
+    parallel_state.get_tensor_model_parallel_rank = lambda: tp_rank
+    parallel_state.get_context_parallel_world_size = lambda: cp_size
+    parallel_state.get_context_parallel_rank = lambda: cp_rank
+    parallel_state.get_pipeline_model_parallel_world_size = lambda: pp_size
+    parallel_state.get_pipeline_model_parallel_rank = lambda: pp_rank
+    parallel_state.is_pipeline_first_stage = lambda ignore_virtual=True: pp_rank == 0
+    parallel_state.is_pipeline_last_stage = lambda ignore_virtual=True: pp_rank == pp_size - 1
+    parallel_state.get_virtual_pipeline_model_parallel_world_size = lambda: virtual_pp_size
+    core = ModuleType("megatron.core")
+    core.parallel_state = parallel_state
+    megatron = ModuleType("megatron")
+    megatron.core = core
+    monkeypatch.setitem(sys.modules, "megatron", megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
 
 
 def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_positions():
@@ -25,6 +56,8 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
     }
     model_config = SimpleNamespace(
         pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
         context_parallel_size=1,
         apply_rope_fusion=False,
         fused_single_qkv_rope=False,
@@ -89,16 +122,7 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
     expected_positions,
     expected_mask,
 ):
-    parallel_state = ModuleType("megatron.core.parallel_state")
-    parallel_state.get_tensor_model_parallel_world_size = lambda: tp_size
-    parallel_state.get_context_parallel_world_size = lambda: 1
-    core = ModuleType("megatron.core")
-    core.parallel_state = parallel_state
-    megatron = ModuleType("megatron")
-    megatron.core = core
-    monkeypatch.setitem(sys.modules, "megatron", megatron)
-    monkeypatch.setitem(sys.modules, "megatron.core", core)
-    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
+    _install_megatron_parallel_state(monkeypatch, tp_size=tp_size)
 
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
@@ -112,6 +136,8 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
     }
     model_config = SimpleNamespace(
         pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=False,
         context_parallel_size=1,
         apply_rope_fusion=False,
         fused_single_qkv_rope=False,
@@ -137,7 +163,8 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
 def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
     # prefix-last-only case (no interior response).
     # input: [[1,2,3,10,11], [1,2,3,20,21]] → prefix_len=3, prompt_len=3
-    # Only prefix-last spec: provider_prefix_last_pos=2, target_2d_pos=2.
+    # Planner emits 3 specs (2 interior + 1 prefix-last); here we focus on the
+    # prefix-last spec at index 2: provider_prefix_last_pos=2, target_2d_pos=2.
     # Reuser's first suffix token at target_2d_pos=2 differs from provider's,
     # so logprob must be recomputed from saved provider logits.
     batch = {
@@ -152,6 +179,8 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
     }
     model_config = SimpleNamespace(
         pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
         context_parallel_size=1,
         apply_rope_fusion=False,
         fused_single_qkv_rope=False,
@@ -192,3 +221,174 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
     restored_val.backward()
     assert saved_logits.grad is not None
     assert saved_logits.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "expected_padded_lengths", "expected_cu_seqlens"),
+    [
+        (2, [6, 2], [0, 6, 8]),
+        (4, [8, 4], [0, 8, 12]),
+        (8, [8, 8], [0, 8, 16]),
+    ],
+)
+def test_build_prefix_sharing_micro_batch_keeps_global_layout_with_sequence_parallel(
+    monkeypatch,
+    tp_size,
+    expected_padded_lengths,
+    expected_cu_seqlens,
+):
+    _install_megatron_parallel_state(monkeypatch, tp_size=tp_size)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": True, "sequence_parallel": True},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=True,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+
+    layout = prefix_sharing_runtime_state.packed_batch_layout
+    assert layout.valid_lengths == [5, 2]
+    assert layout.padded_lengths == expected_padded_lengths
+    assert layout.cu_seqlens == expected_cu_seqlens
+    assert layout.total_padded_length == expected_cu_seqlens[-1]
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
+        # 3 restore specs: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+
+
+@pytest.mark.parametrize("pp_size", [2, 4, 8])
+def test_build_prefix_sharing_micro_batch_records_physical_pipeline_parallel_info(monkeypatch, pp_size):
+    pp_rank = pp_size - 1
+    _install_megatron_parallel_state(monkeypatch, pp_size=pp_size, pp_rank=pp_rank)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": True},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=None,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+
+    parallel_info = prefix_sharing_runtime_state.parallel_info
+    assert parallel_info.pp_size == pp_size
+    assert parallel_info.pp_rank == pp_rank
+    assert parallel_info.is_pipeline_first_stage is False
+    assert parallel_info.is_pipeline_last_stage is True
+    assert prefix_sharing_runtime_state.packed_batch_layout.cu_seqlens == [0, 5, 7]
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "pp_size", "expected_cu_seqlens"),
+    [
+        (2, 2, [0, 6, 8]),
+        (2, 4, [0, 6, 8]),
+    ],
+)
+def test_build_prefix_sharing_micro_batch_combines_tp_padding_with_physical_pp(
+    monkeypatch,
+    tp_size,
+    pp_size,
+    expected_cu_seqlens,
+):
+    _install_megatron_parallel_state(monkeypatch, tp_size=tp_size, pp_size=pp_size, pp_rank=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": True},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=None,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=False,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+
+    assert prefix_sharing_runtime_state.parallel_info.tp_size == tp_size
+    assert prefix_sharing_runtime_state.parallel_info.pp_size == pp_size
+    assert prefix_sharing_runtime_state.packed_batch_layout.cu_seqlens == expected_cu_seqlens
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
+        # 3 restore specs: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+
+
+def test_attention_hook_rejects_sp_local_shard_token_length():
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": True},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=True,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    attention_module = SimpleNamespace(config=SimpleNamespace(sequence_parallel=True), layer_number=1)
+    packed_seq_params = SimpleNamespace(qkv_format="thd")
+    query = torch.randn(6, 1, 2)
+    key = torch.randn(6, 1, 2)
+    value = torch.randn(6, 1, 2)
+
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
+        with pytest.raises(RuntimeError, match="SP-local shard"):
+            maybe_run_prefix_sharing_attention(
+                attention_module,
+                query,
+                key,
+                value,
+                attention_mask=None,
+                rotary_pos_emb=(object(), object()),
+                packed_seq_params=packed_seq_params,
+            )

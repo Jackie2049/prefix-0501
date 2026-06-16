@@ -11,7 +11,8 @@ from typing import Any, Iterator
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlan
-from prefix_sharing.core.prefix_store import PrefixKVStore
+from prefix_sharing.core.prefix_store import PrefixAttentionStore
+from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 
 
 _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
@@ -35,11 +36,12 @@ class PackedPrefixLastRestoreIndex:
     """Actual token ID used as label (needed when label isn't in trimmed packed region)."""
 
 
-@dataclass
+@dataclass(init=False)
 class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan
     packed_batch_layout: PackedBatchLayout
-    store: PrefixKVStore
+    parallel_info: MegatronParallelInfo
+    store: PrefixAttentionStore
     backend: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
     prefix_last_logits_saved: dict[tuple[int, int], Any] = field(default_factory=dict)
@@ -56,6 +58,37 @@ class PrefixSharingRuntimeContext:
     """Per-row tensor positions of valid tokens in the original 2D tensors.
     Used to map planner's valid-space target_2d_pos to tensor-space columns."""
     stats: PrefixSharingStats | None = None
+
+    def __init__(self, runtime_state: Any, store: PrefixAttentionStore) -> None:
+        self.prefix_sharing_plan = runtime_state.prefix_sharing_plan
+        self.packed_batch_layout = runtime_state.packed_batch_layout
+        self.parallel_info = runtime_state.parallel_info
+        self.store = store
+        self.backend = runtime_state.backend
+        self.prefix_last_restore_indices = _build_prefix_last_restore_indices(
+            runtime_state.prefix_sharing_plan,
+            runtime_state.packed_batch_layout,
+        )
+        # Provider packed logits saved for prefix-last logprob recompute in 2D
+        # space.  Populated lazily by the verl vocab-logprobs patch for each
+        # non-interior (prefix-last) restore spec; read by
+        # restore_reuser_prefix_columns_2d.  Always present (possibly empty).
+        self.prefix_last_logits_saved: dict[tuple[int, int], Any] = {}
+        # valid_indices maps planner's valid-space target_2d_pos to tensor
+        # columns; used by the 2D restore path in verl_mcore.  May be absent
+        # on minimal runtime states (e.g. unit-test fixtures).
+        self.valid_indices = getattr(runtime_state, "valid_indices", None)
+        # stats drives the per-micro-batch audit log.  Prefer an explicit
+        # stats object carried by the runtime state; otherwise derive one
+        # from the plan so the audit summary is always available.
+        self.stats = getattr(runtime_state, "stats", None)
+        if self.stats is None:
+            try:
+                self.stats = PrefixSharingStats.from_plan(
+                    self.prefix_sharing_plan, self.packed_batch_layout
+                )
+            except Exception:
+                self.stats = None
 
 
 def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
@@ -147,21 +180,8 @@ def prefix_sharing_runtime_context(
         yield None
         return
 
-    ctx = PrefixSharingRuntimeContext(
-        prefix_sharing_plan=prefix_sharing_runtime_state.prefix_sharing_plan,
-        packed_batch_layout=prefix_sharing_runtime_state.packed_batch_layout,
-        store=PrefixKVStore(),
-        backend=prefix_sharing_runtime_state.backend,
-        prefix_last_restore_indices=_build_prefix_last_restore_indices(
-            prefix_sharing_runtime_state.prefix_sharing_plan,
-            prefix_sharing_runtime_state.packed_batch_layout,
-        ),
-        valid_indices=prefix_sharing_runtime_state.valid_indices,
-        stats=PrefixSharingStats.from_plan(
-            prefix_sharing_runtime_state.prefix_sharing_plan,
-            prefix_sharing_runtime_state.packed_batch_layout,
-        ),
-    )
+    store = PrefixAttentionStore()
+    ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
     token = _current_context.set(ctx)
     try:
         yield ctx
