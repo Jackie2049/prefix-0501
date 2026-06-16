@@ -100,7 +100,6 @@ def build_prefix_sharing_micro_batch(
     model_config: Any,
     *,
     backend: Any | None = None,
-    prompt_lens: Sequence[int] | None = None,
 ) -> tuple[Any, PrefixSharingRuntimeState | None]:
     """Trim one verl Megatron actor micro-batch in-place for prefix sharing.
 
@@ -170,7 +169,7 @@ def build_prefix_sharing_micro_batch(
     seq_lens = [len(s) for s in sequences]
     logger.warning(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
 
-    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences, prompt_lens=prompt_lens)
+    prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
     logger.warning(
         f"[PS][prepare] prefix_sharing_plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "

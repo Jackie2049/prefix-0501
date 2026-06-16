@@ -224,7 +224,6 @@ class PrefixSharingPlanner:
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
-        prompt_lens: Sequence[int] | None = None,
     ) -> PrefixSharingPlan:
         detection = self.detector.detect(input_ids)
         return self.plan_from_detection(
@@ -232,7 +231,6 @@ class PrefixSharingPlanner:
             detection,
             forward_id=forward_id,
             micro_batch_id=micro_batch_id,
-            prompt_lens=prompt_lens,
         )
 
     def plan_from_detection(
@@ -242,7 +240,6 @@ class PrefixSharingPlanner:
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
-        prompt_lens: Sequence[int] | None = None,
     ) -> PrefixSharingPlan:
         if len(input_ids) != detection.batch_size:
             raise ValueError("input_ids batch size does not match detection result")
@@ -292,9 +289,10 @@ class PrefixSharingPlanner:
                 # inside the shared prefix so the logprob is identical for
                 # provider and reuser: compute once from provider logits,
                 # store as a non-detached scalar tensor.
-                # Note: prompt positions (0..prompt_len-1) may also be
-                # restored, but their label_mask is False so they don't
-                # affect loss — waste-free simplicity over prompt_lens.
+                # Note: prompt positions (0..prompt_len-1) are also
+                # restored, but downstream label_mask is False for them
+                # so they don't affect loss — restoring the whole prefix
+                # column uniformly keeps planning simple.
                 for prefix_label_pos in range(1, prefix_len):
                     # Shared-prefix interior token logprob: computed from
                     # logits[prefix_label_pos-1] predicting token at

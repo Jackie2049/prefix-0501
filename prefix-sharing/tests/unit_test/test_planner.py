@@ -83,11 +83,10 @@ def test_planner_generates_interior_response_restore_specs():
         [1, 2, 3, 4, 5, 6],     # 1,2,3,A,B,C
         [1, 2, 3, 4, 7, 8],     # 1,2,3,A,D,E
     ]
-    prompt_lens = [3, 3]
     planner = PrefixSharingPlanner(
         PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2)
     )
-    plan = planner.plan(input_ids, prompt_lens=prompt_lens, forward_id=1, micro_batch_id=1)
+    plan = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 
     # Interior restore covers all prefix columns 1..prefix_len-1:
     #   prefix_label_pos=1: provider_predict_pos=0, target_2d_pos=0
@@ -120,8 +119,8 @@ def test_planner_generates_interior_response_restore_specs():
     assert plan.kept_lengths_q == [6, 2]
 
 
-def test_planner_no_prompt_lens_still_generates_interior_restore():
-    """Even without prompt_lens, shared-prefix interior restore covers all prefix columns."""
+def test_planner_generates_interior_restore_with_minimal_args():
+    """Shared-prefix interior restore covers all prefix columns using only input_ids."""
     input_ids = [
         [1, 2, 3, 4, 5],
         [1, 2, 3, 4, 6],
