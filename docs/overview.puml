@@ -189,10 +189,10 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         描述如何从provider恢复reuser的prefix-last位置logprob
         +reuse_idx_in_batch: int
         +provider_idx_in_batch: int
-        +provider_prefix_last_pos: int
+        +provider_predict_pos: int
         +reuse_first_suffix_label_pos: int
-        +output_slot: int
         +group_id: int
+        +is_shared_prefix_interior: bool
     }
     
     class "planner.py\nPrefixSharingPlan" as Plan #CE93D8 {

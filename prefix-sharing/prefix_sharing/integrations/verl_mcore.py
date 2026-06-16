@@ -2,9 +2,10 @@
 
 This module has two layers:
 
-* ``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
-  verl-style micro-batch payload into prefix-sharing metadata plus trimmed
-  inputs/labels/masks, and it assembles restored logprobs after forward.
+* ``build_prefix_sharing_micro_batch`` / ``restore_reuser_prefix_columns_2d``
+  are the production entry points consumed by the verl Megatron actor. They
+  prepare a trimmed micro-batch and restore reuser prefix columns in 2D space
+  after forward.
 * ``VerlMCoreIntegration`` installs the Megatron attention patch. The real
   Megatron QKV rewiring still requires the framework runtime and remains guarded
   by optional integration tests.
@@ -14,23 +15,15 @@ from __future__ import annotations
 
 import importlib
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, Sequence, TypeVar
+from dataclasses import dataclass
+from typing import Any, Iterator, Mapping, Sequence
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.batch_trim import (
-    TrimmedBatch,
-    trim_inputs,
-    trim_labels,
-    trim_loss_masks,
-)
-from prefix_sharing.core.logprob import restore_prefix_last_logprobs
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
-from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
@@ -41,110 +34,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-T = TypeVar("T")
-
-
 @dataclass(frozen=True)
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
     backend: Any
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
-
-
-@dataclass(frozen=True)
-class VerlMCorePrefixSharingBatch:
-    """Framework-independent materialization of one verl actor micro-batch."""
-
-    prefix_sharing_plan: PrefixSharingPlan
-    input_ids: TrimmedBatch[int]
-    labels: TrimmedBatch[Any] | None = None
-    loss_masks: TrimmedBatch[Any] | None = None
-
-
-@dataclass
-class VerlMCoreBatchAdapter:
-    """Prepare and restore verl Megatron actor micro-batches.
-
-    The adapter is intentionally tensor-agnostic for Phase 1 local tests. A real
-    verl integration can map the returned ``TrimmedBatch.flattened`` and
-    ``prefix_sharing_plan.cu_seqlens_q`` fields to torch tensors without changing core
-    semantics.
-    """
-
-    config: PrefixSharingConfig
-    planner: PrefixSharingPlanner | None = None
-
-    def __post_init__(self) -> None:
-        if self.planner is None:
-            self.planner = PrefixSharingPlanner(self.config)
-
-    def prepare_micro_batch(
-        self,
-        input_ids: Sequence[Sequence[int]],
-        *,
-        labels: Sequence[Sequence[T]] | None = None,
-        loss_masks: Sequence[Sequence[T]] | None = None,
-        forward_id: int | None = None,
-        micro_batch_id: int | None = None,
-    ) -> VerlMCorePrefixSharingBatch:
-        """Plan prefix sharing and trim a micro-batch."""
-
-        assert self.planner is not None
-        prefix_sharing_plan = self.planner.plan(
-            input_ids,
-            forward_id=forward_id,
-            micro_batch_id=micro_batch_id,
-        )
-        trimmed_inputs = trim_inputs(input_ids, prefix_sharing_plan)
-        trimmed_labels = trim_labels(labels, prefix_sharing_plan) if labels is not None else None
-        trimmed_loss_masks = trim_loss_masks(loss_masks, prefix_sharing_plan) if loss_masks is not None else None
-        return VerlMCorePrefixSharingBatch(
-            prefix_sharing_plan=prefix_sharing_plan,
-            input_ids=trimmed_inputs,
-            labels=trimmed_labels,
-            loss_masks=trimmed_loss_masks,
-        )
-
-    def prefix_sharing_runtime_context(
-        self,
-        prefix_sharing_batch: VerlMCorePrefixSharingBatch,
-    ) -> Iterator[Any]:
-        """Open the runtime context consumed by patched attention."""
-
-        runtime_state = PrefixSharingRuntimeState(
-            prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
-            backend=get_backend_instance(self.config),
-            packed_batch_layout=PackedBatchLayout.from_valid_lengths(
-                prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
-            ),
-            parallel_info=get_megatron_parallel_info(),
-        )
-        return _prefix_sharing_runtime_context(runtime_state)
-
-    def restore_logprobs(
-        self,
-        suffix_logprobs: Sequence[Sequence[float]],
-        provider_prefix_last_logprobs: Sequence[float],
-        prefix_sharing_plan: PrefixSharingPlan,
-    ) -> list[list[float]]:
-        """Assemble per-row logprobs with Prefix-Last Restore."""
-
-        return restore_prefix_last_logprobs(
-            suffix_logprobs,
-            provider_prefix_last_logprobs,
-            prefix_sharing_plan,
-        )
+    valid_indices: list | None = None
+    """Per-row tensor positions of valid (non-padding) tokens in the
+    original 2D tensors.  Used to map planner's valid-space target_2d_pos
+    to tensor-space columns (needed when sequences have left padding)."""
 
 
 @dataclass
 class VerlMCoreIntegration:
     config: PrefixSharingConfig
     backend: Any | None = None
-    batch_adapter: VerlMCoreBatchAdapter = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.batch_adapter = VerlMCoreBatchAdapter(self.config)
 
     def install(self, model_config: Any | None = None) -> PatchHandle:
         self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
@@ -331,6 +236,7 @@ def build_prefix_sharing_micro_batch(
         backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
         parallel_info=parallel_info,
+        valid_indices=valid_indices,
     )
     logger.warning(
         "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
@@ -339,68 +245,140 @@ def build_prefix_sharing_micro_batch(
     return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
-def restore_suffix_first_log_probs_from_prefix(
-    logits: Any,
-    labels: Any,
-    log_probs: Any,
+def restore_reuser_prefix_columns_2d(
+    output: dict[str, Any],
+    label_2d: Any,
     vocab_parallel_log_probs_fn: Any,
-) -> Any:
-    """Restore reuser suffix-first logprob from provider prefix-last logits."""
+    vocab_parallel_entropy_fn: Any = None,
+) -> dict[str, Any]:
+    """Restore reuser prefix columns in 2D space after postprocess_packed_seqs.
+
+    All prefix-column restoration happens purely in 2D [B, L] space,
+    consolidating the previous three-phase approach (packed compute →
+    cache → 2D inject) into a single post-forward step.
+
+    For each :class:`PackedPrefixLastRestoreIndex` in the runtime context:
+
+    - **Interior response** (shared-prefix token): logprob and entropy
+      are identical between provider and reuser because the label is the
+      same shared token and the logits are the same (same KV).  Directly
+      copy from the provider's 2D row.
+
+    - **Prefix-last token**: entropy is still the same (same logits),
+      so copy from provider's 2D row.  Logprob depends on the label
+      which differs (reuser's first suffix token ≠ provider's), so
+      recompute from saved provider packed logits + reuser's 2D label.
+
+    Must be called while ``prefix_sharing_runtime_context`` is still
+    active (i.e. before the context manager exits), and after
+    ``postprocess_packed_seqs`` has produced the 2D output dict.
+
+    Args:
+        output: Output dict from forward, with ``log_probs`` [B, L] and
+            optionally ``entropy`` [B, L] in 2D space.
+        label_2d: Original 2D label [B, L] (from ``forward_step``, before
+            packed preprocessing).  In verl convention,
+            ``label[p] = token at p+1``.
+        vocab_parallel_log_probs_fn: Function to compute logprob from
+            packed logits [1, 1, V//tp] and label [1, 1] → scalar.
+            Typically :func:`verl.utils.megatron.tensor_parallel.vocab_parallel_log_probs_from_logits`.
+        vocab_parallel_entropy_fn: Optional function to compute entropy
+            from packed logits [1, V//tp] → scalar.
+
+    Returns:
+        ``output`` with ``log_probs`` and ``entropy`` mutated in-place.
+    """
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
-        return log_probs
-    parallel_info = ctx.parallel_info
-    if not parallel_info.is_pipeline_last_stage:
-        logger.warning(
-            "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-            "skip prefix-last restore on non-last PP stage: restore_indices=%s "
-            "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
-            parallel_info.global_rank,
-            parallel_info.pp_rank,
-            parallel_info.pp_size,
-            parallel_info.is_pipeline_last_stage,
-            len(ctx.prefix_last_restore_indices),
-            logits.shape[1],
-            log_probs.shape[1],
-            ctx.packed_batch_layout.total_padded_length,
-        )
-        return log_probs
-    ensure_global_packed_token_lengths(
-        {
-            "logits_token_length": logits.shape[1],
-            "log_probs_token_length": log_probs.shape[1],
-        },
-        total_padded_length=ctx.packed_batch_layout.total_padded_length,
-        context="prefix-last restore",
-    )
-    logger.warning(
-        "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-        "running prefix-last restore: restore_indices=%s "
-        "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
-        parallel_info.global_rank,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        parallel_info.is_pipeline_last_stage,
-        len(ctx.prefix_last_restore_indices),
-        logits.shape[1],
-        log_probs.shape[1],
-        ctx.packed_batch_layout.total_padded_length,
-    )
-    restored = log_probs.clone()
+        return output
+
+    log_probs = output.get("log_probs")
+    if log_probs is None:
+        return output
+    entropy = output.get("entropy")
+    # Map planner's valid-space target_2d_pos (0-based within valid content)
+    # to tensor-space 2D columns.  postprocess_packed_seqs places tokens at
+    # their ORIGINAL attention_mask positions, so a valid-space position p
+    # maps to valid_indices[row][p] in the [B, L] output.
+    valid_indices = ctx.valid_indices
+
+    def _map_2d_col(row: int, valid_pos: int) -> int:
+        if valid_indices is not None:
+            vi = valid_indices[row]
+            if vi is not None and 0 <= valid_pos < len(vi):
+                return int(vi[valid_pos].item())
+        return valid_pos
+
+    non_interior_count = 0
     for index in ctx.prefix_last_restore_indices:
-        provider_logits = logits[
-            0:1,
-            index.provider_1d_pos : index.provider_1d_pos + 1,
-            :,
-        ].clone()
-        reuse_label = labels[
-            0:1,
-            index.reuse_1d_pos : index.reuse_1d_pos + 1,
-        ]
-        restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-        restored[0, index.reuse_1d_pos] = restored_value.reshape(())
-    return restored
+        reuser_row = index.reuse_idx_in_batch
+        provider_row = index.provider_idx_in_batch
+        valid_col = index.target_2d_pos
+        # Map valid-space col to per-row tensor-space columns:
+        # postprocess_packed_seqs places tokens at original
+        # attention_mask positions, which may differ between rows.
+        provider_col = _map_2d_col(provider_row, valid_col)
+        reuser_col = _map_2d_col(reuser_row, valid_col)
+
+        if index.is_shared_prefix_interior:
+            # Shared-prefix interior: token is in shared prefix → logprob and entropy
+            # are identical to the provider's (same label, same logits).
+            log_probs[reuser_row, reuser_col] = log_probs[provider_row, provider_col]
+            if entropy is not None:
+                entropy[reuser_row, reuser_col] = entropy[provider_row, provider_col]
+        else:
+            # Prefix-last: entropy is the same (same logits), so copy
+            # from provider's 2D row.  Logprob differs because reuser's
+            # first suffix token ≠ provider's.
+            non_interior_count += 1
+            if entropy is not None:
+                entropy[reuser_row, reuser_col] = entropy[provider_row, provider_col]
+
+            # Recompute logprob from saved provider packed logits
+            # with reuser's own label.
+            # vocab_parallel_log_probs_from_logits expects:
+            #   logits: [N, V//tp]   labels: [N]
+            saved_key = (reuser_row, valid_col)
+            provider_logits = ctx.prefix_last_logits_saved[saved_key]  # [1, V//tp]
+            reuser_label = label_2d[reuser_row:reuser_row + 1, reuser_col:reuser_col + 1].view(1)  # [1]
+            log_probs[reuser_row, reuser_col] = vocab_parallel_log_probs_fn(
+                provider_logits,  # [1, V//tp]
+                reuser_label,    # [1]
+            ).reshape(())
+
+    # === DIAGNOSTIC: sample after restore ===
+    if ctx.prefix_last_restore_indices:
+        _diag_entries = ctx.prefix_last_restore_indices
+        _diag_interior = [e for e in _diag_entries if e.is_shared_prefix_interior]
+        if _diag_interior:
+            _sample = _diag_interior[0]
+            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
+            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
+            logger.warning(
+                f"[RESTORE_DIAG] sample after restore: "
+                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
+                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
+            )
+        _diag_plast = [e for e in _diag_entries if not e.is_shared_prefix_interior]
+        if _diag_plast:
+            _sample = _diag_plast[0]
+            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
+            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
+            logger.warning(
+                f"[RESTORE_DIAG] sample after restore (prefix-last): "
+                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
+                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
+            )
+    # === END DIAGNOSTIC ===
+
+    if ctx.stats is not None:
+        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
+    return output
 
 
 def _clone_batch(batch: Any) -> Any:

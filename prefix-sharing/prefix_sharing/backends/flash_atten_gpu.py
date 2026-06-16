@@ -91,11 +91,13 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
+        stats: Any | None = None,
     ) -> tuple[Any, Any]:
         return self._torch_ref.build_kv(
             key, value, store, prefix_sharing_plan,
             packed_batch_layout=packed_batch_layout,
             layer_id=layer_id, tp_rank=tp_rank,
+            stats=stats,
         )
 
     # ------------------------------------------------------------------

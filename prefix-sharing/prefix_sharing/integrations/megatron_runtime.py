@@ -97,6 +97,7 @@ def maybe_run_prefix_sharing_attention(
         packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=parallel_info.tp_rank,
+        stats=ctx.stats,
     )
     prefix_log.warning(
         "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
@@ -120,7 +121,19 @@ def maybe_run_prefix_sharing_attention(
         attention_mask=attention_mask,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-    return attention_module.linear_proj(core_attn_out)
+    output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
+
+    # --- diag dump (ON attention) ---
+    try:
+        from prefix_sharing.tools.diagnostic_dump import dump_attn_on
+        dump_attn_on(output[0], packed_seq_params, ctx.prefix_sharing_plan,
+                     attention_module.layer_number,
+                     attention_module.config.num_layers)
+    except Exception as e:
+        prefix_log.warning(f"last-attn dump (ON) failed: {e}")
+    # ---
+
+    return output
 
 
 def _apply_positioned_rope(

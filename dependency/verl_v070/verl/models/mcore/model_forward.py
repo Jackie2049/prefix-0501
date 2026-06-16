@@ -86,6 +86,20 @@ def model_forward_gen(vision_model: bool = False):
                 input_args["attention_mask"] = attention_mask
 
             output_orig = model(**input_args)
+            # --- diag dump (logits) ---
+            try:
+                from prefix_sharing.tools.diagnostic_dump import dump_logits, _get_dump_dir
+                if _get_dump_dir() is not None:
+                    from prefix_sharing.integrations.context import current_prefix_sharing_context
+                    ctx = current_prefix_sharing_context()
+                    if ctx is not None:
+                        prefix_lens = list(ctx.prefix_sharing_plan.prefix_lens)
+                    else:
+                        prefix_lens = [0] * (packed_seq_params.cu_seqlens_q_padded.shape[0] - 1)
+                    dump_logits(output_orig, packed_seq_params, prefix_lens)
+            except Exception:
+                pass
+            # ---
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(v, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding)[0]
