@@ -608,8 +608,6 @@ class MegatronPPOActor(BasePPOActor):
                     self.config,
                     self.tf_config,
                 )
-                logger.warning(f"\n\n\nbuild_prefix_sharing_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
-            else: logger.warning("\n\n\nbuild_prefix_sharing_micro_batch is None\n\n\n")
             _prefix_sharing = prefix_sharing_runtime_state is not None
             ######### prefix-sharing #########
 
@@ -703,10 +701,6 @@ class MegatronPPOActor(BasePPOActor):
                         # )
                         entropy = vocab_parallel_entropy(logits)
                         ret["entropy"] = entropy
-                        ########## prefix-sharing logits/entropy dump ##########
-                        # (moved to 2D space after all restores, see below)
-                        pass
-                        ########## prefix-sharing logits/entropy dump ##########
                     else:
                         logits_bak = logits
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
