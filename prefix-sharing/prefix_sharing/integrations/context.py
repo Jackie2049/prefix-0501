@@ -110,7 +110,7 @@ def _build_prefix_last_restore_indices(
         # Interior: provider and reuser share the same prefix tokens,
         # so the logprob at target_pos is identical — just copy.
         # 2D restore uses provider_idx_in_batch + valid_indices mapping,
-        # no packed-index lookup needed.  provider_1d_pos is only used
+        # no packed-index lookup needed.  1d_pos_in_provider is only used
         # for prefix-last entries to fetch saved provider logits.
         # When keep_start-1 resolves to an intermediate reuser, offset
         # can be negative — skip packed_index and use sentinel -1.
@@ -118,9 +118,9 @@ def _build_prefix_last_restore_indices(
             target_pos - prefix_sharing_plan.input_keep_ranges[resolved_provider][0]
         )
         if provider_offset >= 0:
-            provider_1d = packed_batch_layout.packed_index(resolved_provider, provider_offset)
+            pos_1d_in_provider = packed_batch_layout.packed_index(resolved_provider, provider_offset)
         else:
-            provider_1d = -1  # keep_start-1 of intermediate provider, no packed slot
+            pos_1d_in_provider = -1  # keep_start-1 of intermediate provider, no packed slot
 
         reuse_1d = -1  # sentinel: no slot in reuser packed region
 
@@ -128,7 +128,7 @@ def _build_prefix_last_restore_indices(
             PackedPrefixLastRestoreIndex(
                 reuse_idx_in_batch=reuse_idx,
                 provider_idx_in_batch=resolved_provider,
-                provider_1d_pos=provider_1d,
+                provider_1d_pos=pos_1d_in_provider,
                 reuse_1d_pos=reuse_1d,
                 is_interior_response=spec.is_interior_response,
                 output_slot=spec.output_slot,
