@@ -62,15 +62,16 @@ from verl.workers.actor import BasePPOActor
 # 当 prefix-sharing 模块存在时启用功能，不存在时保持原行为（设为 None 作为 guard）
 from contextlib import nullcontext
 try:
-    from prefix_sharing.integrations.context import prefix_sharing_runtime_context
+    from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
     from prefix_sharing.integrations.verl_mcore import (
         build_prefix_sharing_micro_batch,
-        restore_suffix_first_log_probs_from_prefix,
+        restore_reuser_prefix_columns_2d,
     )
 except ModuleNotFoundError:
+    current_prefix_sharing_context = None
     prefix_sharing_runtime_context = None
     build_prefix_sharing_micro_batch = None
-    restore_suffix_first_log_probs_from_prefix = None
+    restore_reuser_prefix_columns_2d = None
 ######### prefix-sharing #########
 
 __all__ = ["MegatronPPOActor"]
@@ -286,6 +287,17 @@ class MegatronPPOActor(BasePPOActor):
                     async_op=False,
                 )
                 log_probs = log_probs.to("cpu")
+                
+
+                ########## prefix-sharing diag dump (legacy logprobs) ##########
+                try:
+                    from prefix_sharing.tools.diagnostic_dump import dump_logprobs_legacy
+                    dump_logprobs_legacy(log_probs, input_ids)
+                except Exception:
+                    pass
+                ########## prefix-sharing diag dump ##########
+
+
                 if calculate_entropy:
                     # Note that o[0] is metrics, o[1] is entropy
                     if mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -596,8 +608,7 @@ class MegatronPPOActor(BasePPOActor):
                     self.config,
                     self.tf_config,
                 )
-                logger.warning(f"\n\n\nbuild_prefix_sharing_micro_batch is not None\nbatch: {batch is not None}\nprefix_sharing_runtime_state: {prefix_sharing_runtime_state is not None}\n\n\n")
-            else: logger.warning("\n\n\nbuild_prefix_sharing_micro_batch is None\n\n\n")
+            _prefix_sharing = prefix_sharing_runtime_state is not None
             ######### prefix-sharing #########
 
             input_ids = batch["input_ids"]
@@ -623,6 +634,23 @@ class MegatronPPOActor(BasePPOActor):
             label_mask = attention_mask.clone()
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
+            ######### prefix-sharing #########
+            try:
+                from prefix_sharing.tools.diagnostic_dump import dump_label_mask
+                dump_label_mask(label_mask)
+            except Exception:
+                pass
+            if _prefix_sharing:
+                # Fix prompt-position labels: use actual next-token (from input_ids)
+                # instead of position_ids, so provider prompt log_probs are meaningful
+                # and can be copied to reuser interior positions.
+                label[:, : -response_length - 1] = input_ids[:, 1 : -response_length]
+                # Loss uses response_mask, not label_mask; label_mask only
+                # controls log_probs zeroing via masked_fill.  Set all True so
+                # full log_probs survive restore_reuser_prefix_columns_2d
+                # without special-casing.
+                label_mask = torch.ones_like(attention_mask, dtype=torch.bool)
+            ######### prefix-sharing #########
 
             if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
@@ -677,16 +705,26 @@ class MegatronPPOActor(BasePPOActor):
                         logits_bak = logits
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
-                    ######### prefix-sharing #########
-                    # prefix-sharing 的 One-Forward 方案会跳过前缀 token 的 logits 计算，
-                    # 需要在 logits_processor 中恢复这些位置的 log_probs 以保证训练语义正确性
-                    if restore_suffix_first_log_probs_from_prefix is not None:
-                        log_probs = restore_suffix_first_log_probs_from_prefix(
-                            logits_bak,
-                            label,
-                            log_probs,
-                            vocab_parallel_log_probs_from_logits,
-                        )
+                    # Save provider prefix-last packed logits for 2D recompute.
+                    # logprob/entropy restore is deferred entirely to the 2D
+                    # postprocess stage (restore_reuser_prefix_columns_2d).
+                    # Only prefix-last specs need saved logits; interior
+                    # specs copy directly from the provider's 2D row.
+                    if _prefix_sharing:
+                        ctx = current_prefix_sharing_context()
+                        if ctx is not None and ctx.prefix_last_restore_indices:
+                            for index in ctx.prefix_last_restore_indices:
+                                if not index.is_shared_prefix_interior:
+                                    # logits may be [N, V//tp] or [1, N, V//tp];
+                                    # flatten then slice on dim 0 to get [1, V//tp].
+                                    logits_flat = logits.view(-1, logits.size(-1))
+                                    saved = logits_flat[
+                                        index.provider_1d_pos:index.provider_1d_pos + 1,
+                                        :,
+                                    ].clone()
+                                    ctx.prefix_last_logits_saved[
+                                        (index.reuse_idx_in_batch, index.target_2d_pos)
+                                    ] = saved
                     ######### prefix-sharing #########
                     ret["log_probs"] = log_probs
                     return ret
@@ -707,6 +745,51 @@ class MegatronPPOActor(BasePPOActor):
                         logits_processor_args=logits_processor_args,
                         data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                     )
+                    ########## prefix-sharing diag: pre-restore snapshot ##########
+                    # Dump 2D logprobs/entropy BEFORE any prefix-column
+                    # restoration, so we can verify that the restore
+                    # actually changes the right positions.  (ON/OFF comparison
+                    # alone can't distinguish "restore did nothing" from
+                    # "restore happened correctly".)
+                    try:
+                        from prefix_sharing.tools.diagnostic_dump import (
+                            dump_logprobs_2d, dump_entropy_2d,
+                            dump_label, dump_label_mask,
+                        )
+                        dump_logprobs_2d(output["log_probs"], "before_restore")
+                        if "entropy" in output:
+                            dump_entropy_2d(output["entropy"], "before_restore")
+                    except Exception:
+                        pass
+                    ########## prefix-sharing diag: pre-restore snapshot ##########
+
+                    # Restore reuser prefix columns in 2D space.
+                    # All logprob/entropy restoration (interior + prefix-last)
+                    # happens here after postprocess_packed_seqs has produced
+                    # the 2D [B, L] output.  Interior: direct 2D copy from
+                    # provider.  Prefix-last: entropy copied from provider
+                    # (same logits), logprob recomputed from saved provider
+                    # logits with reuser's own label.
+                    if _prefix_sharing:
+                        output = restore_reuser_prefix_columns_2d(
+                            output,
+                            label,                                     # 2D label [B, L]
+                            vocab_parallel_log_probs_from_logits,
+                            vocab_parallel_entropy if calculate_entropy else None,
+                        )
+
+                    ########## prefix-sharing diag dump (2D after restores) ##########
+                    try:
+                        # re-import or use already-imported names
+                        tag = "old" if forward_only else "train"
+                        dump_logprobs_2d(output["log_probs"], tag)
+                        if "entropy" in output:
+                            dump_entropy_2d(output["entropy"], tag)
+                        dump_label(label)
+                        # label_mask already dumped before PS patch
+                    except Exception:
+                        pass
+                    ########## prefix-sharing diag dump ##########
                 ######### prefix-sharing #########
 
             if forward_only:
@@ -795,9 +878,31 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
+
+        ######### profiling #########
+        # Profiling setup: triggered by PROFILE_OUTPUT_DIR env variable
+        profile_output_dir = os.environ.get("PROFILE_OUTPUT_DIR", None)
+        _profile_ctx_var = None
+        if profile_output_dir:
+            from prefix_sharing.tools.training_monitor import MemoryMonitor, Stopwatch
+            from megatron.core.pipeline_parallel.schedules import _profile_stopwatch_var
+
+            _profile_ctx_var = _profile_stopwatch_var
+            self._profile_sw = Stopwatch()
+            self._profile_mon = MemoryMonitor(interval=0.1)
+            self._profile_mon.start()
+            _train_step = 0
+        ######### profiling #########
+
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
         for data in dataloader:
+            ######### profiling #########
+            if profile_output_dir:
+                self._profile_sw.set_step_context(_train_step)
+                _profile_ctx_var.set(self._profile_sw)
+            ######### profiling #########
+
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             self.actor_optimizer.zero_grad()
@@ -827,7 +932,20 @@ class MegatronPPOActor(BasePPOActor):
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
+            ######### profiling #########
+            if profile_output_dir:
+                _profile_ctx_var.set(None)
+                self._profile_sw.start("update")
+            ######### profiling #########
+
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+
+            ######### profiling #########
+            if profile_output_dir:
+                self._profile_sw.stop("update")
+                _train_step += 1
+            ######### profiling #########
+
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
 
@@ -842,6 +960,19 @@ class MegatronPPOActor(BasePPOActor):
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
+
+        ######### profiling #########
+        # Save profiling traces to CSV files under PROFILE_OUTPUT_DIR
+        if profile_output_dir:
+            _profile_ctx_var.set(None)
+            self._profile_mon.stop()
+            os.makedirs(profile_output_dir, exist_ok=True)
+            rank = torch.distributed.get_rank()
+            self._profile_mon.save_to_csv(os.path.join(profile_output_dir, f"memory_trace_rank{rank}.csv"))
+            self._profile_sw.save_to_csv(os.path.join(profile_output_dir, f"timing_trace_rank{rank}.csv"))
+            self._profile_sw = None
+            self._profile_mon = None
+        ######### profiling #########
 
         # add empty cache after each compute
         if self.use_torch_profiler and self.prof and self.prof.enable:

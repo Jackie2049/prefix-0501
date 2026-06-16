@@ -10,6 +10,7 @@ import torch
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import (
     PREFIX_STATE_TYPE_ATTENTION_KV,
@@ -58,6 +59,7 @@ class TorchReferenceBackend:
         packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
+        stats: PrefixSharingStats | None = None,
     ) -> tuple[Any, Any]:
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         # Input K/V still follow the framework's padded packed layout; only
@@ -66,6 +68,12 @@ class TorchReferenceBackend:
         value_rows = _split_packed(value, layout.padded_lengths)
         expanded_keys = []
         expanded_values = []
+        store_count = 0
+        reuse_count = 0
+        reuse_hit_count = 0
+        reuse_miss_count = 0
+        stored_tokens = 0
+        reused_prefix_tokens = 0
         # This loop relies on the current online detector invariant that a provider
         # appears before every reuser that loads from it. All rows' QKV tensors have
         # already been produced in parallel by this point; the ordering here only
@@ -93,6 +101,8 @@ class TorchReferenceBackend:
                     prefix_len=valid_key_row.shape[0],
                     overwrite=True,
                 )
+                store_count += 1
+                stored_tokens += int(valid_key_row.shape[0])
                 expanded_keys.append(valid_key_row)
                 expanded_values.append(valid_value_row)
             else:
@@ -106,8 +116,28 @@ class TorchReferenceBackend:
                     tp_rank,
                 )
                 # Load the already-published provider KV before building this reuser's expanded KV.
-                entry = store.load(provider_slot_id)
+                reuse_count += 1
+                try:
+                    entry = store.load(provider_slot_id)
+                except KeyError:
+                    reuse_miss_count += 1
+                    if stats is not None:
+                        stats.record_attention_kv_build(
+                            layer_id=layer_id,
+                            store_count=store_count,
+                            reuse_count=reuse_count,
+                            reuse_hit_count=reuse_hit_count,
+                            reuse_miss_count=reuse_miss_count,
+                            stored_tokens=stored_tokens,
+                            reused_prefix_tokens=reused_prefix_tokens,
+                            expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
+                            valid_q_tokens=layout.total_valid_length,
+                            padded_q_tokens=layout.total_padded_length,
+                        )
+                    raise
+                reuse_hit_count += 1
                 prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
+                reused_prefix_tokens += int(prefix_len)
                 expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
                 expanded_value = torch.cat([entry.value_tensor[:prefix_len], valid_value_row], dim=0)
                 own_slot_id = PrefixActivationSlotId(
@@ -126,8 +156,23 @@ class TorchReferenceBackend:
                     prefix_len=expanded_key.shape[0],
                     overwrite=True,
                 )
+                store_count += 1
+                stored_tokens += int(expanded_key.shape[0])
                 expanded_keys.append(expanded_key)
                 expanded_values.append(expanded_value)
+        if stats is not None:
+            stats.record_attention_kv_build(
+                layer_id=layer_id,
+                store_count=store_count,
+                reuse_count=reuse_count,
+                reuse_hit_count=reuse_hit_count,
+                reuse_miss_count=reuse_miss_count,
+                stored_tokens=stored_tokens,
+                reused_prefix_tokens=reused_prefix_tokens,
+                expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
+                valid_q_tokens=layout.total_valid_length,
+                padded_q_tokens=layout.total_padded_length,
+            )
         return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
 
     def attention(
