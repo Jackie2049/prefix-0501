@@ -29,7 +29,6 @@ class PackedPrefixLastRestoreIndex:
     provider_1d_pos: int
     reuse_1d_pos: int
     is_shared_prefix_interior: bool = False
-    output_slot: int = 0
     target_2d_pos: int = -1
     """Absolute 2D position in output where restored logprob is written."""
     label_value: int = -1
@@ -164,7 +163,6 @@ def _build_prefix_last_restore_indices(
                 provider_1d_pos=pos_1d_in_provider,
                 reuse_1d_pos=reuse_1d,
                 is_shared_prefix_interior=spec.is_shared_prefix_interior,
-                output_slot=spec.output_slot,
                 target_2d_pos=spec.target_2d_pos,
                 label_value=spec.label_value,
             )

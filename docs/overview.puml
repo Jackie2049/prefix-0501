@@ -191,7 +191,6 @@ package "prefix-sharing/core/ (核心语义层)" as CoreLayer #F3E5F5 {
         +provider_idx_in_batch: int
         +provider_predict_pos: int
         +reuse_first_suffix_label_pos: int
-        +output_slot: int
         +group_id: int
         +is_shared_prefix_interior: bool
     }

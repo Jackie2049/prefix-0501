@@ -88,7 +88,6 @@ class PrefixLastRestoreSpec:
     field to document the provider-side lookup semantic and to drive provider
     chain resolution in ``context.py``."""
     reuse_first_suffix_label_pos: int
-    output_slot: int
     group_id: int
     is_shared_prefix_interior: bool = False
     target_2d_pos: int = -1
@@ -296,7 +295,6 @@ class PrefixSharingPlanner:
                 # Note: prompt positions (0..prompt_len-1) may also be
                 # restored, but their label_mask is False so they don't
                 # affect loss — waste-free simplicity over prompt_lens.
-                interior_slot = 0
                 for prefix_label_pos in range(1, prefix_len):
                     # Shared-prefix interior token logprob: computed from
                     # logits[prefix_label_pos-1] predicting token at
@@ -308,15 +306,12 @@ class PrefixSharingPlanner:
                             provider_idx_in_batch=provider_index[index],
                             provider_predict_pos=prefix_label_pos - 1,
                             reuse_first_suffix_label_pos=prefix_label_pos,
-                            output_slot=interior_slot,
                             group_id=group_ids[index],
                             is_shared_prefix_interior=True,
                             target_2d_pos=prefix_label_pos - 1,
                             label_value=input_ids[index][prefix_label_pos],
                         )
                     )
-                    interior_slot += 1
-                first_suffix_slot = interior_slot
 
                 # --- Prefix-last restore (first suffix token) ---
                 # The logits at position prefix_len-1 predict the first suffix
@@ -330,7 +325,6 @@ class PrefixSharingPlanner:
                             provider_idx_in_batch=provider_index[index],
                             provider_predict_pos=prefix_len - 1,
                             reuse_first_suffix_label_pos=prefix_len,
-                            output_slot=first_suffix_slot,
                             group_id=group_ids[index],
                             target_2d_pos=prefix_len - 1,
                             label_value=input_ids[index][prefix_len],
