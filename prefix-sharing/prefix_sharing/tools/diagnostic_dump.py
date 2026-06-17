@@ -5,7 +5,7 @@ Supports two dump modes:
 
 1. Packed format:
    - ``attn_outputs.pt``    — per-layer attention output dict {layer_idx: tensor}
-   - ``logits.pt``          — model output logits [N, vocab//tp]
+   - ``logits.pt``          — model output logits [B, N, vocab//tp] (vocab=last dim)
    - Metadata: ``cu_seqlens_q.pt`` / ``cu_seqlens_q_logits.pt``, ``prefix_lens.pt``
 
 2. Positional encoding:
@@ -269,7 +269,7 @@ def dump_logits(
     packed_seq_params: Any,
     prefix_lens_list: list[int],
 ) -> None:
-    """Dump model output logits [N, vocab//tp]."""
+    """Dump model output logits [B, N, vocab//tp] — vocab is always the last dim."""
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return

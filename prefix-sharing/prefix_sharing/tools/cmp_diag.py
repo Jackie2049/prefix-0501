@@ -62,11 +62,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+
+_log = logging.getLogger(__name__)
 
 # ── Constants ──
 _SEP_DOUBLE = "=" * 70
@@ -74,6 +77,8 @@ _SEP_SINGLE = "-" * 70
 _SEP_THIN   = "─" * 70
 _CHECK      = "\u2713"
 _CROSS      = "\u2717"
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 def _fmt_shape(s: tuple[int, ...]) -> str:
@@ -169,6 +174,32 @@ def _first_token_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
     return {"mean_abs": err["abs_mean"], "max_abs": err["abs_max"],
             "rel_max": err["rel_max"], "rel_mean": err["rel_mean"],
             "cos": cos, "pearson": pr}
+
+
+def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
+                        ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Extract first token's full-vocab vector from ON/OFF logits.
+
+    Logits are either [N, V] (token-major) or [B, N, V] (batched token-major).
+    Vocab is always the last dim (verified from Megatron model forward:
+    output_layer → [S, B, V//tp] → model returns [B, S, V//tp]).
+    """
+    # Flatten all leading batch/token dims into N, keep V as last dim
+    lo_2d = lo.reshape(-1, lo.size(-1))
+    lf_2d = lf.reshape(-1, lf.size(-1))
+    # First token = first row → full-vocab vector [V]
+    return lo_2d[0, :].contiguous(), lf_2d[0, :].contiguous()
+
+
+def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
+                               ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ensure logits are 2D [N, V] for packed alignment.
+
+    Vocab is always the last dim (verified from Megatron model forward).
+    Batch dim on leading axes is flattened into N.
+    """
+    return (lo.reshape(-1, lo.size(-1)).contiguous(),
+            lf.reshape(-1, lf.size(-1)).contiguous())
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -479,12 +510,17 @@ def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
             ft = _first_token_metrics(a0[0], b0[0])
             results.append(CheckResult(name="first_token_attn", metrics=ft))
 
-    # logits — packed[0]
+    # logits — packed[0], auto-detect [N,V] vs [V,N] format
     lo = _load_tensor(dir_on,  "logits.pt")
     lf = _load_tensor(dir_off, "logits.pt")
     if lo is not None and lf is not None:
-        ft = _first_token_metrics(lo[0], lf[0])
-        results.append(CheckResult(name="first_token_logits", metrics=ft))
+        lo_first, lf_first = _logits_first_token(lo, lf)
+        if lo_first is not None:
+            ft = _first_token_metrics(lo_first, lf_first)
+            results.append(CheckResult(name="first_token_logits", metrics=ft))
+        else:
+            _log.warning("first_token_logits skipped: cannot determine token dim "
+                         "(ON %s, OFF %s)", _fmt_shape(lo.shape), _fmt_shape(lf.shape))
 
     return results
 
@@ -504,6 +540,9 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     lf = _load_tensor(dir_off, "logits.pt")
     if lo is None or lf is None:
         return None
+
+    # Logits may be [N,V] or [V,N] — ensure token-major [N,V] for alignment
+    lo, lf = _logits_ensure_token_major(lo, lf)
 
     # Metadata for logits uses cu_seqlens_q_logits.pt
     ma = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
@@ -860,8 +899,10 @@ def main():
             lo = _load_tensor(args.dir_on,  "logits.pt")
             lf = _load_tensor(args.dir_off, "logits.pt")
             if lo is not None and lf is not None:
-                _print_topk_vec(lo[0].cpu(), lf[0].cpu(), args.topk,
-                                args.sort_err, "first_token_logits")
+                ft = _logits_first_token(lo, lf)
+                if ft is not None:
+                    _print_topk_vec(ft[0].cpu(), ft[1].cpu(), args.topk,
+                                    args.sort_err, "first_token_logits")
 
     # ── ④b Logits (full packed alignment via attention_mask + dual pointer) ──
     if not stop:
