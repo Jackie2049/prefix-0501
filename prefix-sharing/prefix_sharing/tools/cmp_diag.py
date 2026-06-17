@@ -157,7 +157,7 @@ def _cosine_sim(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> torch.Tensor
     nb = b.norm(dim=dim)
     denom = (na * nb).clamp(min=eps)
     cos = (a * b).sum(dim=dim) / denom
-    near_zero = (na < eps.sqrt()) & (nb < eps.sqrt())
+    near_zero = (na < eps ** 0.5) & (nb < eps ** 0.5)
     return torch.where(near_zero, torch.ones_like(cos), cos)
 
 
