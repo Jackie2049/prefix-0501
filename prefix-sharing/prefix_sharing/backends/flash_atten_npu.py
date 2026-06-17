@@ -220,9 +220,10 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
            both forward and backward route through the non-varlen CANN APIs.
         5. Unpack the BSHD output back to THD.
         """
+        layer_id = kwargs.get('layer_id', '?')
         print(
             f"[PS][backend] flash_atten_npu attention: "
-            f"layer={getattr(prefix_sharing_plan, 'layer_id', '?')}, "
+            f"layer={layer_id}, "
             f"q_shape={tuple(query.shape)}, k_shape={tuple(key.shape)}, "
             f"v_shape={tuple(value.shape)}"
         )

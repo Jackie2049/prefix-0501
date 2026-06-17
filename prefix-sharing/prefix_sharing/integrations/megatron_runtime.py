@@ -26,13 +26,8 @@ def maybe_run_prefix_sharing_attention(
     owns RoPE, KV expansion, causal masking, and output projection.
     """
 
-    import logging
-    prefix_log = logging.getLogger(__file__)
-    prefix_log.warning("\n\n\nsuccess come into def maybe_run_prefix_sharing_attention\n\n\n")
-
     ctx = current_prefix_sharing_context()
     if ctx is None:
-        prefix_log.warning("\n\n\nctx is None\n\n\n")
         return None
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         raise RuntimeError("prefix sharing phase 1 requires packed_seq_params.qkv_format='thd'")
@@ -66,28 +61,18 @@ def maybe_run_prefix_sharing_attention(
     parallel_info = ctx.parallel_info
     layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
 
-    prefix_log.warning("\n\n\ntry to build kv\n\n\n")
-    prefix_log.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
-        "enter prefix-sharing path: "
-        "sequence_parallel=%s query_token_length=%s total_padded_length=%s "
-        "query_shape=%s, key_shape=%s, value_shape=%s, valid_lengths=%s, "
-        "padded_lengths=%s, cu_seqlens=%s",
-        parallel_info.global_rank,
-        parallel_info.tp_rank,
-        parallel_info.tp_size,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        layer_id,
-        getattr(getattr(attention_module, "config", None), "sequence_parallel", None),
-        query.shape[0],
-        packed_batch_layout.total_padded_length,
-        tuple(query.shape),
-        tuple(key.shape),
-        tuple(value.shape),
-        packed_batch_layout.valid_lengths,
-        packed_batch_layout.padded_lengths,
-        packed_batch_layout.cu_seqlens,
+    print(
+        f"[PS][attention][global_rank={parallel_info.global_rank} "
+        f"tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
+        f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} "
+        f"layer={layer_id}] "
+        f"enter prefix-sharing path: "
+        f"sequence_parallel={getattr(getattr(attention_module, 'config', None), 'sequence_parallel', None)} "
+        f"query_token_length={query.shape[0]} total_padded_length={packed_batch_layout.total_padded_length} "
+        f"query_shape={tuple(query.shape)}, key_shape={tuple(key.shape)}, value_shape={tuple(value.shape)}, "
+        f"valid_lengths={packed_batch_layout.valid_lengths}, "
+        f"padded_lengths={packed_batch_layout.padded_lengths}, cu_seqlens={packed_batch_layout.cu_seqlens}",
+        flush=True,
     )
     expanded_key, expanded_value = backend.build_kv(
         key,
@@ -98,18 +83,15 @@ def maybe_run_prefix_sharing_attention(
         layer_id=layer_id,
         tp_rank=parallel_info.tp_rank,
     )
-    prefix_log.warning(
-        "[PS][attention][global_rank=%s tp_rank=%s/tp_size=%s pp_rank=%s/pp_size=%s layer=%s] "
-        "built expanded kv: "
-        "expanded_key_shape=%s, expanded_value_shape=%s",
-        parallel_info.global_rank,
-        parallel_info.tp_rank,
-        parallel_info.tp_size,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        layer_id,
-        tuple(expanded_key.shape),
-        tuple(expanded_value.shape),
+    print(
+        f"[PS][attention][global_rank={parallel_info.global_rank} "
+        f"tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
+        f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} "
+        f"layer={layer_id}] "
+        f"built expanded kv: "
+        f"expanded_key_shape={tuple(expanded_key.shape)}, "
+        f"expanded_value_shape={tuple(expanded_value.shape)}",
+        flush=True,
     )
     core_attn_out = backend.attention(
         query,
@@ -118,6 +100,7 @@ def maybe_run_prefix_sharing_attention(
         ctx.prefix_sharing_plan,
         packed_batch_layout=packed_batch_layout,
         attention_mask=attention_mask,
+        layer_id=layer_id,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
     return attention_module.linear_proj(core_attn_out)
