@@ -678,13 +678,13 @@ def _print_per_layer(r: CheckResult):
     print(_SEP_SINGLE)
     layers = r.metrics.get("layers")
     if isinstance(layers, dict):
-        print(f"  {'LAYER':>6s}  {'COS_AVG':>10s}  {'COS_MIN':>10s}  {'TOKENS':>8s}  {'STATUS':>8s}")
-        print(f"  {'─'*6}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*8}")
+        print(f"  {'LAYER':>6s}  {'COS_AVG':>12s}  {'COS_MIN':>12s}  {'TOKENS':>8s}  {'STATUS':>8s}")
+        print(f"  {'─'*6}  {'─'*12}  {'─'*12}  {'─'*8}  {'─'*8}")
         bad = []
         for lyr in sorted(layers.keys()):
             d = layers[lyr]
             ok = d["cos_avg"] > 0.9999 and d["cos_min"] > 0.999
-            print(f"  {lyr:>6d}  {d['cos_avg']:>10.6f}  {d['cos_min']:>10.6f}  "
+            print(f"  {lyr:>6d}  {d['cos_avg']:>12.8f}  {d['cos_min']:>12.8f}  "
                   f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
             if not ok:
                 bad.append(lyr)
@@ -692,7 +692,7 @@ def _print_per_layer(r: CheckResult):
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
     elif "cos_avg" in r.metrics:
         d = r.metrics
-        print(f"  L{d['layer']}  cos_avg={d['cos_avg']:.6f}  cos_min={d['cos_min']:.6f}")
+        print(f"  L{d['layer']}  cos_avg={d['cos_avg']:.8f}  cos_min={d['cos_min']:.8f}")
     print()
 
 
