@@ -39,6 +39,8 @@ _DUMP_DIR: str | None = None
 _META_SAVED: set[str] = set()       # saved metadata keys (dedup per key)
 _ATTN_BUFFER: dict[int, torch.Tensor] | None = None  # {layer_idx: tensor}
 _ROPE_BUFFER: dict[int, dict] | None = None           # {layer_idx: {"query": q, "key": k}}
+_ROPE_FREQS_ON_BUFFER: dict[int, torch.Tensor] | None = None   # {layer_idx: q_freqs per-token}
+_ROPE_FREQS_OFF_BUFFER: dict[int, torch.Tensor] | None = None  # {layer_idx: q_pos_emb table}
 
 
 def _get_dump_dir() -> str | None:
@@ -169,6 +171,62 @@ def _flush_rope_buffer(dump_dir: str) -> None:
         _ROPE_BUFFER = None
     except Exception as e:
         _log.warning("rope_emb.pt save failed: %s", e)
+
+
+# ── RoPE angle dump (pre-apply, per-layer) ──────────────────────
+
+def dump_rope_freqs_on(q_freqs: torch.Tensor, layer_number: int,
+                       num_layers: int) -> None:
+    """Accumulate ON-mode per-token RoPE angles. Auto-flush on last layer.
+
+    ``q_freqs`` is the result of ``q_pos_emb.index_select(0, packed_position_ids)``
+    — shape [T_on, 1, 1, D], each token's actual rotation angles **before
+    cos/sin**.  Stored as ``rope_freqs_on.pt`` (dict {layer_idx: tensor}).
+    """
+    global _ROPE_FREQS_ON_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _ROPE_FREQS_ON_BUFFER is None:
+        _ROPE_FREQS_ON_BUFFER = {}
+    _ROPE_FREQS_ON_BUFFER[layer_number] = q_freqs.detach().cpu().clone()
+    if layer_number == num_layers:
+        if _rank0_only():
+            try:
+                torch.save(_ROPE_FREQS_ON_BUFFER,
+                           os.path.join(dump_dir, "rope_freqs_on.pt"))
+                _log.warning("rope_freqs_on.pt saved (%d layers)",
+                             len(_ROPE_FREQS_ON_BUFFER))
+            except Exception as e:
+                _log.warning("rope_freqs_on.pt save failed: %s", e)
+        _ROPE_FREQS_ON_BUFFER = None
+
+
+def dump_rope_freqs_off(q_pos_emb: torch.Tensor, layer_number: int,
+                        num_layers: int) -> None:
+    """Accumulate OFF-mode raw RoPE angle table. Auto-flush on last layer.
+
+    ``q_pos_emb`` is the raw angle table (before per-token slicing) —
+    shape [L0, 1, 1, D], where ``freqs[p] = p * inv_freq``.
+    Stored as ``rope_freqs_off.pt`` (dict {layer_idx: tensor}).
+    """
+    global _ROPE_FREQS_OFF_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _ROPE_FREQS_OFF_BUFFER is None:
+        _ROPE_FREQS_OFF_BUFFER = {}
+    _ROPE_FREQS_OFF_BUFFER[layer_number] = q_pos_emb.detach().cpu().clone()
+    if layer_number == num_layers:
+        if _rank0_only():
+            try:
+                torch.save(_ROPE_FREQS_OFF_BUFFER,
+                           os.path.join(dump_dir, "rope_freqs_off.pt"))
+                _log.warning("rope_freqs_off.pt saved (%d layers)",
+                             len(_ROPE_FREQS_OFF_BUFFER))
+            except Exception as e:
+                _log.warning("rope_freqs_off.pt save failed: %s", e)
+        _ROPE_FREQS_OFF_BUFFER = None
 
 
 # ── Position IDs dump ───────────────────────────────────────────

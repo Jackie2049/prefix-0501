@@ -145,7 +145,8 @@ def _resolve_label_mask(mask_file: str | None, dir_off: str,
 
 def _cosine_sim(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> torch.Tensor:
     eps = 1e-8
-    return (a * b).sum(dim=dim) / (a.norm(dim=dim) + eps) / (b.norm(dim=dim) + eps)
+    denom = (a.norm(dim=dim) * b.norm(dim=dim)).clamp(min=eps)
+    return (a * b).sum(dim=dim) / denom
 
 
 def _pearson_r(t1: torch.Tensor, t2: torch.Tensor,
@@ -386,6 +387,102 @@ def cmp_rope_emb(dir_a: str, dir_b: str) -> CheckResult | None:
             md = max(md, float((a[lyr][k] - b[lyr][k]).abs().max()))
     return CheckResult(name="rope_emb", passed=md == 0.0,
                        metrics={"max_diff": md, "num_layers": len(la)})
+
+
+def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare pre-RoPE angles (angle table, not cos/sin) — suffix-aligned.
+
+    ON  ``rope_freqs_on.pt``:  per-token angles [T_on, 1, 1, D]
+    OFF ``rope_freqs_off.pt``: raw angle table [L0, 1, 1, D]
+
+    OFF per-token angles are reconstructed from the raw table via
+    ``cu_seqlens_off`` (each segment takes ``[:seg_len]`` from position 0).
+
+    The two are aligned to suffix-only via the same attention_mask dual-pointer
+    logic used for attn_outputs / logits.
+    """
+    fa = os.path.join(dir_on, "rope_freqs_on.pt")
+    fb = os.path.join(dir_off, "rope_freqs_off.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    on_dict = torch.load(fa, weights_only=True)
+    off_dict = torch.load(fb, weights_only=True)
+    if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
+        return None
+
+    la, lb = set(on_dict.keys()), set(off_dict.keys())
+    if la != lb:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "layer set mismatch",
+                                    "on_layers": sorted(la),
+                                    "off_layers": sorted(lb)})
+
+    # Load OFF metadata for per-token reconstruction + alignment
+    mb = _load_packed_meta(dir_off)
+    if mb is None:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "OFF cu_seqlens missing"})
+    cu_off = mb["cu_seqlens"]
+    T_off = int(cu_off[-1]) if cu_off.numel() > 0 else 0
+
+    # Build alignment mask (prefer 2D attention_mask)
+    mask_on_2d = _load_attention_mask_2d(dir_on)
+    mask_off_2d = _load_attention_mask_2d(dir_off)
+    ma = _load_packed_meta(dir_on)
+    if mask_on_2d is not None and mask_off_2d is not None:
+        align_mask = _build_alignment_mask_from_2d(
+            mask_on_2d, mask_off_2d, cu_off, T_off)
+    elif ma is not None:
+        align_mask = _build_alignment_mask(
+            cu_off, ma["prefix_lens"], T_off)
+    else:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "cannot build alignment mask"})
+
+    # Reconstruct OFF per-token angles from raw table
+    seqlens = (cu_off[1:] - cu_off[:-1]).tolist()
+
+    max_diff = 0.0
+    mismatches: list[dict] = []  # [{layer, token_idx, dim, on_val, off_val, diff}]
+    for lyr in sorted(la):
+        on_freqs = on_dict[lyr]                          # [T_on, 1, 1, D]
+        # Reconstruct OFF per-token for this layer
+        off_freqs = torch.cat(
+            [off_dict[lyr][:s, :, :, :] for s in seqlens], dim=0)  # [T_off, 1, 1, D]
+
+        try:
+            on_aligned, off_aligned = _align_packed(
+                on_freqs, off_freqs, align_mask)
+        except ValueError as e:
+            return CheckResult(name="rope_freqs", passed=False,
+                               metrics={"error": f"align failed L{lyr}: {e}"})
+
+        diff = (on_aligned - off_aligned).abs()                # [N, 1, 1, D]
+        md = float(diff.max())
+        max_diff = max(max_diff, md)
+
+        if md > 0:
+            # per-token max diff across all dims
+            token_diff = diff.squeeze(1).squeeze(1).max(dim=-1)  # values [N], indices [N]
+            bad_mask = token_diff.values > 0
+            for t in bad_mask.nonzero(as_tuple=True)[0].tolist():
+                t = int(t)
+                d = int(token_diff.indices[t])
+                mismatches.append({
+                    "layer": lyr,
+                    "token_idx": t,
+                    "dim": d,
+                    "on_val": float(on_aligned[t, 0, 0, d]),
+                    "off_val": float(off_aligned[t, 0, 0, d]),
+                    "diff": float(token_diff.values[t]),
+                })
+
+    metrics: dict = {"max_diff": max_diff, "num_layers": len(la)}
+    if mismatches:
+        metrics["mismatches"] = mismatches[:20]  # cap to top 20
+        metrics["total_mismatches"] = len(mismatches)
+    return CheckResult(name="rope_freqs", passed=max_diff == 0.0,
+                       metrics=metrics)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -678,6 +775,29 @@ def _print_rope(r: CheckResult):
     print()
 
 
+def _print_rope_freqs(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [rope_freqs]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {m['error']}")
+    else:
+        print(f"  layers: {m.get('num_layers','—')}  max_diff: {m.get('max_diff','—')}")
+        total = m.get("total_mismatches", 0)
+        if total > 0:
+            print(f"  mismatched tokens: {total}"
+                  f"{' (showing first 20)' if total > 20 else ''}")
+            print(f"  {'Layer':>6s} {'Token':>6s} {'Dim':>6s}  "
+                  f"{'ON_val':>14s}  {'OFF_val':>14s}  {'Abs_err':>12s}")
+            for mm in m.get("mismatches", []):
+                print(f"  {mm['layer']:>6d} {mm['token_idx']:>6d} {mm['dim']:>6d}  "
+                      f"{mm['on_val']:>14.6e}  {mm['off_val']:>14.6e}  "
+                      f"{mm['diff']:>12.6e}")
+    if not r.passed:
+        print(f"  {_CROSS} CRITICAL — STOP.\n")
+    print()
+
+
 def _print_per_layer(r: CheckResult):
     print(_SEP_SINGLE + "\n  [attn_output]  Per-Layer Cosine Similarity")
     print(_SEP_SINGLE)
@@ -779,11 +899,11 @@ def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
     rows = idx // sort_key.shape[1]
     cols = idx % sort_key.shape[1]
     print(f"\n  [{label}]  top-{topk} positions (sort by {sort_by})")
-    print(f"  {'B':>4s} {'POS':>6s}  {'ON':>14s}  {'OFF':>14s}  "
+    print(f"  {'Seq_idx':>7s} {'POS':>6s}  {'ON':>14s}  {'OFF':>14s}  "
           f"{'ABS_ERR':>12s}  {'REL_ERR':>12s}")
     for k in range(len(flat)):
         r, c = int(rows[k]), int(cols[k])
-        print(f"  {r:>4d} {c:>6d}  {float(on_t[r,c]):>14.6e}  "
+        print(f"  {r:>7d} {c:>6d}  {float(on_t[r,c]):>14.6e}  "
               f"{float(off_t[r,c]):>14.6e}"
               f"  {float(abs_err[r,c]):>12.6e}  {float(rel_err[r,c]):>12.6e}")
 
@@ -878,7 +998,16 @@ def main():
         if not r.passed:
             stop = True
 
-    # ── ② RoPE encoding ──
+    # ── ② RoPE freqs (pre-apply angle table, suffix-aligned) ──
+    if not stop:
+        r = cmp_rope_freqs(args.dir_on, args.dir_off)
+        if r:
+            all_results.append(r)
+            _print_rope_freqs(r)
+            if not r.passed:
+                stop = True
+
+    # ── ②b RoPE encoding (post-apply rotated Q/K) ──
     if not stop:
         r = cmp_rope_emb(args.dir_on, args.dir_off)
         if r:

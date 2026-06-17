@@ -626,6 +626,16 @@ class Attention(MegatronModule, ABC):
 
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify
+                ######### prefix-sharing diag: OFF rope_freqs (per-layer) #########
+                try:
+                    from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs_off
+                    dump_rope_freqs_off(q_pos_emb, self.layer_number,
+                                        self.config.num_layers)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"rope_freqs_off dump failed: {e}")
+                ######### prefix-sharing diag: OFF rope_freqs (per-layer) #########
                 if inference_context is None or inference_context.is_static_batching():
                     query = apply_rotary_pos_emb(
                         query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
