@@ -44,7 +44,7 @@ from prefix_sharing.integrations.megatron_attention import IntegrationUnavailabl
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.patch_manager import PatchHandle
-from prefix_sharing.utils import ensure_global_packed_token_lengths
+from prefix_sharing.utils import ensure_global_packed_token_lengths, pad_to_multiple
 
 import logging
 logger = logging.getLogger(__name__)
@@ -604,9 +604,9 @@ def build_prefix_sharing_micro_batch_verl080(
     参数 ps_config 已由调用方通过 PrefixSharingConfig.from_raw() 解析完成，
     不需要再次 from_raw。
 
-    核心原则：以 v070 验证过的 2D + attention_mask 路径为主，
-    NestedTensor 路径仅在 GPU + use_remove_padding=True 时作为可选优化。
-    NPU 不支持 torch.nested，所有 NPU 场景都走 2D 路径。
+    核心原则：以 v070 验证过的 2D + attention_mask 路径为主。
+    v080 BSHD 原生路径也可能接收 NestedTensor；此时先物理裁剪
+    NestedTensor，再由 verl 的 preprocess_bshd_engine pad 成 dense BSHD。
     """
     # ── PATH 1: prefix sharing disabled ──
     if not ps_config.enable_prefix_sharing:
@@ -673,8 +673,9 @@ def build_prefix_sharing_micro_batch_verl080(
             trimmed_batch = _trim_plain_batch_thd(batch, plan)
     else:
         if is_nested_tensor:
-            raise RuntimeError("prefix sharing BSHD path expects dense 2D input_ids")
-        trimmed_batch = _trim_plain_batch_bshd(batch, plan, attention_mask_bool_for_layout)
+            trimmed_batch = _trim_nested_batch(batch, plan)
+        else:
+            trimmed_batch = _trim_plain_batch_bshd(batch, plan, attention_mask_bool_for_layout)
 
     # ── 阶段 6: 构建 layout ──
     parallel_info = get_megatron_parallel_info()
@@ -693,10 +694,16 @@ def build_prefix_sharing_micro_batch_verl080(
             align_size=int(align_size),
         )
     else:
-        batch_runtime_layout = BshdBatchLayout.from_valid_token_mask(
-            trimmed_batch["attention_mask"].to(bool),
-            position_ids=trimmed_batch["position_ids"],
-        )
+        if is_nested_tensor:
+            batch_runtime_layout = _build_bshd_layout_from_nested_position_ids(
+                trimmed_batch["position_ids"],
+                parallel_info,
+            )
+        else:
+            batch_runtime_layout = BshdBatchLayout.from_valid_token_mask(
+                trimmed_batch["attention_mask"].to(bool),
+                position_ids=trimmed_batch["position_ids"],
+            )
 
     # ── 阶段 7: 构建 state ──
     state = PrefixSharingRuntimeState(
@@ -855,6 +862,55 @@ def _trim_plain_batch_bshd(batch: Any, plan: PrefixSharingPlan, attention_mask_b
         new_attention_mask[row, kept_indices] = True
     trimmed_batch["attention_mask"] = new_attention_mask
     return trimmed_batch
+
+
+def _build_bshd_layout_from_nested_position_ids(
+    position_ids: Any,
+    parallel_info: MegatronParallelInfo,
+) -> BshdBatchLayout:
+    """Build BSHD runtime layout matching verl's preprocess_bshd_engine output.
+
+    v080 BSHD can receive jagged NestedTensor input. The framework later pads
+    it to dense [batch, max_seqlen] where max_seqlen is aligned to TP (CP is
+    still outside the supported prefix-sharing scope). The layout must describe
+    that post-preprocess dense coordinate system, not the jagged input object.
+    """
+    import torch
+
+    if parallel_info.cp_size != 1:
+        raise RuntimeError("prefix sharing BSHD NestedTensor path currently supports CP=1 only")
+    offsets = position_ids.offsets()
+    values = position_ids.values()
+    lengths = [int(length) for length in offsets.diff().detach().cpu().tolist()]
+    batch_size = len(lengths)
+    max_valid_length = max(lengths, default=0)
+    align_size = max(int(parallel_info.tp_size), 1)
+    max_seqlen = pad_to_multiple(max_valid_length, align_size)
+
+    valid_token_mask = torch.zeros(
+        batch_size,
+        max_seqlen,
+        dtype=torch.bool,
+        device=values.device,
+    )
+    dense_position_ids = torch.zeros(
+        batch_size,
+        max_seqlen,
+        dtype=values.dtype,
+        device=values.device,
+    )
+    for row, valid_length in enumerate(lengths):
+        if valid_length == 0:
+            continue
+        start = offsets[row]
+        end = offsets[row + 1]
+        valid_token_mask[row, :valid_length] = True
+        dense_position_ids[row, :valid_length] = values[start:end]
+
+    return BshdBatchLayout.from_valid_token_mask(
+        valid_token_mask,
+        position_ids=dense_position_ids,
+    )
 
 
 def _slice_nested_sequences(nested_tensor: Any, plan: PrefixSharingPlan) -> list[Any]:

@@ -12,6 +12,8 @@ from typing import Any, Protocol, Sequence
 
 import torch
 
+from prefix_sharing.utils import pad_to_multiple
+
 
 @dataclass(frozen=True)
 class BshdTokenIndex:
@@ -118,7 +120,7 @@ class ThdBatchLayout:
         dtype = kept_position_ids[0].dtype
 
         valid_lengths = [int(seq_positions.shape[0]) for seq_positions in kept_position_ids]
-        padded_lengths = [cls._pad_to_multiple(length, align_size) for length in valid_lengths]
+        padded_lengths = [pad_to_multiple(length, align_size) for length in valid_lengths]
         total_padded = sum(padded_lengths)
 
         # Pre-allocate full-size tensors; fill via slice assignment instead of per-row cat.
@@ -215,11 +217,6 @@ class ThdBatchLayout:
             )
             repadded.append(torch.cat([row, pad], dim=0))
         return torch.cat(repadded, dim=0)
-
-    @staticmethod
-    def _pad_to_multiple(length: int, align_size: int) -> int:
-        """Pad length to the next multiple of align_size."""
-        return int(length + (align_size - length % align_size) % align_size)
 
     @staticmethod
     def _cumsum(lengths: Sequence[int]) -> list[int]:

@@ -200,6 +200,70 @@ def test_build_prefix_sharing_micro_batch_verl080_builds_bshd_layout_without_rem
         assert restore_index.reuse_token_index == BshdTokenIndex(1, 3)
 
 
+def test_build_prefix_sharing_micro_batch_verl080_builds_bshd_layout_from_nested_input(monkeypatch):
+    monkeypatch.setattr(
+        "prefix_sharing.integrations.verl_mcore.get_megatron_parallel_info",
+        lambda: MegatronParallelInfo(tp_size=4),
+    )
+    engine = type(
+        "Engine",
+        (),
+        {
+            "engine_config": type(
+                "EngineConfig",
+                (),
+                {
+                    "use_remove_padding": False,
+                    "dynamic_context_parallel": False,
+                },
+            )()
+        },
+    )()
+    batch = {
+        "input_ids": torch.nested.nested_tensor(
+            [
+                torch.tensor([1, 2, 3, 10, 11]),
+                torch.tensor([1, 2, 3, 20, 21]),
+            ],
+            layout=torch.jagged,
+        ),
+        "position_ids": torch.nested.nested_tensor(
+            [
+                torch.tensor([0, 1, 2, 3, 4]),
+                torch.tensor([0, 1, 2, 3, 4]),
+            ],
+            layout=torch.jagged,
+        ),
+    }
+    config = PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=3)
+
+    trimmed_batch, runtime_state = build_prefix_sharing_micro_batch_verl080(
+        engine,
+        batch,
+        config,
+    )
+
+    assert runtime_state is not None
+    assert trimmed_batch["input_ids"].offsets().diff().tolist() == [5, 2]
+    assert trimmed_batch["position_ids"].offsets().diff().tolist() == [5, 2]
+    layout = runtime_state.batch_runtime_layout
+    assert layout.layout_kind == "bshd"
+    assert layout.valid_lengths == [5, 2]
+    assert layout.max_seqlen == 8
+    assert layout.valid_token_mask.tolist() == [
+        [True, True, True, True, True, False, False, False],
+        [True, True, False, False, False, False, False, False],
+    ]
+    assert layout.position_ids.tolist() == [
+        [0, 1, 2, 3, 4, 0, 0, 0],
+        [3, 4, 0, 0, 0, 0, 0, 0],
+    ]
+    with prefix_sharing_runtime_context(runtime_state) as ctx:
+        restore_index = ctx.prefix_last_restore_indices[0]
+        assert restore_index.provider_token_index == BshdTokenIndex(0, 2)
+        assert restore_index.reuse_token_index == BshdTokenIndex(1, 0)
+
+
 # ═══════════════════════════════════════
 # compat_matrix 新条目匹配
 # ═══════════════════════════════════════
