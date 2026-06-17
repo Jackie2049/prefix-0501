@@ -10,11 +10,36 @@ Covers the precision verification spec (see plan.md):
   6. OFF vs OFF baseline — noise floor for all metrics
 
 Usage:
+    # 最小对比 (attention_output + logits + logprobs + entropy)
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old \
-        --mask-file ./my_mask.pt --layer 12
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \
-        --dir-off2 ./dump_off2 --tag old -o report.json
+
+    # 只看某一层 attention_output
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old --layer 12
+
+    # OFF vs OFF baseline (测自然噪声底)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
+        --dir-off2 ./dump_off2 --tag old
+
+    # 导出 JSON 报告
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
+        --tag old -o report.json
+
+Parameters:
+    --dir-on      (必需) ON模式 dump 目录，含 attn_outputs.pt / logits.pt /
+                          logprobs_{tag}.pt / entropy_{tag}.pt / attention_mask.pt
+    --dir-off     (必需) OFF模式 dump 目录，文件同 --dir-on
+    --dir-off2    (可选) 第二个 OFF 目录，用于 OFF-vs-OFF baseline
+                          两个独立 OFF run 之间的自然误差可作噪声参考基准
+    --tag         (可选) 2D文件标签，如 old / train / before_restore
+                          对应文件: logprobs_{tag}.pt / entropy_{tag}.pt
+    --tag-on      (可选) 覆盖 ON 侧的 tag (不传则用 --tag)
+    --tag-off     (可选) 覆盖 OFF 侧的 tag (不传则用 --tag)
+    --layer       (可选) 只对比指定层的 attention output (1-indexed)
+                          不传则所有层遍历对比
+    --atol        (可选) 2D 对比绝对容差，默认 1e-5
+    --mask-file   (可选) 外部 label_mask.pt，会裁剪每行最后一个 True
+    --no-trim     (flag)  不裁剪 label_mask 的最后一个 True
+    -o, --output  (可选) 将对比报告保存为 JSON 文件
 """
 
 from __future__ import annotations

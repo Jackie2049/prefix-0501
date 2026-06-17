@@ -130,8 +130,14 @@ def _flush_attn_buffer(dump_dir: str) -> None:
     global _ATTN_BUFFER
     if _ATTN_BUFFER is None:
         return
+    if not _rank0_only():
+        _ATTN_BUFFER = None
+        return
     try:
-        _save_tensor("attn_outputs.pt", _ATTN_BUFFER, dump_dir)
+        # Move every tensor to CPU (dict has no .detach()/.cpu()/.clone())
+        moved = {k: v.detach().cpu().clone() for k, v in _ATTN_BUFFER.items()}
+        torch.save(moved, os.path.join(dump_dir, "attn_outputs.pt"))
+        _log.warning("attn_outputs.pt saved (%d layers)", len(moved))
         _ATTN_BUFFER = None
     except Exception as e:
         _log.warning("attn_outputs.pt save failed: %s", e)
@@ -154,8 +160,12 @@ def _flush_rope_buffer(dump_dir: str) -> None:
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
         return
+    if not _rank0_only():
+        _ROPE_BUFFER = None
+        return
     try:
-        _save_tensor("rope_emb.pt", _ROPE_BUFFER, dump_dir)
+        torch.save(_ROPE_BUFFER, os.path.join(dump_dir, "rope_emb.pt"))
+        _log.warning("rope_emb.pt saved (%d layers)", len(_ROPE_BUFFER))
         _ROPE_BUFFER = None
     except Exception as e:
         _log.warning("rope_emb.pt save failed: %s", e)
