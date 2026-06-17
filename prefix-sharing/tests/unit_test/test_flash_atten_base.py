@@ -14,6 +14,7 @@ from prefix_sharing.backends.flash_atten_base import (
     FlashAttentionMixin,
     FlashBackendValidationError,
 )
+from prefix_sharing.backends.flash_atten_npu import _build_per_sample_mask
 from prefix_sharing.backends.batch_layout import BshdBatchLayout, ThdBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
@@ -369,3 +370,25 @@ def test_scatter_bshd_varlen_output_writes_only_valid_tokens():
     assert dense_output[0, 3].abs().sum().item() == 0
     assert dense_output[1, 0].abs().sum().item() == 0
     assert dense_output[1, 3].abs().sum().item() == 0
+
+
+def test_npu_per_sample_mask_supports_square_dense_bsh_prefix_layout():
+    plan = _make_plan([5, 5], [0, 3])
+    mask = _build_per_sample_mask(
+        plan,
+        valid_lens=[5, 2],
+        expanded_kv_lens=[5, 5],
+        max_q=5,
+        max_kv=5,
+        device="cpu",
+    )
+
+    assert mask.shape == (2, 1, 5, 5)
+    # Provider row: standard causal mask.
+    assert mask[0, 0, 0].tolist() == [False, True, True, True, True]
+    assert mask[0, 0, 4].tolist() == [False, False, False, False, False]
+    # Reuser row: prefix columns are visible; suffix columns are causal.
+    assert mask[1, 0, 0].tolist() == [False, False, False, False, True]
+    assert mask[1, 0, 1].tolist() == [False, False, False, False, False]
+    # Padded query rows remain masked and their outputs are ignored.
+    assert mask[1, 0, 2:].all()

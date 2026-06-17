@@ -26,7 +26,9 @@ fused attention kernel time.
 Mask semantics
 --------------
 ``atten_mask``: True = masked (not participate), False = visible.
-Shape = ``(batch_size, 1, max_q, max_kv)`` — per-sample, prefix-aware:
+Shape is per-sample and prefix-aware. The THD adapter keeps the historical
+``(batch_size, 1, max_q, max_kv)`` mask, while the BSHD runtime branch pads to
+a shared ``max_s = max(max_q, max_kv)`` dense BSH shape:
 
   - **Provider** → standard causal (upper-tri True).
   - **Reuser**   → prefix KV columns all-visible, suffix KV columns causal.
@@ -383,10 +385,14 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         hidden_kv = num_kv_heads * head_dim
         max_q = max(valid_lens)
         max_kv = max(kv_lens)
+        max_s = max(max_q, max_kv)
 
-        q_bsh = torch.zeros(batch_size, max_q, hidden_q, dtype=first_q.dtype, device=first_q.device)
-        k_bsh = torch.zeros(batch_size, max_kv, hidden_kv, dtype=first_k.dtype, device=first_k.device)
-        v_bsh = torch.zeros(batch_size, max_kv, hidden_kv, dtype=first_v.dtype, device=first_v.device)
+        # Keep the dense NPU FA call on a shared S dimension. Reuser rows have
+        # shorter Q than expanded KV; padding Q to max_s avoids rectangular BSH
+        # inputs and the output is scattered only for valid query tokens.
+        q_bsh = torch.zeros(batch_size, max_s, hidden_q, dtype=first_q.dtype, device=first_q.device)
+        k_bsh = torch.zeros(batch_size, max_s, hidden_kv, dtype=first_k.dtype, device=first_k.device)
+        v_bsh = torch.zeros(batch_size, max_s, hidden_kv, dtype=first_v.dtype, device=first_v.device)
 
         for batch_index in range(batch_size):
             q_len = valid_lens[batch_index]
@@ -401,8 +407,8 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
             plan,
             valid_lens,
             kv_lens,
-            max_q,
-            max_kv,
+            max_s,
+            max_s,
             first_q.device,
         )
 
@@ -420,14 +426,14 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
                 atten_mask=atten_mask,
                 scale=scale,
                 keep_prob=keep_prob,
-                sparse_mode=1,
+                sparse_mode=0,
             )
         except Exception as exc:
             raise FlashBackendValidationError(
                 f"npu_fusion_attention (BSHD input via BSH) failed: q={tuple(q_bsh.shape)}, "
                 f"k={tuple(k_bsh.shape)}, v={tuple(v_bsh.shape)}, "
                 f"mask={tuple(atten_mask.shape)}, batch_size={batch_size}, "
-                f"max_q={max_q}, max_kv={max_kv}"
+                f"max_q={max_q}, max_kv={max_kv}, max_s={max_s}"
             ) from exc
 
         output_bsh = result[0] if isinstance(result, (tuple, list)) else result
