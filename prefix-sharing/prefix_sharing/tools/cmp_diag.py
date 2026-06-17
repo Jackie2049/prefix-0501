@@ -144,9 +144,21 @@ def _resolve_label_mask(mask_file: str | None, dir_off: str,
 # ══════════════════════════════════════════════════════════════════
 
 def _cosine_sim(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Cosine similarity along ``dim``.
+
+    Near-zero vectors (both norms < ``sqrt(eps)``) are treated as
+    identical and return 1.0. This avoids the clamp artifact where a
+    tiny norm gets bumped to ``eps`` and yields ``cos = |a|^2 / eps``
+    instead of 1.0 for a==b. Without this guard, cos_min is dominated
+    by these pathological tokens and loses diagnostic value.
+    """
     eps = 1e-8
-    denom = (a.norm(dim=dim) * b.norm(dim=dim)).clamp(min=eps)
-    return (a * b).sum(dim=dim) / denom
+    na = a.norm(dim=dim)
+    nb = b.norm(dim=dim)
+    denom = (na * nb).clamp(min=eps)
+    cos = (a * b).sum(dim=dim) / denom
+    near_zero = (na < eps.sqrt()) & (nb < eps.sqrt())
+    return torch.where(near_zero, torch.ones_like(cos), cos)
 
 
 def _pearson_r(t1: torch.Tensor, t2: torch.Tensor,
