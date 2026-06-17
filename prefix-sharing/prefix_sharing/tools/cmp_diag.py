@@ -701,21 +701,15 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     cos_avg = float(cos.mean())
     cos_min = float(cos.min())
 
-    # Overall abs/rel error + pearson across all aligned elements
-    err = _error_abs_rel(on_aligned, off_aligned)
-    pr = _pearson_r(on_aligned, off_aligned)
-
+    # Logits live in vocab space (V ~ 1e5); abs/rel error and pearson are
+    # dominated by a few extreme dims and carry little signal. Per-token
+    # cosine similarity is the meaningful metric here.
     return CheckResult(
         name="logits",
         passed=cos_avg > 0.9999 and cos_min > 0.999,
         metrics={"n_tokens": n_tokens,
                  "cos_avg": cos_avg,
-                 "cos_min": cos_min,
-                 "abs_max": err["abs_max"],
-                 "abs_mean": err["abs_mean"],
-                 "rel_max": err["rel_max"],
-                 "rel_mean": err["rel_mean"],
-                 "pearson_r": pr})
+                 "cos_min": cos_min})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -860,10 +854,7 @@ def _print_logits_packed(r: CheckResult):
         print(f"  {_CROSS} {m['error']}")
     else:
         print(f"  n_tokens={m.get('n_tokens','—')}  "
-              f"cos_avg={m.get('cos_avg',0):.6e}  cos_min={m.get('cos_min',0):.6e}")
-        print(f"  abs_max={m.get('abs_max',0):.6e}  abs_mean={m.get('abs_mean',0):.6e}  "
-              f"rel_max={m.get('rel_max',0):.6e}  rel_mean={m.get('rel_mean',0):.6e}")
-        print(f"  pearson={m.get('pearson_r',float('nan')):.8f}  "
+              f"cos_avg={m.get('cos_avg',0):.6e}  cos_min={m.get('cos_min',0):.6e}  "
               f"{_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
     print()
 
@@ -872,9 +863,13 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
                     topk: int, sort_by: str, label: str):
     """Print top-K dimensions from two 1D vectors.
 
-    sort_by = "abs" → sort by absolute error  |on - off|
-    sort_by = "rel" → sort by relative error    |on - off| / max(|on|,|off|)
-    sort_by = "val" → sort by max magnitude      max(|on|,|off|)  (largest dims)
+    sort_by = "abs"  → sort by absolute error  |on - off|
+    sort_by = "rel"  → sort by relative error  |on - off| / max(|on|,|off|)
+    sort_by = "val"  → sort by max magnitude    max(|on|,|off|)  (largest dims)
+    sort_by = "real" → sort by ON's actual value (signed), largest first.
+                       Useful for logits where positive values dominate
+                       sampling probability; ranking by magnitude surfaces
+                       "never selected" negative tokens instead.
     """
     abs_err = (on_vec - off_vec).abs()
     rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
@@ -882,6 +877,8 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
         sort_key = abs_err
     elif sort_by == "rel":
         sort_key = rel_err
+    elif sort_by == "real":
+        sort_key = on_vec
     else:  # "val"
         sort_key = torch.maximum(on_vec.abs(), off_vec.abs())
     _, idx = sort_key.topk(min(topk, sort_key.numel()))
@@ -1060,14 +1057,16 @@ def main():
                     b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
                     _print_topk_vec(a0, b0, args.topk, "val",
                                     "first_token_attn")
-            # first_token_logits — per-dim top-K (val = max magnitude)
+            # first_token_logits — per-dim top-K (real = ON signed value,
+            # so positive logits — the tokens actually selectable by
+            # sampling — surface first, not the large-magnitude negatives)
             lo = _load_tensor(args.dir_on,  "logits.pt")
             lf = _load_tensor(args.dir_off, "logits.pt")
             if lo is not None and lf is not None:
                 ft = _logits_first_token(lo, lf)
                 if ft is not None:
                     _print_topk_vec(ft[0].cpu(), ft[1].cpu(), args.topk,
-                                    "val", "first_token_logits")
+                                    "real", "first_token_logits")
 
     # ── ④b Logits (full packed alignment via attention_mask + dual pointer) ──
     if not stop:
