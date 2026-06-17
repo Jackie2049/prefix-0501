@@ -5,9 +5,13 @@ Covers the precision verification spec (see plan.md):
   1. position_ids      — absolute equality (STOP if fail)
   2. RoPE encoding     — absolute equality (STOP if fail)
   3. attn_output per-layer cos  — avg / min per layer
-  4. First-token suite — mean_abs / max_abs / rel(max,mean) / cos / pearson
+  4. First-token suite — attn[0] + logits[0] (mean_abs/max_abs/rel/cos/pearson)
+  4b.Logits packed align — full packed logits via attention_mask + dual pointer
   5. entropy / logp    — error_abs(max,mean) / error_rel(max,mean) / pearson
   6. OFF vs OFF baseline — noise floor for all metrics
+
+  Top-K 可选: --topk N --sort-err abs|rel 打印 first_token/logp/entropy 前N个
+               最差维度或位置 (abs=绝对误差排序, rel=相对误差排序)
 
 Usage:
     # 最小对比 (attention_output + logits + logprobs + entropy)
@@ -17,12 +21,20 @@ Usage:
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old --layer 12
 
     # OFF vs OFF baseline (测自然噪声底)
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
         --dir-off2 ./dump_off2 --tag old
 
     # 导出 JSON 报告
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
         --tag old -o report.json
+
+    # 打印每种比较最差的 10 个元素 (按绝对误差排)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
+        --tag old --topk 10
+
+    # 打印每种比较最差的 20 个元素 (按相对误差排)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
+        --tag old --topk 20 --sort-err rel
 
 Parameters:
     --dir-on      (必需) ON模式 dump 目录，含 attn_outputs.pt / logits.pt /
@@ -40,6 +52,10 @@ Parameters:
     --mask-file   (可选) 外部 label_mask.pt，会裁剪每行最后一个 True
     --no-trim     (flag)  不裁剪 label_mask 的最后一个 True
     -o, --output  (可选) 将对比报告保存为 JSON 文件
+    --topk        (可选) 打印前 N 个误差最大的元素 (0=关闭, 默认 0)
+                          对 first_token_attn/logits 按维度排名
+                          对 logp/entropy 按 (batch, pos) 位置排名
+    --sort-err    (可选) top-K 排序依据: abs=绝对误差, rel=相对误差 (默认 abs)
 """
 
 from __future__ import annotations
@@ -296,25 +312,6 @@ def _build_alignment_mask_from_2d(
     return align
 
 
-def _extract_suffix_rows(packed: torch.Tensor, cu_seqlens: torch.Tensor,
-                         prefix_lens: torch.Tensor) -> list[torch.Tensor]:
-    """Extract per-sequence suffix rows from packed tensor.
-
-    Works for both ON (real prefix_lens) and OFF (prefix_lens=all-0,
-    i.e. entire sequence is suffix).  Sequences with no suffix are skipped.
-    """
-    rows = []
-    for i in range(cu_seqlens.shape[0] - 1):
-        pf = int(prefix_lens[i])
-        total_len = int(cu_seqlens[i + 1] - cu_seqlens[i])
-        suffix_len = total_len - pf
-        if suffix_len <= 0:
-            continue
-        start = int(cu_seqlens[i]) + pf
-        t = packed[start:start + suffix_len]
-        rows.append(t.squeeze(1) if t.dim() == 3 else t)
-    return rows
-
 
 # ══════════════════════════════════════════════════════════════════
 #  1. position_ids — absolute equality
@@ -460,65 +457,105 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
 
 
 # ══════════════════════════════════════════════════════════════════
-#  4. First-token metrics (last-layer attn + logits)
+#  4. First-token metrics (last-layer attn[0] + logits[0])
 # ══════════════════════════════════════════════════════════════════
 
-def _first_token_from_rows(rows_on: list, rows_off: list) -> dict | None:
-    """Compare first token of each suffix row across ON/OFF.
-
-    Both row lists must have the same number of sequences.  Per-sequence
-    suffix lengths may differ — we use the shorter length.
-    """
-    if not rows_on or not rows_off:
-        return None
-    if len(rows_on) != len(rows_off):
-        return None
-    agg = {}
-    for seq_idx, (ro, r_off) in enumerate(zip(rows_on, rows_off)):
-        # Take the shorter suffix if lengths differ (safety belt)
-        n = min(ro.shape[0], r_off.shape[0])
-        if n == 0:
-            continue
-        ro, r_off = ro[:n], r_off[:n]
-        fm = _first_token_metrics(ro[0], r_off[0])
-        for k, v in fm.items():
-            agg.setdefault(k, []).append(v)
-    if not agg:
-        return None
-    return {k: {"mean": sum(v) / len(v), "min": min(v), "max": max(v)}
-            for k, v in agg.items()}
-
-
 def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
+    """Compare packed[0] of last-layer attn_output + logits.
+
+    The first sentence never becomes a resuer so its packed[0] is always a
+    complete suffix token — safe to compare directly without alignment.
+    """
     results: list[CheckResult] = []
     last = _get_num_layers(dir_on) or _get_num_layers(dir_off)
 
-    # attn_output (last layer only)
+    # attn_output (last layer) — packed[0]
     if last:
-        ma = _load_packed_meta(dir_on)
-        mb = _load_packed_meta(dir_off)
-        if ma and mb:
-            a = _load_attn_output(dir_on, last)
-            b = _load_attn_output(dir_off, last)
-            if a is not None and b is not None:
-                ft = _first_token_from_rows(
-                    _extract_suffix_rows(a, ma["cu_seqlens"], ma["prefix_lens"]),
-                    _extract_suffix_rows(b, mb["cu_seqlens"], mb["prefix_lens"]))
-                if ft:
-                    results.append(CheckResult(name="first_token_attn", metrics=ft))
+        a = _load_attn_output(dir_on, last)
+        b = _load_attn_output(dir_off, last)
+        if a is not None and b is not None:
+            a0 = a.squeeze(1) if a.dim() == 3 else a
+            b0 = b.squeeze(1) if b.dim() == 3 else b
+            ft = _first_token_metrics(a0[0], b0[0])
+            results.append(CheckResult(name="first_token_attn", metrics=ft))
 
-    # logits
-    ml_on  = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
-    ml_off = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    # logits — packed[0]
     lo = _load_tensor(dir_on,  "logits.pt")
     lf = _load_tensor(dir_off, "logits.pt")
-    if ml_on and ml_off and lo is not None and lf is not None:
-        ft = _first_token_from_rows(
-            _extract_suffix_rows(lo, ml_on["cu_seqlens"], ml_on["prefix_lens"]),
-            _extract_suffix_rows(lf, ml_off["cu_seqlens"], ml_off["prefix_lens"]))
-        if ft:
-            results.append(CheckResult(name="first_token_logits", metrics=ft))
+    if lo is not None and lf is not None:
+        ft = _first_token_metrics(lo[0], lf[0])
+        results.append(CheckResult(name="first_token_logits", metrics=ft))
+
     return results
+
+
+# ══════════════════════════════════════════════════════════════════
+#  4b. Logits — full packed alignment (attention_mask + dual pointer)
+# ══════════════════════════════════════════════════════════════════
+
+def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare ON vs OFF logits with full packed alignment.
+
+    Uses attention_mask_2d + dual-pointer to align ON (suffix-only)
+    with OFF (full-sequence) logits, same alignment logic as attn_output
+    per-layer comparison.
+    """
+    lo = _load_tensor(dir_on,  "logits.pt")
+    lf = _load_tensor(dir_off, "logits.pt")
+    if lo is None or lf is None:
+        return None
+
+    # Metadata for logits uses cu_seqlens_q_logits.pt
+    ma = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
+    mb = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    if ma is None or mb is None:
+        return None
+
+    T_off = int(mb["cu_seqlens"][-1]) if mb["cu_seqlens"].numel() > 0 else 0
+    if T_off == 0 or lo.shape[0] == 0 or lf.shape[0] == 0:
+        return None
+
+    # Build alignment mask (same logic as attn_output all-layers)
+    mask_on_2d = _load_attention_mask_2d(dir_on)
+    mask_off_2d = _load_attention_mask_2d(dir_off)
+    if mask_on_2d is not None and mask_off_2d is not None:
+        align_mask = _build_alignment_mask_from_2d(
+            mask_on_2d, mask_off_2d, mb["cu_seqlens"], T_off)
+    else:
+        align_mask = _build_alignment_mask(
+            mb["cu_seqlens"], ma["prefix_lens"], T_off)
+
+    # Align: extract suffix-only region from OFF
+    try:
+        on_aligned, off_aligned = _align_packed(lo, lf, align_mask)
+    except ValueError as e:
+        return CheckResult(name="logits", passed=False,
+                           metrics={"error": str(e),
+                                    "n_on": lo.shape[0],
+                                    "n_off": lf.shape[0]})
+
+    n_tokens = on_aligned.shape[0]
+
+    # Per-token cosine similarity (dim=-1 across vocab)
+    cos = _cosine_sim(on_aligned, off_aligned, dim=-1)
+    cos_avg = float(cos.mean())
+    cos_min = float(cos.min())
+
+    # Overall abs/rel error + pearson across all aligned elements
+    err = _error_abs_rel(on_aligned, off_aligned)
+    pr = _pearson_r(on_aligned, off_aligned)
+
+    return CheckResult(
+        name="logits",
+        passed=cos_avg > 0.9999 and cos_min > 0.999,
+        metrics={"n_tokens": n_tokens,
+                 "cos_avg": cos_avg,
+                 "cos_min": cos_min,
+                 "abs_max": err["abs_max"],
+                 "abs_mean": err["abs_mean"],
+                 "rel_max": err["rel_max"],
+                 "rel_mean": err["rel_mean"],
+                 "pearson_r": pr})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -621,18 +658,78 @@ def _print_per_layer(r: CheckResult):
 
 
 def _print_first_token(r: CheckResult):
-    print(_SEP_SINGLE + f"\n  [first_token]  {r.name}")
+    print(_SEP_SINGLE + f"\n  [first_token]  {r.name}  (packed position [0])")
     print(_SEP_SINGLE)
     m = r.metrics
-    print(f"  {'METRIC':>12s}  {'MEAN':>14s}  {'MIN':>14s}  {'MAX':>14s}")
-    print(f"  {'─'*12}  {'─'*14}  {'─'*14}  {'─'*14}")
     for k in ["mean_abs", "max_abs", "rel_max", "rel_mean", "cos", "pearson"]:
         v = m.get(k)
-        if isinstance(v, dict):
-            print(f"  {k:>12s}  {v['mean']:>14.6e}  {v['min']:>14.6e}  {v['max']:>14.6e}")
-        elif v is not None:
+        if v is not None:
             print(f"  {k:>12s}  {v:>14.6e}")
     print()
+
+
+def _print_logits_packed(r: CheckResult):
+    """Print full packed logits comparison (attention_mask + dual pointer aligned)."""
+    print(_SEP_SINGLE + "\n  [logits]  packed alignment (attention_mask + dual pointer)")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}")
+    else:
+        print(f"  n_tokens={m.get('n_tokens','—')}  "
+              f"cos_avg={m.get('cos_avg',0):.8f}  cos_min={m.get('cos_min',0):.8f}")
+        print(f"  abs_max={m.get('abs_max',0):.6e}  abs_mean={m.get('abs_mean',0):.6e}  "
+              f"rel_max={m.get('rel_max',0):.6e}  rel_mean={m.get('rel_mean',0):.6e}")
+        print(f"  pearson={m.get('pearson_r',float('nan')):.8f}  "
+              f"{_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print()
+
+
+def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
+                    topk: int, sort_by: str, label: str):
+    """Print top-K worst dimensions from two 1D vectors.
+
+    sort_by = "abs" → sort by absolute error  |on - off|
+    sort_by = "rel" → sort by relative error    |on - off| / max(|on|,|off|)
+    """
+    abs_err = (on_vec - off_vec).abs()
+    rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
+    sort_key = abs_err if sort_by == "abs" else rel_err
+    _, idx = sort_key.topk(min(topk, sort_key.numel()))
+    idx = idx.to(torch.long)
+    print(f"\n  [{label}]  top-{topk} worst dims (sort by {sort_by})")
+    print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}  {'REL_ERR':>12s}")
+    for k, i in enumerate(idx.tolist()):
+        print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
+              f"  {float(abs_err[i]):>12.6e}  {float(rel_err[i]):>12.6e}")
+
+
+def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
+                   mask: torch.Tensor, topk: int, sort_by: str, label: str):
+    """Print top-K worst (batch, pos) elements from two 2D tensors.
+
+    sort_by = "abs" → sort by absolute error  |on - off|
+    sort_by = "rel" → sort by relative error    |on - off| / max(|on|,|off|)
+    """
+    abs_err = (on_t - off_t).abs()
+    rel_err = abs_err / torch.maximum(on_t.abs(), off_t.abs()).clamp(min=1e-8)
+    sort_key = abs_err if sort_by == "abs" else rel_err
+    # Mask invalid positions to -inf so they never sort into top-K
+    if mask is not None:
+        sort_key = sort_key.clone()
+        sort_key[~mask.to(sort_key.device)] = float("-inf")
+    flat, idx = sort_key.flatten().topk(min(topk, sort_key.numel()))
+    # Convert flat indices → (row, col)
+    rows = idx // sort_key.shape[1]
+    cols = idx % sort_key.shape[1]
+    print(f"\n  [{label}]  top-{topk} worst positions (sort by {sort_by})")
+    print(f"  {'B':>4s} {'POS':>6s}  {'ON':>14s}  {'OFF':>14s}  "
+          f"{'ABS_ERR':>12s}  {'REL_ERR':>12s}")
+    for k in range(len(flat)):
+        r, c = int(rows[k]), int(cols[k])
+        print(f"  {r:>4d} {c:>6d}  {float(on_t[r,c]):>14.6e}  "
+              f"{float(off_t[r,c]):>14.6e}"
+              f"  {float(abs_err[r,c]):>12.6e}  {float(rel_err[r,c]):>12.6e}")
 
 
 def _print_summary(all_results: list[CheckResult]):
@@ -695,6 +792,10 @@ def main():
     ap.add_argument("--no-trim", action="store_true",
                     help="Skip last-True trimming of label_mask")
     ap.add_argument("--output", "-o", default=None, help="Save report as JSON")
+    ap.add_argument("--topk", type=int, default=0,
+                    help="Print top-K worst elements (0 = disabled)")
+    ap.add_argument("--sort-err", choices=["abs", "rel"], default="abs",
+                    help="Sort top-K by abs error or rel error (default: abs)")
     args = ap.parse_args()
 
     tag_on  = args.tag_on  or args.tag
@@ -737,11 +838,37 @@ def main():
             all_results.append(r)
             _print_per_layer(r)
 
-    # ── ④ First-token metrics ──
+    # ── ④ First-token (attn[0] + logits[0]) ──
     if not stop:
         for r in cmp_first_token(args.dir_on, args.dir_off):
             all_results.append(r)
             _print_first_token(r)
+
+        # Top-K per-dimension errors
+        if args.topk > 0:
+            last = _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off)
+            # first_token_attn — per-dim top-K
+            if last:
+                a = _load_attn_output(args.dir_on, last)
+                b = _load_attn_output(args.dir_off, last)
+                if a is not None and b is not None:
+                    a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
+                    b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
+                    _print_topk_vec(a0, b0, args.topk, args.sort_err,
+                                    "first_token_attn")
+            # first_token_logits — per-dim top-K
+            lo = _load_tensor(args.dir_on,  "logits.pt")
+            lf = _load_tensor(args.dir_off, "logits.pt")
+            if lo is not None and lf is not None:
+                _print_topk_vec(lo[0].cpu(), lf[0].cpu(), args.topk,
+                                args.sort_err, "first_token_logits")
+
+    # ── ④b Logits (full packed alignment via attention_mask + dual pointer) ──
+    if not stop:
+        r = cmp_logits_packed(args.dir_on, args.dir_off)
+        if r:
+            all_results.append(r)
+            _print_logits_packed(r)
 
     # ── ⑤ 2D comparison (entropy / logp) ──
     if tag_on:
@@ -761,6 +888,10 @@ def main():
                   f"pearson={m.get('pearson_r',float('nan')):.8f}")
             print(f"  abs_mean={m.get('abs_mean',0):.6e}  rel_mean={m.get('rel_mean',0):.6e}  "
                   f"{_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+            # Top-K worst positions
+            if args.topk > 0:
+                _print_topk_2d(t1.cpu(), t2.cpu(), label_mask, args.topk,
+                               args.sort_err, r.name)
             print()
 
     # ── ⑥ OFF vs OFF baseline ──
