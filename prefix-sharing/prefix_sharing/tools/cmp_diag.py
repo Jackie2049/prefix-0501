@@ -10,8 +10,8 @@ Covers the precision verification spec (see plan.md):
   5. entropy / logp    — error_abs(max,mean) / error_rel(max,mean) / pearson
   6. OFF vs OFF baseline — noise floor for all metrics
 
-  Top-K 可选: --topk N --sort-err abs|rel 打印 first_token/logp/entropy 前N个
-               最差维度或位置 (abs=绝对误差排序, rel=相对误差排序)
+  Top-K 可选: --topk N --sort-err abs|rel 控制 2D 标量排序
+               first_token 固定按 val (max magnitude) 排，不受 --sort-err 影响
 
 Usage:
     # 最小对比 (attention_output + logits + logprobs + entropy)
@@ -36,6 +36,10 @@ Usage:
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
         --tag old --topk 20 --sort-err rel
 
+    # 打印 first_token/logp/entropy 值最大的 10 个维度 (不受 0 附近噪声干扰)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
+        --tag old --topk 10 --sort-err val
+
 Parameters:
     --dir-on      (必需) ON模式 dump 目录，含 attn_outputs.pt / logits.pt /
                           logprobs_{tag}.pt / entropy_{tag}.pt / attention_mask.pt
@@ -55,7 +59,8 @@ Parameters:
     --topk        (可选) 打印前 N 个误差最大的元素 (0=关闭, 默认 0)
                           对 first_token_attn/logits 按维度排名
                           对 logp/entropy 按 (batch, pos) 位置排名
-    --sort-err    (可选) top-K 排序依据: abs=绝对误差, rel=相对误差 (默认 abs)
+    --sort-err    (可选) 2D 标量 top-K 排序依据: abs=绝对误差, rel=相对误差 (默认 abs)
+                          first_token 固定按 val (max magnitude) 排，不受此参数影响
 """
 
 from __future__ import annotations
@@ -678,13 +683,13 @@ def _print_per_layer(r: CheckResult):
     print(_SEP_SINGLE)
     layers = r.metrics.get("layers")
     if isinstance(layers, dict):
-        print(f"  {'LAYER':>6s}  {'COS_AVG':>12s}  {'COS_MIN':>12s}  {'TOKENS':>8s}  {'STATUS':>8s}")
-        print(f"  {'─'*6}  {'─'*12}  {'─'*12}  {'─'*8}  {'─'*8}")
+        print(f"  {'LAYER':>6s}  {'COS_AVG':>14s}  {'COS_MIN':>14s}  {'TOKENS':>8s}  {'STATUS':>8s}")
+        print(f"  {'─'*6}  {'─'*14}  {'─'*14}  {'─'*8}  {'─'*8}")
         bad = []
         for lyr in sorted(layers.keys()):
             d = layers[lyr]
             ok = d["cos_avg"] > 0.9999 and d["cos_min"] > 0.999
-            print(f"  {lyr:>6d}  {d['cos_avg']:>12.8f}  {d['cos_min']:>12.8f}  "
+            print(f"  {lyr:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
                   f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
             if not ok:
                 bad.append(lyr)
@@ -692,7 +697,7 @@ def _print_per_layer(r: CheckResult):
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
     elif "cos_avg" in r.metrics:
         d = r.metrics
-        print(f"  L{d['layer']}  cos_avg={d['cos_avg']:.8f}  cos_min={d['cos_min']:.8f}")
+        print(f"  L{d['layer']}  cos_avg={d['cos_avg']:.6e}  cos_min={d['cos_min']:.6e}")
     print()
 
 
@@ -716,7 +721,7 @@ def _print_logits_packed(r: CheckResult):
         print(f"  {_CROSS} {m['error']}")
     else:
         print(f"  n_tokens={m.get('n_tokens','—')}  "
-              f"cos_avg={m.get('cos_avg',0):.8f}  cos_min={m.get('cos_min',0):.8f}")
+              f"cos_avg={m.get('cos_avg',0):.6e}  cos_min={m.get('cos_min',0):.6e}")
         print(f"  abs_max={m.get('abs_max',0):.6e}  abs_mean={m.get('abs_mean',0):.6e}  "
               f"rel_max={m.get('rel_max',0):.6e}  rel_mean={m.get('rel_mean',0):.6e}")
         print(f"  pearson={m.get('pearson_r',float('nan')):.8f}  "
@@ -726,17 +731,23 @@ def _print_logits_packed(r: CheckResult):
 
 def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
                     topk: int, sort_by: str, label: str):
-    """Print top-K worst dimensions from two 1D vectors.
+    """Print top-K dimensions from two 1D vectors.
 
     sort_by = "abs" → sort by absolute error  |on - off|
     sort_by = "rel" → sort by relative error    |on - off| / max(|on|,|off|)
+    sort_by = "val" → sort by max magnitude      max(|on|,|off|)  (largest dims)
     """
     abs_err = (on_vec - off_vec).abs()
     rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
-    sort_key = abs_err if sort_by == "abs" else rel_err
+    if sort_by == "abs":
+        sort_key = abs_err
+    elif sort_by == "rel":
+        sort_key = rel_err
+    else:  # "val"
+        sort_key = torch.maximum(on_vec.abs(), off_vec.abs())
     _, idx = sort_key.topk(min(topk, sort_key.numel()))
     idx = idx.to(torch.long)
-    print(f"\n  [{label}]  top-{topk} worst dims (sort by {sort_by})")
+    print(f"\n  [{label}]  top-{topk} dims (sort by {sort_by})")
     print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}  {'REL_ERR':>12s}")
     for k, i in enumerate(idx.tolist()):
         print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
@@ -745,14 +756,20 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
 
 def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
                    mask: torch.Tensor, topk: int, sort_by: str, label: str):
-    """Print top-K worst (batch, pos) elements from two 2D tensors.
+    """Print top-K (batch, pos) elements from two 2D tensors.
 
     sort_by = "abs" → sort by absolute error  |on - off|
     sort_by = "rel" → sort by relative error    |on - off| / max(|on|,|off|)
+    sort_by = "val" → sort by max magnitude      max(|on|,|off|)
     """
     abs_err = (on_t - off_t).abs()
     rel_err = abs_err / torch.maximum(on_t.abs(), off_t.abs()).clamp(min=1e-8)
-    sort_key = abs_err if sort_by == "abs" else rel_err
+    if sort_by == "abs":
+        sort_key = abs_err
+    elif sort_by == "rel":
+        sort_key = rel_err
+    else:  # "val"
+        sort_key = torch.maximum(on_t.abs(), off_t.abs())
     # Mask invalid positions to -inf so they never sort into top-K
     if mask is not None:
         sort_key = sort_key.clone()
@@ -761,7 +778,7 @@ def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
     # Convert flat indices → (row, col)
     rows = idx // sort_key.shape[1]
     cols = idx % sort_key.shape[1]
-    print(f"\n  [{label}]  top-{topk} worst positions (sort by {sort_by})")
+    print(f"\n  [{label}]  top-{topk} positions (sort by {sort_by})")
     print(f"  {'B':>4s} {'POS':>6s}  {'ON':>14s}  {'OFF':>14s}  "
           f"{'ABS_ERR':>12s}  {'REL_ERR':>12s}")
     for k in range(len(flat)):
@@ -833,8 +850,8 @@ def main():
     ap.add_argument("--output", "-o", default=None, help="Save report as JSON")
     ap.add_argument("--topk", type=int, default=0,
                     help="Print top-K worst elements (0 = disabled)")
-    ap.add_argument("--sort-err", choices=["abs", "rel"], default="abs",
-                    help="Sort top-K by abs error or rel error (default: abs)")
+    ap.add_argument("--sort-err", choices=["abs", "rel", "val"], default="abs",
+                    help="Sort top-K by abs error / rel error / max magnitude (val)")
     args = ap.parse_args()
 
     tag_on  = args.tag_on  or args.tag
@@ -893,16 +910,16 @@ def main():
                 if a is not None and b is not None:
                     a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
                     b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
-                    _print_topk_vec(a0, b0, args.topk, args.sort_err,
+                    _print_topk_vec(a0, b0, args.topk, "val",
                                     "first_token_attn")
-            # first_token_logits — per-dim top-K
+            # first_token_logits — per-dim top-K (val = max magnitude)
             lo = _load_tensor(args.dir_on,  "logits.pt")
             lf = _load_tensor(args.dir_off, "logits.pt")
             if lo is not None and lf is not None:
                 ft = _logits_first_token(lo, lf)
                 if ft is not None:
                     _print_topk_vec(ft[0].cpu(), ft[1].cpu(), args.topk,
-                                    args.sort_err, "first_token_logits")
+                                    "val", "first_token_logits")
 
     # ── ④b Logits (full packed alignment via attention_mask + dual pointer) ──
     if not stop:
