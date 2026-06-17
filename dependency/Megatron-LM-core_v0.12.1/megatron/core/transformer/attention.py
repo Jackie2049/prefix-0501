@@ -696,7 +696,7 @@ class Attention(MegatronModule, ABC):
 
         output, bias = self.linear_proj(core_attn_out)
 
-        # --- diag dump (OFF attention) ---
+        ######### prefix-sharing diag: OFF attention_output (per-layer) #########
         try:
             from prefix_sharing.tools.diagnostic_dump import dump_attn_off
             if packed_seq_params is not None \
@@ -709,7 +709,7 @@ class Attention(MegatronModule, ABC):
         except Exception as e:
             import logging
             logging.getLogger(__file__).warning("last-attn dump (OFF) failed: %s", e)
-        # ---
+        ######### prefix-sharing diag: OFF attention_output (per-layer) #########
 
         return output, bias
 

@@ -289,13 +289,13 @@ class MegatronPPOActor(BasePPOActor):
                 log_probs = log_probs.to("cpu")
                 
 
-                ########## prefix-sharing diag dump (legacy logprobs) ##########
+                ######### prefix-sharing diag: legacy logprobs #########
                 try:
                     from prefix_sharing.tools.diagnostic_dump import dump_logprobs_legacy
                     dump_logprobs_legacy(log_probs, input_ids)
                 except Exception:
                     pass
-                ########## prefix-sharing diag dump ##########
+                ######### prefix-sharing diag: legacy logprobs #########
 
 
                 if calculate_entropy:
@@ -613,6 +613,16 @@ class MegatronPPOActor(BasePPOActor):
 
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
+            ######### prefix-sharing diag: 2D attention_mask #########
+            # ON: suffix mask (rewritten by verl_mcore._trim_micro_batch before this point)
+            # OFF: original valid-token mask
+            # Both share [B, L_max] shape; ON ⊂ OFF per row.
+            try:
+                from prefix_sharing.tools.diagnostic_dump import dump_attention_mask_2d
+                dump_attention_mask_2d(attention_mask)
+            except Exception:
+                pass
+            ######### prefix-sharing diag: 2D attention_mask #########
             position_ids = batch["position_ids"]
 
             unwrapped_model = unwrap_model(model)
@@ -634,12 +644,13 @@ class MegatronPPOActor(BasePPOActor):
             label_mask = attention_mask.clone()
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
-            ######### prefix-sharing #########
+            ######### prefix-sharing diag: label_mask #########
             try:
                 from prefix_sharing.tools.diagnostic_dump import dump_label_mask
                 dump_label_mask(label_mask)
             except Exception:
                 pass
+            ######### prefix-sharing diag: label_mask #########
             if _prefix_sharing:
                 # Fix prompt-position labels: use actual next-token (from input_ids)
                 # instead of position_ids, so provider prompt log_probs are meaningful
@@ -751,6 +762,7 @@ class MegatronPPOActor(BasePPOActor):
                     # actually changes the right positions.  (ON/OFF comparison
                     # alone can't distinguish "restore did nothing" from
                     # "restore happened correctly".)
+                    ######### prefix-sharing diag: pre-restore snapshot #########
                     try:
                         from prefix_sharing.tools.diagnostic_dump import (
                             dump_logprobs_2d, dump_entropy_2d,
@@ -761,7 +773,7 @@ class MegatronPPOActor(BasePPOActor):
                             dump_entropy_2d(output["entropy"], "before_restore")
                     except Exception:
                         pass
-                    ########## prefix-sharing diag: pre-restore snapshot ##########
+                    ######### prefix-sharing diag: pre-restore snapshot #########
 
                     # Restore reuser prefix columns in 2D space.
                     # All logprob/entropy restoration (interior + prefix-last)
@@ -778,7 +790,7 @@ class MegatronPPOActor(BasePPOActor):
                             vocab_parallel_entropy if calculate_entropy else None,
                         )
 
-                    ########## prefix-sharing diag dump (2D after restores) ##########
+                    ######### prefix-sharing diag: logprobs/entropy/label (2D after restores) #########
                     try:
                         # re-import or use already-imported names
                         tag = "old" if forward_only else "train"
@@ -789,7 +801,7 @@ class MegatronPPOActor(BasePPOActor):
                         # label_mask already dumped before PS patch
                     except Exception:
                         pass
-                    ########## prefix-sharing diag dump ##########
+                    ######### prefix-sharing diag: logprobs/entropy/label (2D after restores) #########
                 ######### prefix-sharing #########
 
             if forward_only:
