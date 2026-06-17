@@ -146,12 +146,19 @@ def _resolve_label_mask(mask_file: str | None, dir_off: str,
 def _cosine_sim(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Cosine similarity along ``dim``.
 
+    Inputs are promoted to float32 before computing to avoid low-precision
+    (bf16) rounding artifacts: even when a==b, the numerator
+    ``(a*b).sum()`` and the denominator ``|a|*|b| = sqrt(sum(a^2)) *
+    sqrt(sum(b^2))`` take different reduction paths and round to
+    different bf16 values, yielding cos < 1.0 (e.g. 0.988) for identical
+    tensors. In float32 the two paths agree closely enough that a==b
+    gives cos ≈ 1.0.
+
     Near-zero vectors (both norms < ``sqrt(eps)``) are treated as
-    identical and return 1.0. This avoids the clamp artifact where a
-    tiny norm gets bumped to ``eps`` and yields ``cos = |a|^2 / eps``
-    instead of 1.0 for a==b. Without this guard, cos_min is dominated
-    by these pathological tokens and loses diagnostic value.
+    identical and return 1.0 to avoid the clamp artifact on tiny norms.
     """
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
     eps = 1e-8
     na = a.norm(dim=dim)
     nb = b.norm(dim=dim)
