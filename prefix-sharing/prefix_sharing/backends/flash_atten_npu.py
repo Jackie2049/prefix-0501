@@ -222,7 +222,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         )
 
         npu_fusion_attention = _import_npu_fusion_attention()
-        batch_runtime_layout = kwargs.get("batch_runtime_layout")
+        batch_runtime_layout = kwargs.pop("batch_runtime_layout", None)
         if batch_runtime_layout is None:
             raise FlashBackendValidationError(
                 "flash_atten_npu.attention requires batch_runtime_layout kwarg."

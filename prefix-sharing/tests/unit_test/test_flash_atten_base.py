@@ -14,6 +14,8 @@ from prefix_sharing.backends.flash_atten_base import (
     FlashAttentionMixin,
     FlashBackendValidationError,
 )
+from prefix_sharing.backends.flash_atten_npu import NpuFlashAttentionBackend
+import prefix_sharing.backends.flash_atten_npu as flash_atten_npu
 from prefix_sharing.backends.flash_atten_npu import _build_per_sample_mask
 from prefix_sharing.backends.batch_layout import BshdBatchLayout, ThdBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
@@ -392,3 +394,46 @@ def test_npu_per_sample_mask_supports_square_dense_bsh_prefix_layout():
     assert mask[1, 0, 1].tolist() == [False, False, False, False, False]
     # Padded query rows remain masked and their outputs are ignored.
     assert mask[1, 0, 2:].all()
+
+
+def test_npu_bshd_attention_consumes_layout_kwarg_once(monkeypatch):
+    plan = _make_plan([5, 5], [0, 3])
+    layout = BshdBatchLayout.from_valid_token_mask(
+        torch.tensor(
+            [
+                [True, True, True, True, True],
+                [True, True, False, False, False],
+            ]
+        )
+    )
+    query = torch.randn(2, 5, 2, 4)
+    key_rows = [torch.randn(5, 2, 4), torch.randn(5, 2, 4)]
+    value_rows = [torch.randn(5, 2, 4), torch.randn(5, 2, 4)]
+    backend = NpuFlashAttentionBackend()
+    captured = {}
+
+    def fake_import():
+        return object()
+
+    def fake_attention_bshd(
+        self,
+        query_arg,
+        key_arg,
+        value_arg,
+        plan_arg,
+        layout_arg,
+        kernel_arg,
+        **kwargs,
+    ):
+        captured["layout"] = layout_arg
+        captured["kwargs"] = kwargs
+        return torch.zeros_like(query_arg)
+
+    monkeypatch.setattr(flash_atten_npu, "_import_npu_fusion_attention", fake_import)
+    monkeypatch.setattr(NpuFlashAttentionBackend, "_attention_bshd", fake_attention_bshd)
+
+    out = backend.attention(query, key_rows, value_rows, plan, batch_runtime_layout=layout)
+
+    assert out.shape == query.shape
+    assert captured["layout"] is layout
+    assert "batch_runtime_layout" not in captured["kwargs"]
