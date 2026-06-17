@@ -22,11 +22,8 @@ The JSON format expected:
 """
 
 import json
-import logging
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 
 def _load_json_to_dataproto(json_path: str):
@@ -90,7 +87,7 @@ def _load_json_to_dataproto(json_path: str):
         batch["sequences"] = torch.cat([batch["prompts"], batch["responses"]], dim=1)
 
     data = DataProto.from_dict(batch)
-    logger.warning(
+    print(
         f"[FixedRollout] Loaded {data.batch['input_ids'].shape[0]} samples from {json_path}"
     )
     return data
@@ -119,19 +116,19 @@ def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
     if remainder != 0:
         pad_size = num_workers - remainder
         fixed_data.padding(pad_size, "last")
-        logger.warning(
+        print(
             f"[FixedRollout] Padded from {n} to {n + pad_size} samples"
             f" (divisible by {num_workers})."
         )
 
     def _patched(batch, **kwargs):
-        logger.warning("[FixedRollout] Returning fixed rollout data, skipping generation.")
+        print("[FixedRollout] Returning fixed rollout data, skipping generation.")
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
     trainer.actor_rollout_wg.generate_sequences = _patched
-    logger.warning("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
+    print("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
 
     if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
         trainer.async_rollout_manager.generate_sequences = _patched
-        logger.warning("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
+        print("[FixedRollout] Patched async_rollout_manager.generate_sequences.")

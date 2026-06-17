@@ -12,12 +12,9 @@
 from __future__ import annotations
 
 import inspect
-import logging
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 
 def _target_name(target: Any) -> str:
@@ -103,14 +100,12 @@ class PatchHandle:
             return
         for record in reversed(self._records):
             setattr(record.target, record.attr_name, record.original)
-            logger.info(
-                "[PS] Restored %s.%s → %s",
-                _target_name(record.target),
-                record.attr_name,
-                getattr(record.original, "__qualname__", "original"),
+            print(
+                f"[PS] Restored {_target_name(record.target)}.{record.attr_name} → "
+                f"{getattr(record.original, '__qualname__', 'original')}"
             )
         self._active = False
-        logger.info("[PS] All %d patches reverted.", len(self._records))
+        print(f"[PS] All {len(self._records)} patches reverted.")
 
     def describe(self) -> str:
         """返回所有 patch 的人类可读清单，区分已应用和待挂起。"""
@@ -197,12 +192,10 @@ class LoggedPatchManager:
                 replacement=replacement,
             )
         )
-        logger.info(
-            "[PS] Patched %s.%s: %s → %s",
-            _target_name(target),
-            attr_name,
-            getattr(original, "__qualname__", "original"),
-            getattr(replacement, "__qualname__", "replacement"),
+        print(
+            f"[PS] Patched {_target_name(target)}.{attr_name}: "
+            f"{getattr(original, '__qualname__', 'original')} → "
+            f"{getattr(replacement, '__qualname__', 'replacement')}"
         )
 
     def handle(self) -> PatchHandle:

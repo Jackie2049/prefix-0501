@@ -6,9 +6,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
-from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_attention
+from prefix_sharing.integrations.megatron_runtime import prefix_attention
 from prefix_sharing.integrations.verl_mcore import (
-    build_prefix_sharing_micro_batch,
+    build_prefix_sharing_micro_batch_verl070,
     restore_reuser_prefix_columns_2d,
 )
 
@@ -43,7 +43,7 @@ def _install_megatron_parallel_state(
     monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
 
 
-def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_positions():
+def test_build_prefix_sharing_micro_batch_verl070_trims_reuser_mask_and_context_positions():
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
@@ -64,7 +64,7 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
         model_type="text_only_causal_lm",
     )
 
-    trimmed_micro_batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    trimmed_micro_batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     assert prefix_sharing_runtime_state is not None
     assert prefix_sharing_runtime_state.prefix_sharing_plan.has_sharing
@@ -114,7 +114,7 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
         ),
     ],
 )
-def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
+def test_build_prefix_sharing_micro_batch_verl070_builds_common_tp_padded_layouts(
     monkeypatch,
     tp_size,
     expected_padded_lengths,
@@ -144,7 +144,7 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     layout = prefix_sharing_runtime_state.packed_batch_layout
     assert layout.valid_lengths == [5, 2]
@@ -186,7 +186,7 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
         fused_single_qkv_rope=False,
         model_type="text_only_causal_lm",
     )
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     def gather_fn(provider_logits, reuse_label):
         return torch.gather(
@@ -231,7 +231,7 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
         (8, [8, 8], [0, 8, 16]),
     ],
 )
-def test_build_prefix_sharing_micro_batch_keeps_global_layout_with_sequence_parallel(
+def test_build_prefix_sharing_micro_batch_verl070_keeps_global_layout_with_sequence_parallel(
     monkeypatch,
     tp_size,
     expected_padded_lengths,
@@ -259,7 +259,7 @@ def test_build_prefix_sharing_micro_batch_keeps_global_layout_with_sequence_para
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     layout = prefix_sharing_runtime_state.packed_batch_layout
     assert layout.valid_lengths == [5, 2]
@@ -274,7 +274,7 @@ def test_build_prefix_sharing_micro_batch_keeps_global_layout_with_sequence_para
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
-def test_build_prefix_sharing_micro_batch_records_physical_pipeline_parallel_info(monkeypatch, pp_size):
+def test_build_prefix_sharing_micro_batch_verl070_records_physical_pipeline_parallel_info(monkeypatch, pp_size):
     pp_rank = pp_size - 1
     _install_megatron_parallel_state(monkeypatch, pp_size=pp_size, pp_rank=pp_rank)
     batch = {
@@ -298,7 +298,7 @@ def test_build_prefix_sharing_micro_batch_records_physical_pipeline_parallel_inf
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     parallel_info = prefix_sharing_runtime_state.parallel_info
     assert parallel_info.pp_size == pp_size
@@ -315,7 +315,7 @@ def test_build_prefix_sharing_micro_batch_records_physical_pipeline_parallel_inf
         (2, 4, [0, 6, 8]),
     ],
 )
-def test_build_prefix_sharing_micro_batch_combines_tp_padding_with_physical_pp(
+def test_build_prefix_sharing_micro_batch_verl070_combines_tp_padding_with_physical_pp(
     monkeypatch,
     tp_size,
     pp_size,
@@ -343,7 +343,7 @@ def test_build_prefix_sharing_micro_batch_combines_tp_padding_with_physical_pp(
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     assert prefix_sharing_runtime_state.parallel_info.tp_size == tp_size
     assert prefix_sharing_runtime_state.parallel_info.pp_size == pp_size
@@ -374,7 +374,7 @@ def test_attention_hook_rejects_sp_local_shard_token_length():
         fused_single_qkv_rope=False,
         model_type="text_only_causal_lm",
     )
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
     attention_module = SimpleNamespace(config=SimpleNamespace(sequence_parallel=True), layer_number=1)
     packed_seq_params = SimpleNamespace(qkv_format="thd")
     query = torch.randn(6, 1, 2)
@@ -383,7 +383,7 @@ def test_attention_hook_rejects_sp_local_shard_token_length():
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
         with pytest.raises(RuntimeError, match="SP-local shard"):
-            maybe_run_prefix_sharing_attention(
+            prefix_attention(
                 attention_module,
                 query,
                 key,
