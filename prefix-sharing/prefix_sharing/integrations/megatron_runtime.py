@@ -98,7 +98,7 @@ def prefix_attention(
         packed_batch_layout=packed_batch_layout,
         layer_id=layer_id,
         tp_rank=parallel_info.tp_rank,
-        stats=ctx.stats,
+        stats=prefix_sharing_context.stats,
     )
     print(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
@@ -121,11 +121,11 @@ def prefix_attention(
     # --- diag dump (ON attention) ---
     try:
         from prefix_sharing.tools.diagnostic_dump import dump_attn_on
-        dump_attn_on(output[0], packed_seq_params, ctx.prefix_sharing_plan,
+        dump_attn_on(output[0], packed_seq_params, prefix_sharing_context.prefix_sharing_plan,
                      attention_module.layer_number,
                      attention_module.config.num_layers)
     except Exception as e:
-        prefix_log.warning(f"last-attn dump (ON) failed: {e}")
+        print(f"last-attn dump (ON) failed: {e}")
     # ---
 
     return output
