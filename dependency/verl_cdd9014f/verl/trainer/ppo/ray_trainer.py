@@ -1316,6 +1316,14 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        # [prefix-sharing benchmark] inject fixed rollout when USE_FIXED_ROLLOUT is set,
+        # so PS-on / PS-off runs see identical input without editing trainer code.
+        try:
+            from prefix_sharing.tools.inject_fixed_rollout import maybe_patch_fixed_rollout
+            maybe_patch_fixed_rollout(self)
+        except Exception:
+            pass
+
         if self._dump_executor._shutdown:
             self._init_dump_executor()
 

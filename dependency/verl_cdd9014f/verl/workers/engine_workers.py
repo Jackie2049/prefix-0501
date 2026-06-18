@@ -273,6 +273,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None),
         ):
+            # [prefix-sharing benchmark] profiling, triggered by PROFILE_OUTPUT_DIR
+            import os as _os
+            _profile_dir = _os.environ.get("PROFILE_OUTPUT_DIR")
+            if _profile_dir:
+                from prefix_sharing.tools.training_monitor import MemoryMonitor as _MM, Stopwatch as _SW
+                _profile_sw = _SW()
+                _profile_mon = _MM(interval=0.05)
+                _profile_mon.start()
+                _profile_step = 0
+
             # update
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
@@ -298,7 +308,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
+                if _profile_dir:
+                    _profile_sw.set_step_context(_profile_step)
+                    _profile_sw.start("microbatch_fwd_bwd")
                 actor_output = self.train_batch(mini_batch_td)
+                if _profile_dir:
+                    _profile_sw.stop("microbatch_fwd_bwd")
+                    _profile_step += 1
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -318,6 +334,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
                 output = None
+
+            # [prefix-sharing benchmark] save profiling traces
+            if _profile_dir:
+                _profile_mon.stop()
+                _os.makedirs(_profile_dir, exist_ok=True)
+                _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                _profile_mon.save_to_csv(_os.path.join(_profile_dir, f"memory_trace_rank{_rank}.csv"))
+                _profile_sw.save_to_csv(_os.path.join(_profile_dir, f"timing_trace_rank{_rank}.csv"))
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)

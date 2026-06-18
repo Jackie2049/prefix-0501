@@ -8,7 +8,10 @@ from prefix_sharing.tools.training_monitor import (
     training_monitor_context,
 )
 
-from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
+from prefix_sharing.tools.inject_fixed_rollout import (
+    patch_fixed_rollout,
+    maybe_patch_fixed_rollout,
+)
 
 __all__ = [
     "MemoryMonitor",
@@ -19,4 +22,5 @@ __all__ = [
     "current_stopwatch",
     "training_monitor_context",
     "patch_fixed_rollout",
+    "maybe_patch_fixed_rollout",
 ]

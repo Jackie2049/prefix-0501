@@ -1,0 +1,1104 @@
+{
+  "config": {
+    "num_groups": 4,
+    "group_size": 8,
+    "num_steps": 3,
+    "base_prompt_len": 128,
+    "step_prompt_len": 48,
+    "step_response_len": 32,
+    "vocab_size": 32000,
+    "vocab_min": 5,
+    "pad_token_id": 0,
+    "seed": 42
+  },
+  "num_groups": 4,
+  "group_size": 8,
+  "num_steps": 3,
+  "total_samples": 96,
+  "groups": [
+    {
+      "group_id": 0,
+      "base_prompt_len": 128,
+      "group_shared_prefix_len": 128,
+      "chains": [
+        {
+          "traj_id": 0,
+          "samples": [
+            {
+              "sample_idx": 0,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 1,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 0,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 2,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 1,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 1,
+          "samples": [
+            {
+              "sample_idx": 3,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 4,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 3,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 5,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 4,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 2,
+          "samples": [
+            {
+              "sample_idx": 6,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 7,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 6,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 8,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 7,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 3,
+          "samples": [
+            {
+              "sample_idx": 9,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 10,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 9,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 11,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 10,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 4,
+          "samples": [
+            {
+              "sample_idx": 12,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 13,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 12,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 14,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 13,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 5,
+          "samples": [
+            {
+              "sample_idx": 15,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 16,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 15,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 17,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 16,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 6,
+          "samples": [
+            {
+              "sample_idx": 18,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 19,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 18,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 20,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 19,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 7,
+          "samples": [
+            {
+              "sample_idx": 21,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 22,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 21,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 23,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 22,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 1,
+      "base_prompt_len": 128,
+      "group_shared_prefix_len": 128,
+      "chains": [
+        {
+          "traj_id": 0,
+          "samples": [
+            {
+              "sample_idx": 24,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 25,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 24,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 26,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 25,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 1,
+          "samples": [
+            {
+              "sample_idx": 27,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 28,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 27,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 29,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 28,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 2,
+          "samples": [
+            {
+              "sample_idx": 30,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 31,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 30,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 32,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 31,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 3,
+          "samples": [
+            {
+              "sample_idx": 33,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 34,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 33,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 35,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 34,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 4,
+          "samples": [
+            {
+              "sample_idx": 36,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 37,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 36,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 38,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 37,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 5,
+          "samples": [
+            {
+              "sample_idx": 39,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 40,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 39,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 41,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 40,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 6,
+          "samples": [
+            {
+              "sample_idx": 42,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 43,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 42,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 44,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 43,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 7,
+          "samples": [
+            {
+              "sample_idx": 45,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 46,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 45,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 47,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 46,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 2,
+      "base_prompt_len": 128,
+      "group_shared_prefix_len": 128,
+      "chains": [
+        {
+          "traj_id": 0,
+          "samples": [
+            {
+              "sample_idx": 48,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 49,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 48,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 50,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 49,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 1,
+          "samples": [
+            {
+              "sample_idx": 51,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 52,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 51,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 53,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 52,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 2,
+          "samples": [
+            {
+              "sample_idx": 54,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 55,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 54,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 56,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 55,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 3,
+          "samples": [
+            {
+              "sample_idx": 57,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 58,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 57,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 59,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 58,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 4,
+          "samples": [
+            {
+              "sample_idx": 60,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 61,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 60,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 62,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 61,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 5,
+          "samples": [
+            {
+              "sample_idx": 63,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 64,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 63,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 65,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 64,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 6,
+          "samples": [
+            {
+              "sample_idx": 66,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 67,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 66,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 68,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 67,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 7,
+          "samples": [
+            {
+              "sample_idx": 69,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 70,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 69,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 71,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 70,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 3,
+      "base_prompt_len": 128,
+      "group_shared_prefix_len": 128,
+      "chains": [
+        {
+          "traj_id": 0,
+          "samples": [
+            {
+              "sample_idx": 72,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 73,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 72,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 74,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 73,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 1,
+          "samples": [
+            {
+              "sample_idx": 75,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 76,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 75,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 77,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 76,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 2,
+          "samples": [
+            {
+              "sample_idx": 78,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 79,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 78,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 80,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 79,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 3,
+          "samples": [
+            {
+              "sample_idx": 81,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 82,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 81,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 83,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 82,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 4,
+          "samples": [
+            {
+              "sample_idx": 84,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 85,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 84,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 86,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 85,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 5,
+          "samples": [
+            {
+              "sample_idx": 87,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 88,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 87,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 89,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 88,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 6,
+          "samples": [
+            {
+              "sample_idx": 90,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 91,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 90,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 92,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 91,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        },
+        {
+          "traj_id": 7,
+          "samples": [
+            {
+              "sample_idx": 93,
+              "step": 0,
+              "seq_len": 160,
+              "prompt_len": 128,
+              "response_len": 32,
+              "is_chain_provider": true
+            },
+            {
+              "sample_idx": 94,
+              "step": 1,
+              "seq_len": 240,
+              "prompt_len": 208,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 93,
+              "expected_shared_prefix_len": 160
+            },
+            {
+              "sample_idx": 95,
+              "step": 2,
+              "seq_len": 320,
+              "prompt_len": 288,
+              "response_len": 32,
+              "is_chain_provider": false,
+              "expected_reuse_sample_idx": 94,
+              "expected_shared_prefix_len": 240
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

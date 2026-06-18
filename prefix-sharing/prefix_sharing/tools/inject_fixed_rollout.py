@@ -132,3 +132,27 @@ def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
     if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
         trainer.async_rollout_manager.generate_sequences = _patched
         print("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
+
+
+def maybe_patch_fixed_rollout(trainer, num_workers: int = 8) -> bool:
+    """Auto-patch fixed rollout when ``USE_FIXED_ROLLOUT`` env var is set.
+
+    Reads the JSON path from the ``USE_FIXED_ROLLOUT`` environment variable.
+    If set, calls :func:`patch_fixed_rollout` on *trainer*; otherwise is a
+    no-op. Designed to be called once at the start of the trainer's
+    ``fit()`` so benchmark runners can inject data without editing trainer
+    code::
+
+        # at the top of RayMegatronTrainer.fit():
+        from prefix_sharing.tools.inject_fixed_rollout import maybe_patch_fixed_rollout
+        maybe_patch_fixed_rollout(self)
+
+    Returns True if patched, False otherwise.
+    """
+    import os
+
+    json_path = os.environ.get("USE_FIXED_ROLLOUT")
+    if not json_path:
+        return False
+    patch_fixed_rollout(trainer, json_path, num_workers=num_workers)
+    return True
