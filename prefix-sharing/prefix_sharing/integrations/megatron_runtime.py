@@ -43,8 +43,55 @@ def prefix_attention(
     if prefix_sharing_context.packed_batch_layout.packed_position_ids is None:
         raise RuntimeError("prefix sharing context is missing packed_position_ids")
 
-    # 确保 QKV 符合 THD packing格式
     packed_batch_layout = prefix_sharing_context.packed_batch_layout
+    parallel_info = prefix_sharing_context.parallel_info
+    layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
+    seq_parallel = getattr(getattr(attention_module, "config", None), "sequence_parallel", None)
+    context_parallel_algo = prefix_sharing_context.context_parallel_algo or getattr(
+        getattr(attention_module, "config", None),
+        "context_parallel_algo",
+        None,
+    )
+    cu_seqlens_q = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_q_padded", "cu_seqlens_q")
+    cu_seqlens_kv = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_kv_padded", "cu_seqlens_kv")
+    expected_cp_local_length = (
+        packed_batch_layout.total_padded_length // parallel_info.cp_size
+        if parallel_info.cp_size > 1 and packed_batch_layout.total_padded_length % parallel_info.cp_size == 0
+        else None
+    )
+    print(
+        f"[PS][attention-probe][global_rank={parallel_info.global_rank} "
+        f"tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
+        f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
+        f"context_parallel_algo={context_parallel_algo} "
+        f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} "
+        f"layer={layer_id} sequence_parallel={seq_parallel}] "
+        f"qkv_format={getattr(packed_seq_params, 'qkv_format', None)} "
+        f"query_token_length={query.shape[0]} key_token_length={key.shape[0]} "
+        f"value_token_length={value.shape[0]} "
+        f"total_padded_length={packed_batch_layout.total_padded_length} "
+        f"expected_cp_local_length={expected_cp_local_length} "
+        f"query_shape={tuple(query.shape)} key_shape={tuple(key.shape)} "
+        f"value_shape={tuple(value.shape)} "
+        f"valid_lengths={packed_batch_layout.valid_lengths} "
+        f"padded_lengths={packed_batch_layout.padded_lengths} "
+        f"layout_cu_seqlens={packed_batch_layout.cu_seqlens} "
+        f"packed_seq_params.cu_seqlens_q_padded={_tensor_to_log_list(cu_seqlens_q)} "
+        f"packed_seq_params.cu_seqlens_kv_padded={_tensor_to_log_list(cu_seqlens_kv)} "
+        f"packed_seq_params.max_seqlen_q={getattr(packed_seq_params, 'max_seqlen_q', None)} "
+        f"packed_seq_params.max_seqlen_kv={getattr(packed_seq_params, 'max_seqlen_kv', None)}"
+    )
+    if parallel_info.cp_size > 1:
+        raise RuntimeError(
+            "prefix sharing CP probe captured THD context-parallel runtime shapes. "
+            "Stop before KV injection/attention because CP-local layout support is not implemented yet. "
+            f"cp_rank={parallel_info.cp_rank}, cp_size={parallel_info.cp_size}, "
+            f"context_parallel_algo={context_parallel_algo}, query_length={query.shape[0]}, "
+            f"total_padded_length={packed_batch_layout.total_padded_length}, "
+            f"expected_cp_local_length={expected_cp_local_length}"
+        )
+
+    # 确保 QKV 符合 THD packing格式
     ensure_global_packed_token_lengths(
         {
             "query_length": query.shape[0],
@@ -59,8 +106,6 @@ def prefix_attention(
     #   mcore v0.16.1 的 RoPE 需要 cu_seqlens, mscale, cp_group 等入参
     #       returns cu_seqlens for verl 0.8.0 (mcore 0.16.1)
     #       returns None/defaults for verl 0.7.0 (mcore 0.12.1 ~ 0.15.x) 
-    cu_seqlens_q = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_q_padded", "cu_seqlens_q")
-    cu_seqlens_kv = _extract_cu_seqlens(packed_seq_params, "cu_seqlens_kv_padded", "cu_seqlens_kv")
     mscale = _get_yarn_mscale(attention_module)
     cp_group = _get_cp_group(attention_module)
     q_pos_emb, k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
@@ -78,13 +123,11 @@ def prefix_attention(
         cp_group=cp_group,
     )
 
-    parallel_info = prefix_sharing_context.parallel_info
-    layer_id = int(getattr(attention_module, "layer_number", 0) or 0)
     logger.warning("\n\n\ntry to build kv\n\n\n")
-    seq_parallel = getattr(getattr(attention_module, "config", None), "sequence_parallel", None)
     logger.warning(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
-        f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
+        f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
+        f"context_parallel_algo={context_parallel_algo} pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
         f"enter prefix-sharing path: query_token_length={query.shape[0]} "
         f"total_padded_length={packed_batch_layout.total_padded_length} query_shape={tuple(query.shape)}, "
         f"key_shape={tuple(key.shape)}, value_shape={tuple(value.shape)}, valid_lengths={packed_batch_layout.valid_lengths}, "
@@ -104,7 +147,8 @@ def prefix_attention(
     )
     logger.warning(
         f"[PS][attention][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/"
-        f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
+        f"tp_size={parallel_info.tp_size}(sequence_parallel={seq_parallel}) cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
+        f"context_parallel_algo={context_parallel_algo} pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} layer={layer_id}] "
         f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"
     )
 
@@ -240,6 +284,18 @@ def _extract_cu_seqlens(packed_seq_params: Any, primary_attr: str, fallback_attr
     if val is None:
         val = getattr(packed_seq_params, fallback_attr, None)
     return val
+
+
+def _tensor_to_log_list(value: Any) -> Any:
+    if value is None:
+        return None
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            return tolist()
+        except Exception:
+            return value
+    return value
 
 
 def _get_yarn_mscale(attention_module: Any) -> float:

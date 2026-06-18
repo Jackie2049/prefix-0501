@@ -19,6 +19,6 @@ def ensure_global_packed_token_lengths(
     rendered_lengths = ", ".join(f"{name}={length}" for name, length in lengths.items())
     raise RuntimeError(
         f"prefix sharing {context} currently requires inputs to use global packed "
-        "token coordinates; SP-local shard inputs are not supported. "
+        "token coordinates; SP-local shard or CP-local shard inputs are not supported. "
         f"{rendered_lengths}, total_padded_length={total_padded_length}"
     )

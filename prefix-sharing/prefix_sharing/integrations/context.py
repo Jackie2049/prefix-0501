@@ -33,6 +33,7 @@ class PrefixSharingRuntimeContext:
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
     store: PrefixAttentionStore
+    context_parallel_algo: str | None = None
     attention_backend: Any | None = None
     kept_position_ids: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
@@ -42,6 +43,7 @@ class PrefixSharingRuntimeContext:
         self.packed_batch_layout = runtime_state.packed_batch_layout
         self.parallel_info = runtime_state.parallel_info
         self.store = store
+        self.context_parallel_algo = getattr(runtime_state, "context_parallel_algo", None)
         self.attention_backend = runtime_state.attention_backend
         self.kept_position_ids = getattr(runtime_state, "kept_position_ids", None)
         self.prefix_last_restore_indices = _build_prefix_last_restore_indices(

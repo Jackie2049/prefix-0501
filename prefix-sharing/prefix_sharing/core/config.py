@@ -69,6 +69,7 @@ class PrefixSharingConfig:
     boundary_strategy: str = "prefix_last_restore"
 
     supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
+    supported_cp_algo: str = "kvallgather_cp_algo"  # CP probe path; other CP algos stay guarded.
     supported_rope_fusion: bool = False  # RoPE fusion kernel support (False = must disable)
     supported_fused_qkv_rope: bool = False  # Fused QKV+RoPE kernel support (False = must disable)
 
@@ -153,6 +154,11 @@ class PrefixSharingConfig:
             "context_parallel_size",
             self.supported_cp_size,
         )
+        context_parallel_algo = _read_config_value(
+            model_config,
+            "context_parallel_algo",
+            None,
+        )
         rope_fusion = _read_config_value(model_config, "apply_rope_fusion", False)
         fused_qkv_rope = _read_config_value(model_config, "fused_single_qkv_rope", False)
         model_type = _read_config_value(model_config, "model_type", "text_only_causal_lm")
@@ -175,11 +181,12 @@ class PrefixSharingConfig:
                 "当前仅支持物理 pipeline parallel，不支持 virtual pipeline parallel，"
                 "请关闭 virtual PP 或禁用 prefix sharing。"
             )
-        if cp_size != self.supported_cp_size:
+        if int(cp_size) > 1 and context_parallel_algo != self.supported_cp_algo:
             raise PrefixSharingConfigError(
-                f"[Config Error] context_parallel_size={cp_size} 不支持当前阶段。"
-                f"Phase 1 仅支持 context_parallel_size=1 (无上下文并行)，"
-                f"请修改配置将 CP 大小设为 1，或禁用 prefix sharing。"
+                f"[Config Error] context_parallel_size={cp_size}, "
+                f"context_parallel_algo={context_parallel_algo!r} 不支持当前 CP 探针阶段。"
+                f"当前仅允许 context_parallel_algo='{self.supported_cp_algo}' 用于采集 "
+                f"THD + CP 运行时形状日志；其他 CP 算法请先禁用 prefix sharing。"
             )
         if not self.supported_rope_fusion and rope_fusion:
             raise PrefixSharingConfigError(
@@ -203,6 +210,9 @@ class PrefixSharingConfig:
     def validate_for_engine(
         self,
         use_remove_padding: bool = True,
+        context_parallel_size: int = 1,
+        context_parallel_algo: str | None = None,
+        dynamic_context_parallel: bool = False,
         integrate_mode: str = "verl_megatron_actor",
     ) -> None:
         """Validate phase-1 constraints for verl engine 架构（verl 0.8.0+）。
@@ -231,6 +241,11 @@ class PrefixSharingConfig:
         if self.min_group_size < 2:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
 
+        if integrate_mode != "verl_megatron_actor":
+            raise PrefixSharingConfigError(
+                "phase 1 supports only integrate_mode='verl_megatron_actor'"
+            )
+
         # THD packed layout 需要 use_remove_padding
         if not use_remove_padding:
             raise PrefixSharingConfigError(
@@ -238,3 +253,16 @@ class PrefixSharingConfig:
                 "BSHD 路径 (use_remove_padding=False) 尚未在当前 patch 中支持，"
                 "请启用 use_remove_padding 或使用 BSHD 专用 patch set。"
             )
+        if dynamic_context_parallel:
+            raise PrefixSharingConfigError(
+                "[Config Error] dynamic_context_parallel=True 不支持当前 CP 探针阶段。"
+                "请关闭 dynamic CP，或禁用 prefix sharing。"
+            )
+        if int(context_parallel_size) > 1:
+            active_cp_algo = context_parallel_algo
+            if active_cp_algo != self.supported_cp_algo:
+                raise PrefixSharingConfigError(
+                    f"[Config Error] context_parallel_size={context_parallel_size}, "
+                    f"context_parallel_algo={active_cp_algo!r} 不支持当前 CP 探针阶段。"
+                    f"当前仅允许 context_parallel_algo='{self.supported_cp_algo}'。"
+                )

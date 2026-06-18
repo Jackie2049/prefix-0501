@@ -57,6 +57,7 @@ class PrefixSharingRuntimeState:
     attention_backend: Any
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
+    context_parallel_algo: str | None = None
     kept_position_ids: Any | None = None
 
 
@@ -363,37 +364,65 @@ def restore_suffix_first_log_probs_from_prefix(
         logger.warning(
             "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
             "skip prefix-last restore on non-last PP stage: restore_indices=%s "
-            "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
+            "logits_token_length=%s labels_token_length=%s log_probs_token_length=%s "
+            "total_padded_length=%s cp_rank=%s/cp_size=%s context_parallel_algo=%s",
             parallel_info.global_rank,
             parallel_info.pp_rank,
             parallel_info.pp_size,
             parallel_info.is_pipeline_last_stage,
             len(ctx.prefix_last_restore_indices),
             logits.shape[1],
+            labels.shape[1],
             log_probs.shape[1],
             ctx.packed_batch_layout.total_padded_length,
+            parallel_info.cp_rank,
+            parallel_info.cp_size,
+            ctx.context_parallel_algo,
         )
         return log_probs
+    print(
+        f"[PS][restore-probe][global_rank={parallel_info.global_rank} "
+        f"tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
+        f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
+        f"context_parallel_algo={ctx.context_parallel_algo} "
+        f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} "
+        f"is_pp_last={parallel_info.is_pipeline_last_stage}] "
+        f"restore_indices={len(ctx.prefix_last_restore_indices)} "
+        f"logits_token_length={logits.shape[1]} labels_token_length={labels.shape[1]} "
+        f"log_probs_token_length={log_probs.shape[1]} "
+        f"total_padded_length={ctx.packed_batch_layout.total_padded_length} "
+        f"valid_lengths={ctx.packed_batch_layout.valid_lengths} "
+        f"padded_lengths={ctx.packed_batch_layout.padded_lengths} "
+        f"cu_seqlens={ctx.packed_batch_layout.cu_seqlens}"
+    )
+    if parallel_info.cp_size > 1:
+        raise RuntimeError(
+            "prefix sharing CP probe captured prefix-last restore runtime shapes. "
+            "Stop before restore because CP-local restore ownership is not implemented yet. "
+            f"cp_rank={parallel_info.cp_rank}, cp_size={parallel_info.cp_size}, "
+            f"context_parallel_algo={ctx.context_parallel_algo}, logits_length={logits.shape[1]}, "
+            f"labels_length={labels.shape[1]}, log_probs_length={log_probs.shape[1]}, "
+            f"total_padded_length={ctx.packed_batch_layout.total_padded_length}"
+        )
     ensure_global_packed_token_lengths(
         {
             "logits_token_length": logits.shape[1],
+            "labels_token_length": labels.shape[1],
             "log_probs_token_length": log_probs.shape[1],
         },
         total_padded_length=ctx.packed_batch_layout.total_padded_length,
         context="prefix-last restore",
     )
-    logger.warning(
-        "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-        "running prefix-last restore: restore_indices=%s "
-        "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
-        parallel_info.global_rank,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        parallel_info.is_pipeline_last_stage,
-        len(ctx.prefix_last_restore_indices),
-        logits.shape[1],
-        log_probs.shape[1],
-        ctx.packed_batch_layout.total_padded_length,
+    print(
+        f"[PS][restore][global_rank={parallel_info.global_rank} "
+        f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} "
+        f"is_pp_last={parallel_info.is_pipeline_last_stage}] "
+        f"running prefix-last restore: restore_indices={len(ctx.prefix_last_restore_indices)} "
+        f"logits_token_length={logits.shape[1]} labels_token_length={labels.shape[1]} "
+        f"log_probs_token_length={log_probs.shape[1]} "
+        f"total_padded_length={ctx.packed_batch_layout.total_padded_length} "
+        f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
+        f"context_parallel_algo={ctx.context_parallel_algo}"
     )
     restored = log_probs.clone()
     for index in ctx.prefix_last_restore_indices:
@@ -438,6 +467,10 @@ def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
             else:
                 current = getattr(current, part, default)
     return current
+
+
+def _read_engine_value(config: Any, dotted_name: str, default: Any) -> Any:
+    return _read_actor_value(config, dotted_name, default)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -485,7 +518,25 @@ def build_prefix_sharing_micro_batch_verl080(
 
     # ── 阶段 1: 配置校验 ──
     use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
-    ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
+    context_parallel_size = _read_engine_value(
+        engine_self.engine_config,
+        "context_parallel_size",
+        1,
+    )
+    context_parallel_algo = _read_engine_value(
+        engine_self.engine_config,
+        "override_transformer_config.context_parallel_algo",
+        _read_engine_value(engine_self.engine_config, "context_parallel_algo", None),
+    )
+    dynamic_context_parallel = bool(
+        getattr(engine_self.engine_config, "dynamic_context_parallel", False)
+    )
+    ps_config.validate_for_engine(
+        use_remove_padding=use_remove_padding,
+        context_parallel_size=int(context_parallel_size),
+        context_parallel_algo=context_parallel_algo,
+        dynamic_context_parallel=dynamic_context_parallel,
+    )
 
     # ── 阶段 2: 拒绝不支持的特性 ──
     try:
@@ -495,8 +546,6 @@ def build_prefix_sharing_micro_batch_verl080(
         use_fused = False
     if use_fused:
         raise RuntimeError("prefix sharing phase 1 requires fused kernels disabled")
-    if getattr(engine_self.engine_config, "dynamic_context_parallel", False):
-        raise RuntimeError("prefix sharing phase 1 does not support dynamic context parallel")
 
     # ── 阶段 3: 从 batch 提取序列 ──
     # NestedTensor → 从 offsets/values 提取
@@ -564,10 +613,20 @@ def build_prefix_sharing_micro_batch_verl080(
         attention_backend=get_backend_instance(ps_config),
         packed_batch_layout=packed_layout,
         parallel_info=parallel_info,
+        context_parallel_algo=context_parallel_algo,
     )
 
-    logger.info(
-        f"[PS][prepare] PATH 6: sharing detected, plan={plan}, layout={packed_layout}"
+    print(
+        f"[PS][prepare][global_rank={parallel_info.global_rank} "
+        f"tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
+        f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
+        f"context_parallel_algo={context_parallel_algo} "
+        f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size}] "
+        f"PATH 6: sharing detected, "
+        f"valid_lengths={packed_layout.valid_lengths} "
+        f"padded_lengths={packed_layout.padded_lengths} "
+        f"cu_seqlens={packed_layout.cu_seqlens} "
+        f"total_padded={packed_layout.total_padded_length} plan={plan}"
     )
 
     return trimmed_batch, state

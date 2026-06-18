@@ -400,6 +400,66 @@ def test_attention_hook_rejects_sp_local_shard_token_length():
             )
 
 
+def test_attention_hook_stops_at_context_parallel_probe_before_kv_injection(monkeypatch):
+    _install_megatron_parallel_state(monkeypatch, cp_size=2, cp_rank=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": True},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=True,
+        context_parallel_size=2,
+        context_parallel_algo="kvallgather_cp_algo",
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
+    prefix_sharing_runtime_state = SimpleNamespace(
+        prefix_sharing_plan=prefix_sharing_runtime_state.prefix_sharing_plan,
+        attention_backend=prefix_sharing_runtime_state.attention_backend,
+        packed_batch_layout=prefix_sharing_runtime_state.packed_batch_layout,
+        parallel_info=prefix_sharing_runtime_state.parallel_info,
+        context_parallel_algo="kvallgather_cp_algo",
+    )
+    assert prefix_sharing_runtime_state.packed_batch_layout.total_padded_length == 12
+
+    attention_module = SimpleNamespace(
+        config=SimpleNamespace(sequence_parallel=True, context_parallel_algo="kvallgather_cp_algo"),
+        layer_number=1,
+    )
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q_padded=torch.tensor([0, 8, 12], dtype=torch.int32),
+        cu_seqlens_kv_padded=torch.tensor([0, 8, 12], dtype=torch.int32),
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+    )
+    query = torch.randn(6, 1, 2)
+    key = torch.randn(6, 1, 2)
+    value = torch.randn(6, 1, 2)
+
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
+        with pytest.raises(RuntimeError, match="CP probe captured"):
+            prefix_attention(
+                attention_module,
+                query,
+                key,
+                value,
+                attention_mask=None,
+                rotary_pos_emb=(object(), object()),
+                packed_seq_params=packed_seq_params,
+            )
+
+
 def test_restore_suffix_first_log_probs_rejects_sp_local_shard_token_length():
     logits = torch.randn(1, 6, 8, requires_grad=True)
     labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
