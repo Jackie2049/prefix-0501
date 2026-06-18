@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
-import logging
 import sys
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,9 +25,8 @@ def detect_versions() -> DetectedVersions:
     mcore_ver = _detect("megatron.core", "__version__")
     ms_ver = _detect_mindspeed()
 
-    logger.info(
-        "[PS] Detected: verl=%s, megatron_core=%s, mindspeed=%s",
-        verl_ver, mcore_ver, ms_ver,
+    print(
+        f"[PS] Detected: verl={verl_ver}, megatron_core={mcore_ver}, mindspeed={ms_ver}"
     )
     return DetectedVersions(
         verl=verl_ver,

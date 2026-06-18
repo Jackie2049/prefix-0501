@@ -129,12 +129,16 @@ PYTHONPATH=prefix-sharing pytest -q \
 
 ## 7. Git 提交规范
 
-- 修改完成后，默认等待用户明确要求提交；用户要求“提交”时再执行 commit。
-- 用户要求提交时，必须先运行与改动范围匹配的必要测试并确认通过；仅知识整理类文档修改可例外，但必须在回复中明确说明未运行测试的原因。
+- **修改完成后，必须等待用户审核并明确同意，才能执行 `git commit`。** 要先展示改动内容、确保测试通过，并请求用户审核确认后再 commit，不得未经审核直接 commit + push。
 - commit 完成后按用户要求或仓库协作约定尝试 push；若网络或权限策略阻止 push，需报告本地分支 ahead 状态。
 - 如果修改未完成或只做了一半，**不要 commit**
-- commit message 格式：`[type] <中文简要说明>`
-- type 取值：
+
+### commit message 格式（强制）
+
+**所有 commit message 必须遵循 `[type] <中文简要说明>` 格式。**
+
+- **必须有中文简要说明**：用中文简要描述本次 commit 或 PR 的主题和意图，不允许只写英文或只写 type
+- **type 必须是以下之一**：
   - `feat`：新特性或能力
   - `fix`：修复 bug 或错误行为
   - `refactor`：不改变外部行为的代码整理；包括重命名、结构调整，以及在源码中补充/改写**语义说明性注释**（帮助理解实现约束与不变量，但不改运行逻辑）
@@ -142,6 +146,20 @@ PYTHONPATH=prefix-sharing pytest -q \
   - `doc`：仅 `docs/` 等文档内容改动
   - `chore`：与业务代码语义无关的仓库维护；如依赖快照、CI、脚本、配置、ignore 规则等
 - 选型提示：改源码注释以澄清实现语义时用 `refactor`，不要误标为 `chore`；改 `docs/` 下文档时用 `doc`
+
+**示例**：
+```
+[refactor] 将runtime_adapters业务逻辑迁移到integrations层
+[feat] 新增verl080 engine架构的prefix-sharing micro-batch构建
+[fix] 修复NestedTensor检测在NPU上的兼容性问题
+```
+
+**错误示例**（不允许）：
+```
+refactor: move runtime_adapters to integrations    ← 缺少中文说明
+[refactor]                                           ← 缺少中文说明
+move code                                            ← 缺少type和中文说明
+```
 
 ### Cursor Agent 特殊规则
 
@@ -164,7 +182,7 @@ PYTHONPATH=prefix-sharing pytest -q \
   - 如果有 skip，需简要说明 skip 原因（如缺少 GPU、verl、torch_npu 等本地不可用的 optional 依赖）
   - 如果未跑测试（仅文档/依赖快照等改动），必须在测试结果小节中**明确说明未跑测试的原因**
 - PR 提交前，开发者必须确认本地测试已通过；测试结果小节中的数据应与本地实际结果一致
-- PR title 格式参照 commit message 格式：`[type] 中文简要说明`
+- PR title 格式与 commit message 一致：`[type] 中文简要说明`（必须有中文简要说明，不允许纯英文或只有 type）
 
 ---
 
@@ -173,7 +191,7 @@ PYTHONPATH=prefix-sharing pytest -q \
 - 在 `dependency/` 中做超出必要的 verl / Megatron 改动，或把 core 算法散落到 dependency 中
 - prefix KV 缓存使用 `detach()` 或切断 autograd 图
 - 未经要求修改 `survey/` 源码
-- 未经同意自动 commit / push
+- 未经同意自动 commit / push（必须等用户审核确认后再 commit）
 - 做与任务无关的大范围重构
 - 把 PrefixTrain_dev 的 Megatron 魔改方式直接当作最终集成方案
 

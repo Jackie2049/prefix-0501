@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+import torch
+
 
 @dataclass(frozen=True)
 class PackedBatchLayout:
@@ -63,7 +65,6 @@ class PackedBatchLayout:
             return cls.from_valid_lengths([])
 
         first = kept_position_rows[0]
-        torch = _torch()
         valid_lengths = [int(row.shape[0]) for row in kept_position_rows]
         padded_lengths = [_pad_to_multiple(length, align_size) for length in valid_lengths]
         packed_position_rows = []
@@ -133,7 +134,6 @@ class PackedBatchLayout:
         """
         if not self.has_padding:
             return tensor
-        torch = _torch()
         rows = list(torch.split(tensor, self.padded_lengths, dim=0))
         return torch.cat(
             [row[:vl] for row, vl in zip(rows, self.valid_lengths)], dim=0,
@@ -148,7 +148,6 @@ class PackedBatchLayout:
         """
         if not self.has_padding:
             return tensor
-        torch = _torch()
         rows = list(torch.split(tensor, self.valid_lengths, dim=0))
         repadded: list[Any] = []
         for row, padded_len, valid_len in zip(rows, self.padded_lengths, self.valid_lengths):
@@ -174,11 +173,3 @@ def _cumsum(lengths: Sequence[int]) -> list[int]:
         running += int(length)
         values.append(running)
     return values
-
-
-def _torch() -> Any:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("PackedBatchLayout tensor construction requires PyTorch") from exc
-    return torch

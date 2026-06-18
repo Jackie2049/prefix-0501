@@ -15,7 +15,7 @@ def _prefix_sharing_runtime_state():
     )
     return PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        backend=None,
+        attention_backend=None,
         packed_batch_layout=PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(pp_rank=1, pp_size=2, is_pipeline_first_stage=False),
     )
@@ -53,7 +53,7 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
     )
     runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        backend=None,
+        attention_backend=None,
         packed_batch_layout=PackedBatchLayout(
             valid_lengths=[5, 2],
             padded_lengths=[6, 2],

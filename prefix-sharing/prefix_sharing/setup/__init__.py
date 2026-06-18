@@ -10,36 +10,10 @@
 from __future__ import annotations
 
 import importlib
-import logging
-import sys
-
 from prefix_sharing.setup.version_guard import detect_versions, DetectedVersions
 from prefix_sharing.setup.compat_matrix import COMPAT_MATRIX, CompatEntry
 from prefix_sharing.setup.registry import PatchSpec, PatchRegistry
 from prefix_sharing.setup.logged_patch import PatchHandle
-
-logger = logging.getLogger(__name__)
-
-
-def _ensure_logging_visible() -> None:
-    """确保 prefix_sharing.setup 的 INFO 日志对用户可见。
-
-    Python logging 默认只输出 WARNING 及以上级别，
-    但 patch 安装信息（INFO 级别）对使用者至关重要。
-    此函数为 prefix_sharing.setup 日志命名空间配置
-    专用的 StreamHandler(stderr) + INFO 级别 + propagate=False，
-    确保 [PS] 消息始终可见，不受 root logger 配置影响。
-    用户已自行配置 handler 时，不干预。
-    """
-    ns_logger = logging.getLogger("prefix_sharing.setup")
-    if ns_logger.handlers:
-        return  # 用户已自行配置，不干预
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    ns_logger.addHandler(handler)
-    ns_logger.setLevel(logging.INFO)
-    ns_logger.propagate = False
 
 
 class IncompatibleEnvironment(RuntimeError):
@@ -52,7 +26,6 @@ def check() -> DetectedVersions:
     Returns: 探测到的版本信息
     Raises: IncompatibleEnvironment — 版本组合不兼容
     """
-    _ensure_logging_visible()
     versions = detect_versions()
     entry = _find_compat_entry(versions)
     if entry is None:
@@ -62,12 +35,9 @@ def check() -> DetectedVersions:
             f"mindspeed={versions.mindspeed}。\n"
             + _format_compat_matrix()
         )
-    logger.info(
-        "[PS] Version check: verl=%s, megatron_core=%s, "
-        "mindspeed=%s → compatible (patch_set=%s)",
-        versions.verl, versions.megatron_core,
-        versions.mindspeed,
-        entry.patch_set_id,
+    print(
+        f"[PS] Version check: verl={versions.verl}, megatron_core={versions.megatron_core}, "
+        f"mindspeed={versions.mindspeed} → compatible (patch_set={entry.patch_set_id})"
     )
     return versions
 
@@ -87,9 +57,8 @@ def install() -> PatchHandle:
 
     handle = PatchRegistry.install_all()
 
-    logger.info(
-        "[PS] install() complete. %d patches active. patch_set=%s",
-        len(patch_set), entry.patch_set_id,
+    print(
+        f"[PS] install() complete. {len(patch_set)} patches active. patch_set={entry.patch_set_id}"
     )
     return handle
 

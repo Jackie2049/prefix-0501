@@ -1029,3 +1029,13 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
 
     def prepare_model_outputs(self, output: dict | torch.Tensor, data: TensorDict):
         return {"values": output}
+
+
+# prefix-sharing: 特性使能入口（放在文件末尾，确保 MegatronEngineWithLMHead 已完成定义）
+# ENABLE_PREFIX_SHARING 环境变量触发 monkey patch 注入，
+# 不安装 prefix_sharing 时此 import 被跳过，不影响正常训练。
+# 放在末尾使 PatchRegistry 走"模块已加载 + 目标存在 → 立即 patch"分支，避免 import hook 分支的时序问题。
+try:
+    import prefix_sharing
+except ModuleNotFoundError:
+    pass
