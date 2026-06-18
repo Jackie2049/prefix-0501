@@ -86,7 +86,7 @@ def model_forward_gen(vision_model: bool = False):
                 input_args["attention_mask"] = attention_mask
 
             output_orig = model(**input_args)
-            # --- diag dump (logits) ---
+            ######### prefix-sharing diag: logits #########
             try:
                 from prefix_sharing.tools.diagnostic_dump import dump_logits, _get_dump_dir
                 if _get_dump_dir() is not None:
@@ -99,7 +99,7 @@ def model_forward_gen(vision_model: bool = False):
                     dump_logits(output_orig, packed_seq_params, prefix_lens)
             except Exception:
                 pass
-            # ---
+            ######### prefix-sharing diag: logits #########
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(v, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding)[0]

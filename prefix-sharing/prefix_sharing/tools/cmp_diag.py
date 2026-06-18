@@ -1,288 +1,120 @@
-"""Unified precision comparison — ON vs OFF diagnostic dumps.
+"""Precision comparison — ON vs OFF (and OFF vs OFF) diagnostic dumps.
 
-Auto-detects available dump files and selects the right comparison strategy:
+Covers the precision verification spec (see plan.md):
 
-- Packed (attn_output.pt / logits.pt): cu_seqlens + prefix_lens row mapping,
-  cosine similarity, dim buckets, verdict.
+  1. position_ids      — absolute equality (STOP if fail)
+  2. RoPE encoding     — absolute equality (STOP if fail)
+  3. attn_output per-layer cos  — avg / min per layer
+  4. First-token suite — attn[0] + logits[0] (mean_abs/max_abs/rel/cos/pearson)
+  4b.Logits packed align — full packed logits via attention_mask + dual pointer
+  5. entropy / logp    — error_abs(max,mean) / error_rel(max,mean) / pearson
+  6. OFF vs OFF baseline — noise floor for all metrics
 
-- 2D (logprobs_{tag}.pt / entropy_{tag}.pt): label_mask → Pearson r, top-N.
-
-- 3D (logits_{tag}.pt): element-wise + per-position max-over-vocab diff.
-
-Mask modes (--mask):
-  off    (default) compare only response tokens, using OFF label_mask
-  on              use ON (prefix-sharing side) label_mask
-  all             compare ALL [B,L] positions — prompt + suffix; use
-                  for same-dir pre-vs-post restore checks
-  prefix          isolate prefix region: OFF_response_mask & ~ON_suffix_mask;
-                  compares only the shared prefix positions (ON treats these
-                  differently from OFF) — use to verify interior restore
+  Top-K 可选: --topk N --sort-err abs|rel 控制 2D 标量排序
+               first_token 固定按 val (max magnitude) 排，不受 --sort-err 影响
 
 Usage:
-    # ON vs OFF (response only — standard check)
+    # 最小对比 (attention_output + logits + logprobs + entropy)
     python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old
 
-    # ON-pre vs OFF (response only)
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
-        --tag-on before_restore --tag-off old
+    # 只看某一层 attention_output
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off --tag old --layer 12
 
-    # ON-pre vs ON-post (ALL positions — check restore actually writes)
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_on \\
-        --tag-on before_restore --tag-off old --mask all
+    # OFF vs OFF baseline (测自然噪声底)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
+        --dir-off2 ./dump_off2 --tag old
 
-    # JSON output
-    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\
+    # 导出 JSON 报告
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
         --tag old -o report.json
+
+    # 打印每种比较最差的 10 个元素 (按绝对误差排)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
+        --tag old --topk 10
+
+    # 打印每种比较最差的 20 个元素 (按相对误差排)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
+        --tag old --topk 20 --sort-err rel
+
+    # 打印 first_token/logp/entropy 值最大的 10 个维度 (不受 0 附近噪声干扰)
+    python cmp_diag.py --dir-on ./dump_on --dir-off ./dump_off \\\\
+        --tag old --topk 10 --sort-err val
+
+Parameters:
+    --dir-on      (必需) ON模式 dump 目录，含 attn_outputs.pt / logits.pt /
+                          logprobs_{tag}.pt / entropy_{tag}.pt / attention_mask.pt
+    --dir-off     (必需) OFF模式 dump 目录，文件同 --dir-on
+    --dir-off2    (可选) 第二个 OFF 目录，用于 OFF-vs-OFF baseline
+                          两个独立 OFF run 之间的自然误差可作噪声参考基准
+    --tag         (可选) 2D文件标签，如 old / train / before_restore
+                          对应文件: logprobs_{tag}.pt / entropy_{tag}.pt
+    --tag-on      (可选) 覆盖 ON 侧的 tag (不传则用 --tag)
+    --tag-off     (可选) 覆盖 OFF 侧的 tag (不传则用 --tag)
+    --layer       (可选) 只对比指定层的 attention output (1-indexed)
+                          不传则所有层遍历对比
+    --atol        (可选) 2D 对比绝对容差，默认 1e-5
+    --mask-file   (可选) 外部 label_mask.pt，会裁剪每行最后一个 True
+    --no-trim     (flag)  不裁剪 label_mask 的最后一个 True
+    -o, --output  (可选) 将对比报告保存为 JSON 文件
+    --topk        (可选) 打印前 N 个误差最大的元素 (0=关闭, 默认 0)
+                          对 first_token_attn/logits 按维度排名
+                          对 logp/entropy 按 (batch, pos) 位置排名
+    --sort-err    (可选) 2D 标量 top-K 排序依据: abs=绝对误差, rel=相对误差 (默认 abs)
+                          first_token 固定按 val (max magnitude) 排，不受此参数影响
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
-import pathlib
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
-# ── Constants ──────────────────────────────────────────────────
+_log = logging.getLogger(__name__)
+
+# ── Constants ──
 _SEP_DOUBLE = "=" * 70
 _SEP_SINGLE = "-" * 70
-_SEP_THIN = "─" * 70
-CHECK = "\u2713"
-CROSS = "\u2717"
-TOP_N = 20
+_SEP_THIN   = "─" * 70
+_CHECK      = "\u2713"
+_CROSS      = "\u2717"
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 def _fmt_shape(s: tuple[int, ...]) -> str:
     return "(" + ", ".join(str(x) for x in s) + ")"
 
 
-# ── Packed: load & compare ─────────────────────────────────────
-
-def _load_packed(dir_path: str, output_file: str,
-                 cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
-    """Load a packed-format dump. Returns None if file missing.
-
-    cu_fname: metadata filename (e.g. "cu_seqlens_q.pt" for attn,
-    "cu_seqlens_q_logits.pt" for logits). Falls back to "cu_seqlens_q.pt"
-    if the specific file is not found.
-    """
-    fp = os.path.join(dir_path, output_file)
-    if not os.path.exists(fp):
-        return None
-    # Try specific cu_seqlens file, fallback to default
-    cu_fp = os.path.join(dir_path, cu_fname)
-    if not os.path.exists(cu_fp):
-        cu_fp = os.path.join(dir_path, "cu_seqlens_q.pt")
-        if not os.path.exists(cu_fp):
-            return None
-    pl_fp = os.path.join(dir_path, "prefix_lens.pt")
-    if not os.path.exists(pl_fp):
-        return None
-    return {
-        "output": torch.load(fp, weights_only=True).float(),
-        "cu_seqlens": torch.load(cu_fp, weights_only=True),
-        "prefix_lens": torch.load(pl_fp, weights_only=True),
-    }
-
-
-def _diagnose_packed(a: torch.Tensor, b: torch.Tensor, prefix_len: int,
-                     max_tokens: int = 3) -> bool:
-    """Print per-token diagnostics for packed tensors. Returns True if clean."""
-    n_tokens, d = a.shape
-    n_show = min(n_tokens, max_tokens)
-
-    diff_abs = (a - b).abs()                                     # [N, D]
-    token_max_diff, _ = diff_abs.max(dim=-1)                     # [N]
-    worst_indices = token_max_diff.topk(min(n_show, n_tokens)).indices
-
-    eps = 1e-8
-    a_norm = a.norm(dim=-1) + eps
-    b_norm = b.norm(dim=-1) + eps
-    dot = (a * b).sum(dim=-1)
-    cos_sim = dot / (a_norm * b_norm)
-
-    rel_err = diff_abs / (b.abs() + eps)
-
-    thresholds = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
-    dim_buckets = {t: (diff_abs > t).sum(dim=-1).float() for t in thresholds}
-
-    all_cos = cos_sim.tolist()
-    avg_cos = sum(all_cos) / len(all_cos)
-    min_cos = min(all_cos)
-    avg_max = sum(token_max_diff.tolist()) / len(token_max_diff.tolist())
-    avg_mean_rel = sum(rel_err.mean(dim=-1).tolist()) / len(all_cos)
-    total_dims = n_tokens * d
-
-    print(f"  n_tokens={n_tokens} dim={d}")
-    print(f"  cosine_sim:    avg={avg_cos:.6f}  min={min_cos:.6f}")
-    print(f"  max_abs_diff:   avg={avg_max:.6e}  max={max(token_max_diff.tolist()):.6e}")
-    print(f"  mean_rel_err:   avg={avg_mean_rel:.6e}")
-    print(f"  dim_frac >1e-5: {(dim_buckets[1e-5].sum().item())/total_dims:.4f}",
-          f">1e-4: {(dim_buckets[1e-4].sum().item())/total_dims:.4f}",
-          f">1e-3: {(dim_buckets[1e-3].sum().item())/total_dims:.4f}",
-          f">1e-2: {(dim_buckets[1e-2].sum().item())/total_dims:.4f}",
-          f">1e-1: {(dim_buckets[1e-1].sum().item())/total_dims:.4f}")
-
-    for rank, idx in enumerate(worst_indices.tolist()):
-        abs_pos = prefix_len + idx
-        cos = cos_sim[idx].item()
-        max_d = token_max_diff[idx].item()
-        mean_rel = rel_err[idx].mean().item()
-        bucket_str = " ".join(
-            f">{t}={dim_buckets[t][idx].item():.0f}/{d}"
-            for t in thresholds[:4]
-        )
-        print(f"  worst#{rank+1} abs_pos={abs_pos} cos={cos:.6f} "
-              f"max_diff={max_d:.4e} mean_rel={mean_rel:.4e}  [{bucket_str}]")
-
-    # Verdict
-    is_clean = avg_cos > 0.9999 and min_cos > 0.999
-    if is_clean:
-        print(f"  VERDICT: PRECISION NOISE (cosine ~1, likely bf16/fp32 rounding)")
-    elif avg_cos > 0.99:
-        print(f"  VERDICT: SUSPICIOUS (small systematic deviation)")
-    else:
-        print(f"  VERDICT: COMPUTATION ERROR (fundamentally wrong output)")
-    return is_clean
-
-
-def compare_packed(
-    dir_on: str, dir_off: str, output_file: str, name: str,
-    atol: float, rtol: float = 1e-5,
-) -> dict | None:
-    """Compare a packed-format dump (attn_output.pt or logits.pt)."""
-    # Use dump-type-specific cu_seqlens filename (with fallback)
-    cu_fname = "cu_seqlens_q_logits.pt" if name == "logits" else "cu_seqlens_q.pt"
-    on = _load_packed(dir_on, output_file, cu_fname)
-    off = _load_packed(dir_off, output_file, cu_fname)
-    if on is None or off is None:
-        return None
-
-    # Section header
-    print(_SEP_SINGLE)
-    print(f"  [Packed]  {name}  —  ON vs OFF")
-    print(_SEP_SINGLE)
-    print()
-
-    on_out = on["output"]
-    off_out = off["output"]
-    cu_on = on["cu_seqlens"]
-    cu_off = off["cu_seqlens"]
-    pl = on["prefix_lens"]
-
-    batch = min(cu_on.shape[0], cu_off.shape[0]) - 1
-    is_attn = on_out.dim() == 3  # [N, 1, hidden]
-
-    total_tokens = 0
-    global_max_diff = 0.0
-    ok_rows = 0
-    fail_rows = 0
-
-    for i in range(batch):
-        pf = int(pl[i])
-        if pf <= 0:
-            continue
-
-        # Compute suffix lengths independently from each side's cu_seqlens.
-        # ON cu_seqlens may be either suffix-only (prefix sharing) or
-        # full-sequence; auto-detect by checking bounds.
-        on_full_len = int(cu_on[i + 1] - cu_on[i])
-        on_start_raw = int(cu_on[i])
-        # First try suffix-only interpretation
-        on_suffix_len = on_full_len
-        on_start = on_start_raw
-        if on_start + on_suffix_len > on_out.shape[0]:
-            # Fallback: cu_seqlens is full-sequence, skip prefix portion
-            on_suffix_len = max(0, on_full_len - pf)
-            on_start = on_start_raw + pf
-            if on_suffix_len < 0 or on_start + on_suffix_len > on_out.shape[0]:
-                print(f"[WARN] {name} row[{i}] prefix_len={pf}: "
-                      f"ON out of bounds (raw_len={on_full_len}, "
-                      f"adj_len={on_suffix_len}, tensor_len={on_out.shape[0]}), skip")
-                continue
-
-        # OFF: always full-sequence layout
-        off_full_len = int(cu_off[i + 1] - cu_off[i])
-        off_suffix_len = max(0, off_full_len - pf)
-        off_start = int(cu_off[i]) + pf
-
-        # Validate OFF bounds
-        if off_start < 0 or off_start + off_suffix_len > off_out.shape[0]:
-            print(f"[WARN] {name} row[{i}] prefix_len={pf}: OFF out of bounds, skip")
-            continue
-        # Validate suffix lengths match
-        if on_suffix_len != off_suffix_len:
-            print(f"[WARN] {name} row[{i}] prefix_len={pf}: "
-                  f"suffix len mismatch (ON={on_suffix_len}, OFF={off_suffix_len}), skip")
-            continue
-        suffix_len = on_suffix_len
-
-        if suffix_len == 0:
-            print(f"row[{i}] prefix_len={pf} (pure-reuser): suffix_len=0, skip")
-            continue
-
-        if is_attn:
-            a = on_out[on_start:on_start + suffix_len, 0, :]
-            b = off_out[off_start:off_start + suffix_len, 0, :]
-        else:
-            a = on_out[on_start:on_start + suffix_len, :]
-            b = off_out[off_start:off_start + suffix_len, :]
-
-        diff_abs = (a - b).abs()
-        row_max = diff_abs.max().item()
-        row_mismatch = (~torch.isclose(a, b, rtol=rtol, atol=atol)).any(dim=-1)
-        n_mismatch = row_mismatch.sum().item()
-
-        if n_mismatch > 0:
-            fail_rows += 1
-            global_max_diff = max(global_max_diff, row_max)
-            print(f"row[{i}] prefix_len={pf}: "
-                  f"{n_mismatch}/{suffix_len} tokens exceed atol={atol}"
-                  f" (max_abs_diff={row_max:.6e})")
-            _diagnose_packed(a, b, pf)
-        else:
-            ok_rows += 1
-            print(f"row[{i}] prefix_len={pf}: ALL MATCH ({suffix_len} tokens)")
-
-        total_tokens += suffix_len
-
-    print()
-    print(_SEP_DOUBLE)
-    print(f"  [{name}] ROWS: {ok_rows} OK, {fail_rows} FAIL")
-    print(f"  TOTAL_SUFFIX_TOKENS: {total_tokens}")
-    print(f"  MAX_ABS_DIFF: {global_max_diff:.6e}")
-    print(_SEP_DOUBLE)
-    print()
-    print()
-
-    return {
-        "name": name, "ok_rows": ok_rows, "fail_rows": fail_rows,
-        "total_tokens": total_tokens, "max_abs_diff": global_max_diff,
-        "passed": fail_rows == 0,
-    }
-
-
-# ── 2D: load & compare (reuses compare_logprobs.py logic) ────────
+# ══════════════════════════════════════════════════════════════════
+#  Dataclasses
+# ══════════════════════════════════════════════════════════════════
 
 @dataclass
-class CompareResult:
+class CheckResult:
     name: str
-    shape: tuple[int, ...] = ()
-    max_diff: float = float("nan")
-    mean_diff: float = float("nan")
-    n_mismatch: int = -1
-    n_total: int | None = None
-    passed: bool = False
-    shape_on: tuple[int, ...] | None = None
-    shape_off: tuple[int, ...] | None = None
-    pearson_r: float | None = None
+    passed: bool = True
+    metrics: dict = field(default_factory=dict)
 
-    @property
-    def shape_mismatch(self) -> bool:
-        return self.shape_on is not None and self.shape_off is not None
+
+# ══════════════════════════════════════════════════════════════════
+#  Mask helpers
+# ══════════════════════════════════════════════════════════════════
+
+def _trim_last_true_per_row(mask: torch.Tensor) -> torch.Tensor:
+    """In each row of a 2D bool mask, flip the last True to False."""
+    if mask.dim() != 2:
+        return mask
+    result = mask.clone()
+    for row in range(mask.shape[0]):
+        pos = mask[row].nonzero(as_tuple=True)[0]
+        if len(pos) > 0:
+            result[row, pos[-1]] = False
+    return result
 
 
 def _load_label_mask(dir_path: str) -> torch.Tensor | None:
@@ -292,553 +124,1010 @@ def _load_label_mask(dir_path: str) -> torch.Tensor | None:
     return torch.load(path, weights_only=True).to(torch.bool)
 
 
-def _load_label(dir_path: str) -> torch.Tensor | None:
-    path = os.path.join(dir_path, "label.pt")
-    if not os.path.exists(path):
-        return None
-    return torch.load(path, weights_only=True).float()
+def _resolve_label_mask(mask_file: str | None, dir_off: str,
+                        trim_last: bool = True) -> torch.Tensor | None:
+    """Resolve effective label_mask: external file > auto-load from OFF dump.
+
+    Always applies last-True→False trim when ``trim_last=True``.
+    """
+    if mask_file:
+        mask = torch.load(mask_file, weights_only=True).to(torch.bool)
+        return _trim_last_true_per_row(mask) if trim_last else mask
+    mask = _load_label_mask(dir_off)
+    if mask is not None and trim_last:
+        mask = _trim_last_true_per_row(mask)
+    return mask
 
 
-def _load_2d_tensor(dir_path: str, filename: str) -> torch.Tensor | None:
+# ══════════════════════════════════════════════════════════════════
+#  Metric computation helpers
+# ══════════════════════════════════════════════════════════════════
+
+def _cosine_sim(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Cosine similarity along ``dim``.
+
+    Inputs are promoted to float32 before computing to avoid low-precision
+    (bf16) rounding artifacts: even when a==b, the numerator
+    ``(a*b).sum()`` and the denominator ``|a|*|b| = sqrt(sum(a^2)) *
+    sqrt(sum(b^2))`` take different reduction paths and round to
+    different bf16 values, yielding cos < 1.0 (e.g. 0.988) for identical
+    tensors. In float32 the two paths agree closely enough that a==b
+    gives cos ≈ 1.0.
+
+    Near-zero vectors (both norms < ``sqrt(eps)``) are treated as
+    identical and return 1.0 to avoid the clamp artifact on tiny norms.
+    """
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
+    eps = 1e-8
+    na = a.norm(dim=dim)
+    nb = b.norm(dim=dim)
+    denom = (na * nb).clamp(min=eps)
+    cos = (a * b).sum(dim=dim) / denom
+    near_zero = (na < eps ** 0.5) & (nb < eps ** 0.5)
+    return torch.where(near_zero, torch.ones_like(cos), cos)
+
+
+def _pearson_r(t1: torch.Tensor, t2: torch.Tensor,
+               mask: torch.Tensor | None = None) -> float:
+    x = (t1[mask] if mask is not None else t1.flatten()).to(torch.float64)
+    y = (t2[mask] if mask is not None else t2.flatten()).to(torch.float64)
+    if x.numel() < 2:
+        return float("nan")
+    mx, my = x.mean(), y.mean()
+    cov = ((x - mx) * (y - my)).sum()
+    sx, sy = ((x - mx) ** 2).sum().sqrt(), ((y - my) ** 2).sum().sqrt()
+    return float("nan") if sx == 0 or sy == 0 else float(cov / (sx * sy))
+
+
+def _error_abs_rel(a: torch.Tensor, b: torch.Tensor,
+                   mask: torch.Tensor | None = None) -> dict:
+    diff = (a - b).abs()
+    rel = diff / torch.maximum(a.abs(), b.abs()).clamp(min=1e-8)
+    if mask is not None:
+        diff, rel = diff[mask], rel[mask]
+    if diff.numel() == 0:
+        return {"abs_max": 0.0, "abs_mean": 0.0, "rel_max": 0.0, "rel_mean": 0.0}
+    return {"abs_max": float(diff.max()), "abs_mean": float(diff.mean()),
+            "rel_max": float(rel.max()), "rel_mean": float(rel.mean())}
+
+
+def _first_token_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
+    err = _error_abs_rel(a_vec, b_vec)
+    cos = float(_cosine_sim(a_vec, b_vec, dim=-1))
+    pr  = _pearson_r(a_vec, b_vec)
+    return {"mean_abs": err["abs_mean"], "max_abs": err["abs_max"],
+            "rel_max": err["rel_max"], "rel_mean": err["rel_mean"],
+            "cos": cos, "pearson": pr}
+
+
+def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
+                        ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Extract first token's full-vocab vector from ON/OFF logits.
+
+    Logits are either [N, V] (token-major) or [B, N, V] (batched token-major).
+    Vocab is always the last dim (verified from Megatron model forward:
+    output_layer → [S, B, V//tp] → model returns [B, S, V//tp]).
+    """
+    # Flatten all leading batch/token dims into N, keep V as last dim
+    lo_2d = lo.reshape(-1, lo.size(-1))
+    lf_2d = lf.reshape(-1, lf.size(-1))
+    # First token = first row → full-vocab vector [V]
+    return lo_2d[0, :].contiguous(), lf_2d[0, :].contiguous()
+
+
+def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
+                               ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ensure logits are 2D [N, V] for packed alignment.
+
+    Vocab is always the last dim (verified from Megatron model forward).
+    Batch dim on leading axes is flattened into N.
+    """
+    return (lo.reshape(-1, lo.size(-1)).contiguous(),
+            lf.reshape(-1, lf.size(-1)).contiguous())
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Loading helpers
+# ══════════════════════════════════════════════════════════════════
+
+def _load_tensor(dir_path: str, filename: str) -> torch.Tensor | None:
     fp = os.path.join(dir_path, filename)
+    return torch.load(fp, weights_only=True).float() if os.path.exists(fp) else None
+
+
+def _load_packed_meta(dir_path: str,
+                      cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
+    fp = os.path.join(dir_path, cu_fname)
+    if not os.path.exists(fp):
+        fp = os.path.join(dir_path, "cu_seqlens_q.pt")
+        if not os.path.exists(fp):
+            return None
+    pl_fp = os.path.join(dir_path, "prefix_lens.pt")
+    if not os.path.exists(pl_fp):
+        return None
+    return {"cu_seqlens": torch.load(fp, weights_only=True),
+            "prefix_lens": torch.load(pl_fp, weights_only=True)}
+
+
+def _load_attn_output(dir_path: str, layer: int) -> torch.Tensor | None:
+    """Load a single layer's attn_output from attn_outputs.pt dict."""
+    fp = os.path.join(dir_path, "attn_outputs.pt")
     if not os.path.exists(fp):
         return None
-    return torch.load(fp, weights_only=True).float()
+    d = torch.load(fp, weights_only=True)
+    return d.get(layer) if isinstance(d, dict) else None
 
 
-def _pearson_r(t1: torch.Tensor, t2: torch.Tensor, mask: torch.Tensor) -> float:
-    x = t1[mask].to(torch.float64)
-    y = t2[mask].to(torch.float64)
-    n = x.numel()
-    if n < 2:
-        return float("nan")
-    mean_x = x.mean()
-    mean_y = y.mean()
-    cov = ((x - mean_x) * (y - mean_y)).sum()
-    std_x = ((x - mean_x) ** 2).sum().sqrt()
-    std_y = ((y - mean_y) ** 2).sum().sqrt()
-    if std_x == 0 or std_y == 0:
-        return float("nan")
-    return float(cov / (std_x * std_y))
+def _load_attention_mask_2d(dir_path: str) -> torch.Tensor | None:
+    """Load 2D [B, L_max] attention_mask.pt dumped by ``dump_attention_mask_2d``.
 
+    Semantics (see diagnostic_dump.dump_attention_mask_2d):
+      - ON: True only at suffix columns per row (rewritten by verl_mcore)
+      - OFF: True at all valid token columns per row
 
-def _make_2d_result(name: str, diff: torch.Tensor, mask: torch.Tensor,
-                    atol: float, t1: torch.Tensor | None = None,
-                    t2: torch.Tensor | None = None) -> CompareResult:
-    mismatched_mask = (diff > atol) & mask
-    n_mismatch = int(mismatched_mask.sum().item())
-    max_diff = float(diff[mask].max().item()) if mask.any() else 0.0
-    mean_diff = float(diff[mask].mean().item()) if mask.any() else 0.0
-    n_total = int(mask.sum().item())
-    pr = _pearson_r(t1, t2, mask) if t1 is not None and t2 is not None else None
-    return CompareResult(
-        name=name, shape=tuple(diff.shape),
-        max_diff=max_diff, mean_diff=mean_diff,
-        n_mismatch=n_mismatch, n_total=n_total,
-        passed=(n_mismatch == 0), pearson_r=pr,
-    )
-
-
-def _print_2d_detail(
-    name: str, t1: torch.Tensor, t2: torch.Tensor,
-    diff: torch.Tensor, mask: torch.Tensor, atol: float,
-    label: torch.Tensor | None,
-):
-    B, L = t1.shape
-    active = int(mask.sum().item())
-    mismatched_mask = (diff > atol) & mask
-    n_mismatch = int(mismatched_mask.sum().item())
-    max_diff = float(diff[mask].max().item()) if mask.any() else 0.0
-    mean_diff = float(diff[mask].mean().item()) if mask.any() else 0.0
-    pr = _pearson_r(t1, t2, mask)
-
-    print(_SEP_THIN)
-    print(f"─── {name}  shape=({B}, {L})  active_tokens={active}  pearson_r={pr:.8f}")
-    print(f"    max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  mismatched={n_mismatch}")
-    print(_SEP_THIN)
-
-    if n_mismatch == 0:
-        print(f"  {CHECK} ALL MATCH")
-        print()
-        return
-
-    mismatch_pos = mismatched_mask.nonzero(as_tuple=False)
-    n_total_mismatch = mismatch_pos.size(0)
-    mismatch_vals = diff[mismatch_pos[:, 0], mismatch_pos[:, 1]]
-    sorted_order = mismatch_vals.argsort(descending=True)
-    top_indices = mismatch_pos[sorted_order[:TOP_N]]
-    n_show = min(TOP_N, n_total_mismatch)
-
-    print(f"  {CROSS} 差异最大的 {n_show}/{n_total_mismatch} 个不匹配位置 (按 diff 降序):")
-    print(f"  {'POS':>10s}  {'TOKEN':>10s}  {'ON':>14s}  {'OFF':>14s}  {'DIFF':>14s}  {'REL%':>10s}")
-    print(f"  {'─'*10}  {'─'*10}  {'─'*14}  {'─'*14}  {'─'*14}  {'─'*10}")
-
-    for idx in top_indices:
-        b, p = idx[0].item(), idx[1].item()
-        tok = str(int(label[b, p].item())) if label is not None else "—"
-        on_val = t1[b, p].item()
-        off_val = t2[b, p].item()
-        d = diff[b, p].item()
-        rel = abs(d / max(abs(on_val), abs(off_val), 1e-8)) * 100
-        print(f"  [{b:>4d},{p:>4d}]  {tok:>10s}  {on_val:>14.6f}  {off_val:>14.6f}  {d:>14.6e}  {rel:>9.2f}%")
-
-    per_row = mismatched_mask.sum(dim=1)
-    n_active_per_row = mask.sum(dim=1)
-    print(f"\n  Row breakdown:")
-    for b in range(B):
-        n_row = int(per_row[b].item())
-        n_active = int(n_active_per_row[b].item())
-        if n_row > 0:
-            row_mask = mismatched_mask[b]
-            row_diffs = diff[b][row_mask]
-            row_max = float(row_diffs.max().item())
-            row_max_pos = int(diff[b].argmax().item())
-            lh = f" token={int(label[b, row_max_pos].item())}" if label is not None else ""
-            print(f"    row[{b}]: {n_row}/{n_active} mismatches  (max_diff={row_max:.6e} @ col={row_max_pos}{lh})")
-        else:
-            print(f"    row[{b}]: ALL MATCH ({n_active} active tokens)")
-    print()
-
-
-_MASK_ALL = "all"          # compare every [B, L] position (for pre-vs-post restore check)
-_MASK_OFF = "off"          # use OFF (no prefix-sharing) label_mask  — default
-_MASK_ON  = "on"           # use ON  (prefix-sharing)   label_mask
-_MASK_PREFIX = "prefix"    # use OFF_mask & ~ON_mask — isolate prefix region
-
-
-def _resolve_compare_mask(
-    mask_mode: str,
-    label_mask_on: torch.Tensor | None,
-    label_mask_off: torch.Tensor | None,
-    shape: torch.Size,
-    fallback_tensor: torch.Tensor,
-) -> tuple[torch.Tensor | None, str]:
-    """Resolve the effective comparison mask and a human-readable label.
-
-    Returns (mask_tensor_or_none, mask_description).
+    Both share the same [B, L_max] shape and per-row column semantics
+    (column ``c`` corresponds to the same original token position in both
+    runs).  ON mask is a strict subset of OFF mask per row, which
+    ``_build_alignment_mask_from_2d`` relies on.
     """
-    if mask_mode == _MASK_ALL:
-        return None, "all (full [B,L], no filtering)"
-    if mask_mode == _MASK_PREFIX:
-        # OFF response_mask MINUS ON suffix_mask = prefix-only region
-        if label_mask_off is not None and label_mask_on is not None and label_mask_off.shape == label_mask_on.shape == shape:
-            prefix_mask = label_mask_off & (~label_mask_on)
-            return prefix_mask, f"prefix_mask (OFF & ~ON), {int(prefix_mask.sum().item())} active"
-        # Fallback: try OFF mask then fallback to t2!=0
-        if label_mask_off is not None and label_mask_off.shape == shape:
-            return label_mask_off, f"prefix_mask (OFF fallback, ON mask unavailable), {int(label_mask_off.sum().item())} active"
-        fb = fallback_tensor != 0
-        return fb, f"prefix_mask (t2!=0 fallback), {int(fb.sum().item())} active"
-    # off / on
-    chosen = label_mask_off if mask_mode == _MASK_OFF else label_mask_on
-    chosen_label = "response_mask (OFF)" if mask_mode == _MASK_OFF else "suffix_mask (ON)"
-    if chosen is not None and chosen.shape == shape:
-        return chosen, f"{chosen_label}, {int(chosen.sum().item())} active"
-    # fallback
-    fb = fallback_tensor != 0
-    return fb, f"t2!=0 (fallback, {int(fb.sum().item())} active)"
-
-
-def compare_2d_item(
-    dir_on: str, dir_off: str, filename: str, name: str,
-    atol: float,
-    label_mask_on: torch.Tensor | None,
-    label_mask_off: torch.Tensor | None,
-    label: torch.Tensor | None,
-    filename_off: str | None = None,
-    mask_mode: str = _MASK_OFF,
-) -> CompareResult | None:
-    """Compare a single 2D tensor file between on/off dumps.
-
-    When ``filename_off`` is provided, it is used for the OFF file;
-    otherwise ``filename`` is used for both.
-
-    ``mask_mode`` controls which positions are compared:
-      - "off" (default): OFF label_mask (response tokens only)
-      - "on":            ON  label_mask
-      - "all":           every [B, L] position
-    """
-    t1 = _load_2d_tensor(dir_on, filename)
-    t2 = _load_2d_tensor(dir_off, filename_off or filename)
-    if t1 is None or t2 is None:
+    fp = os.path.join(dir_path, "attention_mask.pt")
+    if not os.path.exists(fp):
         return None
-    if t1.shape != t2.shape:
-        return CompareResult(name=name, shape_on=tuple(t1.shape),
-                             shape_off=tuple(t2.shape))
-
-    compare_mask, _mask_desc = _resolve_compare_mask(
-        mask_mode, label_mask_on, label_mask_off, t1.shape, t2,
-    )
-    if compare_mask is None:
-        compare_mask = torch.ones(t1.shape, dtype=torch.bool, device=t1.device)
-    diff = (t1 - t2).abs()
-    mask = torch.logical_and(compare_mask.to(diff.device), diff == diff)
-    return _make_2d_result(name, diff, mask, atol, t1=t1, t2=t2)
+    return torch.load(fp, weights_only=True).to(torch.bool)
 
 
-def compare_2d(
-    dir_on: str, dir_off: str, tag_on: str, atol: float,
-    tag_off: str | None = None,
-    mask_mode: str = _MASK_OFF,
-) -> tuple[list[CompareResult], dict]:
-    """Compare all 2D dumps with the given tags.
+def _get_num_layers(dir_path: str) -> int:
+    fp = os.path.join(dir_path, "attn_outputs.pt")
+    if not os.path.exists(fp):
+        return 0
+    d = torch.load(fp, weights_only=True)
+    return max(d.keys()) if isinstance(d, dict) and d else 0
 
-    Args:
-        tag_on: Tag for ON directory files (e.g. ``logprobs_{tag_on}.pt``).
-        tag_off: Tag for OFF directory files; defaults to ``tag_on`` when None.
-        mask_mode: ``"off"`` | ``"on"`` | ``"all"`` — which label_mask to use.
+
+# ══════════════════════════════════════════════════════════════════
+#  Packed alignment — build 1D suffix mask, align ON/OFF tensors
+# ══════════════════════════════════════════════════════════════════
+
+def _build_alignment_mask(cu_seqlens: torch.Tensor,
+                          prefix_lens: torch.Tensor,
+                          total_tokens: int) -> torch.Tensor:
+    """Build 1D bool mask [total_tokens]: True iff position is a suffix token.
+
+    Built from ON's metadata and applied to OFF's full packed data to extract
+    the same suffix region, yielding equal-shape tensors for comparison.
+
+    Example:
+        cu_seqlens=[0,7,13], prefix_lens=[3,4], total_tokens=13
+        → [0,0,0, 1,1,1,1,  0,0,0,0, 1,1]
     """
-    if tag_off is None:
-        tag_off = tag_on
+    mask = torch.zeros(total_tokens, dtype=torch.bool)
+    for i in range(cu_seqlens.shape[0] - 1):
+        pf = int(prefix_lens[i])
+        start = int(cu_seqlens[i]) + pf
+        end = int(cu_seqlens[i + 1])
+        mask[start:end] = True
+    return mask
 
-    results: list[CompareResult] = []
-    detail_data: list[dict] = []
 
-    # Load both masks: suffix_mask from ON, response_mask from OFF.
-    label_mask_on = _load_label_mask(dir_on)   # suffix_mask (prefix-sharing side)
-    label_mask_off = _load_label_mask(dir_off) # response_mask (ground truth)
-    label = _load_label(dir_off)
-    if label is None:
-        label = _load_label(dir_on)
-    if label is not None:
-        print(f"label  shape={_fmt_shape(tuple(label.shape))}")
-        print()
+def _align_packed(on_tensor: torch.Tensor,
+                  off_tensor: torch.Tensor,
+                  alignment_mask: torch.Tensor,
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align ON-only-suffix with OFF-full-packed via 1D alignment_mask.
 
-    # Build effective mask and description for the comparison header.
-    _sample_tensor = _load_2d_tensor(dir_on, f"logprobs_{tag_on}.pt")
-    if _sample_tensor is not None:
-        _, mask_desc = _resolve_compare_mask(
-            mask_mode, label_mask_on, label_mask_off,
-            _sample_tensor.shape, _sample_tensor,
-        )
+    Returns (on, off_suffix) where off_suffix has same shape[0] as on_tensor.
+
+    Double-pointer semantics:
+      for each i in [0, OFF_total_tokens):
+        if alignment_mask[i]: compare ON[on_ptr++] vs OFF[i]
+        else:                skip (prefix position in OFF)
+    """
+    T = off_tensor.shape[0]
+    n_suffix = int(alignment_mask.sum())
+    if alignment_mask.shape[0] != T:
+        raise ValueError(
+            f"alignment_mask len {alignment_mask.shape[0]} != OFF tokens {T}")
+    if on_tensor.shape[0] != n_suffix:
+        raise ValueError(
+            f"ON tokens {on_tensor.shape[0]} != alignment True count {n_suffix}")
+    return on_tensor, off_tensor[alignment_mask]
+
+
+def _build_alignment_mask_from_2d(
+    mask_on_2d: torch.Tensor,
+    mask_off_2d: torch.Tensor,
+    cu_seqlens_off: torch.Tensor,
+    total_off: int,
+) -> torch.Tensor:
+    """Build 1D alignment mask [total_off] from ON/OFF 2D [B, L_max] masks.
+
+    ON mask is a strict subset of OFF mask per row (ON ⊂ OFF).
+    For each sequence row r:
+      - OFF packed row r = cu_seqlens_off[r] : cu_seqlens_off[r+1],
+        whose tokens correspond to mask_off_2d[r] True columns in order.
+      - ON wants the suffix tokens → columns where mask_on_2d[r] is True.
+      - Since mask_on[r] ⊂ mask_off[r], we intersect to find which OFF
+        packed positions correspond to suffix tokens in ON.
+    """
+    align = torch.zeros(total_off, dtype=torch.bool)
+    for r in range(mask_on_2d.shape[0]):
+        row_start = int(cu_seqlens_off[r])
+        row_end = int(cu_seqlens_off[r + 1])
+        if row_start >= row_end:
+            continue
+        off_len = row_end - row_start
+        # Columns in original L_max that correspond to OFF packed row tokens
+        off_cols = mask_off_2d[r].nonzero(as_tuple=True)[0]
+        if off_cols.numel() < off_len:
+            continue
+        off_cols = off_cols[:off_len]
+        # Mark positions where ON mask also has True (these are suffix token columns)
+        is_on = mask_on_2d[r, off_cols].to(torch.bool)
+        align[row_start:row_end] = is_on
+    return align
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  1. position_ids — absolute equality
+# ══════════════════════════════════════════════════════════════════
+
+def cmp_position_ids(dir_a: str, dir_b: str) -> CheckResult | None:
+    a = _load_tensor(dir_a, "position_ids.pt")
+    b = _load_tensor(dir_b, "position_ids.pt")
+    if a is None or b is None:
+        return None
+    ok = bool((a.to(torch.long) == b.to(torch.long)).all())
+    return CheckResult(name="position_ids", passed=ok,
+                       metrics={"shape": _fmt_shape(tuple(a.shape))})
+
+
+# ══════════════════════════════════════════════════════════════════
+#  2. RoPE encoding — absolute equality
+# ══════════════════════════════════════════════════════════════════
+
+def cmp_rope_emb(dir_a: str, dir_b: str) -> CheckResult | None:
+    fa = os.path.join(dir_a, "rope_emb.pt")
+    fb = os.path.join(dir_b, "rope_emb.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    a = torch.load(fa, weights_only=True)
+    b = torch.load(fb, weights_only=True)
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return None
+    la, lb = set(a.keys()), set(b.keys())
+    if la != lb:
+        return CheckResult(name="rope_emb", passed=False,
+                           metrics={"error": "layer set mismatch"})
+    md = 0.0
+    for lyr in sorted(la):
+        for k in ("query", "key"):
+            md = max(md, float((a[lyr][k] - b[lyr][k]).abs().max()))
+    return CheckResult(name="rope_emb", passed=md == 0.0,
+                       metrics={"max_diff": md, "num_layers": len(la)})
+
+
+def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare pre-RoPE angles (angle table, not cos/sin) — suffix-aligned.
+
+    ON  ``rope_freqs_on.pt``:  per-token angles [T_on, 1, 1, D]
+    OFF ``rope_freqs_off.pt``: raw angle table [L0, 1, 1, D]
+
+    OFF per-token angles are reconstructed from the raw table via
+    ``cu_seqlens_off`` (each segment takes ``[:seg_len]`` from position 0).
+
+    The two are aligned to suffix-only via the same attention_mask dual-pointer
+    logic used for attn_outputs / logits.
+    """
+    fa = os.path.join(dir_on, "rope_freqs_on.pt")
+    fb = os.path.join(dir_off, "rope_freqs_off.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    on_dict = torch.load(fa, weights_only=True)
+    off_dict = torch.load(fb, weights_only=True)
+    if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
+        return None
+
+    la, lb = set(on_dict.keys()), set(off_dict.keys())
+    if la != lb:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "layer set mismatch",
+                                    "on_layers": sorted(la),
+                                    "off_layers": sorted(lb)})
+
+    # Load OFF metadata for per-token reconstruction + alignment
+    mb = _load_packed_meta(dir_off)
+    if mb is None:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "OFF cu_seqlens missing"})
+    cu_off = mb["cu_seqlens"]
+    T_off = int(cu_off[-1]) if cu_off.numel() > 0 else 0
+
+    # Build alignment mask (prefer 2D attention_mask)
+    mask_on_2d = _load_attention_mask_2d(dir_on)
+    mask_off_2d = _load_attention_mask_2d(dir_off)
+    ma = _load_packed_meta(dir_on)
+    if mask_on_2d is not None and mask_off_2d is not None:
+        align_mask = _build_alignment_mask_from_2d(
+            mask_on_2d, mask_off_2d, cu_off, T_off)
+    elif ma is not None:
+        align_mask = _build_alignment_mask(
+            cu_off, ma["prefix_lens"], T_off)
     else:
-        mask_desc = "—"
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "cannot build alignment mask"})
 
-    # Section header
-    print(_SEP_DOUBLE)
-    print(f"  [2D]  ON  [{dir_on}]  ({tag_on})")
-    print(f"        OFF [{dir_off}]  ({tag_off})")
-    print(f"        mask: {mask_desc}")
-    print(_SEP_DOUBLE)
-    print()
+    # Reconstruct OFF per-token angles from raw table
+    seqlens = (cu_off[1:] - cu_off[:-1]).tolist()
 
-    # Helper: pick the right mask and make a detail entry
-    def _mask_for(tensor_for_mask: torch.Tensor) -> torch.Tensor | None:
-        c, _ = _resolve_compare_mask(
-            mask_mode, label_mask_on, label_mask_off,
-            tensor_for_mask.shape, tensor_for_mask,
-        )
-        return c
+    max_diff = 0.0
+    mismatches: list[dict] = []  # [{layer, token_idx, dim, on_val, off_val, diff}]
+    for lyr in sorted(la):
+        on_freqs = on_dict[lyr]                          # [T_on, 1, 1, D]
+        # Reconstruct OFF per-token for this layer
+        off_freqs = torch.cat(
+            [off_dict[lyr][:s, :, :, :] for s in seqlens], dim=0)  # [T_off, 1, 1, D]
 
-    # entropy
-    fn_on = f"entropy_{tag_on}.pt"
-    fn_off = f"entropy_{tag_off}.pt"
-    r = compare_2d_item(dir_on, dir_off, fn_on,
-                        f"entropy_{tag_on} vs entropy_{tag_off}",
-                        atol, label_mask_on, label_mask_off, label,
-                        filename_off=fn_off,
-                        mask_mode=mask_mode)
-    if r is not None:
-        results.append(r)
-        if not r.shape_mismatch:
-            t1 = _load_2d_tensor(dir_on, fn_on)
-            t2 = _load_2d_tensor(dir_off, fn_off)
-            cm = _mask_for(t1)
-            if cm is None:
-                cm = torch.ones(t1.shape, dtype=torch.bool, device=t1.device)
-            diff, mk = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
-            detail_data.append({"type": "2d", "name": r.name,
-                                "t1": t1, "t2": t2, "diff": diff, "mask": mk,
-                                "atol": atol, "label": label, "result": r})
+        try:
+            on_aligned, off_aligned = _align_packed(
+                on_freqs, off_freqs, align_mask)
+        except ValueError as e:
+            return CheckResult(name="rope_freqs", passed=False,
+                               metrics={"error": f"align failed L{lyr}: {e}"})
 
-    # logprobs
-    fn_on = f"logprobs_{tag_on}.pt"
-    fn_off = f"logprobs_{tag_off}.pt"
-    r = compare_2d_item(dir_on, dir_off, fn_on,
-                        f"logprobs_{tag_on} vs logprobs_{tag_off}",
-                        atol, label_mask_on, label_mask_off, label,
-                        filename_off=fn_off,
-                        mask_mode=mask_mode)
+        diff = (on_aligned - off_aligned).abs()                # [N, 1, 1, D]
+        md = float(diff.max())
+        max_diff = max(max_diff, md)
+
+        if md > 0:
+            # per-token max diff across all dims
+            token_diff = diff.squeeze(1).squeeze(1).max(dim=-1)  # values [N], indices [N]
+            bad_mask = token_diff.values > 0
+            for t in bad_mask.nonzero(as_tuple=True)[0].tolist():
+                t = int(t)
+                d = int(token_diff.indices[t])
+                mismatches.append({
+                    "layer": lyr,
+                    "token_idx": t,
+                    "dim": d,
+                    "on_val": float(on_aligned[t, 0, 0, d]),
+                    "off_val": float(off_aligned[t, 0, 0, d]),
+                    "diff": float(token_diff.values[t]),
+                })
+
+    metrics: dict = {"max_diff": max_diff, "num_layers": len(la)}
+    if mismatches:
+        metrics["mismatches"] = mismatches[:20]  # cap to top 20
+        metrics["total_mismatches"] = len(mismatches)
+    return CheckResult(name="rope_freqs", passed=max_diff == 0.0,
+                       metrics=metrics)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  3. attention_output per-layer cos
+# ══════════════════════════════════════════════════════════════════
+
+def _per_layer_cos(dir_on: str, dir_off: str, layer: int | None) -> dict | None:
+    """Per-layer cosine similarity with packed alignment.
+
+    ON attn_output may have fewer tokens (suffix only) than OFF (all tokens).
+    Builds alignment_mask from ON's cu_seqlens/prefix_lens and uses it to
+    extract the matching suffix region from OFF before comparison.
+    """
+
+    def _cos_for_layer(a, b, lyr, need_align, align_mask):
+        if a.dim() == 3:
+            a, b = a.squeeze(1), b.squeeze(1)
+        if need_align and a.shape[0] != b.shape[0]:
+            try:
+                a, b = _align_packed(a, b, align_mask)
+            except ValueError as e:
+                return {"cos_avg": 0.0, "cos_min": 0.0,
+                        "n_tokens": a.shape[0], "error": str(e)}
+        cos = _cosine_sim(a, b, dim=-1)
+        return {"cos_avg": float(cos.mean()), "cos_min": float(cos.min()),
+                "n_tokens": a.shape[0]}
+
+    # Single-layer mode
+    if layer is not None:
+        a = _load_attn_output(dir_on, layer)
+        b = _load_attn_output(dir_off, layer)
+        if a is None or b is None:
+            return None
+        ma = _load_packed_meta(dir_on)
+        align_mask = None
+        need_align = (ma is not None and a.shape[0] != b.shape[0])
+        if need_align:
+            mb = _load_packed_meta(dir_off)
+            T = int(mb["cu_seqlens"][-1]) if mb and mb["cu_seqlens"].numel() > 0 else b.shape[0]
+            # Prefer 2D attention_mask.pt for exact suffix alignment (dp aligned)
+            mask_on_2d = _load_attention_mask_2d(dir_on)
+            mask_off_2d = _load_attention_mask_2d(dir_off)
+            if mask_on_2d is not None and mask_off_2d is not None and mb is not None:
+                align_mask = _build_alignment_mask_from_2d(
+                    mask_on_2d, mask_off_2d, mb["cu_seqlens"], T)
+            else:
+                align_mask = _build_alignment_mask(
+                    mb["cu_seqlens"], ma["prefix_lens"], T)
+        d = _cos_for_layer(a, b, layer, need_align, align_mask)
+        d["layer"] = layer
+        return d
+
+    # All-layers mode
+    fa = os.path.join(dir_on, "attn_outputs.pt")
+    fb = os.path.join(dir_off, "attn_outputs.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    da = torch.load(fa, weights_only=True)
+    db = torch.load(fb, weights_only=True)
+    if not isinstance(da, dict) or not isinstance(db, dict):
+        return None
+
+    # Build alignment mask once from ON metadata
+    ma = _load_packed_meta(dir_on)
+    align_mask = None
+    need_align = False
+    if ma is not None:
+        mb = _load_packed_meta(dir_off)
+        T = int(mb["cu_seqlens"][-1]) if mb and mb["cu_seqlens"].numel() > 0 else 0
+        if T > 0:
+            # Check if any layer has shape mismatch
+            for lyr in da:
+                if lyr in db and da[lyr].shape != db[lyr].shape:
+                    need_align = True
+                    break
+            if need_align:
+                # Prefer 2D attention_mask.pt for exact suffix alignment
+                mask_on_2d = _load_attention_mask_2d(dir_on)
+                mask_off_2d = _load_attention_mask_2d(dir_off)
+                if mask_on_2d is not None and mask_off_2d is not None:
+                    align_mask = _build_alignment_mask_from_2d(
+                        mask_on_2d, mask_off_2d, mb["cu_seqlens"], T)
+                else:
+                    align_mask = _build_alignment_mask(
+                        mb["cu_seqlens"], ma["prefix_lens"], T)
+
+    results = {}
+    for lyr in sorted(set(da.keys()) & set(db.keys())):
+        results[lyr] = _cos_for_layer(da[lyr], db[lyr], lyr, need_align, align_mask)
+    return results
+
+
+def cmp_attn_layer(dir_on: str, dir_off: str,
+                   layer: int | None) -> CheckResult | None:
+    r = _per_layer_cos(dir_on, dir_off, layer)
     if r is None:
-        # Legacy fallback
-        r = compare_2d_item(dir_on, dir_off, "logprobs.pt",
-                            "logprobs", atol, label_mask_on, label_mask_off, label)
-    if r is not None:
-        results.append(r)
-        if not r.shape_mismatch:
-            fp_on = fn_on if os.path.exists(os.path.join(dir_on, fn_on)) else "logprobs.pt"
-            fp_off = fn_off if os.path.exists(os.path.join(dir_off, fn_off)) else "logprobs.pt"
-            t1 = _load_2d_tensor(dir_on, fp_on)
-            t2 = _load_2d_tensor(dir_off, fp_off)
-            cm = _mask_for(t1)
-            if cm is None:
-                cm = torch.ones(t1.shape, dtype=torch.bool, device=t1.device)
-            diff, mk = (t1 - t2).abs(), torch.logical_and(cm.to(t1.device), (t1 - t2).abs() == (t1 - t2).abs())
-            detail_data.append({"type": "2d", "name": r.name,
-                                "t1": t1, "t2": t2, "diff": diff, "mask": mk,
-                                "atol": atol, "label": label, "result": r})
+        return None
+    if "cos_avg" in r:
+        lyr = r["layer"]
+        return CheckResult(name=f"attn_L{lyr}",
+                           passed=r["cos_avg"] > 0.9999 and r["cos_min"] > 0.999,
+                           metrics=r)
+    return CheckResult(name="attn_per_layer", passed=True,
+                       metrics={"layers": r})
 
-    # logits (3D) — tag_off defaults to tag_on for logits
-    logits_off_tag = tag_off if (tag_off == tag_on or 
-        os.path.exists(os.path.join(dir_off, f"logits_{tag_off}.pt"))) else tag_on
-    t1 = _load_2d_tensor(dir_on, f"logits_{tag_on}.pt")
-    t2 = _load_2d_tensor(dir_off, f"logits_{logits_off_tag}.pt")
-    if t1 is not None and t2 is not None and t1.dim() == 3:
-        if t1.shape != t2.shape:
-            r = CompareResult(name=f"logits_{tag_on}", shape_on=tuple(t1.shape),
-                              shape_off=tuple(t2.shape))
+
+# ══════════════════════════════════════════════════════════════════
+#  4. First-token metrics (last-layer attn[0] + logits[0])
+# ══════════════════════════════════════════════════════════════════
+
+def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
+    """Compare packed[0] of last-layer attn_output + logits.
+
+    The first sentence never becomes a resuer so its packed[0] is always a
+    complete suffix token — safe to compare directly without alignment.
+    """
+    results: list[CheckResult] = []
+    last = _get_num_layers(dir_on) or _get_num_layers(dir_off)
+
+    # attn_output (last layer) — packed[0]
+    if last:
+        a = _load_attn_output(dir_on, last)
+        b = _load_attn_output(dir_off, last)
+        if a is not None and b is not None:
+            a0 = a.squeeze(1) if a.dim() == 3 else a
+            b0 = b.squeeze(1) if b.dim() == 3 else b
+            ft = _first_token_metrics(a0[0], b0[0])
+            results.append(CheckResult(name="first_token_attn", metrics=ft))
+
+    # logits — packed[0], auto-detect [N,V] vs [V,N] format
+    lo = _load_tensor(dir_on,  "logits.pt")
+    lf = _load_tensor(dir_off, "logits.pt")
+    if lo is not None and lf is not None:
+        lo_first, lf_first = _logits_first_token(lo, lf)
+        if lo_first is not None:
+            ft = _first_token_metrics(lo_first, lf_first)
+            results.append(CheckResult(name="first_token_logits", metrics=ft))
         else:
-            diff = (t1 - t2).abs()
-            mask = torch.ones_like(diff, dtype=torch.bool)
-            r = _make_2d_result(f"logits_{tag_on}", diff, mask, atol,
-                                t1=t1, t2=t2)
-            delta_per_pos = diff.max(dim=-1).values
-            detail_data.append({"type": "3d", "name": f"logits_{tag_on}",
-                                "t1": t1, "t2": t2, "diff": diff,
-                                "diff_per_pos": delta_per_pos, "mask": mask,
-                                "atol": atol, "label": label, "result": r})
-        results.append(r)
+            _log.warning("first_token_logits skipped: cannot determine token dim "
+                         "(ON %s, OFF %s)", _fmt_shape(lo.shape), _fmt_shape(lf.shape))
 
-    return results, {"detail_data": detail_data, "label": label}
+    return results
 
 
-# ── 3D detail print ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  4b. Logits — full packed alignment (attention_mask + dual pointer)
+# ══════════════════════════════════════════════════════════════════
 
-def _print_3d_detail(
-    name: str, t1: torch.Tensor, t2: torch.Tensor,
-    diff: torch.Tensor, diff_per_pos: torch.Tensor, atol: float,
-    label: torch.Tensor | None,
-):
-    B, L, V = t1.shape
-    n_total = int(diff.numel())
-    n_mismatch = int((diff > atol).sum().item())
-    max_diff = float(diff.max().item())
-    mean_diff = float(diff.mean().item())
-    pr = _pearson_r(t1, t2, torch.ones_like(diff, dtype=torch.bool))
-    mismatched_positions = int((diff_per_pos > atol).sum().item())
+def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare ON vs OFF logits with full packed alignment.
 
-    print(_SEP_THIN)
-    print(f"─── {name}  shape=({B}, {L}, {V})  total_elements={n_total}  pearson_r={pr:.8f}")
-    print(f"    element-wise:  max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  mismatched={n_mismatch}")
-    print(f"    per-position (max over vocab):  {mismatched_positions}/{B*L} positions affected")
-    print(_SEP_THIN)
+    Uses attention_mask_2d + dual-pointer to align ON (suffix-only)
+    with OFF (full-sequence) logits, same alignment logic as attn_output
+    per-layer comparison.
+    """
+    lo = _load_tensor(dir_on,  "logits.pt")
+    lf = _load_tensor(dir_off, "logits.pt")
+    if lo is None or lf is None:
+        return None
 
-    if n_mismatch == 0:
-        print(f"  {CHECK} ALL MATCH")
-        print()
-        return
+    # Logits may be [N,V] or [V,N] — ensure token-major [N,V] for alignment
+    lo, lf = _logits_ensure_token_major(lo, lf)
 
-    n_show_elem = min(TOP_N, n_mismatch)
-    flat_top = diff.view(-1).topk(n_show_elem)
-    print(f"  {CROSS} 差异最大的 {flat_top.values.size(0)} 个元素, 按 diff 降序:")
-    print(f"  {'POS':>20s}  {'TOKEN':>10s}  {'VOCAB':>10s}  {'ON':>14s}  {'OFF':>14s}  {'DIFF':>14s}")
-    print(f"  {'─'*20}  {'─'*10}  {'─'*10}  {'─'*14}  {'─'*14}  {'─'*14}")
-    for val, flat_idx in zip(flat_top.values, flat_top.indices):
-        b = int(flat_idx // (L * V))
-        rest = int(flat_idx % (L * V))
-        l_idx = int(rest // V)
-        v = int(rest % V)
-        tok = str(int(label[b, l_idx].item())) if label is not None else "—"
-        print(f"  [{b:>4d},{l_idx:>4d},{v:>4d}]  {tok:>10s}  {v:>10d}  "
-              f"{t1[b,l_idx,v]:>14.6f}  {t2[b,l_idx,v]:>14.6f}  {val:>14.6e}")
+    # Metadata for logits uses cu_seqlens_q_logits.pt
+    ma = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
+    mb = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    if ma is None or mb is None:
+        return None
 
-    n_show_pos = min(TOP_N, B * L)
-    top_pos = diff_per_pos.view(-1).topk(n_show_pos)
-    print(f"\n  跨 vocab 差异最大的 {n_show_pos} 个 (b, l) 位置:")
-    print(f"  {'POS':>10s}  {'TOKEN':>10s}  {'MAX_DIFF':>16s}")
-    print(f"  {'─'*10}  {'─'*10}  {'─'*16}")
-    for val, flat_idx in zip(top_pos.values, top_pos.indices):
-        b = int(flat_idx // L)
-        l_idx = int(flat_idx % L)
-        tok = str(int(label[b, l_idx].item())) if label is not None else "—"
-        print(f"  [{b:>4d},{l_idx:>4d}]  {tok:>10s}  {val:>16.6e}")
+    T_off = int(mb["cu_seqlens"][-1]) if mb["cu_seqlens"].numel() > 0 else 0
+    if T_off == 0 or lo.shape[0] == 0 or lf.shape[0] == 0:
+        return None
+
+    # Build alignment mask (same logic as attn_output all-layers)
+    mask_on_2d = _load_attention_mask_2d(dir_on)
+    mask_off_2d = _load_attention_mask_2d(dir_off)
+    if mask_on_2d is not None and mask_off_2d is not None:
+        align_mask = _build_alignment_mask_from_2d(
+            mask_on_2d, mask_off_2d, mb["cu_seqlens"], T_off)
+    else:
+        align_mask = _build_alignment_mask(
+            mb["cu_seqlens"], ma["prefix_lens"], T_off)
+
+    # Align: extract suffix-only region from OFF
+    try:
+        on_aligned, off_aligned = _align_packed(lo, lf, align_mask)
+    except ValueError as e:
+        return CheckResult(name="logits", passed=False,
+                           metrics={"error": str(e),
+                                    "n_on": lo.shape[0],
+                                    "n_off": lf.shape[0]})
+
+    n_tokens = on_aligned.shape[0]
+
+    # Per-token cosine similarity (dim=-1 across vocab)
+    cos = _cosine_sim(on_aligned, off_aligned, dim=-1)
+    cos_avg = float(cos.mean())
+    cos_min = float(cos.min())
+
+    # Logits live in vocab space (V ~ 1e5); abs/rel error and pearson are
+    # dominated by a few extreme dims and carry little signal. Per-token
+    # cosine similarity is the meaningful metric here.
+    return CheckResult(
+        name="logits",
+        passed=cos_avg > 0.9999 and cos_min > 0.999,
+        metrics={"n_tokens": n_tokens,
+                 "cos_avg": cos_avg,
+                 "cos_min": cos_min})
+
+
+# ══════════════════════════════════════════════════════════════════
+#  5. 2D comparison (entropy / logp) — error_abs + error_rel + pearson
+# ══════════════════════════════════════════════════════════════════
+
+def cmp_2d(dir_on: str, dir_off: str, filename: str, name: str,
+           mask: torch.Tensor | None, atol: float,
+           label: torch.Tensor | None = None) -> CheckResult:
+    t1 = _load_tensor(dir_on,  filename)
+    t2 = _load_tensor(dir_off, filename)
+    if t1 is None or t2 is None:
+        return CheckResult(name=name, passed=False,
+                           metrics={"error": "file missing"})
+    if t1.shape != t2.shape:
+        return CheckResult(name=name, passed=False,
+                           metrics={"error": "shape mismatch",
+                                    "s_on": _fmt_shape(tuple(t1.shape)),
+                                    "s_off": _fmt_shape(tuple(t2.shape))})
+    if mask is None:
+        mask = torch.ones(t1.shape, dtype=torch.bool, device=t1.device)
+    else:
+        mask = mask.to(t1.device)
+    mask = mask & ~torch.isnan(t1) & ~torch.isnan(t2)
+    err = _error_abs_rel(t1, t2, mask)
+    n_act = int(mask.sum())
+    return CheckResult(name=name,
+                       passed=n_act == 0 or err["abs_max"] <= atol,
+                       metrics={"shape": _fmt_shape(tuple(t1.shape)),
+                                "active": n_act,
+                                "abs_max": err["abs_max"],
+                                "abs_mean": err["abs_mean"],
+                                "rel_max": err["rel_max"],
+                                "rel_mean": err["rel_mean"],
+                                "pearson_r": _pearson_r(t1, t2, mask),
+                                "atol": atol})
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Output helpers
+# ══════════════════════════════════════════════════════════════════
+
+def _print_header(dir_on, dir_off, dir_off2, tag, mask_file, layer):
+    print(_SEP_DOUBLE)
+    print(f"  Prefix-Sharing Diag Report")
+    print(f"  ON :  {dir_on}\n  OFF:  {dir_off}")
+    if dir_off2:
+        print(f"  OFF2: {dir_off2}")
+    if tag:
+        print(f"  TAG: {tag}")
+    if mask_file:
+        print(f"  MASK: {mask_file} (external, last-token trimmed)")
+    if layer is not None:
+        print(f"  LAYER: {layer}")
+    print(_SEP_DOUBLE + "\n")
+
+
+def _print_pos_ids(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [position_ids]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print(_SEP_SINGLE + f"\n  shape: {r.metrics.get('shape','—')}")
+    if not r.passed:
+        print(f"  {_CROSS} CRITICAL — STOP.\n")
     print()
 
 
-# ── Summary table ───────────────────────────────────────────────
-
-def _print_summary(all_results: list[dict], atol: float):
-    """Print a unified summary table from all comparison results."""
+def _print_rope(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [rope_emb]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {m['error']}")
+    else:
+        print(f"  layers: {m.get('num_layers','—')}  max_diff: {m.get('max_diff','—')}")
+    if not r.passed:
+        print(f"  {_CROSS} CRITICAL — STOP.\n")
     print()
-    print(_SEP_DOUBLE)
-    print(f"  SUMMARY (atol={atol:.1e})")
-    print(_SEP_DOUBLE)
-    hdr = (f"  {'NAME':<24s} {'SHAPE':<20s} {'MAX_DIFF':>14s}  "
-           f"{'MISMATCH':>12s}  {'PEARSON_R':>10s}  {'STATUS':>8s}")
-    print(hdr)
-    print(f"  {'─'*24} {'─'*20} {'─'*14}  {'─'*12}  {'─'*10}  {'─'*8}")
 
+
+def _print_rope_freqs(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [rope_freqs]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {m['error']}")
+    else:
+        print(f"  layers: {m.get('num_layers','—')}  max_diff: {m.get('max_diff','—')}")
+        total = m.get("total_mismatches", 0)
+        if total > 0:
+            print(f"  mismatched tokens: {total}"
+                  f"{' (showing first 20)' if total > 20 else ''}")
+            print(f"  {'Layer':>6s} {'Token':>6s} {'Dim':>6s}  "
+                  f"{'ON_val':>14s}  {'OFF_val':>14s}  {'Abs_err':>12s}")
+            for mm in m.get("mismatches", []):
+                print(f"  {mm['layer']:>6d} {mm['token_idx']:>6d} {mm['dim']:>6d}  "
+                      f"{mm['on_val']:>14.6e}  {mm['off_val']:>14.6e}  "
+                      f"{mm['diff']:>12.6e}")
+    if not r.passed:
+        print(f"  {_CROSS} CRITICAL — STOP.\n")
+    print()
+
+
+def _print_per_layer(r: CheckResult):
+    print(_SEP_SINGLE + "\n  [attn_output]  Per-Layer Cosine Similarity")
+    print(_SEP_SINGLE)
+    layers = r.metrics.get("layers")
+    if isinstance(layers, dict):
+        print(f"  {'LAYER':>6s}  {'COS_AVG':>14s}  {'COS_MIN':>14s}  {'TOKENS':>8s}  {'STATUS':>8s}")
+        print(f"  {'─'*6}  {'─'*14}  {'─'*14}  {'─'*8}  {'─'*8}")
+        bad = []
+        for lyr in sorted(layers.keys()):
+            d = layers[lyr]
+            ok = d["cos_avg"] > 0.9999 and d["cos_min"] > 0.999
+            print(f"  {lyr:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
+                  f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
+            if not ok:
+                bad.append(lyr)
+        if bad:
+            print(f"\n  ⚠ First deviating layer: {bad[0]}")
+    elif "cos_avg" in r.metrics:
+        d = r.metrics
+        print(f"  L{d['layer']}  cos_avg={d['cos_avg']:.6e}  cos_min={d['cos_min']:.6e}")
+    print()
+
+
+def _print_first_token(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [first_token]  {r.name}  (packed position [0])")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    for k in ["mean_abs", "max_abs", "rel_max", "rel_mean", "cos", "pearson"]:
+        v = m.get(k)
+        if v is not None:
+            print(f"  {k:>12s}  {v:>14.6e}")
+    print()
+
+
+def _print_logits_packed(r: CheckResult):
+    """Print full packed logits comparison (attention_mask + dual pointer aligned)."""
+    print(_SEP_SINGLE + "\n  [logits]  packed alignment (attention_mask + dual pointer)")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}")
+    else:
+        print(f"  n_tokens={m.get('n_tokens','—')}  "
+              f"cos_avg={m.get('cos_avg',0):.6e}  cos_min={m.get('cos_min',0):.6e}  "
+              f"{_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print()
+
+
+def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
+                    topk: int, sort_by: str, label: str):
+    """Print top-K dimensions from two 1D vectors.
+
+    sort_by = "abs"  → sort by absolute error  |on - off|
+    sort_by = "rel"  → sort by relative error  |on - off| / max(|on|,|off|)
+    sort_by = "val"  → sort by max magnitude    max(|on|,|off|)  (largest dims)
+    sort_by = "real" → sort by ON's actual value (signed), largest first.
+                       Useful for logits where positive values dominate
+                       sampling probability; ranking by magnitude surfaces
+                       "never selected" negative tokens instead.
+    """
+    abs_err = (on_vec - off_vec).abs()
+    rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
+    if sort_by == "abs":
+        sort_key = abs_err
+    elif sort_by == "rel":
+        sort_key = rel_err
+    elif sort_by == "real":
+        sort_key = on_vec
+    else:  # "val"
+        sort_key = torch.maximum(on_vec.abs(), off_vec.abs())
+    _, idx = sort_key.topk(min(topk, sort_key.numel()))
+    idx = idx.to(torch.long)
+    print(f"\n  [{label}]  top-{topk} dims (sort by {sort_by})")
+    print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}  {'REL_ERR':>12s}")
+    for k, i in enumerate(idx.tolist()):
+        print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
+              f"  {float(abs_err[i]):>12.6e}  {float(rel_err[i]):>12.6e}")
+
+
+def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
+                   mask: torch.Tensor, topk: int, sort_by: str, label: str):
+    """Print top-K (batch, pos) elements from two 2D tensors.
+
+    sort_by = "abs" → sort by absolute error  |on - off|
+    sort_by = "rel" → sort by relative error    |on - off| / max(|on|,|off|)
+    sort_by = "val" → sort by max magnitude      max(|on|,|off|)
+    """
+    abs_err = (on_t - off_t).abs()
+    rel_err = abs_err / torch.maximum(on_t.abs(), off_t.abs()).clamp(min=1e-8)
+    if sort_by == "abs":
+        sort_key = abs_err
+    elif sort_by == "rel":
+        sort_key = rel_err
+    else:  # "val"
+        sort_key = torch.maximum(on_t.abs(), off_t.abs())
+    # Mask invalid positions to -inf so they never sort into top-K
+    if mask is not None:
+        sort_key = sort_key.clone()
+        sort_key[~mask.to(sort_key.device)] = float("-inf")
+    flat, idx = sort_key.flatten().topk(min(topk, sort_key.numel()))
+    # Convert flat indices → (row, col)
+    rows = idx // sort_key.shape[1]
+    cols = idx % sort_key.shape[1]
+    print(f"\n  [{label}]  top-{topk} positions (sort by {sort_by})")
+    print(f"  {'Seq_idx':>7s} {'POS':>6s}  {'ON':>14s}  {'OFF':>14s}  "
+          f"{'ABS_ERR':>12s}  {'REL_ERR':>12s}")
+    for k in range(len(flat)):
+        r, c = int(rows[k]), int(cols[k])
+        print(f"  {r:>7d} {c:>6d}  {float(on_t[r,c]):>14.6e}  "
+              f"{float(off_t[r,c]):>14.6e}"
+              f"  {float(abs_err[r,c]):>12.6e}  {float(rel_err[r,c]):>12.6e}")
+
+
+def _print_summary(all_results: list[CheckResult]):
+    print(_SEP_DOUBLE + "\n  SUMMARY")
+    print(_SEP_DOUBLE)
+    hdr = (f"  {'NAME':<28s} {'SHAPE':<18s} {'ABS_MAX':>12s}  {'REL_MAX':>10s}  "
+           f"{'PEARSON_R':>10s}  {'STATUS':>8s}")
+    print(hdr + "\n  " + "─" * (len(hdr) - 2))
     for r in all_results:
-        status = f"  {CHECK} PASS" if r["passed"] else f"  {CROSS} FAIL"
-        mm = f"{r.get('n_mismatch', '—')}/{r.get('n_total', '—')}"
-        pr = f"{r.get('pearson_r', float('nan')):>10.6f}" if 'pearson_r' in r and r['pearson_r'] is not None else "        —"
-        print(f"  {r['name']:<24s} {r.get('shape_str', '—'):<20s} "
-              f"{r.get('max_diff', float('nan')):>14.6e}  {mm:>12s}  {pr}  {status}")
-    print(_SEP_DOUBLE)
-    print()
+        m = r.metrics
+        shape = m.get("shape", m.get("error", "—"))
+        am = f"{m.get('abs_max', float('nan')):.6e}" if "abs_max" in m else "—"
+        rm = f"{m.get('rel_max', float('nan')):.6e}" if "rel_max" in m else "—"
+        pr = f"{m.get('pearson_r', float('nan')):.6f}" if m.get('pearson_r') is not None else "—"
+        s  = f"  {_CHECK} PASS" if r.passed else f"  {_CROSS} FAIL"
+        print(f"  {r.name:<28s} {shape:<18s} {am:>12s}  {rm:>10s}  {pr:>10s}  {s}")
+    print(_SEP_DOUBLE + "\n")
 
 
-# ── JSON output ─────────────────────────────────────────────────
-
-def _dump_json(all_results: list[dict], output_path: str, atol: float,
-               dir_on: str, dir_off: str, tag: str | None):
-    record = {
-        "atol": atol,
-        "dir_on": dir_on,
-        "dir_off": dir_off,
-        "tag": tag,
-        "results": [
-            {k: v for k, v in r.items()
-             if not isinstance(v, torch.Tensor)}
-            for r in all_results
-        ],
-        "all_passed": all(r["passed"] for r in all_results),
-    }
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
+def _dump_json(all_results: list[CheckResult], path: str,
+               dir_on: str, dir_off: str, tag: str, dir_off2: str | None):
+    record = {"dir_on": dir_on, "dir_off": dir_off}
+    if dir_off2:
+        record["dir_off2"] = dir_off2
+    if tag:
+        record["tag"] = tag
+    record["results"] = [{k: v for k, v in r.metrics.items()} | {"name": r.name, "passed": r.passed}
+                         for r in all_results]
+    record["all_passed"] = all(r.passed for r in all_results)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2, ensure_ascii=False)
-    print(f"  Precision report saved to: {output_path}")
-    print()
+    print(f"  Report saved to: {path}\n")
 
 
-# ── Main ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════════════════
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Unified precision comparison — ON vs OFF diagnostic dumps",
+        description="Precision comparison — ON vs OFF diagnostic dumps",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     ap.add_argument("--dir-on", required=True, help="ON dump directory")
     ap.add_argument("--dir-off", required=True, help="OFF dump directory")
-    ap.add_argument("--tag", choices=["old", "train", "before_restore"], default=None,
-                    help="Dump tag for both ON and OFF 2D files (shortcut for --tag-on/--tag-off)")
-    ap.add_argument("--tag-on", default=None,
-                    help="Dump tag for ON 2D files (overrides --tag for ON)")
-    ap.add_argument("--tag-off", default=None,
-                    help="Dump tag for OFF 2D files (overrides --tag for OFF)")
-    ap.add_argument("--atol", type=float, default=1e-3,
-                    help="Absolute tolerance (default: 1e-3 for packed, 1e-5 for 2D)")
-    ap.add_argument("--rtol", type=float, default=1e-5,
-                    help="Relative tolerance (packed only)")
-    ap.add_argument("--output", "-o", type=str, default=None,
-                    help="Save report as JSON")
-    ap.add_argument("--mask", choices=["off", "on", "all", "prefix"], default="off",
-                    help="Comparison mask mode: off=OFF label_mask (default, "
-                         "response tokens only), on=ON label_mask, "
-                         "all=full [B,L] (for pre-vs-post restore checks)")
+    ap.add_argument("--dir-off2", default=None,
+                    help="Second OFF directory for OFF-vs-OFF baseline")
+    ap.add_argument("--tag", default=None,
+                    help="Dump tag for 2D files (e.g. 'old', 'train')")
+    ap.add_argument("--tag-on", default=None, help="Override tag for ON")
+    ap.add_argument("--tag-off", default=None, help="Override tag for OFF")
+    ap.add_argument("--atol", type=float, default=1e-5,
+                    help="Absolute tolerance for 2D comparison (default: 1e-5)")
+    ap.add_argument("--layer", type=int, default=None,
+                    help="Compare specific attn layer (default: all layers)")
+    ap.add_argument("--mask-file", default=None,
+                    help="External label_mask.pt file (auto-trims last True per row)")
+    ap.add_argument("--no-trim", action="store_true",
+                    help="Skip last-True trimming of label_mask")
+    ap.add_argument("--output", "-o", default=None, help="Save report as JSON")
+    ap.add_argument("--topk", type=int, default=0,
+                    help="Print top-K worst elements (0 = disabled)")
+    ap.add_argument("--sort-err", choices=["abs", "rel", "val"], default="abs",
+                    help="Sort top-K by abs error / rel error / max magnitude (val)")
     args = ap.parse_args()
 
-    dir_on = args.dir_on
-    dir_off = args.dir_off
-    # Resolve tags: --tag-on / --tag-off override --tag
-    tag_on = args.tag_on or args.tag
+    tag_on  = args.tag_on  or args.tag
     tag_off = args.tag_off or args.tag
 
-    print(_SEP_DOUBLE)
-    print(f"  Prefix-Sharing Diag Report")
-    print(f"  ON : {dir_on}")
-    print(f"  OFF: {dir_off}")
-    if tag_on:
-        tag_str = f"TAG_ON={tag_on}" + (f" TAG_OFF={tag_off}" if tag_off != tag_on else "")
-        print(f"  TAG: {tag_str}")
-    print(f"  mask: {args.mask}")
-    print(_SEP_DOUBLE)
-    print()
+    _print_header(args.dir_on, args.dir_off, args.dir_off2,
+                  tag_on, args.mask_file, args.layer)
 
-    all_results: list[dict] = []
-    detail_2d = None  # will be set by compare_2d
+    # Resolve label mask (with trim)
+    label_mask = _resolve_label_mask(args.mask_file, args.dir_off,
+                                     trim_last=not args.no_trim)
+    if label_mask is not None:
+        print(f"  label_mask: {_fmt_shape(tuple(label_mask.shape))}  "
+              f"active={int(label_mask.sum())}\n")
 
-    # 1. Try packed dumps (attn_output.pt, logits.pt)
-    for fname, label in [("attn_output.pt", "attn_output"),
-                          ("logits.pt", "logits")]:
-        r = compare_packed(dir_on, dir_off, fname, label, args.atol, args.rtol)
-        if r is not None:
+    all_results: list[CheckResult] = []
+    stop = False
+
+    # ── ① position_ids ──
+    r = cmp_position_ids(args.dir_on, args.dir_off)
+    if r:
+        all_results.append(r)
+        _print_pos_ids(r)
+        if not r.passed:
+            stop = True
+
+    # ── ② RoPE freqs (pre-apply angle table, suffix-aligned) ──
+    if not stop:
+        r = cmp_rope_freqs(args.dir_on, args.dir_off)
+        if r:
             all_results.append(r)
+            _print_rope_freqs(r)
+            if not r.passed:
+                stop = True
 
-    # 2. Try 2D dumps with --tag
+    # ── ②b RoPE encoding (post-apply rotated Q/K) ──
+    if not stop:
+        r = cmp_rope_emb(args.dir_on, args.dir_off)
+        if r:
+            all_results.append(r)
+            _print_rope(r)
+            if not r.passed:
+                stop = True
+
+    # ── ③ attn_output per-layer cos ──
+    if not stop:
+        r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)
+        if r:
+            all_results.append(r)
+            _print_per_layer(r)
+
+    # ── ④ First-token (attn[0] + logits[0]) ──
+    if not stop:
+        for r in cmp_first_token(args.dir_on, args.dir_off):
+            all_results.append(r)
+            _print_first_token(r)
+
+        # Top-K per-dimension errors
+        if args.topk > 0:
+            last = _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off)
+            # first_token_attn — per-dim top-K
+            if last:
+                a = _load_attn_output(args.dir_on, last)
+                b = _load_attn_output(args.dir_off, last)
+                if a is not None and b is not None:
+                    a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
+                    b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
+                    _print_topk_vec(a0, b0, args.topk, "val",
+                                    "first_token_attn")
+            # first_token_logits — per-dim top-K (real = ON signed value,
+            # so positive logits — the tokens actually selectable by
+            # sampling — surface first, not the large-magnitude negatives)
+            lo = _load_tensor(args.dir_on,  "logits.pt")
+            lf = _load_tensor(args.dir_off, "logits.pt")
+            if lo is not None and lf is not None:
+                ft = _logits_first_token(lo, lf)
+                if ft is not None:
+                    _print_topk_vec(ft[0].cpu(), ft[1].cpu(), args.topk,
+                                    "real", "first_token_logits")
+
+    # ── ④b Logits (full packed alignment via attention_mask + dual pointer) ──
+    if not stop:
+        r = cmp_logits_packed(args.dir_on, args.dir_off)
+        if r:
+            all_results.append(r)
+            _print_logits_packed(r)
+
+    # ── ⑤ 2D comparison (entropy / logp) ──
     if tag_on:
-        results_2d, meta = compare_2d(dir_on, dir_off, tag_on, args.atol,
-                                       tag_off=tag_off,
-                                       mask_mode=args.mask)
-        detail_2d = meta
-        for r in results_2d:
-            all_results.append({
-                "name": r.name,
-                "shape_str": _fmt_shape(r.shape) if r.shape else "mismatch",
-                "max_diff": r.max_diff,
-                "mean_diff": r.mean_diff,
-                "n_mismatch": r.n_mismatch,
-                "n_total": r.n_total,
-                "pearson_r": r.pearson_r,
-                "passed": r.passed,
-            })
+        for fname, cname in [("entropy", "entropy"), ("logprobs", "logp")]:
+            fn = f"{fname}_{tag_on}.pt"
+            t1 = _load_tensor(args.dir_on, fn)
+            t2 = _load_tensor(args.dir_off, f"{fname}_{tag_off or tag_on}.pt")
+            if t1 is None or t2 is None:
+                continue
+            r = cmp_2d(args.dir_on, args.dir_off, fn,
+                       f"{cname}_{tag_on}", label_mask, args.atol)
+            all_results.append(r)
+            print(_SEP_THIN)
+            m = r.metrics
+            print(f"  [{r.name}]  shape={m.get('shape','—')}  active={m.get('active','—')}  "
+                  f"abs_max={m.get('abs_max',0):.6e}  rel_max={m.get('rel_max',0):.6e}  "
+                  f"pearson={m.get('pearson_r',float('nan')):.8f}")
+            print(f"  abs_mean={m.get('abs_mean',0):.6e}  rel_mean={m.get('rel_mean',0):.6e}  "
+                  f"{_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+            # Top-K worst positions
+            if args.topk > 0:
+                _print_topk_2d(t1.cpu(), t2.cpu(), label_mask, args.topk,
+                               args.sort_err, r.name)
+            print()
 
-    # 3. Legacy (no --tag): try logprobs.pt + input_ids.pt
-    else:
-        tag = None
-        fp = os.path.join(dir_on, "logprobs.pt")
-        if os.path.exists(fp):
-            tag = "legacy"
-            label_mask_on_legacy = _load_label_mask(dir_on)
-            label_mask_off_legacy = _load_label_mask(dir_off)
-            r = compare_2d_item(dir_on, dir_off, "logprobs.pt", "logprobs",
-                                args.atol, label_mask_on_legacy, label_mask_off_legacy, None)
-            if r is not None:
-                all_results.append({
-                    "name": r.name,
-                    "shape_str": _fmt_shape(r.shape) if r.shape else "mismatch",
-                    "max_diff": r.max_diff,
-                    "mean_diff": r.mean_diff,
-                    "n_mismatch": r.n_mismatch,
-                    "n_total": r.n_total,
-                    "pearson_r": r.pearson_r,
-                    "passed": r.passed,
-                })
-            # Also try logprobs_{train/old}.pt
-            for try_tag in ["old", "train"]:
-                fp2 = os.path.join(dir_on, f"logprobs_{try_tag}.pt")
-                if os.path.exists(fp2):
-                    r = compare_2d_item(dir_on, dir_off,
-                                        f"logprobs_{try_tag}.pt",
-                                        f"logprobs_{try_tag}",
-                                        args.atol, label_mask_on_legacy, label_mask_off_legacy, None)
-                    if r is not None:
-                        all_results.append({
-                            "name": r.name,
-                            "shape_str": _fmt_shape(r.shape) if r.shape else "mismatch",
-                            "max_diff": r.max_diff,
-                            "mean_diff": r.mean_diff,
-                            "n_mismatch": r.n_mismatch,
-                            "n_total": r.n_total,
-                            "pearson_r": r.pearson_r,
-                            "passed": r.passed,
-                        })
+    # ── ⑥ OFF vs OFF baseline ──
+    if args.dir_off2:
+        print(_SEP_DOUBLE + "\n  [BASELINE]  OFF vs OFF2 Noise Floor\n" + _SEP_DOUBLE)
+        # position_ids baseline
+        rb = cmp_position_ids(args.dir_off, args.dir_off2)
+        if rb:
+            rb.name = "bl_pos_ids"
+            print(f"  bl_pos_ids: {_CHECK if rb.passed else _CROSS} {'PASS' if rb.passed else 'FAIL'}\n")
+            all_results.append(rb)
+        # 2D baseline
+        if tag_on:
+            for fname, cname in [("entropy", "entropy"), ("logprobs", "logp")]:
+                fn = f"{fname}_{tag_on}.pt"
+                r = cmp_2d(args.dir_off, args.dir_off2, fn,
+                           f"bl_{cname}_{tag_on}", label_mask, args.atol)
+                all_results.append(r)
+                m = r.metrics
+                print(_SEP_THIN)
+                print(f"  [{r.name}]  active={m.get('active','—')}  "
+                      f"abs_max={m.get('abs_max',0):.6e}  rel_max={m.get('rel_max',0):.6e}  "
+                      f"pearson={m.get('pearson_r',float('nan')):.8f}")
+                print()
 
-    if not all_results:
-        print("No dump files found in either directory.")
-        return
+    # ── Summary ──
+    _print_summary(all_results)
 
-    # Print summary table
-    _print_summary(all_results, args.atol)
-
-    # Print details for 2D/3D dumps
-    if detail_2d is not None:
-        for d in detail_2d["detail_data"]:
-            r = d["result"]
-            if d["type"] == "2d" and not r.passed:
-                _print_2d_detail(d["name"], d["t1"], d["t2"],
-                                 d["diff"], d["mask"], d["atol"],
-                                 d["label"])
-            elif d["type"] == "3d" and not r.passed:
-                _print_3d_detail(d["name"], d["t1"], d["t2"],
-                                 d["diff"], d["diff_per_pos"],
-                                 d["atol"], d["label"])
-
-    # JSON output
     if args.output:
-        _dump_json(all_results, args.output, args.atol,
-                   dir_on, dir_off, args.tag)
+        _dump_json(all_results, args.output, args.dir_on, args.dir_off,
+                   tag_on, args.dir_off2)
 
 
 if __name__ == "__main__":

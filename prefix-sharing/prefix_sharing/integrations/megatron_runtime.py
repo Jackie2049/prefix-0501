@@ -118,14 +118,15 @@ def prefix_attention(
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
     output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
 
-    # --- diag dump (ON attention) ---
+    ######### prefix-sharing diag: ON attention_output (per-layer) #########
     try:
         from prefix_sharing.tools.diagnostic_dump import dump_attn_on
         dump_attn_on(output[0], packed_seq_params, prefix_sharing_context.prefix_sharing_plan,
                      attention_module.layer_number,
                      attention_module.config.num_layers)
     except Exception as e:
-        print(f"last-attn dump (ON) failed: {e}")
+        prefix_log.warning(f"last-attn dump (ON) failed: {e}")
+    ######### prefix-sharing diag: ON attention_output (per-layer) #########
     # ---
 
     return output
@@ -208,6 +209,14 @@ def _apply_positioned_rope(
 
     if q_pos_emb is not None:
         q_freqs = q_pos_emb.index_select(0, positions)
+        ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
+        try:
+            from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs_on
+            dump_rope_freqs_on(q_freqs, attention_module.layer_number,
+                               attention_module.config.num_layers)
+        except Exception as e:
+            prefix_log.warning(f"rope_freqs_on dump failed: {e}")
+        ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
         query = apply_rotary_pos_emb(
             query.unsqueeze(1),
             q_freqs,
