@@ -1,5 +1,15 @@
 # prefix-sharing — Agent 开发规范
 
+> **本文件仅约定 prefix-sharing 模块的专属开发规范（模块边界、技术约束、注入方式等）。**
+> **所有开发者必须同时遵守仓库完整开发规范：[`../AGENTS.md`](../AGENTS.md)**，包括但不限于：
+> - Git 提交规范（**强制 `[type] <中文简要说明>` 格式，必须有中文简要说明**）
+> - **commit 前必须等用户审核确认**，不得未经审核直接 commit + push
+> - PR 规范（测试结果小节、title 格式）
+> - 不可违反的技术原则、禁止事项、目录边界
+> - 测试规范、文档入口
+>
+> 两份规范同时生效；本文件是对完整规范的**补充**，不是替代。
+
 ## 项目背景
 
 RL 训练中前缀复用（prefix sharing），目标是插件化集成到 rllm+verl+megatron 的 RL pipeline。`prefix-sharing/` 是 `prefix-0501` 仓库中的正式开发目录；因上下游（verl、Megatron、调研 PoC）存在依赖，与 `survey/`、`dependency/`、`docs/` 放在同一仓库内联开发，便于快速迭代与集成验证。
@@ -13,12 +23,6 @@ prefix-0501/
 ├── dependency/              # verl_v070, megatron_v0150
 └── prefix-sharing/          # 正式开发目录（prefix sharing 核心代码与测试）
 ```
-
-文档、提交、测试等规范统一见仓库根目录 [`AGENTS.md`](../AGENTS.md)。本文件仅保留 prefix-sharing 模块专属的开发和约束规范：
-
-- 文档入口与维护原则：见根目录 `AGENTS.md` 的“文档入口”
-- 提交规范 / Cursor Agent 特殊规则：见根目录 `AGENTS.md` 的“Git 提交规范”
-- 测试规范：见根目录 `AGENTS.md` 的“测试”
 
 当前开发默认先读本文件和相关代码；涉及 prefix sharing 语义、术语命名、分层边界或设计取舍时，再查阅 [`docs/concepts.md`](../docs/concepts.md)。架构关系参考 [`docs/overview.md`](../docs/overview.md) 和 [`docs/overview.puml`](../docs/overview.puml)。[`docs/legacy/`](../docs/legacy/) 仅作历史背景参考，不作为当前实现规范。
 

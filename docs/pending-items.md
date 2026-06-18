@@ -4,6 +4,18 @@
 
 ## 当前事项
 
+### 2026-06-05：prefix-interior-grad — packed tensor 路径的 interior-response logprob 插入
+
+**状态**：已由 PR #16 的 2D 后注入方案解决。
+
+**历史背景**：`prefix-interior-grad` 分支早期通过 planner 生成 interior `PrefixLastRestoreSpec`，并提供 Python-list 路径（`restore_prefix_last_logprobs`）和 packed-1D tensor 路径（`restore_suffix_first_log_probs_from_prefix`）两种 logprob 恢复方式。PR #16 将两条路径统一替换为 **2D 后注入**：`restore_reuser_prefix_columns_2d` 在 `postprocess_packed_seqs` 产出的 2D `[B, L]` 空间直接恢复 reuser 的 prefix 列，不再使用 packed-1D 注入或 Python-list 组装。旧的 Python-list 路径（`core/logprob.py`）及其配套的 `VerlMCoreBatchAdapter` 已作为死代码删除。
+
+### 2026-06-04：prefix-sharing 可观测性日志分级与耗时拆分
+
+**问题**：当前 profiler 分支先补充 expected/actual 复用统计，用于定位“理论应复用”和“运行时真实复用”是否一致；但还没有完整日志分级，也没有拆分 `plan_ms`、`build_kv_ms`、`attention_ms`、`restore_ms` 等耗时指标。若 expected/actual 已匹配但性能仍未提升，需要进一步定位慢点是复用比例不足、backend/kernel 路径低效，还是 Python `split/cat/store/load` 开销抵消收益。
+
+**方案**：后续增加类似 `PREFIX_SHARING_OBSERVE=off|summary|layer|profile|debug` 的观测级别控制，并在 profile 级别补充阶段耗时。summary/layer 级别用于常驻问题定位，profile/debug 级别只在专项排查时打开，避免训练日志过量。
+
 ### 2026-06-02：设计 inter micro-batch sharing 的 store 生命周期与 PP 隔离
 
 **问题**：当前 PP 支持只覆盖单 micro-batch 内 prefix-sharing。`PrefixAttentionStore` / `PrefixDeltanetStore` 仍绑定在单次 `PrefixSharingRuntimeContext` 生命周期内，PP 下也保持 stage-local，不跨 micro-batch、不跨 PP stage 传递 prefix activation。后续若支持 inter micro-batch sharing，需要重新定义缓存生命周期、复用边界和清理策略。

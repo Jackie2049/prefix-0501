@@ -1,150 +1,59 @@
 """verl Megatron actor integration helpers.
 
-This module has two layers:
+This module covers both v070 and v080 (verl 0.8.0 engine) paths:
 
-* ``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
-  verl-style micro-batch payload into prefix-sharing metadata plus trimmed
-  inputs/labels/masks, and it assembles restored logprobs after forward.
-* ``VerlMCoreIntegration`` installs the Megatron attention patch. The real
-  Megatron QKV rewiring still requires the framework runtime and remains guarded
-  by optional integration tests.
+* v070: ``build_prefix_sharing_micro_batch_verl070`` and ``restore_reuser_prefix_columns_2d``
+  handle the invasive integration via ``megatron_actor.py``.
+* v080: ``build_prefix_sharing_micro_batch_verl080`` and ``read_ps_config_from_engine_config``
+  handle the monkey-patch integration via ``setup/patches/``.
+
+Both paths share the same core logic (plan -> trim -> layout -> state).
+
+``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
+verl-style micro-batch payload into prefix-sharing metadata plus trimmed
+inputs/labels/masks, and it assembles restored logprobs after forward.
+``VerlMCoreIntegration`` installs the Megatron attention patch. The real
+Megatron QKV rewiring still requires the framework runtime and remains guarded
+by optional integration tests.
 """
 
 from __future__ import annotations
 
 import importlib
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, Sequence, TypeVar
+from dataclasses import dataclass
+from typing import Any, Iterator, Mapping, Sequence
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.batch_trim import (
-    TrimmedBatch,
-    trim_inputs,
-    trim_labels,
-    trim_loss_masks,
-)
-from prefix_sharing.core.logprob import restore_prefix_last_logprobs
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
-from prefix_sharing.integrations.context import prefix_sharing_runtime_context as _prefix_sharing_runtime_context
 from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.integrations.patch_manager import PatchHandle
-from prefix_sharing.integrations.utils import ensure_global_packed_token_lengths
-
-import logging
-logger = logging.getLogger(__name__)
-
-
-T = TypeVar("T")
+from prefix_sharing.utils import ensure_global_packed_token_lengths
 
 
 @dataclass(frozen=True)
 class PrefixSharingRuntimeState:
     prefix_sharing_plan: PrefixSharingPlan
-    backend: Any
+    attention_backend: Any
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
-
-
-@dataclass(frozen=True)
-class VerlMCorePrefixSharingBatch:
-    """Framework-independent materialization of one verl actor micro-batch."""
-
-    prefix_sharing_plan: PrefixSharingPlan
-    input_ids: TrimmedBatch[int]
-    labels: TrimmedBatch[Any] | None = None
-    loss_masks: TrimmedBatch[Any] | None = None
-
-
-@dataclass
-class VerlMCoreBatchAdapter:
-    """Prepare and restore verl Megatron actor micro-batches.
-
-    The adapter is intentionally tensor-agnostic for Phase 1 local tests. A real
-    verl integration can map the returned ``TrimmedBatch.flattened`` and
-    ``prefix_sharing_plan.cu_seqlens_q`` fields to torch tensors without changing core
-    semantics.
-    """
-
-    config: PrefixSharingConfig
-    planner: PrefixSharingPlanner | None = None
-
-    def __post_init__(self) -> None:
-        if self.planner is None:
-            self.planner = PrefixSharingPlanner(self.config)
-
-    def prepare_micro_batch(
-        self,
-        input_ids: Sequence[Sequence[int]],
-        *,
-        labels: Sequence[Sequence[T]] | None = None,
-        loss_masks: Sequence[Sequence[T]] | None = None,
-        forward_id: int | None = None,
-        micro_batch_id: int | None = None,
-    ) -> VerlMCorePrefixSharingBatch:
-        """Plan prefix sharing and trim a micro-batch."""
-
-        assert self.planner is not None
-        prefix_sharing_plan = self.planner.plan(
-            input_ids,
-            forward_id=forward_id,
-            micro_batch_id=micro_batch_id,
-        )
-        trimmed_inputs = trim_inputs(input_ids, prefix_sharing_plan)
-        trimmed_labels = trim_labels(labels, prefix_sharing_plan) if labels is not None else None
-        trimmed_loss_masks = trim_loss_masks(loss_masks, prefix_sharing_plan) if loss_masks is not None else None
-        return VerlMCorePrefixSharingBatch(
-            prefix_sharing_plan=prefix_sharing_plan,
-            input_ids=trimmed_inputs,
-            labels=trimmed_labels,
-            loss_masks=trimmed_loss_masks,
-        )
-
-    def prefix_sharing_runtime_context(
-        self,
-        prefix_sharing_batch: VerlMCorePrefixSharingBatch,
-    ) -> Iterator[Any]:
-        """Open the runtime context consumed by patched attention."""
-
-        runtime_state = PrefixSharingRuntimeState(
-            prefix_sharing_plan=prefix_sharing_batch.prefix_sharing_plan,
-            backend=get_backend_instance(self.config),
-            packed_batch_layout=PackedBatchLayout.from_valid_lengths(
-                prefix_sharing_batch.prefix_sharing_plan.kept_lengths_q
-            ),
-            parallel_info=get_megatron_parallel_info(),
-        )
-        return _prefix_sharing_runtime_context(runtime_state)
-
-    def restore_logprobs(
-        self,
-        suffix_logprobs: Sequence[Sequence[float]],
-        provider_prefix_last_logprobs: Sequence[float],
-        prefix_sharing_plan: PrefixSharingPlan,
-    ) -> list[list[float]]:
-        """Assemble per-row logprobs with Prefix-Last Restore."""
-
-        return restore_prefix_last_logprobs(
-            suffix_logprobs,
-            provider_prefix_last_logprobs,
-            prefix_sharing_plan,
-        )
+    valid_indices: list | None = None
+    """Per-row tensor positions of valid (non-padding) tokens in the
+    original 2D tensors.  Used to map planner's valid-space target_2d_pos
+    to tensor-space columns (needed when sequences have left padding)."""
+    kept_position_ids: Any | None = None
 
 
 @dataclass
 class VerlMCoreIntegration:
     config: PrefixSharingConfig
     backend: Any | None = None
-    batch_adapter: VerlMCoreBatchAdapter = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.batch_adapter = VerlMCoreBatchAdapter(self.config)
 
     def install(self, model_config: Any | None = None) -> PatchHandle:
         self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
@@ -189,7 +98,7 @@ def prefix_sharing_enabled(
         handle.disable()
 
 
-def build_prefix_sharing_micro_batch(
+def build_prefix_sharing_micro_batch_verl070(
     batch: Any,
     actor_config: Any,
     model_config: Any,
@@ -205,7 +114,7 @@ def build_prefix_sharing_micro_batch(
     """
 
     batch_size = len(batch["input_ids"]) if "input_ids" in batch else None
-    logger.warning(f"[PS][prepare] ENTER: batch_size={batch_size}, batch_keys={list(batch.keys())}")
+    print(f"[PS][prepare] ENTER: batch_size={batch_size}, batch_keys={list(batch.keys())}")
 
     config = PrefixSharingConfig.from_raw(
         _read_actor_value(actor_config, "prefix_sharing_config", None)
@@ -213,59 +122,59 @@ def build_prefix_sharing_micro_batch(
 
     # --- Path 1: prefix sharing disabled by config ---
     if not config.enable_prefix_sharing:
-        logger.warning(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enable_prefix_sharing=False), returning (batch, None)")
+        print(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enable_prefix_sharing=False), returning (batch, None)")
         return batch, None
 
-    logger.warning(f"[PS][prepare] config.enable_prefix_sharing=True, validating config...")
+    print(f"[PS][prepare] config.enable_prefix_sharing=True, validating config...")
 
     config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
-    logger.warning(f"[PS][prepare] config.validate() returned OK")
+    print(f"[PS][prepare] config.validate() returned OK")
 
     # --- Path 2: missing use_remove_padding ---
-    logger.warning(f"[PS][prepare] checking megatron.use_remove_padding...")
+    print(f"[PS][prepare] checking megatron.use_remove_padding...")
     if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
-        logger.warning(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
+        print(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
         raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
 
     # --- Path 3: multi_modal check ---
-    logger.warning(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
+    print(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
     multi_modal_inputs = batch.get("multi_modal_inputs")
     if multi_modal_inputs is not None:
         # tensorclass 无法遍历（触发 CUDA 同步），改用底层 td 检查字段数
         import inspect
         is_tensorclass = hasattr(multi_modal_inputs, 'batch_size')
-        logger.warning(f"[PS][prepare] multi_modal_inputs type: tensorclass={is_tensorclass}, type={type(multi_modal_inputs).__name__}")
+        print(f"[PS][prepare] multi_modal_inputs type: tensorclass={is_tensorclass}, type={type(multi_modal_inputs).__name__}")
         if is_tensorclass:
             _td = getattr(multi_modal_inputs, 'td', None) or getattr(multi_modal_inputs, '_tensordict', None)
             _keys = list(_td.keys()) if _td is not None else []
             has_mm = len(_keys) > 0
-            logger.warning(f"[PS][prepare] tensorclass td keys={_keys}, has_mm={has_mm}")
+            print(f"[PS][prepare] tensorclass td keys={_keys}, has_mm={has_mm}")
         else:
             has_mm = any(mmi is not None and len(mmi.keys()) > 0 for mmi in multi_modal_inputs)
         if has_mm:
-            logger.warning(f"[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
+            print(f"[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
             raise RuntimeError("prefix sharing phase 1 supports only text-only actor micro-batches")
-        logger.warning(f"[PS][prepare] multi_modal check PASSED (no real multi-modal content)")
+        print(f"[PS][prepare] multi_modal check PASSED (no real multi-modal content)")
 
     # --- Read tensors ---
     attention_mask = batch["attention_mask"].to(bool)
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
-    logger.warning(f"[PS][prepare] tensor shapes: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}, position_ids={position_ids.shape}")
+    print(f"[PS][prepare] tensor shapes: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}, position_ids={position_ids.shape}")
 
     # --- Path 4: wrong tensor dims ---
     if attention_mask.dim() != 2 or input_ids.dim() != 2 or position_ids.dim() != 2:
-        logger.warning(f"[PS][prepare] PATH 4: non-2D tensors detected, raising RuntimeError")
+        print(f"[PS][prepare] PATH 4: non-2D tensors detected, raising RuntimeError")
         raise RuntimeError("prefix sharing phase 1 expects 2D input_ids/attention_mask/position_ids")
 
     # --- Planning ---
     valid_indices = [attention_mask[row].nonzero(as_tuple=False).flatten() for row in range(input_ids.shape[0])]
     sequences = [input_ids[row, indices].detach().cpu().tolist() for row, indices in enumerate(valid_indices)]
     seq_lens = [len(s) for s in sequences]
-    logger.warning(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
+    print(f"[PS][prepare] sequences: num_seq={len(sequences)}, seq_lens={seq_lens}")
 
     prefix_sharing_plan = PrefixSharingPlanner(config).plan(sequences)
-    logger.warning(
+    print(
         f"[PS][prepare] prefix_sharing_plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
         f"prefix_last_restore={prefix_sharing_plan.prefix_last_restore}"
@@ -273,11 +182,11 @@ def build_prefix_sharing_micro_batch(
 
     # --- Path 5: no sharing found ---
     if not prefix_sharing_plan.has_sharing:
-        logger.warning(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
+        print(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
         return batch, None
 
     # --- Path 6: sharing found, trim the original micro-batch ---
-    logger.warning(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
+    print(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
     trimmed_micro_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
     new_attention_mask[:] = False
@@ -305,102 +214,164 @@ def build_prefix_sharing_micro_batch(
         kept_position_rows,
         align_size=int(align_size),
     )
-    logger.warning(
-        "[PS][prepare][global_rank=%s tp_rank=%s/tp_size=%s cp_rank=%s/cp_size=%s "
-        "pp_rank=%s/pp_size=%s is_pp_first=%s is_pp_last=%s] packed_batch_layout: "
-        "valid_lengths=%s, padded_lengths=%s, cu_seqlens=%s, max_seqlen=%s, "
-        "total_valid=%s, total_padded=%s",
-        parallel_info.global_rank,
-        parallel_info.tp_rank,
-        parallel_info.tp_size,
-        parallel_info.cp_rank,
-        parallel_info.cp_size,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        parallel_info.is_pipeline_first_stage,
-        parallel_info.is_pipeline_last_stage,
-        packed_batch_layout.valid_lengths,
-        packed_batch_layout.padded_lengths,
-        packed_batch_layout.cu_seqlens,
-        packed_batch_layout.max_seqlen,
-        packed_batch_layout.total_valid_length,
-        packed_batch_layout.total_padded_length,
+    print(
+        f"[PS][prepare][global_rank={parallel_info.global_rank} tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
+        f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size} "
+        f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} "
+        f"is_pp_first={parallel_info.is_pipeline_first_stage} is_pp_last={parallel_info.is_pipeline_last_stage}] "
+        f"packed_batch_layout: valid_lengths={packed_batch_layout.valid_lengths}, "
+        f"padded_lengths={packed_batch_layout.padded_lengths}, cu_seqlens={packed_batch_layout.cu_seqlens}, "
+        f"max_seqlen={packed_batch_layout.max_seqlen}, total_valid={packed_batch_layout.total_valid_length}, "
+        f"total_padded={packed_batch_layout.total_padded_length}"
     )
     prefix_sharing_runtime_state = PrefixSharingRuntimeState(
         prefix_sharing_plan=prefix_sharing_plan,
-        backend=get_backend_instance(config, backend),
+        attention_backend=get_backend_instance(config, backend),
         packed_batch_layout=packed_batch_layout,
         parallel_info=parallel_info,
+        valid_indices=valid_indices,
     )
-    logger.warning(
-        "[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
+    print(
+        f"[PS][prepare] PATH 6 DONE: returning (trimmed_micro_batch, "
         f"prefix_sharing_runtime_state) with keep_ranges={prefix_sharing_plan.input_keep_ranges}"
     )
     return trimmed_micro_batch, prefix_sharing_runtime_state
 
 
-def restore_suffix_first_log_probs_from_prefix(
-    logits: Any,
-    labels: Any,
-    log_probs: Any,
+def restore_reuser_prefix_columns_2d(
+    output: dict[str, Any],
+    label_2d: Any,
     vocab_parallel_log_probs_fn: Any,
-) -> Any:
-    """Restore reuser suffix-first logprob from provider prefix-last logits."""
+    vocab_parallel_entropy_fn: Any = None,
+) -> dict[str, Any]:
+    """Restore reuser prefix columns in 2D space after postprocess_packed_seqs.
+
+    All prefix-column restoration happens purely in 2D [B, L] space,
+    consolidating the previous three-phase approach (packed compute →
+    cache → 2D inject) into a single post-forward step.
+
+    For each :class:`PackedPrefixLastRestoreIndex` in the runtime context:
+
+    - **Interior response** (shared-prefix token): logprob and entropy
+      are identical between provider and reuser because the label is the
+      same shared token and the logits are the same (same KV).  Directly
+      copy from the provider's 2D row.
+
+    - **Prefix-last token**: entropy is still the same (same logits),
+      so copy from provider's 2D row.  Logprob depends on the label
+      which differs (reuser's first suffix token ≠ provider's), so
+      recompute from saved provider packed logits + reuser's 2D label.
+
+    Must be called while ``prefix_sharing_runtime_context`` is still
+    active (i.e. before the context manager exits), and after
+    ``postprocess_packed_seqs`` has produced the 2D output dict.
+
+    Args:
+        output: Output dict from forward, with ``log_probs`` [B, L] and
+            optionally ``entropy`` [B, L] in 2D space.
+        label_2d: Original 2D label [B, L] (from ``forward_step``, before
+            packed preprocessing).  In verl convention,
+            ``label[p] = token at p+1``.
+        vocab_parallel_log_probs_fn: Function to compute logprob from
+            packed logits [1, 1, V//tp] and label [1, 1] → scalar.
+            Typically :func:`verl.utils.megatron.tensor_parallel.vocab_parallel_log_probs_from_logits`.
+        vocab_parallel_entropy_fn: Optional function to compute entropy
+            from packed logits [1, V//tp] → scalar.
+
+    Returns:
+        ``output`` with ``log_probs`` and ``entropy`` mutated in-place.
+    """
 
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
-        return log_probs
-    parallel_info = ctx.parallel_info
-    if not parallel_info.is_pipeline_last_stage:
-        logger.warning(
-            "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-            "skip prefix-last restore on non-last PP stage: restore_indices=%s "
-            "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
-            parallel_info.global_rank,
-            parallel_info.pp_rank,
-            parallel_info.pp_size,
-            parallel_info.is_pipeline_last_stage,
-            len(ctx.prefix_last_restore_indices),
-            logits.shape[1],
-            log_probs.shape[1],
-            ctx.packed_batch_layout.total_padded_length,
-        )
-        return log_probs
-    ensure_global_packed_token_lengths(
-        {
-            "logits_token_length": logits.shape[1],
-            "log_probs_token_length": log_probs.shape[1],
-        },
-        total_padded_length=ctx.packed_batch_layout.total_padded_length,
-        context="prefix-last restore",
-    )
-    logger.warning(
-        "[PS][restore][global_rank=%s pp_rank=%s/pp_size=%s is_pp_last=%s] "
-        "running prefix-last restore: restore_indices=%s "
-        "logits_token_length=%s log_probs_token_length=%s total_padded_length=%s",
-        parallel_info.global_rank,
-        parallel_info.pp_rank,
-        parallel_info.pp_size,
-        parallel_info.is_pipeline_last_stage,
-        len(ctx.prefix_last_restore_indices),
-        logits.shape[1],
-        log_probs.shape[1],
-        ctx.packed_batch_layout.total_padded_length,
-    )
-    restored = log_probs.clone()
+        return output
+
+    log_probs = output.get("log_probs")
+    if log_probs is None:
+        return output
+    entropy = output.get("entropy")
+    # Map planner's valid-space target_2d_pos (0-based within valid content)
+    # to tensor-space 2D columns.  postprocess_packed_seqs places tokens at
+    # their ORIGINAL attention_mask positions, so a valid-space position p
+    # maps to valid_indices[row][p] in the [B, L] output.
+    valid_indices = ctx.valid_indices
+
+    def _map_2d_col(row: int, valid_pos: int) -> int:
+        if valid_indices is not None:
+            vi = valid_indices[row]
+            if vi is not None and 0 <= valid_pos < len(vi):
+                return int(vi[valid_pos].item())
+        return valid_pos
+
+    non_interior_count = 0
     for index in ctx.prefix_last_restore_indices:
-        provider_logits = logits[
-            0:1,
-            index.provider_1d_pos : index.provider_1d_pos + 1,
-            :,
-        ].clone()
-        reuse_label = labels[
-            0:1,
-            index.reuse_1d_pos : index.reuse_1d_pos + 1,
-        ]
-        restored_value = vocab_parallel_log_probs_fn(provider_logits, reuse_label)
-        restored[0, index.reuse_1d_pos] = restored_value.reshape(())
-    return restored
+        reuser_row = index.reuse_idx_in_batch
+        provider_row = index.provider_idx_in_batch
+        valid_col = index.target_2d_pos
+        # Map valid-space col to per-row tensor-space columns:
+        # postprocess_packed_seqs places tokens at original
+        # attention_mask positions, which may differ between rows.
+        provider_col = _map_2d_col(provider_row, valid_col)
+        reuser_col = _map_2d_col(reuser_row, valid_col)
+
+        if index.is_shared_prefix_interior:
+            # Shared-prefix interior: token is in shared prefix → logprob and entropy
+            # are identical to the provider's (same label, same logits).
+            log_probs[reuser_row, reuser_col] = log_probs[provider_row, provider_col]
+            if entropy is not None:
+                entropy[reuser_row, reuser_col] = entropy[provider_row, provider_col]
+        else:
+            # Prefix-last: entropy is the same (same logits), so copy
+            # from provider's 2D row.  Logprob differs because reuser's
+            # first suffix token ≠ provider's.
+            non_interior_count += 1
+            if entropy is not None:
+                entropy[reuser_row, reuser_col] = entropy[provider_row, provider_col]
+
+            # Recompute logprob from saved provider packed logits
+            # with reuser's own label.
+            # vocab_parallel_log_probs_from_logits expects:
+            #   logits: [N, V//tp]   labels: [N]
+            saved_key = (reuser_row, valid_col)
+            provider_logits = ctx.prefix_last_logits_saved[saved_key]  # [1, V//tp]
+            reuser_label = label_2d[reuser_row:reuser_row + 1, reuser_col:reuser_col + 1].view(1)  # [1]
+            log_probs[reuser_row, reuser_col] = vocab_parallel_log_probs_fn(
+                provider_logits,  # [1, V//tp]
+                reuser_label,    # [1]
+            ).reshape(())
+
+    # === DIAGNOSTIC: sample after restore ===
+    if ctx.prefix_last_restore_indices:
+        _diag_entries = ctx.prefix_last_restore_indices
+        _diag_interior = [e for e in _diag_entries if e.is_shared_prefix_interior]
+        if _diag_interior:
+            _sample = _diag_interior[0]
+            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
+            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
+            print(
+                f"[RESTORE_DIAG] sample after restore: "
+                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
+                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
+            )
+        _diag_plast = [e for e in _diag_entries if not e.is_shared_prefix_interior]
+        if _diag_plast:
+            _sample = _diag_plast[0]
+            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
+            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
+            print(
+                f"[RESTORE_DIAG] sample after restore (prefix-last): "
+                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
+                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
+                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
+                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
+            )
+    # === END DIAGNOSTIC ===
+
+    if ctx.stats is not None:
+        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
+    return output
 
 
 def _clone_batch(batch: Any) -> Any:
@@ -430,3 +401,360 @@ def _read_actor_value(config: Any, dotted_name: str, default: Any) -> Any:
             else:
                 current = getattr(current, part, default)
     return current
+
+
+# ═══════════════════════════════════════════════════════════════
+# verl 0.8.0 engine 架构适配
+# ═══════════════════════════════════════════════════════════════
+
+
+def read_ps_config_from_engine_config(engine_config: Any) -> Any | None:
+    """从 verl080 engine_config 读取 prefix_sharing_config。
+
+    verl080 engine_config 中 prefix_sharing_config 的位置：
+    1. engine_config.override_transformer_config 是 dict -> 从 dict 中取
+    2. engine_config.override_transformer_config 是对象 -> 从对象属性取
+    3. 回退 -> engine_config.prefix_sharing_config（直接挂在 engine_config 上）
+    """
+    override = getattr(engine_config, "override_transformer_config", None)
+    if override is not None:
+        if isinstance(override, dict):
+            return override.get("prefix_sharing_config")
+        return getattr(override, "prefix_sharing_config", None)
+    return getattr(engine_config, "prefix_sharing_config", None)
+
+
+def build_prefix_sharing_micro_batch_verl080(
+    engine_self: Any,
+    batch: Any,
+    ps_config: PrefixSharingConfig,
+) -> tuple[Any, PrefixSharingRuntimeState | None]:
+    """verl 0.8.0 engine 架构下的 prefix-sharing micro-batch 构建。
+
+    与 v070 的 build_prefix_sharing_micro_batch_verl070 共用核心流程（PATH 1-6），
+    差异仅在 config 来源和 batch 格式适配。
+
+    参数 ps_config 已由调用方通过 PrefixSharingConfig.from_raw() 解析完成，
+    不需要再次 from_raw。
+
+    核心原则：以 v070 验证过的 2D + attention_mask 路径为主，
+    NestedTensor 路径仅在 GPU + use_remove_padding=True 时作为可选优化。
+    NPU 不支持 torch.nested，所有 NPU 场景都走 2D 路径。
+    """
+    # ── PATH 1: prefix sharing disabled ──
+    if not ps_config.enable_prefix_sharing:
+        print("[PS][prepare] PATH 1: prefix sharing disabled")
+        return batch, None
+
+    # ── 阶段 1: 配置校验 ──
+    use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
+    ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
+
+    # ── 阶段 2: 拒绝不支持的特性 ──
+    try:
+        from verl.utils import tensordict_utils as tu
+        use_fused = tu.get_non_tensor_data(batch, "use_fused_kernels", default=False)
+    except Exception:
+        use_fused = False
+    if use_fused:
+        raise RuntimeError("prefix sharing phase 1 requires fused kernels disabled")
+    if getattr(engine_self.engine_config, "dynamic_context_parallel", False):
+        raise RuntimeError("prefix sharing phase 1 does not support dynamic context parallel")
+
+    # ── 阶段 3: 从 batch 提取序列 ──
+    # NestedTensor → 从 offsets/values 提取
+    # Plain 2D → 从 attention_mask.nonzero() 提取
+    # 同时保留 attention_mask_bool，供阶段 6 的 _collect_kept_position_rows 使用。
+    input_ids = batch["input_ids"]
+    is_nested_tensor = _is_nested_tensor(input_ids)
+    attention_mask_bool_for_layout = None
+
+    if is_nested_tensor:
+        sequences = _extract_seq_from_nested_tensor(input_ids)
+    else:
+        # plain 2D tensor（需要 attention_mask）
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is None:
+            print("[PS][prepare] PATH 4: plain 2D batch without attention_mask")
+            return batch, None
+        attention_mask_bool = attention_mask.to(bool)
+        attention_mask_bool_for_layout = attention_mask_bool  # 供阶段 6 使用
+        valid_indices = [
+            attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+            for row in range(input_ids.shape[0])
+        ]
+        sequences = [
+            input_ids[row, indices].detach().cpu().tolist()
+            for row, indices in enumerate(valid_indices)
+        ]
+
+    # ── 阶段 4: 前缀共享规划 ──
+    plan = PrefixSharingPlanner(ps_config).plan(sequences)
+    if not plan.has_sharing:
+        print("[PS][prepare] no prefix sharing detected")
+        return batch, None
+
+    # ── 阶段 5: 物理裁剪 batch ──
+    #   与 v070 的核心区别：v070 只改 attention_mask（Megatron 从 mask 动态重算 packed），
+    #   v080 THD 路径用 preprocess_thd_engine(input_ids) 直接处理数据，
+    #   不看 attention_mask。必须物理裁剪 input_ids/position_ids。
+    if is_nested_tensor:
+        trimmed_batch = _trim_nested_batch(batch, plan)
+    else:
+        trimmed_batch = _trim_plain_batch_thd(batch, plan)
+
+    # layout 计算：从 trimmed 后的实际 kept position rows 构建
+    kept_position_rows = _collect_kept_position_rows(
+        trimmed_batch, plan, is_nested_tensor,
+        attention_mask_bool=attention_mask_bool_for_layout,
+    )
+
+    # ── 阶段 6: 构建 layout ──
+    parallel_info = get_megatron_parallel_info()
+    align_size = (
+        parallel_info.tp_size * parallel_info.cp_size * 2
+        if parallel_info.cp_size > 1
+        else parallel_info.tp_size
+    )
+    packed_layout = PackedBatchLayout.from_kept_position_rows(
+        kept_position_rows,
+        align_size=int(align_size),
+    )
+
+    # ── 阶段 7: 构建 state ──
+    state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=plan,
+        attention_backend=get_backend_instance(ps_config),
+        packed_batch_layout=packed_layout,
+        parallel_info=parallel_info,
+    )
+
+    print(
+        f"[PS][prepare] PATH 6: sharing detected, plan={plan}, layout={packed_layout}"
+    )
+
+    return trimmed_batch, state
+
+
+# ═══════════════════════════════════════
+# Batch 物理裁剪（verl080 THD 路径必须改数据本身，不能只改 mask）
+# ═══════════════════════════════════════
+
+def _trim_nested_batch(batch: Any, plan: PrefixSharingPlan) -> Any:
+    """物理裁剪 NestedTensor batch（verl080 GPU THD 路径）。
+
+    preprocess_thd_engine 从 NestedTensor offsets/values 直接创建 packed 数据，
+    不看 attention_mask。因此必须物理裁剪 input_ids/position_ids，
+    去掉 reuser 的 prefix tokens，只保留 provider + reuser 的 kept 区段。
+    """
+    import torch
+
+    trimmed_batch = _clone_batch(batch)
+
+    input_ids = batch["input_ids"]
+    position_ids = batch["position_ids"]
+
+    # 裁剪 input_ids NestedTensor
+    trimmed_ids_seqs = _slice_nested_sequences(input_ids, plan)
+    new_input_ids = torch.nested.nested_tensor(trimmed_ids_seqs, layout=torch.jagged)
+    trimmed_batch["input_ids"] = new_input_ids
+
+    # 裁剪 position_ids NestedTensor
+    if _is_nested_tensor(position_ids):
+        trimmed_pos_seqs = _slice_nested_sequences(position_ids, plan)
+        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
+    else:
+        # position_ids 是 2D tensor → 需要用 attention_mask 的
+        # valid_indices 切片（keep_range 是序列偏移，不是列索引）
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask_bool = attention_mask.to(bool)
+        else:
+            import torch
+            # NestedTensor batch 无 explicit attention_mask → 所有位置都 valid
+            # 这意味着 position_ids 每行的有效位置从列 0 开始，
+            # valid_indices 等于 range(seq_len)，keep_range 可以直接当列索引用。
+            # 但仍然走 nonzero 路径保持一致性。
+            attention_mask_bool = torch.ones(
+                position_ids.shape[0], position_ids.shape[1],
+                dtype=torch.bool, device=position_ids.device,
+            )
+        trimmed_pos_seqs = _slice_2d_position_rows(
+            position_ids, plan, attention_mask_bool,
+        )
+        new_position_ids = torch.nested.nested_tensor(trimmed_pos_seqs, layout=torch.jagged)
+    trimmed_batch["position_ids"] = new_position_ids
+
+    # loss_mask 也需要裁剪（如果存在）
+    loss_mask = batch.get("loss_mask")
+    if loss_mask is not None and _is_nested_tensor(loss_mask):
+        trimmed_loss_seqs = _slice_nested_sequences(loss_mask, plan)
+        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
+            trimmed_loss_seqs, layout=torch.jagged
+        )
+
+    return trimmed_batch
+
+
+def _trim_plain_batch_thd(batch: Any, plan: PrefixSharingPlan) -> Any:
+    """物理裁剪 plain 2D tensor batch（verl080 NPU THD 路径）。
+
+    v080 THD 路径即使 input_ids 是 2D tensor，preprocess_thd_engine
+    也直接从 input_ids 数据创建 packed（不看 attention_mask）。
+    因此 2D 路径同样需要物理裁剪 input_ids/position_ids，
+    去掉 reuser 的 prefix tokens。
+
+    裁剪方式：将被移除的 prefix 位置用 padding 填充（0 值），
+    attention_mask 标记为 False，这样 Megatron 处理时只看 True 的位置。
+    同时将裁剪后的数据转为 NestedTensor 格式，确保
+    preprocess_thd_engine 正确处理。
+    """
+    import torch
+
+    input_ids = batch["input_ids"]
+    position_ids = batch["position_ids"]
+    attention_mask = batch.get("attention_mask")
+
+    if attention_mask is not None:
+        attention_mask_bool = attention_mask.to(bool)
+    else:
+        # 无 explicit attention_mask → 所有位置都 valid
+        attention_mask_bool = torch.ones(
+            input_ids.shape[0], input_ids.shape[1],
+            dtype=torch.bool, device=input_ids.device,
+        )
+
+    # 按 keep_ranges 从每个 row 中提取 kept 区段
+    kept_id_rows = []
+    kept_pos_rows = []
+    kept_mask_rows = []
+
+    for row in range(input_ids.shape[0]):
+        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+        keep_start, keep_end = plan.input_keep_ranges[row]
+        kept_indices = indices[keep_start:keep_end]
+        kept_id_rows.append(input_ids[row, kept_indices])
+        kept_pos_rows.append(position_ids[row, kept_indices])
+        # loss_mask 的 kept 区段（如果存在）
+        kept_mask_rows.append(torch.ones(
+            kept_indices.shape[0], dtype=torch.bool, device=input_ids.device,
+        ))
+
+    # 用裁剪后的序列构建 NestedTensor（jagged layout）
+    # 这样 preprocess_thd_engine 会从 offsets 正确计算 cu_seqlens
+    trimmed_batch = _clone_batch(batch)
+    trimmed_batch["input_ids"] = torch.nested.nested_tensor(kept_id_rows, layout=torch.jagged)
+    trimmed_batch["position_ids"] = torch.nested.nested_tensor(kept_pos_rows, layout=torch.jagged)
+
+    # loss_mask
+    loss_mask = batch.get("loss_mask")
+    if loss_mask is not None:
+        kept_loss_rows = []
+        for row in range(loss_mask.shape[0]):
+            indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+            keep_start, keep_end = plan.input_keep_ranges[row]
+            kept_indices = indices[keep_start:keep_end]
+            kept_loss_rows.append(loss_mask[row, kept_indices])
+        trimmed_batch["loss_mask"] = torch.nested.nested_tensor(
+            kept_loss_rows, layout=torch.jagged
+        )
+
+    return trimmed_batch
+
+
+def _slice_nested_sequences(nested_tensor: Any, plan: PrefixSharingPlan) -> list[Any]:
+    """从 NestedTensor 中按 keep_ranges 切片每个序列。
+
+    Provider 序列：保留全部 tokens。
+    Reuser 序列：只保留 keep_range 区段的 tokens。
+    """
+    offsets = nested_tensor.offsets()
+    values = nested_tensor.values()
+
+    sliced = []
+    for i in range(len(plan.input_keep_ranges)):
+        seq_values = values[offsets[i]:offsets[i + 1]]
+        keep_start, keep_end = plan.input_keep_ranges[i]
+        sliced.append(seq_values[keep_start:keep_end])
+
+    return sliced
+
+
+def _slice_2d_position_rows(
+    position_ids: Any,
+    plan: PrefixSharingPlan,
+    attention_mask_bool: Any,
+) -> list[Any]:
+    """从 2D position_ids 中按 keep_ranges 提取每个 row 的 kept 区段。
+
+    keep_range 指的是序列中第几个有效 token（在去掉 padding 后的偏移量），
+    不是 position_ids 张量的列索引。必须先通过 attention_mask 找到有效列索引，
+    再取子范围：kept_indices = valid_indices[keep_start:keep_end]。
+    """
+    kept_rows = []
+    for row in range(position_ids.shape[0]):
+        indices = attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+        keep_start, keep_end = plan.input_keep_ranges[row]
+        kept_indices = indices[keep_start:keep_end]
+        kept_rows.append(position_ids[row, kept_indices])
+    return kept_rows
+
+
+def _collect_kept_position_rows(
+    trimmed_batch: Any,
+    plan: PrefixSharingPlan,
+    is_nested_tensor: bool,
+    attention_mask_bool: Any | None = None,
+) -> list[Any]:
+    """从裁剪后的 batch 中收集各序列的 kept position_ids（per-row 1D tensors）。
+
+    用于 PackedBatchLayout.from_kept_position_rows 构建 layout。
+
+    当 position_ids 是 2D tensor 时，需要 attention_mask_bool 来定位有效列索引
+    （keep_range 是序列偏移，不是列索引）。当 position_ids 是 NestedTensor 时，
+    offsets/values 已包含裁剪后的正确数据，无需 attention_mask。
+    """
+    position_ids = trimmed_batch["position_ids"]
+
+    if is_nested_tensor or _is_nested_tensor(position_ids):
+        offsets = position_ids.offsets()
+        values = position_ids.values()
+        return [values[offsets[i]:offsets[i + 1]] for i in range(len(plan.input_keep_ranges))]
+
+    # 2D tensor — 用 attention_mask 的 valid_indices 切片
+    if attention_mask_bool is None:
+        raise ValueError(
+            "attention_mask_bool is required when position_ids is 2D tensor; "
+            "keep_range is a sequence offset, not a column index"
+        )
+    rows = []
+    for i in range(len(plan.input_keep_ranges)):
+        indices = attention_mask_bool[i].nonzero(as_tuple=False).flatten()
+        keep_start, keep_end = plan.input_keep_ranges[i]
+        kept_indices = indices[keep_start:keep_end]
+        rows.append(position_ids[i, kept_indices])
+    return rows
+
+
+def _is_nested_tensor(tensor: Any) -> bool:
+    """安全检测 NestedTensor，避免在 NPU 上引用 torch.nested 模块。
+
+    NPU 不支持 torch.nested，直接 isinstance(tensor, torch.nested.NestedTensor)
+    会崩溃。使用 duck-typing: 有 offsets() 和 values() 方法即为 NestedTensor。
+    """
+    return (
+        hasattr(tensor, "offsets")
+        and callable(tensor.offsets)
+        and hasattr(tensor, "values")
+        and callable(tensor.values)
+    )
+
+
+def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
+    """从 NestedTensor (jagged layout) 中提取每个序列的 token ID 列表。"""
+    offsets = nested_tensor.offsets()
+    values = nested_tensor.values()
+    return [
+        values[offsets[i]:offsets[i + 1]].detach().cpu().tolist()
+        for i in range(offsets.diff().shape[0])
+    ]

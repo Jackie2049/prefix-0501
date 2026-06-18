@@ -6,10 +6,10 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from prefix_sharing.integrations.context import current_prefix_sharing_context, prefix_sharing_runtime_context
-from prefix_sharing.integrations.megatron_runtime import maybe_run_prefix_sharing_attention
+from prefix_sharing.integrations.megatron_runtime import prefix_attention
 from prefix_sharing.integrations.verl_mcore import (
-    build_prefix_sharing_micro_batch,
-    restore_suffix_first_log_probs_from_prefix,
+    build_prefix_sharing_micro_batch_verl070,
+    restore_reuser_prefix_columns_2d,
 )
 
 
@@ -43,7 +43,7 @@ def _install_megatron_parallel_state(
     monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
 
 
-def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_positions():
+def test_build_prefix_sharing_micro_batch_verl070_trims_reuser_mask_and_context_positions():
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
@@ -64,7 +64,7 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
         model_type="text_only_causal_lm",
     )
 
-    trimmed_micro_batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    trimmed_micro_batch, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     assert prefix_sharing_runtime_state is not None
     assert prefix_sharing_runtime_state.prefix_sharing_plan.has_sharing
@@ -80,8 +80,11 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == 5
+        # 3 restore indices: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
     assert current_prefix_sharing_context() is None
 
 
@@ -111,7 +114,7 @@ def test_build_prefix_sharing_micro_batch_trims_reuser_mask_and_context_position
         ),
     ],
 )
-def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
+def test_build_prefix_sharing_micro_batch_verl070_builds_common_tp_padded_layouts(
     monkeypatch,
     tp_size,
     expected_padded_lengths,
@@ -141,7 +144,7 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     layout = prefix_sharing_runtime_state.packed_batch_layout
     assert layout.valid_lengths == [5, 2]
@@ -150,8 +153,74 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
     assert layout.packed_position_ids.tolist() == expected_positions
     assert layout.valid_token_mask.tolist() == expected_mask
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == expected_cu_seqlens[1]
+        # 3 restore indices: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+
+
+def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
+    # prefix-last-only case (no interior response).
+    # input: [[1,2,3,10,11], [1,2,3,20,21]] → prefix_len=3, prompt_len=3
+    # Planner emits 3 specs (2 interior + 1 prefix-last); here we focus on the
+    # prefix-last spec at index 2: provider_predict_pos=2, target_2d_pos=2.
+    # Reuser's first suffix token at target_2d_pos=2 differs from provider's,
+    # so logprob must be recomputed from saved provider logits.
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
+        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        "position_ids": torch.arange(5).repeat(2, 1),
+        "responses": torch.tensor([[10, 11], [20, 21]]),
+    }
+    actor_config = {
+        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
+        "megatron": {"use_remove_padding": True},
+    }
+    model_config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        context_parallel_size=1,
+        apply_rope_fusion=False,
+        fused_single_qkv_rope=False,
+        model_type="text_only_causal_lm",
+    )
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
+
+    def gather_fn(provider_logits, reuse_label):
+        return torch.gather(
+            torch.log_softmax(provider_logits, dim=-1),
+            dim=-1,
+            index=reuse_label.unsqueeze(-1),
+        ).squeeze(-1)
+
+    with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
+        # 3 restore specs: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        index = ctx.prefix_last_restore_indices[2]  # prefix-last spec
+        assert not index.is_shared_prefix_interior
+
+        # Simulate 2D postprocess: output dict with [B, L] log_probs.
+        log_probs_2d = torch.zeros(2, 5)
+        output = {"log_probs": log_probs_2d}
+
+        # 2D label: label[p] = token at p+1 (verl convention).
+        label_2d = torch.tensor([[0, 0, 0, 10, 11], [0, 0, 0, 20, 21]])
+
+        # Saved provider packed logits for prefix-last recompute.
+        saved_logits = torch.randn(1, 32, requires_grad=True)
+        ctx.prefix_last_logits_saved[(index.reuse_idx_in_batch, index.target_2d_pos)] = saved_logits
+
+        output = restore_reuser_prefix_columns_2d(output, label_2d, gather_fn)
+        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 3
+
+        restored_val = output["log_probs"][index.reuse_idx_in_batch, index.target_2d_pos]
+
+    # Gradient must flow through saved_logits.
+    restored_val.backward()
+    assert saved_logits.grad is not None
+    assert saved_logits.grad.abs().sum() > 0
 
 
 @pytest.mark.parametrize(
@@ -162,7 +231,7 @@ def test_build_prefix_sharing_micro_batch_builds_common_tp_padded_layouts(
         (8, [8, 8], [0, 8, 16]),
     ],
 )
-def test_build_prefix_sharing_micro_batch_keeps_global_layout_with_sequence_parallel(
+def test_build_prefix_sharing_micro_batch_verl070_keeps_global_layout_with_sequence_parallel(
     monkeypatch,
     tp_size,
     expected_padded_lengths,
@@ -190,7 +259,7 @@ def test_build_prefix_sharing_micro_batch_keeps_global_layout_with_sequence_para
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     layout = prefix_sharing_runtime_state.packed_batch_layout
     assert layout.valid_lengths == [5, 2]
@@ -198,12 +267,14 @@ def test_build_prefix_sharing_micro_batch_keeps_global_layout_with_sequence_para
     assert layout.cu_seqlens == expected_cu_seqlens
     assert layout.total_padded_length == expected_cu_seqlens[-1]
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == expected_cu_seqlens[1]
+        # 3 restore specs: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
-def test_build_prefix_sharing_micro_batch_records_physical_pipeline_parallel_info(monkeypatch, pp_size):
+def test_build_prefix_sharing_micro_batch_verl070_records_physical_pipeline_parallel_info(monkeypatch, pp_size):
     pp_rank = pp_size - 1
     _install_megatron_parallel_state(monkeypatch, pp_size=pp_size, pp_rank=pp_rank)
     batch = {
@@ -227,7 +298,7 @@ def test_build_prefix_sharing_micro_batch_records_physical_pipeline_parallel_inf
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     parallel_info = prefix_sharing_runtime_state.parallel_info
     assert parallel_info.pp_size == pp_size
@@ -244,7 +315,7 @@ def test_build_prefix_sharing_micro_batch_records_physical_pipeline_parallel_inf
         (2, 4, [0, 6, 8]),
     ],
 )
-def test_build_prefix_sharing_micro_batch_combines_tp_padding_with_physical_pp(
+def test_build_prefix_sharing_micro_batch_verl070_combines_tp_padding_with_physical_pp(
     monkeypatch,
     tp_size,
     pp_size,
@@ -272,92 +343,15 @@ def test_build_prefix_sharing_micro_batch_combines_tp_padding_with_physical_pp(
         model_type="text_only_causal_lm",
     )
 
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
 
     assert prefix_sharing_runtime_state.parallel_info.tp_size == tp_size
     assert prefix_sharing_runtime_state.parallel_info.pp_size == pp_size
     assert prefix_sharing_runtime_state.packed_batch_layout.cu_seqlens == expected_cu_seqlens
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == expected_cu_seqlens[1]
-
-
-def test_restore_suffix_first_log_probs_from_prefix_keeps_provider_autograd_path():
-    # THD compact format: [1, total_kept_tokens, V]
-    # row0 (provider) all 5 tokens, row1 (reuser) suffix 2 tokens (positions 3,4)
-    # total = 5 + 2 = 7, align_size=1 so no padding
-    logits = torch.randn(1, 7, 8, requires_grad=True)
-    labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
-    log_probs = torch.zeros(1, 7, requires_grad=True)
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
-        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
-        "position_ids": torch.arange(5).repeat(2, 1),
-        "responses": torch.tensor([[10, 11], [20, 21]]),
-    }
-    actor_config = {
-        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
-        "megatron": {"use_remove_padding": True},
-    }
-    model_config = SimpleNamespace(
-        pipeline_model_parallel_size=1,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
-        context_parallel_size=1,
-        apply_rope_fusion=False,
-        fused_single_qkv_rope=False,
-        model_type="text_only_causal_lm",
-    )
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
-
-    def gather_fn(provider_logits, reuse_label):
-        return torch.gather(
-            torch.log_softmax(provider_logits, dim=-1),
-            dim=-1,
-            index=reuse_label.unsqueeze(-1),
-        ).squeeze(-1)
-
-    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
-        restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
-
-    restored[0, 5].backward()
-    assert logits.grad is not None
-    assert logits.grad[0, 2].abs().sum() > 0
-
-
-def test_restore_suffix_first_log_probs_from_prefix_noops_on_non_last_pp_stage(monkeypatch):
-    _install_megatron_parallel_state(monkeypatch, pp_size=2, pp_rank=0)
-    logits = torch.randn(1, 7, 8, requires_grad=True)
-    labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
-    log_probs = torch.zeros(1, 7, requires_grad=True)
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
-        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
-        "position_ids": torch.arange(5).repeat(2, 1),
-        "responses": torch.tensor([[10, 11], [20, 21]]),
-    }
-    actor_config = {
-        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
-        "megatron": {"use_remove_padding": True},
-    }
-    model_config = SimpleNamespace(
-        pipeline_model_parallel_size=2,
-        virtual_pipeline_model_parallel_size=None,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
-        context_parallel_size=1,
-        apply_rope_fusion=False,
-        fused_single_qkv_rope=False,
-        model_type="text_only_causal_lm",
-    )
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
-
-    def gather_fn(provider_logits, reuse_label):
-        raise AssertionError("non-last PP stage must not run prefix-last restore")
-
-    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
-        restored = restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)
-
-    assert restored is log_probs
+        # 3 restore specs: 2 interior + 1 prefix-last
+        assert len(ctx.prefix_last_restore_indices) == 3
+        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
 def test_attention_hook_rejects_sp_local_shard_token_length():
@@ -380,7 +374,7 @@ def test_attention_hook_rejects_sp_local_shard_token_length():
         fused_single_qkv_rope=False,
         model_type="text_only_causal_lm",
     )
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
+    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch_verl070(batch, actor_config, model_config)
     attention_module = SimpleNamespace(config=SimpleNamespace(sequence_parallel=True), layer_number=1)
     packed_seq_params = SimpleNamespace(qkv_format="thd")
     query = torch.randn(6, 1, 2)
@@ -389,7 +383,7 @@ def test_attention_hook_rejects_sp_local_shard_token_length():
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
         with pytest.raises(RuntimeError, match="SP-local shard"):
-            maybe_run_prefix_sharing_attention(
+            prefix_attention(
                 attention_module,
                 query,
                 key,
@@ -398,36 +392,3 @@ def test_attention_hook_rejects_sp_local_shard_token_length():
                 rotary_pos_emb=(object(), object()),
                 packed_seq_params=packed_seq_params,
             )
-
-
-def test_restore_suffix_first_log_probs_rejects_sp_local_shard_token_length():
-    logits = torch.randn(1, 6, 8, requires_grad=True)
-    labels = torch.tensor([[0, 0, 0, 10, 11, 3, 4]])
-    log_probs = torch.zeros(1, 7, requires_grad=True)
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
-        "attention_mask": torch.ones(2, 5, dtype=torch.bool),
-        "position_ids": torch.arange(5).repeat(2, 1),
-        "responses": torch.tensor([[10, 11], [20, 21]]),
-    }
-    actor_config = {
-        "prefix_sharing_config": {"enable_prefix_sharing": True, "min_prefix_len": 3},
-        "megatron": {"use_remove_padding": True},
-    }
-    model_config = SimpleNamespace(
-        pipeline_model_parallel_size=1,
-        tensor_model_parallel_size=1,
-        sequence_parallel=True,
-        context_parallel_size=1,
-        apply_rope_fusion=False,
-        fused_single_qkv_rope=False,
-        model_type="text_only_causal_lm",
-    )
-    _, prefix_sharing_runtime_state = build_prefix_sharing_micro_batch(batch, actor_config, model_config)
-
-    def gather_fn(provider_logits, reuse_label):
-        raise AssertionError("restore should reject local shard token lengths before gather")
-
-    with prefix_sharing_runtime_context(prefix_sharing_runtime_state):
-        with pytest.raises(RuntimeError, match="SP-local shard"):
-            restore_suffix_first_log_probs_from_prefix(logits, labels, log_probs, gather_fn)

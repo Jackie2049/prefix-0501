@@ -11,13 +11,16 @@ from prefix_sharing.integrations.parallel_info import MegatronParallelInfo, get_
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.integrations.verl_mcore import (
     PrefixSharingRuntimeState,
-    VerlMCoreBatchAdapter,
     VerlMCoreIntegration,
-    VerlMCorePrefixSharingBatch,
     enable_prefix_sharing,
     prefix_sharing_enabled,
-    build_prefix_sharing_micro_batch,
-    restore_suffix_first_log_probs_from_prefix,
+    build_prefix_sharing_micro_batch_verl070,
+    build_prefix_sharing_micro_batch_verl080,
+    restore_reuser_prefix_columns_2d,
+    read_ps_config_from_engine_config,
+)
+from prefix_sharing.integrations.megatron_runtime import (
+    prefix_attention,
 )
 
 __all__ = [
@@ -28,14 +31,15 @@ __all__ = [
     "MegatronParallelInfo",
     "PrefixSharingRuntimeContext",
     "PrefixSharingRuntimeState",
-    "VerlMCoreBatchAdapter",
     "VerlMCoreIntegration",
-    "VerlMCorePrefixSharingBatch",
     "current_prefix_sharing_context",
     "enable_prefix_sharing",
     "prefix_sharing_runtime_context",
     "prefix_sharing_enabled",
-    "build_prefix_sharing_micro_batch",
-    "restore_suffix_first_log_probs_from_prefix",
+    "build_prefix_sharing_micro_batch_verl070",
+    "build_prefix_sharing_micro_batch_verl080",
+    "restore_reuser_prefix_columns_2d",
+    "read_ps_config_from_engine_config",
+    "prefix_attention",
     "get_megatron_parallel_info",
 ]

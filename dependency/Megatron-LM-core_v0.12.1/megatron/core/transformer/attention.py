@@ -626,6 +626,16 @@ class Attention(MegatronModule, ABC):
 
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify
+                ######### prefix-sharing diag: OFF rope_freqs (per-layer) #########
+                try:
+                    from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs_off
+                    dump_rope_freqs_off(q_pos_emb, self.layer_number,
+                                        self.config.num_layers)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"rope_freqs_off dump failed: {e}")
+                ######### prefix-sharing diag: OFF rope_freqs (per-layer) #########
                 if inference_context is None or inference_context.is_static_batching():
                     query = apply_rotary_pos_emb(
                         query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
@@ -695,6 +705,21 @@ class Attention(MegatronModule, ABC):
         # =================
 
         output, bias = self.linear_proj(core_attn_out)
+
+        ######### prefix-sharing diag: OFF attention_output (per-layer) #########
+        try:
+            from prefix_sharing.tools.diagnostic_dump import dump_attn_off
+            if packed_seq_params is not None \
+               and hasattr(packed_seq_params, 'cu_seqlens_q_padded'):
+                batch_size = packed_seq_params.cu_seqlens_q_padded.shape[0] - 1
+            else:
+                batch_size = query.shape[1]  # fallback for BSH path
+            dump_attn_off(output, packed_seq_params, self.layer_number,
+                          batch_size, self.config.num_layers)
+        except Exception as e:
+            import logging
+            logging.getLogger(__file__).warning("last-attn dump (OFF) failed: %s", e)
+        ######### prefix-sharing diag: OFF attention_output (per-layer) #########
 
         return output, bias
 

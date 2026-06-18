@@ -180,6 +180,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
         packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
+        stats: Any | None = None,
     ) -> tuple[Any, Any]:
         """Delegate KV expansion to the torch reference backend.
 
@@ -196,6 +197,7 @@ class NpuFlashAttentionBackend(FlashAttentionMixin):
             packed_batch_layout=packed_batch_layout,
             layer_id=layer_id,
             tp_rank=tp_rank,
+            stats=stats,
         )
 
     # ------------------------------------------------------------------

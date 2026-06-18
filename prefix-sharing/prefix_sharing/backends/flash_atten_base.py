@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
@@ -18,14 +20,6 @@ from prefix_sharing.core.planner import PrefixSharingPlan
 
 class FlashBackendValidationError(RuntimeError):
     """Raised when a flash-attention backend cannot run with the given plan."""
-
-
-def _torch() -> Any:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("Flash Attention backends require PyTorch") from exc
-    return torch
 
 
 class FlashAttentionMixin:
@@ -69,7 +63,6 @@ class FlashAttentionMixin:
         tensors to the backend, so we expect 3-D inputs.  If 2-D is ever
         received we raise loudily rather than guessing.
         """
-        torch = _torch()
         if tensor.dim() == 3:
             return tensor
         if tensor.dim() == 2:
@@ -83,7 +76,6 @@ class FlashAttentionMixin:
 
     def _build_cu_seqlens_tensor(self, lengths: list[int], device: Any, dtype: Any = None) -> Any:
         """Convert a Python list of cumulative lengths to a CUDA/NPU tensor."""
-        torch = _torch()
         t = torch.tensor(lengths, device=device)
         if dtype is not None:
             t = t.to(dtype=dtype)
@@ -148,7 +140,6 @@ class FlashAttentionMixin:
             When not None the caller must re-pad the FA output via
             :meth:`_repad_output`.
         """
-        torch = _torch()
         self._validate_plan_for_flash(prefix_sharing_plan)
 
         q = self._ensure_3d_thd(query, "query")

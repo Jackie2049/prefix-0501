@@ -167,8 +167,7 @@ prefix-sharing/
 │   │   ├── detector.py                  # 前缀检测抽象基类
 │   │   ├── trie_detector.py             # TriePrefixDetector 实现
 │   │   ├── planner.py                   # PrefixSharingPlanner / PrefixSharingPlan 执行规划
-│   │   ├── batch_trim.py                # Batch 裁剪工具
-│   │   └── logprob.py                   # Prefix-Last Restore 逻辑
+│   │   └── batch_trim.py                # Batch 裁剪工具
 │   │
 │   ├── backends/                        # 硬件执行层
 │   │   ├── __init__.py
@@ -204,12 +203,11 @@ prefix-sharing/
 | `core/trie_detector.py` | `TriePrefixDetector` | 基于 Trie 的前缀检测实现 |
 | `core/planner.py` | `PrefixSharingPlanner` / `PrefixSharingPlan` | 将检测结果转为 Batch 级执行计划 |
 | `core/batch_trim.py` | `trim_inputs/labels/masks` | 裁剪输入序列的 prefix |
-| `core/logprob.py` | `restore_prefix_last_logprobs` | Prefix-Last 位置的 logprob 恢复 |
 | `backends/torch_ref/attention.py` | `TorchReferenceBackend` | PyTorch 参考实现，支持 autograd |
 | `integrations/context.py` | `PrefixSharingRuntimeContext` | 运行时上下文管理（thread-local） |
 | `integrations/context.py` | `prefix_sharing_runtime_context` | 绑定当前 prefix sharing runtime context |
 | `integrations/verl_mcore.py` | `build_prefix_sharing_micro_batch` | prefix sharing micro-batch 构建 |
-| `integrations/verl_mcore.py` | `restore_suffix_first_log_probs_from_prefix` | 从 prefix-last logits 恢复 suffix-first logprob |
+| `integrations/verl_mcore.py` | `restore_reuser_prefix_columns_2d` | 2D 空间恢复 reuser 的 prefix 列 logprob/entropy |
 | `integrations/megatron_runtime.py` | `maybe_run_prefix_sharing_attention` | Megatron attention hook 入口 |
 | `integrations/megatron_attention.py` | `MegatronAttentionIntegration` | Megatron attention 补丁安装/卸载 |
 

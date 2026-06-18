@@ -1,4 +1,4 @@
-"""Shared helpers for framework integration code."""
+"""Shared helpers for the prefix_sharing package."""
 
 from __future__ import annotations
 

@@ -1,18 +1,16 @@
-"""Pure PyTorch reference backend.
-
-This module imports torch lazily so the package can be developed and tested in
-CPU environments where PyTorch is not installed. Tests that exercise this module
-skip automatically when torch is unavailable.
-"""
+"""Pure PyTorch reference backend."""
 
 from __future__ import annotations
 
 import math
 from typing import Any
 
+import torch
+
 from prefix_sharing.backends.base import BackendCapabilities
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
+from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.prefix_store import (
     PREFIX_STATE_TYPE_ATTENTION_KV,
@@ -21,14 +19,6 @@ from prefix_sharing.core.prefix_store import (
     PrefixAttentionStore,
     PrefixDeltanetStore,
 )
-
-
-def _torch() -> Any:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("TorchReferenceBackend requires PyTorch") from exc
-    return torch
 
 
 class TorchReferenceBackend:
@@ -69,8 +59,8 @@ class TorchReferenceBackend:
         packed_batch_layout: Any | None = None,
         layer_id: int,
         tp_rank: int = 0,
+        stats: PrefixSharingStats | None = None,
     ) -> tuple[Any, Any]:
-        torch = _torch()
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         # Input K/V still follow the framework's padded packed layout; only
         # valid tokens may enter the store or expanded KV.
@@ -78,6 +68,12 @@ class TorchReferenceBackend:
         value_rows = _split_packed(value, layout.padded_lengths)
         expanded_keys = []
         expanded_values = []
+        store_count = 0
+        reuse_count = 0
+        reuse_hit_count = 0
+        reuse_miss_count = 0
+        stored_tokens = 0
+        reused_prefix_tokens = 0
         # This loop relies on the current online detector invariant that a provider
         # appears before every reuser that loads from it. All rows' QKV tensors have
         # already been produced in parallel by this point; the ordering here only
@@ -105,6 +101,8 @@ class TorchReferenceBackend:
                     prefix_len=valid_key_row.shape[0],
                     overwrite=True,
                 )
+                store_count += 1
+                stored_tokens += int(valid_key_row.shape[0])
                 expanded_keys.append(valid_key_row)
                 expanded_values.append(valid_value_row)
             else:
@@ -118,8 +116,28 @@ class TorchReferenceBackend:
                     tp_rank,
                 )
                 # Load the already-published provider KV before building this reuser's expanded KV.
-                entry = store.load(provider_slot_id)
+                reuse_count += 1
+                try:
+                    entry = store.load(provider_slot_id)
+                except KeyError:
+                    reuse_miss_count += 1
+                    if stats is not None:
+                        stats.record_attention_kv_build(
+                            layer_id=layer_id,
+                            store_count=store_count,
+                            reuse_count=reuse_count,
+                            reuse_hit_count=reuse_hit_count,
+                            reuse_miss_count=reuse_miss_count,
+                            stored_tokens=stored_tokens,
+                            reused_prefix_tokens=reused_prefix_tokens,
+                            expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
+                            valid_q_tokens=layout.total_valid_length,
+                            padded_q_tokens=layout.total_padded_length,
+                        )
+                    raise
+                reuse_hit_count += 1
                 prefix_len = prefix_sharing_plan.prefix_lens[batch_index]
+                reused_prefix_tokens += int(prefix_len)
                 expanded_key = torch.cat([entry.key_tensor[:prefix_len], valid_key_row], dim=0)
                 expanded_value = torch.cat([entry.value_tensor[:prefix_len], valid_value_row], dim=0)
                 own_slot_id = PrefixActivationSlotId(
@@ -138,8 +156,23 @@ class TorchReferenceBackend:
                     prefix_len=expanded_key.shape[0],
                     overwrite=True,
                 )
+                store_count += 1
+                stored_tokens += int(expanded_key.shape[0])
                 expanded_keys.append(expanded_key)
                 expanded_values.append(expanded_value)
+        if stats is not None:
+            stats.record_attention_kv_build(
+                layer_id=layer_id,
+                store_count=store_count,
+                reuse_count=reuse_count,
+                reuse_hit_count=reuse_hit_count,
+                reuse_miss_count=reuse_miss_count,
+                stored_tokens=stored_tokens,
+                reused_prefix_tokens=reused_prefix_tokens,
+                expanded_kv_tokens=sum(int(row.shape[0]) for row in expanded_keys),
+                valid_q_tokens=layout.total_valid_length,
+                padded_q_tokens=layout.total_padded_length,
+            )
         return torch.cat(expanded_keys, dim=0), torch.cat(expanded_values, dim=0)
 
     def attention(
@@ -152,17 +185,18 @@ class TorchReferenceBackend:
         packed_batch_layout: Any | None = None,
         **_: Any,
     ) -> Any:
-        torch = _torch()
-        layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
-        # Query keeps the framework packed shape, so split by padded lengths.
-        # K/V were already depadded and prefix-expanded by build_kv().
-        query_rows = _split_packed(query, layout.padded_lengths)
+        batch_layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
+        
+        # QKV从batch拆分到单条序列，便于精度问题定位
+        query_rows = _split_packed(query, batch_layout.padded_lengths)
         key_rows = _split_packed(key, prefix_sharing_plan.expanded_lengths_kv)
         value_rows = _split_packed(value, prefix_sharing_plan.expanded_lengths_kv)
+
+        # 逐条序列进行注意力计算
         outputs = []
         for batch_index, (q_row, k_row, v_row) in enumerate(zip(query_rows, key_rows, value_rows)):
-            valid_length = layout.valid_lengths[batch_index]
-            # Padding query slots are layout-only; they must not participate in attention.
+            valid_length = batch_layout.valid_lengths[batch_index]
+            # padding不参与注意力计算
             q_valid = q_row[:valid_length]
             prefix_len = prefix_sharing_plan.q_position_offsets[batch_index]
             if valid_length == 0:
@@ -201,7 +235,6 @@ class TorchReferenceBackend:
         invariant explicit for future HybridAttention integrations.
         """
 
-        torch = _torch()
         attention_output = self.attention(
             query,
             key,
@@ -232,7 +265,6 @@ class TorchReferenceBackend:
         params.
         """
 
-        torch = _torch()
         layout = packed_batch_layout or PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q)
         update_rows = _split_packed(state_update, layout.padded_lengths)
         outputs = []
@@ -303,7 +335,6 @@ class TorchReferenceBackend:
 
 
 def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:
-    torch = _torch()
     if not lengths:
         return []
     if sum(lengths) != tensor.shape[0]:
@@ -312,14 +343,12 @@ def _split_packed(tensor: Any, lengths: list[int]) -> list[Any]:
 
 
 def _causal_q_kv_mask(q_len: int, kv_len: int, q_start: int, device: Any) -> Any:
-    torch = _torch()
     q_positions = torch.arange(q_start, q_start + q_len, device=device).unsqueeze(1)
     kv_positions = torch.arange(0, kv_len, device=device).unsqueeze(0)
     return kv_positions <= q_positions
 
 
 def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
-    torch = _torch()
     scale = math.sqrt(q_row.shape[-1])
     if q_row.dim() == 2:
         scores = q_row @ k_row.transpose(-1, -2) / scale
@@ -329,6 +358,7 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
     if q_row.dim() != 3:
         raise ValueError("TorchReferenceBackend attention expects packed rows with 2 or 3 dims")
 
+    # 适配GQA
     q_heads = q_row.shape[1]
     kv_heads = k_row.shape[1]
     if q_heads != kv_heads:
@@ -338,6 +368,7 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
         k_row = k_row.repeat_interleave(repeat, dim=1)
         v_row = v_row.repeat_interleave(repeat, dim=1)
 
+    # 注意力计算
     scores = torch.einsum("qhd,khd->hqk", q_row, k_row) / scale
     scores = scores.masked_fill(~mask.unsqueeze(0), torch.finfo(scores.dtype).min)
     probs = torch.softmax(scores, dim=-1)
@@ -347,7 +378,6 @@ def _attention_row(q_row: Any, k_row: Any, v_row: Any, mask: Any) -> Any:
 def _pad_like_row(valid_row: Any, packed_row: Any) -> Any:
     if valid_row.shape[0] == packed_row.shape[0]:
         return valid_row
-    torch = _torch()
     padded_row = torch.zeros_like(packed_row)
     padded_row[: valid_row.shape[0]] = valid_row
     return padded_row
