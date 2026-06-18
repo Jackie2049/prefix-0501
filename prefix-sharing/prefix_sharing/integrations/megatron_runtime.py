@@ -114,6 +114,7 @@ def prefix_attention(
         prefix_sharing_context.prefix_sharing_plan,
         packed_batch_layout=packed_batch_layout,
         attention_mask=attention_mask,
+        layer_id=layer_id,
     )
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
     output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
