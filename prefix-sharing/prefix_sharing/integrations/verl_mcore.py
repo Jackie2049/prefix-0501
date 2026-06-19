@@ -240,9 +240,9 @@ def build_prefix_sharing_micro_batch_verl070(
 
 def restore_reuser_prefix_columns_2d(
     output: dict[str, Any],
-    label_2d: Any,
     vocab_parallel_log_probs_fn: Any,
     vocab_parallel_entropy_fn: Any = None,
+    label_2d: Any = None,
 ) -> dict[str, Any]:
     """Restore reuser prefix columns in 2D space after postprocess_packed_seqs.
 
@@ -269,14 +269,18 @@ def restore_reuser_prefix_columns_2d(
     Args:
         output: Output dict from forward, with ``log_probs`` [B, L] and
             optionally ``entropy`` [B, L] in 2D space.
-        label_2d: Original 2D label [B, L] (from ``forward_step``, before
-            packed preprocessing).  In verl convention,
-            ``label[p] = token at p+1``.
         vocab_parallel_log_probs_fn: Function to compute logprob from
             packed logits [1, 1, V//tp] and label [1, 1] → scalar.
             Typically :func:`verl.utils.megatron.tensor_parallel.vocab_parallel_log_probs_from_logits`.
         vocab_parallel_entropy_fn: Optional function to compute entropy
             from packed logits [1, V//tp] → scalar.
+        label_2d: Optional original 2D label [B, L]. Only used as a fallback
+            when an index lacks ``label_value``; ignored whenever
+            ``index.label_value >= 0`` (the common path — the per-index label
+            is populated framework-agnostically by the context for both v070
+            and v080). May be ``None`` when every restore index carries a
+            valid ``label_value`` (avoids materialising a dense ``[B, L_max]``
+            long tensor just to look up a handful of entries).
 
     Returns:
         ``output`` with ``log_probs`` and ``entropy`` mutated in-place.
@@ -285,6 +289,8 @@ def restore_reuser_prefix_columns_2d(
     ctx = current_prefix_sharing_context()
     if ctx is None or not ctx.prefix_last_restore_indices:
         return output
+
+    import torch
 
     log_probs = output.get("log_probs")
     if log_probs is None:
@@ -334,7 +340,21 @@ def restore_reuser_prefix_columns_2d(
             #   logits: [N, V//tp]   labels: [N]
             saved_key = (reuser_row, valid_col)
             provider_logits = ctx.prefix_last_logits_saved[saved_key]  # [1, V//tp]
-            reuser_label = label_2d[reuser_row:reuser_row + 1, reuser_col:reuser_col + 1].view(1)  # [1]
+            # Prefer the per-index label_value (framework-agnostic; populated
+            # by the context for both v070 and v080). Fall back to dense
+            # label_2d for backward compat — avoids materialising a
+            # [B, L_max] long tensor just to read a handful of entries.
+            if index.label_value >= 0:
+                reuser_label = torch.tensor(
+                    [index.label_value], dtype=torch.long, device=log_probs.device,
+                )  # [1]
+            elif label_2d is not None:
+                reuser_label = label_2d[reuser_row:reuser_row + 1, reuser_col:reuser_col + 1].view(1)  # [1]
+            else:
+                raise RuntimeError(
+                    "prefix-last restore needs a label but index.label_value<0 "
+                    "and label_2d is None"
+                )
             log_probs[reuser_row, reuser_col] = vocab_parallel_log_probs_fn(
                 provider_logits,  # [1, V//tp]
                 reuser_label,    # [1]
@@ -372,6 +392,183 @@ def restore_reuser_prefix_columns_2d(
     if ctx.stats is not None:
         ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
     return output
+
+
+# ═══════════════════════════════════════════════════════════════
+# v080 restore 包装：NestedTensor → 2D left-pad → 复用 2D restore → 压回
+# ═══════════════════════════════════════════════════════════════
+
+
+def restore_via_2d_unfold_verl080(
+    output: dict,
+    vocab_parallel_log_probs_fn: Any,
+    vocab_parallel_entropy_fn: Any = None,
+) -> dict:
+    """v080 restore 包装：NestedTensor → 2D left-pad → 复用 restore_reuser_prefix_columns_2d → 压回。
+
+    v080 物理裁剪后 reuser NestedTensor 行只含 suffix 区段，prefix 区段（含
+    prefix-last）被物理删除。本函数在 forward_step 出口（context 仍激活、provider
+    prefix-last logits 已存于 ``ctx.prefix_last_logits_saved``）完成重组：
+
+    1. 展开裁剪后 NestedTensor 各行为完整 2D ``[B, L_max]``（reuser prefix 区段
+       left-pad 0，尾部 right-pad 0 到 L_max）
+    2. 构造 ``label_2d``：仅在 prefix-last 列填 ``index.label_value``（reuser
+       suffix_0 token id）；interior 分支不读 label，suffix 区段不动
+    3. 复用 :func:`restore_reuser_prefix_columns_2d`（现有、已测）：interior 直接
+       复制 provider 2D 值，prefix-last 用存的 logits + label_value 重算
+    4. 按各 ``original_lengths`` 切片压回 NestedTensor (jagged)
+
+    ``valid_indices`` 映射：新方案 left-pad 后 valid-content 0-based 偏移即 2D 列号，
+    state 不传 ``valid_indices``，``restore_reuser_prefix_columns_2d`` 内的
+    ``_map_2d_col`` 自动回退 identity（``return valid_pos``）。
+
+    Must be called inside ``prefix_sharing_runtime_context`` (reads
+    ``current_prefix_sharing_context``), after the vocab_logprobs patch has saved
+    provider prefix-last logits into ``ctx.prefix_last_logits_saved``.
+
+    Args:
+        output: forward_step 返回的 output_dict，含 ``"log_probs"`` NestedTensor
+            （裁剪后 jagged），可选 ``"entropy"`` NestedTensor。**不含** tuple 外层
+            （tuple 解包由调用方负责）。
+        vocab_parallel_log_probs_fn: 用于 prefix-last logp 重算。
+        vocab_parallel_entropy_fn: 可选，当前未直接使用（entropy 走复制路径——
+            interior 和 prefix-last 都从 provider 复制，不重算）。
+
+    Returns:
+        ``output``（``log_probs``/``entropy`` 被替换为重组后的 NestedTensor）。
+    """
+    import torch
+
+    ctx = current_prefix_sharing_context()
+    if ctx is None or not ctx.prefix_last_restore_indices:
+        return output
+
+    log_probs_nested = output.get("log_probs")
+    if log_probs_nested is None or not _is_nested_tensor(log_probs_nested):
+        return output
+    entropy_nested = output.get("entropy")
+    has_entropy = entropy_nested is not None and _is_nested_tensor(entropy_nested)
+
+    plan = ctx.prefix_sharing_plan
+    original_lengths = plan.original_lengths
+    input_keep_ranges = plan.input_keep_ranges
+    B = len(original_lengths)
+    if B == 0:
+        return output
+    L_max = max(original_lengths)
+
+    device = log_probs_nested.values().device
+
+    # --- Step 1: 展开裁剪后 NestedTensor → 完整 2D [B, L_max] ---
+    logp_2d, entropy_2d = _unfold_trimmed_nested_to_2d(
+        log_probs_nested,
+        entropy_nested if has_entropy else None,
+        original_lengths,
+        input_keep_ranges,
+        L_max,
+        B,
+    )
+
+    # --- Step 2: 复用 restore_reuser_prefix_columns_2d ---
+    # label 由 index.label_value 提供（context 框架无关透传），无需构造
+    # [B, L_max] dense label_2d —— 每行至多一个 prefix-last，全表只读几个元素。
+    # identity 列映射：target_2d_pos 即 2D 列号（无 left padding）。
+    output_2d: dict[str, Any] = {"log_probs": logp_2d}
+    if entropy_2d is not None:
+        output_2d["entropy"] = entropy_2d
+    output_2d = restore_reuser_prefix_columns_2d(
+        output_2d,
+        vocab_parallel_log_probs_fn,
+        vocab_parallel_entropy_fn,
+    )
+
+    # --- Step 3: 按各 original_lengths 压回 NestedTensor ---
+    output["log_probs"] = _fold_2d_to_nested(output_2d["log_probs"], original_lengths)
+    if entropy_2d is not None:
+        output["entropy"] = _fold_2d_to_nested(output_2d["entropy"], original_lengths)
+
+    _n_total = len(ctx.prefix_last_restore_indices)
+    _n_interior = sum(1 for i in ctx.prefix_last_restore_indices if i.is_shared_prefix_interior)
+    print(
+        f"[PS][restore_verl080] unfolded B={B} L_max={L_max}, "
+        f"restored {_n_total} indices "
+        f"({_n_total - _n_interior} prefix-last, {_n_interior} interior)",
+        flush=True,
+    )
+    return output
+
+
+def _unfold_trimmed_nested_to_2d(
+    log_probs_nested: Any,
+    entropy_nested: Any,
+    original_lengths: list[int],
+    input_keep_ranges: list,
+    L_max: int,
+    B: int,
+) -> tuple[Any, Any | None]:
+    """展开裁剪后 NestedTensor → 完整 2D [B, L_max]（reuser prefix left-pad 0）。
+
+    裁剪后各行：
+      - provider (keep_start=0): 完整 [prefix | suffix]，长度 = original_lengths[i]
+      - reuser  (keep_start=prefix_len>0): 仅 [suffix]，长度 = original_lengths[i]-prefix_len
+
+    展开后每行恢复成 [prefix_zeros | suffix]，再 right-pad 0 到 L_max。
+    left-pad 的 zeros 不在 autograd 图里，但 restore 会覆盖 prefix 区段（interior
+    复制 provider、prefix-last 重算），最终值在图里。right-pad 尾部在压回时丢弃。
+    """
+    import torch
+
+    lp_offsets = log_probs_nested.offsets()
+    lp_values = log_probs_nested.values()
+    if entropy_nested is not None:
+        ent_offsets = entropy_nested.offsets()
+        ent_values = entropy_nested.values()
+
+    logp_rows: list[Any] = []
+    ent_rows: list[Any] | None = [] if entropy_nested is not None else None
+
+    for i in range(B):
+        orig_len = original_lengths[i]
+        prefix_len = input_keep_ranges[i][0]
+
+        lp_suffix = lp_values[lp_offsets[i]:lp_offsets[i + 1]]
+        logp_rows.append(_build_padded_row(lp_suffix, prefix_len, orig_len, L_max))
+
+        if entropy_nested is not None:
+            ent_suffix = ent_values[ent_offsets[i]:ent_offsets[i + 1]]
+            ent_rows.append(_build_padded_row(ent_suffix, prefix_len, orig_len, L_max))
+
+    logp_2d = torch.stack(logp_rows, dim=0)
+    entropy_2d = torch.stack(ent_rows, dim=0) if ent_rows else None
+    return logp_2d, entropy_2d
+
+
+def _build_padded_row(
+    suffix_data: Any, prefix_len: int, orig_len: int, L_max: int,
+) -> Any:
+    """构造一行完整 2D ``[prefix_zeros | suffix]`` right-pad 0 到 L_max。"""
+    import torch
+
+    device = suffix_data.device
+    dtype = suffix_data.dtype
+    tail_shape = tuple(suffix_data.shape[1:])
+    pieces: list[Any] = []
+    if prefix_len > 0:
+        pieces.append(torch.zeros((prefix_len,) + tail_shape, dtype=dtype, device=device))
+    pieces.append(suffix_data)
+    row = torch.cat(pieces, dim=0)  # [orig_len, ...]
+    if orig_len < L_max:
+        pad = torch.zeros((L_max - orig_len,) + tail_shape, dtype=dtype, device=device)
+        row = torch.cat([row, pad], dim=0)
+    return row
+
+
+def _fold_2d_to_nested(tensor_2d: Any, original_lengths: list[int]) -> Any:
+    """完整 2D [B, L_max] → NestedTensor (jagged)，按各 original_lengths 切片。"""
+    import torch
+
+    rows = [tensor_2d[i, :original_lengths[i]] for i in range(len(original_lengths))]
+    return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 
 def _clone_batch(batch: Any) -> Any:

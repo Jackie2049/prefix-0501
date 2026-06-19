@@ -139,6 +139,29 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 logits_processor_func,
                 postprocess_micro_batch_func,
             )
+            # v080 restore：在 context 仍激活时重组 reuser prefix 区段。
+            # forward_step 返回 (output_dict, partial(postprocess_func))，
+            # 解包处理 output_dict 再重包。restore_via_2d_unfold_verl080 内部
+            # 会检查 context / restore_indices，无 restore 需求时 early return。
+            if ps_state is not None:
+                from prefix_sharing.integrations.verl_mcore import restore_via_2d_unfold_verl080
+                from prefix_sharing.integrations.context import current_prefix_sharing_context
+                from verl.utils.megatron.tensor_parallel import (
+                    vocab_parallel_entropy,
+                    vocab_parallel_log_probs_from_logits,
+                )
+                output_dict, postprocess_fn = output
+                output_dict = restore_via_2d_unfold_verl080(
+                    output_dict,
+                    vocab_parallel_log_probs_from_logits,
+                    vocab_parallel_entropy,
+                )
+                # 释放 vocab 维 logits（占用大，只在 context 生命周期内持有，
+                # restore 已消费完毕）。clear 职责在此，不在包装函数内。
+                ctx = current_prefix_sharing_context()
+                if ctx is not None:
+                    ctx.prefix_last_logits_saved.clear()
+                output = (output_dict, postprocess_fn)
         _ps_forward_step_probe("after_original_forward_step")
         return output
 

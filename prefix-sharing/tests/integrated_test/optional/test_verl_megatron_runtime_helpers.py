@@ -212,7 +212,7 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
         saved_logits = torch.randn(1, 32, requires_grad=True)
         ctx.prefix_last_logits_saved[(index.reuse_idx_in_batch, index.target_2d_pos)] = saved_logits
 
-        output = restore_reuser_prefix_columns_2d(output, label_2d, gather_fn)
+        output = restore_reuser_prefix_columns_2d(output, gather_fn, label_2d=label_2d)
         assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 3
 
         restored_val = output["log_probs"][index.reuse_idx_in_batch, index.target_2d_pos]
