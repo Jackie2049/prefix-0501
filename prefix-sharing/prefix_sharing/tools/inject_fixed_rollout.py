@@ -22,8 +22,11 @@ The JSON format expected:
 """
 
 import json
+import logging
 
 import torch
+
+_log = logging.getLogger(__file__)
 
 
 def _load_json_to_dataproto(json_path: str):
@@ -102,16 +105,18 @@ def _load_json_to_dataproto(json_path: str):
             non_tensors = {
                 "multi_modal_inputs": np.array([{}] * n_samples, dtype=object)
             }
-            print(
-                f"[FixedRollout] verl={verl.__version__}, filled empty "
-                f"'multi_modal_inputs' placeholder for {n_samples} text-only samples."
+            _log.warning(
+                "[FixedRollout] verl=%s, filled empty 'multi_modal_inputs' "
+                "placeholder for %s text-only samples.",
+                verl.__version__, n_samples,
             )
     except Exception as e:  # import 失败或版本探测失败，退回到不填占位
-        print(f"[FixedRollout] skip 'multi_modal_inputs' placeholder: {e}")
+        _log.warning("[FixedRollout] skip 'multi_modal_inputs' placeholder: %s", e)
 
     data = DataProto.from_dict(batch, non_tensors=non_tensors)
-    print(
-        f"[FixedRollout] Loaded {data.batch['input_ids'].shape[0]} samples from {json_path}"
+    _log.warning(
+        "[FixedRollout] Loaded %s samples from %s",
+        data.batch['input_ids'].shape[0], json_path,
     )
     return data
 
@@ -139,19 +144,19 @@ def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
     if remainder != 0:
         pad_size = num_workers - remainder
         fixed_data.padding(pad_size, "last")
-        print(
-            f"[FixedRollout] Padded from {n} to {n + pad_size} samples"
-            f" (divisible by {num_workers})."
+        _log.warning(
+            "[FixedRollout] Padded from %s to %s samples (divisible by %s).",
+            n, n + pad_size, num_workers,
         )
 
     def _patched(batch, **kwargs):
-        print("[FixedRollout] Returning fixed rollout data, skipping generation.")
+        _log.warning("[FixedRollout] Returning fixed rollout data, skipping generation.")
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
     trainer.actor_rollout_wg.generate_sequences = _patched
-    print("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
+    _log.warning("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
 
     if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
         trainer.async_rollout_manager.generate_sequences = _patched
-        print("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
+        _log.warning("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
