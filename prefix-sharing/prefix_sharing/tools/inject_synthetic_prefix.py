@@ -20,11 +20,8 @@ Usage:
 """
 
 import json
-import logging
 
 import torch
-
-_log = logging.getLogger(__file__)
 
 
 def _load_base_tokens(json_path: str) -> list[int]:
@@ -92,7 +89,7 @@ def _build_synthetic_batch(
             f"Reduce batch_size or increase max lengths."
         )
 
-    _log.warning("[SyntheticPrefix] bs=%s seg_size=%s total=%s", batch_size, S, total_needed)
+    print(f"[SyntheticPrefix] bs={batch_size} seg_size={S} total={total_needed}")
     tokens = base_tokens[:total_needed]
     segs = [tokens[i * S:(i + 1) * S] for i in range(n_seg)]
 
@@ -180,25 +177,26 @@ def patch_synthetic_prefix(
     # （ray_trainer.py:1483，纯文本场景也走这行）。虚拟注入没有这个字段会 KeyError。
     # v070 trainer 不碰这个字段，无需添加。这里只在 verl>=0.8.0 时填一个空字典占位
     # （下游 'image_grid_thw' 检查会对空 dict continue 跳过，行为正确）。
+    # 注意：用 > 0.7.99 而不是 >= 0.8.0，因为 packaging 解析下 "0.8.0.dev" 是
+    # prerelease，严格 < "0.8.0"，直接用 >= 0.8.0 会让 dev 版本漏掉导致 KeyError。
     non_tensors = None
     try:
         import verl
         from packaging.version import parse as parse_version
 
-        if parse_version(verl.__version__) >= parse_version("0.8.0"):
+        if parse_version(verl.__version__) > parse_version("0.7.99"):
             import numpy as np
 
             n_samples = batch["input_ids"].shape[0]
             non_tensors = {
                 "multi_modal_inputs": np.array([{}] * n_samples, dtype=object)
             }
-            _log.warning(
-                "[SyntheticPrefix] verl=%s, filled empty 'multi_modal_inputs' "
-                "placeholder for %s text-only samples.",
-                verl.__version__, n_samples,
+            print(
+                f"[SyntheticPrefix] verl={verl.__version__}, filled empty 'multi_modal_inputs' "
+                f"placeholder for {n_samples} text-only samples."
             )
     except Exception as e:  # import 失败或版本探测失败，退回到不填占位
-        _log.warning("[SyntheticPrefix] skip 'multi_modal_inputs' placeholder: %s", e)
+        print(f"[SyntheticPrefix] skip 'multi_modal_inputs' placeholder: {e}")
 
     fixed_data = DataProto.from_dict(batch, non_tensors=non_tensors)
 
@@ -208,22 +206,19 @@ def patch_synthetic_prefix(
     if rem:
         pad_size = num_workers - rem
         fixed_data.padding(pad_size, "last")
-        _log.warning(
-            "[SyntheticPrefix] Padded %s -> %s (divisible by %s)",
-            n, n + pad_size, num_workers,
-        )
+        print(f"[SyntheticPrefix] Padded {n} -> {n + pad_size} (divisible by {num_workers})")
 
     def _patched(batch, **kwargs):
-        _log.warning(
-            "[SyntheticPrefix] Returning synthetic prefix data (bs=%s, P=%s, R=%s).",
-            batch_size, max_prompt_length, max_response_length,
+        print(
+            f"[SyntheticPrefix] Returning synthetic prefix data "
+            f"(bs={batch_size}, P={max_prompt_length}, R={max_response_length})."
         )
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
     trainer.actor_rollout_wg.generate_sequences = _patched
-    _log.warning("[SyntheticPrefix] Patched actor_rollout_wg.generate_sequences.")
+    print("[SyntheticPrefix] Patched actor_rollout_wg.generate_sequences.")
 
     if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
         trainer.async_rollout_manager.generate_sequences = _patched
-        _log.warning("[SyntheticPrefix] Patched async_rollout_manager.generate_sequences.")
+        print("[SyntheticPrefix] Patched async_rollout_manager.generate_sequences.")

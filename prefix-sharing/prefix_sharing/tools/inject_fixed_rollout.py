@@ -22,11 +22,8 @@ The JSON format expected:
 """
 
 import json
-import logging
 
 import torch
-
-_log = logging.getLogger(__file__)
 
 
 def _load_json_to_dataproto(json_path: str):
@@ -93,31 +90,29 @@ def _load_json_to_dataproto(json_path: str):
     # （ray_trainer.py:1483，纯文本场景也走这行）。纯文本/虚拟注入没有这个字段会 KeyError。
     # v070 trainer 不碰这个字段，无需添加。这里只在 verl>=0.8.0 时填一个空字典占位
     # （下游 'image_grid_thw' 检查会对空 dict continue 跳过，行为正确）。
+    # 注意：用 > 0.7.99 而不是 >= 0.8.0，因为 packaging 解析下 "0.8.0.dev" 是
+    # prerelease，严格 < "0.8.0"，直接用 >= 0.8.0 会让 dev 版本漏掉导致 KeyError。
     non_tensors = None
     try:
         import verl
         from packaging.version import parse as parse_version
 
-        if parse_version(verl.__version__) >= parse_version("0.8.0"):
+        if parse_version(verl.__version__) > parse_version("0.7.99"):
             import numpy as np
 
             n_samples = batch["input_ids"].shape[0]
             non_tensors = {
                 "multi_modal_inputs": np.array([{}] * n_samples, dtype=object)
             }
-            _log.warning(
-                "[FixedRollout] verl=%s, filled empty 'multi_modal_inputs' "
-                "placeholder for %s text-only samples.",
-                verl.__version__, n_samples,
+            print(
+                f"[FixedRollout] verl={verl.__version__}, filled empty 'multi_modal_inputs' "
+                f"placeholder for {n_samples} text-only samples."
             )
     except Exception as e:  # import 失败或版本探测失败，退回到不填占位
-        _log.warning("[FixedRollout] skip 'multi_modal_inputs' placeholder: %s", e)
+        print(f"[FixedRollout] skip 'multi_modal_inputs' placeholder: {e}")
 
     data = DataProto.from_dict(batch, non_tensors=non_tensors)
-    _log.warning(
-        "[FixedRollout] Loaded %s samples from %s",
-        data.batch['input_ids'].shape[0], json_path,
-    )
+    print(f"[FixedRollout] Loaded {data.batch['input_ids'].shape[0]} samples from {json_path}")
     return data
 
 
@@ -144,19 +139,16 @@ def patch_fixed_rollout(trainer, json_path: str, num_workers: int = 8):
     if remainder != 0:
         pad_size = num_workers - remainder
         fixed_data.padding(pad_size, "last")
-        _log.warning(
-            "[FixedRollout] Padded from %s to %s samples (divisible by %s).",
-            n, n + pad_size, num_workers,
-        )
+        print(f"[FixedRollout] Padded from {n} to {n + pad_size} samples (divisible by {num_workers}).")
 
     def _patched(batch, **kwargs):
-        _log.warning("[FixedRollout] Returning fixed rollout data, skipping generation.")
+        print("[FixedRollout] Returning fixed rollout data, skipping generation.")
         fixed_data.meta_info["timing"] = {}
         return fixed_data
 
     trainer.actor_rollout_wg.generate_sequences = _patched
-    _log.warning("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
+    print("[FixedRollout] Patched actor_rollout_wg.generate_sequences.")
 
     if hasattr(trainer, "async_rollout_manager") and trainer.async_rollout_manager is not None:
         trainer.async_rollout_manager.generate_sequences = _patched
-        _log.warning("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
+        print("[FixedRollout] Patched async_rollout_manager.generate_sequences.")
