@@ -86,7 +86,30 @@ def _load_json_to_dataproto(json_path: str):
     if "sequences" not in outputs:
         batch["sequences"] = torch.cat([batch["prompts"], batch["responses"]], dim=1)
 
-    data = DataProto.from_dict(batch)
+    # verl>=0.8.0 的 trainer.fit() 会硬索引 batch.non_tensor_batch["multi_modal_inputs"]
+    # （ray_trainer.py:1483，纯文本场景也走这行）。纯文本/虚拟注入没有这个字段会 KeyError。
+    # v070 trainer 不碰这个字段，无需添加。这里只在 verl>=0.8.0 时填一个空字典占位
+    # （下游 'image_grid_thw' 检查会对空 dict continue 跳过，行为正确）。
+    non_tensors = None
+    try:
+        import verl
+        from packaging.version import parse as parse_version
+
+        if parse_version(verl.__version__) >= parse_version("0.8.0"):
+            import numpy as np
+
+            n_samples = batch["input_ids"].shape[0]
+            non_tensors = {
+                "multi_modal_inputs": np.array([{}] * n_samples, dtype=object)
+            }
+            print(
+                f"[FixedRollout] verl={verl.__version__}, filled empty "
+                f"'multi_modal_inputs' placeholder for {n_samples} text-only samples."
+            )
+    except Exception as e:  # import 失败或版本探测失败，退回到不填占位
+        print(f"[FixedRollout] skip 'multi_modal_inputs' placeholder: {e}")
+
+    data = DataProto.from_dict(batch, non_tensors=non_tensors)
     print(
         f"[FixedRollout] Loaded {data.batch['input_ids'].shape[0]} samples from {json_path}"
     )
