@@ -309,6 +309,30 @@ def restore_reuser_prefix_columns_2d(
                 return int(vi[valid_pos].item())
         return valid_pos
 
+    # ── 诊断：取 saved logits 之前，打印 saved dict 的 key 和期望的非 interior key ──
+    # 用于定位 vocab_parallel_log_probs_from_logits patch 是否真的在 verl080
+    # logits_processor 闭包调用点上命中、保存了 provider prefix-last logits。
+    #   saved 空 + expected 非空  → 保存侧 patch 完全没生效（没进 patched_fn 循环）
+    #   saved 有但缺某 key        → 部分保存，看缺的是不是 (1,15) 这类
+    #   saved == expected         → 保存正常，KeyError 另有原因
+    _saved_keys = sorted(ctx.prefix_last_logits_saved.keys())
+    _expected_keys = sorted(
+        (i.reuse_idx_in_batch, i.target_2d_pos)
+        for i in ctx.prefix_last_restore_indices
+        if not i.is_shared_prefix_interior
+    )
+    _interior_n = len(ctx.prefix_last_restore_indices) - len(_expected_keys)
+    print(
+        f"[PS][diag] prefix_last_logits_saved keys ({len(_saved_keys)})="
+        f"{_saved_keys}",
+        flush=True,
+    )
+    print(
+        f"[PS][diag] expected non-interior keys ({len(_expected_keys)})="
+        f"{_expected_keys}  (interior={_interior_n}, not read from saved)",
+        flush=True,
+    )
+
     non_interior_count = 0
     for index in ctx.prefix_last_restore_indices:
         reuser_row = index.reuse_idx_in_batch
