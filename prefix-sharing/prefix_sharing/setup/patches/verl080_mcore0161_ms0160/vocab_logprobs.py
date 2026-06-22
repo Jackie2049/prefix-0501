@@ -38,16 +38,27 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
             if index.is_shared_prefix_interior:
                 continue
             pos = index.provider_1d_pos
+            key = (index.reuse_idx_in_batch, index.target_2d_pos)
             if pos < 0:
-                # chain-reuse 中间 reuser 的 keep_start-1 哨兵，无 packed slot。
-                continue
+                # 不应再发生：_build_prefix_last_restore_indices 已对 prefix-last
+                # 二次 strict 解析到 packed 真含 target_pos 的祖先。若到这里说明
+                # 解析逻辑有遗漏，直接 raise 暴露，避免下游 restore 静默 KeyError。
+                raise RuntimeError(
+                    f"[vocab_logprobs] prefix-last spec got provider_1d_pos<0 "
+                    f"after strict resolve; key={key} provider_1d_pos={pos}. "
+                    f"_build_prefix_last_restore_indices 解析逻辑可能有遗漏。"
+                )
             # clone 保留 autograd 图（restore 重算 logp 要走反向传播，禁止 detach）。
             saved = logits_2d[pos:pos + 1, :].clone()  # [1, V//tp]
+            if saved.shape[0] == 0:
+                raise RuntimeError(
+                    f"[vocab_logprobs] empty logits slice: key={key} "
+                    f"pos={pos} N={logits_2d.shape[0]} — strict resolve 返回的 "
+                    f"packed 位置越界"
+                )
             # key 约定：(reuser_row, target_2d_pos)，与 restore_reuser_prefix_columns_2d
             # 第 335 行 saved_key = (reuser_row, valid_col) 对齐。
-            ctx.prefix_last_logits_saved[
-                (index.reuse_idx_in_batch, index.target_2d_pos)
-            ] = saved
+            ctx.prefix_last_logits_saved[key] = saved
 
         return log_probs
 

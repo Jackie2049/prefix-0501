@@ -125,6 +125,35 @@ def _resolve_provider_for_position(
             return provider_idx
 
 
+def _resolve_strict_provider(
+    plan: PrefixSharingPlan,
+    provider_idx: int,
+    target_pos: int,
+) -> int:
+    """Find the nearest chain ancestor whose packed region *strictly*
+    contains ``target_pos`` (``keep_start <= target_pos < keep_end``).
+
+    Unlike :func:`_resolve_provider_for_position`, this does NOT admit
+    ``keep_start - 1``.  It is used for the prefix-last logp recompute,
+    which needs the actual packed logits at ``target_pos``; an
+    intermediate reuser's ``keep_start - 1`` is physically trimmed away
+    (v080) and has no packed slot, so we must keep walking up to a row
+    that actually keeps ``target_pos`` in its packed inputs.
+    """
+    cur = provider_idx
+    while True:
+        keep_start, keep_end = plan.input_keep_ranges[cur]
+        if keep_start <= target_pos < keep_end:
+            return cur
+        if plan.is_reuser(cur):
+            cur = plan.provider_index[cur]
+        else:
+            # Root reached without strict hit.  This should not happen for
+            # a valid prefix-last spec (target_pos is always inside the root
+            # provider's full sequence); fall back to the root as a guard.
+            return cur
+
+
 def _build_prefix_last_restore_indices(
     prefix_sharing_plan: PrefixSharingPlan,
     packed_batch_layout: PackedBatchLayout,
@@ -144,15 +173,39 @@ def _build_prefix_last_restore_indices(
         # 2D restore uses provider_idx_in_batch + valid_indices mapping,
         # no packed-index lookup needed.  1d_pos_in_provider is only used
         # for prefix-last entries to fetch saved provider logits.
-        # When keep_start-1 resolves to an intermediate reuser, offset
-        # can be negative — skip packed_index and use sentinel -1.
         provider_offset = (
             target_pos - prefix_sharing_plan.input_keep_ranges[resolved_provider][0]
         )
         if provider_offset >= 0:
+            # target_pos is inside the resolved provider's packed region.
             pos_1d_in_provider = packed_batch_layout.packed_index(resolved_provider, provider_offset)
+        elif spec.is_shared_prefix_interior:
+            # Interior spec resolved to an intermediate reuser's keep_start-1:
+            # that 2D column will be filled by the provider's own prefix-last
+            # restore, so the 2D copy path needs no packed logits.  Sentinel -1
+            # is safe — interior entries never read prefix_last_logits_saved.
+            pos_1d_in_provider = -1
         else:
-            pos_1d_in_provider = -1  # keep_start-1 of intermediate provider, no packed slot
+            # Prefix-last (logp recompute) needs the provider packed logits at
+            # target_pos.  If target_pos fell on keep_start-1 of an intermediate
+            # reuser, that row physically trims it away (v080 物理裁剪) → its
+            # packed region has no slot.  Walk up the chain to the nearest
+            # ancestor whose packed region *strictly contains* target_pos
+            # (keep_start <= target_pos < keep_end) and pull logits from there.
+            # Prefix-last predict position is shared-prefix content (KV 已 cache
+            # and identical across the chain), so any such ancestor yields the
+            # same logits — only the reuser's own label differs, which the
+            # restore side supplies via label_value.
+            logits_provider = _resolve_strict_provider(
+                prefix_sharing_plan, resolved_provider, target_pos
+            )
+            logits_offset = (
+                target_pos - prefix_sharing_plan.input_keep_ranges[logits_provider][0]
+            )
+            pos_1d_in_provider = packed_batch_layout.packed_index(logits_provider, logits_offset)
+            # Keep provider_idx_in_batch as the 2D-copy source (intermediate
+            # provider whose column will be restored first); only the logits
+            # source changes.
 
         reuse_1d = -1  # sentinel: no slot in reuser packed region
 

@@ -360,35 +360,6 @@ def restore_reuser_prefix_columns_2d(
                 reuser_label,    # [1]
             ).reshape(())
 
-    # === DIAGNOSTIC: sample after restore ===
-    if ctx.prefix_last_restore_indices:
-        _diag_entries = ctx.prefix_last_restore_indices
-        _diag_interior = [e for e in _diag_entries if e.is_shared_prefix_interior]
-        if _diag_interior:
-            _sample = _diag_interior[0]
-            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
-            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
-            print(
-                f"[RESTORE_DIAG] sample after restore: "
-                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
-                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
-                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
-                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
-            )
-        _diag_plast = [e for e in _diag_entries if not e.is_shared_prefix_interior]
-        if _diag_plast:
-            _sample = _diag_plast[0]
-            _s_prov_col = _map_2d_col(_sample.provider_idx_in_batch, _sample.target_2d_pos)
-            _s_reu_col = _map_2d_col(_sample.reuse_idx_in_batch, _sample.target_2d_pos)
-            print(
-                f"[RESTORE_DIAG] sample after restore (prefix-last): "
-                f"reuser_row={_sample.reuse_idx_in_batch} valid_col={_sample.target_2d_pos} "
-                f"reuser_tensor_col={_s_reu_col} provider_tensor_col={_s_prov_col} "
-                f"log_probs[reuser]={log_probs[_sample.reuse_idx_in_batch, _s_reu_col].item():.6f} "
-                f"log_probs[provider]={log_probs[_sample.provider_idx_in_batch, _s_prov_col].item():.6f}"
-            )
-    # === END DIAGNOSTIC ===
-
     if ctx.stats is not None:
         ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
     return output
