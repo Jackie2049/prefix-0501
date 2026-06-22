@@ -117,7 +117,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         else:
             _ps_forward_step_probe("skip_prepare_prefix_sharing_disabled")
 
-        # ##### [PS-diag] dump 元数据 + position_ids（ON/OFF 通用） #####
+        # ##### [PS-diag] dump 元数据 + attention_mask + label_mask（ON/OFF 通用） #####
         # 仅当 PREFIX_SHARING_DIAG_DUMP 设定时触发，否则零开销。
         # ON: prefix_lens / original_lengths 取自 plan；
         # OFF: prefix_lens 全0、original_lengths 从 input_ids NestedTensor offsets diff 推。
@@ -125,8 +125,10 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         import os as _os
         if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             from prefix_sharing.tools.diagnostic_dump_verl080 import (
-                dump_meta_verl080, dump_position_ids_verl080,
-                nested_values_flat, nested_offsets_to_cu,
+                dump_meta_verl080,
+                dump_attention_mask_verl080, dump_label_mask_verl080,
+                build_attention_mask_2d, build_label_mask_2d,
+                nested_to_2d_full, nested_offsets_to_cu,
             )
             from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
             _ids_nested = batch_for_forward["input_ids"]
@@ -140,10 +142,17 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     _orig_lens = [int(d) for d in _diffs]
                     _prefix_lens = [0] * len(_orig_lens)
                 dump_meta_verl080(_prefix_lens, nested_offsets_to_cu(_ids_nested))
-                _pos_nested = batch_for_forward.get("position_ids")
-                if _is_nested_tensor(_pos_nested):
-                    dump_position_ids_verl080(nested_values_flat(_pos_nested))
-        # ##### [PS-diag] dump 元数据 + position_ids end #####
+                # attention_mask + label_mask：两种对比范围。都用原始 batch 完整数据，
+                # 对齐 restore 后 log_probs 的 [B, L_max] 坐标系。
+                #   attention_mask：所有有效 token（prompt+response，去 padding）—— 整体对比
+                #   label_mask：prompt-last 到 response 结束（cmp_diag trim 后 → 去最后位）—— 聚焦 restore 关键位
+                _lm_nested = original_batch.get("loss_mask")
+                if _is_nested_tensor(_lm_nested):
+                    _Lmax_lm = max(_orig_lens) if _orig_lens else 0
+                    _loss_2d = nested_to_2d_full(_lm_nested, _orig_lens, _Lmax_lm)
+                    dump_attention_mask_verl080(build_attention_mask_2d(_orig_lens, _Lmax_lm))
+                    dump_label_mask_verl080(build_label_mask_2d(_loss_2d, _orig_lens, _Lmax_lm))
+        # ##### [PS-diag] dump 元数据 + masks end #####
 
         # ── 构造修改后的 iterator 喂回原始 forward_step ──
         modified_iter = iter([batch_for_forward])
@@ -199,7 +208,12 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
                 )
                 from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
-                _tag = _os2.environ.get("PREFIX_SHARING_DIAG_TAG", "old")
+                # 对齐 v070: tag = "old" if forward_only else "train"。
+                # forward_step 拿不到 forward_only，用 model.training 等价区分
+                # （eval_mode→training=False→"old" 对应 old_logp 阶段；
+                #  train_mode→training=True→"train" 对应 update_actor 阶段）。
+                # 这样一次 run 自动产出 logprobs_old + logprobs_train 两份，不互相覆盖。
+                _tag = "train" if model.training else "old"
                 _out_dict, _ = output
                 _lp = _out_dict.get("log_probs")
                 if _is_nested_tensor(_lp):
