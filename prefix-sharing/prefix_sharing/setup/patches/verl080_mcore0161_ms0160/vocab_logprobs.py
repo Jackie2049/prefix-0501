@@ -41,6 +41,31 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
         # N = 裁剪后 packed 1D 总长度（provider 行完整含 prefix-last token）。
         logits_2d = logits.view(-1, logits.size(-1))
 
+        # ##### [PS-diag] 验证 packed 坐标对齐（logits N 是 valid 还是 padded） #####
+        # packed_index 用 padded cu_seqlens，但 forward 的 logits_2d 可能是 valid（THD jagged 无 pad）。
+        # 若 N == total_valid != total_padded，则 provider_1d_pos（padded 坐标）在 valid logits 上错位。
+        import os as _os_align
+        if _os_align.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            _layout = ctx.packed_batch_layout
+            print(
+                f"[PS-diag][packed-align] logits_N={logits_2d.shape[0]} "
+                f"total_padded={_layout.total_padded_length} "
+                f"total_valid={_layout.total_valid_length} "
+                f"has_padding={_layout.has_padding}",
+                flush=True,
+            )
+            for _idx in ctx.prefix_last_restore_indices:
+                if _idx.is_shared_prefix_interior:
+                    continue
+                print(
+                    f"[PS-diag][packed-align] reuser={_idx.reuse_idx_in_batch} "
+                    f"provider={_idx.provider_idx_in_batch} "
+                    f"provider_1d_pos={_idx.provider_1d_pos} "
+                    f"target_2d_pos={_idx.target_2d_pos}",
+                    flush=True,
+                )
+        # ##### [PS-diag] 验证 packed 坐标对齐 end #####
+
         for index in ctx.prefix_last_restore_indices:
             # interior 走 2D 复制路径，不需要 logits；只保存 prefix-last。
             if index.is_shared_prefix_interior:
