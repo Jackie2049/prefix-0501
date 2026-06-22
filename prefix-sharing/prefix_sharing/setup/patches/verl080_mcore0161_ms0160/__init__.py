@@ -47,8 +47,19 @@ PATCH_SET: list[PatchSpec] = [
         patch_factory=patch_megatron_attention,
         description="Attention.forward → prefix-sharing intercept (mcore 0.16.1)",
     ),
+    # verl080 算 logprob 的真正调用点在 transformer_impl 的 logits_processor
+    # 闭包里（transformer_impl.py:932），该名字是模块加载时 from...import 绑定
+    # 的局部引用。只 patch 源模块 verl.utils.megatron.tensor_parallel 无法命中
+    # （setattr 源模块属性不会改 transformer_impl 的局部引用），必须直接 patch
+    # transformer_impl 模块属性。grep 确认 verl080 里仅此一处调用该函数。
+    #
+    # 注意：不要同时 patch 源模块。restore 侧重算 prefix-last logp 时
+    # （forward_step.py 内 from verl.utils.megatron.tensor_parallel import）
+    # 需要拿原始函数；若源模块被 patch，重算会误入 patched_fn——传入 logits 仅
+    # [1, V//tp]，而 index.provider_1d_pos 是全局 packed 偏移，切片为空会触发
+    # vocab_logprobs.py 的 empty-slice RuntimeError。
     PatchSpec(
-        module_name="verl.utils.megatron.tensor_parallel",
+        module_name="verl.workers.engine.megatron.transformer_impl",
         target_getter=lambda mod: (mod, "vocab_parallel_log_probs_from_logits"),
         patch_factory=patch_megatron_vocab,
         description="vocab_parallel_log_probs → auto logprob restore (verl 0.8.0)",
