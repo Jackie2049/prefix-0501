@@ -117,6 +117,34 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         else:
             _ps_forward_step_probe("skip_prepare_prefix_sharing_disabled")
 
+        # ##### [PS-diag] dump 元数据 + position_ids（ON/OFF 通用） #####
+        # 仅当 PREFIX_SHARING_DIAG_DUMP 设定时触发，否则零开销。
+        # ON: prefix_lens / original_lengths 取自 plan；
+        # OFF: prefix_lens 全0、original_lengths 从 input_ids NestedTensor offsets diff 推。
+        # cu_seqlens 取送进 forward 的 input_ids NestedTensor offsets（ON=裁剪后 packed 边界, OFF=完整）。
+        import os as _os
+        if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                dump_meta_verl080, dump_position_ids_verl080,
+                nested_values_flat, nested_offsets_to_cu,
+            )
+            from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+            _ids_nested = batch_for_forward["input_ids"]
+            if _is_nested_tensor(_ids_nested):
+                if ps_state is not None:
+                    _plan = ps_state.prefix_sharing_plan
+                    _prefix_lens = list(_plan.prefix_lens)
+                    _orig_lens = list(_plan.original_lengths)
+                else:
+                    _diffs = _ids_nested.offsets().diff().tolist()
+                    _orig_lens = [int(d) for d in _diffs]
+                    _prefix_lens = [0] * len(_orig_lens)
+                dump_meta_verl080(_prefix_lens, nested_offsets_to_cu(_ids_nested))
+                _pos_nested = batch_for_forward.get("position_ids")
+                if _is_nested_tensor(_pos_nested):
+                    dump_position_ids_verl080(nested_values_flat(_pos_nested))
+        # ##### [PS-diag] dump 元数据 + position_ids end #####
+
         # ── 构造修改后的 iterator 喂回原始 forward_step ──
         modified_iter = iter([batch_for_forward])
 
@@ -162,6 +190,29 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 if ctx is not None:
                     ctx.prefix_last_logits_saved.clear()
                 output = (output_dict, postprocess_fn)
+            # ##### [PS-diag] dump 2D logprobs/entropy（ON=restore后, OFF=原始） #####
+            # restore 后（ON）或原始 forward（OFF）的 log_probs/entropy 都是 NestedTensor，
+            # 每行长度 = original_lengths[i]，展开到统一 [B, L_max] 供 cmp_diag.cmp_2d 逐元素对比。
+            import os as _os2
+            if _os2.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+                from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                    nested_to_2d_full, dump_logprobs_2d_verl080, dump_entropy_2d_verl080,
+                )
+                from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
+                _tag = _os2.environ.get("PREFIX_SHARING_DIAG_TAG", "old")
+                _out_dict, _ = output
+                _lp = _out_dict.get("log_probs")
+                if _is_nested_tensor(_lp):
+                    if ps_state is not None:
+                        _ol = list(ps_state.prefix_sharing_plan.original_lengths)
+                    else:
+                        _ol = [int(d) for d in _lp.offsets().diff().tolist()]
+                    _Lmax = max(_ol) if _ol else 0
+                    dump_logprobs_2d_verl080(nested_to_2d_full(_lp, _ol, _Lmax), _tag)
+                    _ent = _out_dict.get("entropy")
+                    if _is_nested_tensor(_ent):
+                        dump_entropy_2d_verl080(nested_to_2d_full(_ent, _ol, _Lmax), _tag)
+            # ##### [PS-diag] dump 2D logprobs/entropy end #####
         _ps_forward_step_probe("after_original_forward_step")
         return output
 

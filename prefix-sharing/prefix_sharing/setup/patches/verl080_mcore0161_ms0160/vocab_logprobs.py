@@ -21,6 +21,14 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
     """创建 vocab_parallel_log_probs_from_logits 的 patch wrapper。"""
 
     def patched_fn(logits, labels):
+        # ##### [PS-diag] dump logits（ON/OFF 都 dump，放保存逻辑之前） #####
+        # logits 形态 [N, V//tp]（或 [N,1,V//tp]），cmp_diag.cmp_logits_packed 会
+        # reshape 成 token-major [N,V] 再用 cu_seqlens+prefix_lens 对齐。
+        import os as _os
+        if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump_verl080 import dump_logits_verl080
+            dump_logits_verl080(logits)
+        # ##### [PS-diag] dump logits end #####
         log_probs = original_fn(logits, labels)
 
         from prefix_sharing.integrations.context import current_prefix_sharing_context
