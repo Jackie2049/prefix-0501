@@ -1,83 +1,95 @@
-"""verl080 精度比较 — ON vs OFF 诊断 dump（2D 展开后）。
+"""verl080 精度比较 — ON vs OFF（packed + 2D 整合对比）。
 
-专为 :mod:`diagnostic_dump_verl080` 产出的格式设计，与 v070 ``cmp_diag.py``
-的核心区别：
+对比项分两类：
 
-  v070: logprobs/logits 为 packed 1D，ON 只含 suffix（物理裁剪后）、OFF 含完整序列，
-        需 cu_seqlens + prefix_lens 双指针对齐提取 suffix 再比。
-  v080: logprobs/entropy 已在 dump 端展成 2D ``[B, L_max]``（ON=restore 后 / OFF=原始
-        forward），ON/OFF 同 shape、同坐标系（列 ``c`` = 原 token 位置），
-        **逐元素直接对比，无需 suffix 对齐**。
+  **packed（suffix 对齐，复用 v070 cmp_diag）**
+    - attention_output per-layer cos   每层 attention 输出余弦相似度
+    - first_token                       packed[0]（attn[0] + logits[0]）
+    - logits packed                     全 packed logits suffix 对齐对比
 
-dump 文件约定（见 :mod:`diagnostic_dump_verl080`）::
+  **2D（v080 特有，restore 后 ``[B, L_max]``）**
+    - logprobs / entropy                直接逐元素对比（ON/OFF 同坐标系）
+
+为什么 packed 部分能直接复用 v070 ``cmp_diag``：
+  v080 的 attn/logits dump 沿用 ``diagnostic_dump.py`` 的 ``dump_attn_on/off`` /
+  ``dump_logits``，文件格式与 v070 完全一致（packed ``[N,…]`` + ``cu_seqlens_q.pt`` +
+  ``prefix_lens.pt``）。suffix 对齐逻辑（OFF 的 cu_seqlens + ON 的 prefix_lens 构建
+  1D mask，从 OFF 完整 packed 提取 ON suffix 对应段）通用，直接 import ``cmp_diag``
+  的对比函数即可。
+
+为什么 2D 部分要新写：
+  v080 的 logprobs/entropy 是 restore 后展成的 2D ``[B, L_max]``（ON=restore 后含
+  完整 prompt+response / OFF=原始 forward），ON/OFF 同 shape 同坐标系，直接逐元素
+  对比，**不需要 suffix 对齐**。v070 ``cmp_diag.cmp_2d`` 没有 shape diagnostics，
+  v080 场景下 shape 可能不一致（dump 端坐标系错配），需要增强：开头打印 ON/OFF
+  所有文件 shape 定位根因，shape 不匹配时不 crash 而是报告。
+
+dump 文件约定（``diagnostic_dump_verl080`` + ``diagnostic_dump``）::
 
     logprobs_{tag}.pt       [B, L_max]       restore 后 2D log_probs
-    entropy_{tag}.pt        [B, L_max]       2D entropy（可选）
-    attention_mask_{tag}.pt [B, L_max] bool  [0,L_i-1) 所有 predict 有效位（去越界预测位）
-    label_mask_{tag}.pt     [B, L_max] bool  [prompt-last,L_i-1) PPO loss 范围（不含末尾）
+    entropy_{tag}.pt        [B, L_max]       2D entropy
+    attention_mask_{tag}.pt [B, L_max] bool  [0,L_i-1) 所有 predict 有效位
+    label_mask_{tag}.pt     [B, L_max] bool  [prompt-last,L_i-1) PPO loss 范围
+    logits.pt               [N, V//tp]       packed logits（ON 裁剪后 / OFF 完整）
+    attn_outputs.pt         dict {layer: [N, hidden]}  per-layer packed attn output
     prefix_lens.pt          [B]              ON=plan.prefix_lens / OFF=全0
-    cu_seqlens_q.pt         [B+1]            NestedTensor offsets
-
-聚焦 loss 相关量（logp / entropy）。attn / RoPE / position_ids 留第二阶段
-（v080 NestedTensor 数据结构与 v070 不同，需单独的 dump + 对比设计）。
+    cu_seqlens_q.pt         [B+1]            NestedTensor offsets（ON 裁剪后 / OFF 完整）
 
 Usage:
-    # 默认：logprobs + entropy，用 label_mask（response 区，聚焦 restore 关键位）
+    # 完整对比（attn per-layer + first_token + logits + logprobs + entropy）
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off --tag old
 
-    # 用 attention_mask（全有效位对比）
+    # 只看某一层 attention（1-indexed）
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
-        --tag old --mask attention
+        --tag old --layer 12
 
-    # top-K 误差最大位置
+    # 2D top-K 误差最大位置
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag old --topk 20
 
-    # OFF vs OFF baseline（自然噪声底）
+    # OFF vs OFF baseline（噪声底）
     python cmp_diag_verl080.py --dir-on ./dump_off --dir-off ./dump_off2 \\
         --tag old
 
-    # 导出 JSON 报告
-    python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
-        --tag old -o report.json
-
 Parameters:
-    --dir-on     (必需) ON 模式 dump 目录
-    --dir-off    (必需) OFF 模式 dump 目录
-    --dir-off2   (可选) 第二个 OFF 目录，OFF-vs-OFF baseline（噪声底参考）
-    --tag        (必需) 文件标签 old / train（logprobs_{tag}.pt / mask_{tag}.pt）
-    --mask       (可选) mask 类型: label(默认) / attention / none
-    --atol       (可选) 绝对容差，默认 1e-5
-    --topk       (可选) 打印前 N 个误差最大位置（0=关闭，默认 0）
-    --sort-err   (可选) top-K 排序: abs(默认) / rel / val
-    -o, --output (可选) JSON 报告路径
+    --dir-on     (必需) ON dump 目录
+    --dir-off    (必需) OFF dump 目录
+    --dir-off2   (可选) 第二个 OFF 目录，OFF-vs-OFF baseline
+    --tag        (必需) 2D 文件标签 old / train
+    --mask       (可选) 2D 对比 mask: label(默认) / attention / none
+    --layer      (可选) 只对比指定层 attention (1-indexed)，不传则所有层
+    --atol       (可选) 2D 对比绝对容差，默认 1e-5
+    --topk       (可选) 2D top-K 误差位置（0=关闭）
+    --sort-err   (可选) 2D top-K 排序: abs(默认) / rel / val
+    -o, --output (可选) JSON 报告
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
-from dataclasses import dataclass, field
 
 import torch
 
-_SEP_DOUBLE = "=" * 70
-_SEP_SINGLE = "-" * 70
-_SEP_THIN = "─" * 70
-_CHECK = "✓"
-_CROSS = "✗"
-
-
-@dataclass
-class CheckResult:
-    name: str
-    passed: bool = True
-    metrics: dict = field(default_factory=dict)
+# packed 对比（attn / logits / first_token）复用 v070 cmp_diag —— v080 的 attn/logits
+# dump 沿用 diagnostic_dump.py 的 dump_attn_on/off / dump_logits，文件格式与 v070 一致
+# （packed [N,…] + cu_seqlens_q.pt + prefix_lens.pt），suffix 对齐逻辑通用。
+from prefix_sharing.tools.cmp_diag import (
+    CheckResult,
+    _SEP_DOUBLE, _SEP_THIN, _CHECK, _CROSS,
+    # packed 对比函数
+    cmp_attn_layer, cmp_first_token, cmp_logits_packed,
+    # packed 结果打印
+    _print_per_layer, _print_first_token, _print_logits_packed,
+    # 通用输出（兼容 packed + 2D 混合结果）
+    _print_summary, _dump_json,
+    # 通用 loader
+    _load_tensor,
+)
 
 
 # ════════════════════════════════════════════════════════════════
-#  Metric helpers（与数据结构无关的纯数学；自包含，不依赖 v070 cmp_diag）
+#  2D metric helpers（logprobs/entropy 标量逐元素对比）
 # ════════════════════════════════════════════════════════════════
 
 def _error_abs_rel(a: torch.Tensor, b: torch.Tensor,
@@ -106,13 +118,8 @@ def _pearson_r(t1: torch.Tensor, t2: torch.Tensor,
 
 
 # ════════════════════════════════════════════════════════════════
-#  Loading helpers
+#  2D mask loading
 # ════════════════════════════════════════════════════════════════
-
-def _load_tensor(dir_path: str, filename: str) -> torch.Tensor | None:
-    fp = os.path.join(dir_path, filename)
-    return torch.load(fp, weights_only=True).float() if os.path.exists(fp) else None
-
 
 def _load_mask_2d(dir_path: str, mask_kind: str, tag: str) -> torch.Tensor | None:
     """加载 2D mask：``label_mask_{tag}.pt`` / ``attention_mask_{tag}.pt``。"""
@@ -146,7 +153,7 @@ def _resolve_mask(dir_off: str, mask_kind: str, tag: str,
 
 
 # ════════════════════════════════════════════════════════════════
-#  Core comparison
+#  2D comparison（v080 增强：返回 tensors + shape mismatch 不 crash）
 # ════════════════════════════════════════════════════════════════
 
 def cmp_2d(dir_on: str, dir_off: str, filename: str, name: str,
@@ -184,18 +191,8 @@ def cmp_2d(dir_on: str, dir_off: str, filename: str, name: str,
 
 
 # ════════════════════════════════════════════════════════════════
-#  Output helpers
+#  Shape diagnostics（v080 特有：定位 mismatch 根因）
 # ════════════════════════════════════════════════════════════════
-
-def _print_header(dir_on, dir_off, dir_off2, tag, mask_kind):
-    print(_SEP_DOUBLE)
-    print("  verl080 Prefix-Sharing Diag Report")
-    print(f"  ON :  {dir_on}\n  OFF:  {dir_off}")
-    if dir_off2:
-        print(f"  OFF2: {dir_off2}")
-    print(f"  TAG : {tag}    MASK: {mask_kind}")
-    print(_SEP_DOUBLE + "\n")
-
 
 def _shape_of(dir_path: str, filename: str) -> str:
     fp = os.path.join(dir_path, filename)
@@ -213,13 +210,15 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str):
     logprobs ON vs OFF shape 不同，通常意味着 dump 端两侧坐标系不一致
     （例如 ON restore 后含完整 prompt+response，OFF 只 dump 了 response 段）。
     """
-    print(_SEP_SINGLE + "\n  [shapes]  ON vs OFF dump shapes")
-    print(_SEP_SINGLE)
+    print("-" * 70 + "\n  [shapes]  ON vs OFF dump shapes")
+    print("-" * 70)
     files = [
         f"logprobs_{tag}.pt",
         f"entropy_{tag}.pt",
         f"label_mask_{tag}.pt",
         f"attention_mask_{tag}.pt",
+        "logits.pt",
+        "attn_outputs.pt",
         "prefix_lens.pt",
         "cu_seqlens_q.pt",
     ]
@@ -235,6 +234,23 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str):
             status = f"{_CROSS} DIFF"
         print(f"  {fname:<28s} {s_on:<16s} {s_off:<16s} {status}")
     print()
+
+
+# ════════════════════════════════════════════════════════════════
+#  Output（2D 结果 + header + top-K）
+# ════════════════════════════════════════════════════════════════
+
+def _print_header(dir_on, dir_off, dir_off2, tag, mask_kind, layer):
+    print(_SEP_DOUBLE)
+    print("  verl080 Prefix-Sharing Diag Report")
+    print(f"  ON :  {dir_on}\n  OFF:  {dir_off}")
+    if dir_off2:
+        print(f"  OFF2: {dir_off2}")
+    detail = f"TAG: {tag}    MASK: {mask_kind}"
+    if layer is not None:
+        detail += f"    LAYER: {layer}"
+    print(f"  {detail}")
+    print(_SEP_DOUBLE + "\n")
 
 
 def _print_2d_result(r: CheckResult):
@@ -281,44 +297,13 @@ def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
               f"{float(rel_err[r, c]):>12.6e}")
 
 
-def _print_summary(results: list[CheckResult]):
-    print(_SEP_DOUBLE + "\n  SUMMARY")
-    print(_SEP_DOUBLE)
-    hdr = (f"  {'NAME':<20s} {'SHAPE':<16s} {'ABS_MAX':>12s}  {'REL_MAX':>10s}  "
-           f"{'PEARSON_R':>10s}  {'STATUS':>8s}")
-    print(hdr + "\n  " + "─" * (len(hdr) - 2))
-    for r in results:
-        m = r.metrics
-        shape = str(m.get("shape", m.get("error", "—")))
-        am = f"{m['abs_max']:.6e}" if "abs_max" in m else "—"
-        rm = f"{m['rel_max']:.6e}" if "rel_max" in m else "—"
-        pr = f"{m['pearson_r']:.6f}" if m.get("pearson_r") is not None else "—"
-        s = f"  {_CHECK} PASS" if r.passed else f"  {_CROSS} FAIL"
-        print(f"  {r.name:<20s} {shape:<16s} {am:>12s}  {rm:>10s}  {pr:>10s}  {s}")
-    print(_SEP_DOUBLE + "\n")
-
-
-def _dump_json(results: list[CheckResult], path: str,
-               dir_on: str, dir_off: str, tag: str, dir_off2: str | None):
-    record = {"dir_on": dir_on, "dir_off": dir_off, "tag": tag}
-    if dir_off2:
-        record["dir_off2"] = dir_off2
-    record["results"] = [{**r.metrics, "name": r.name, "passed": r.passed}
-                         for r in results]
-    record["all_passed"] = all(r.passed for r in results)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=2, ensure_ascii=False)
-    print(f"  Report saved to: {path}\n")
-
-
 # ════════════════════════════════════════════════════════════════
 #  Main
 # ════════════════════════════════════════════════════════════════
 
 def main():
     ap = argparse.ArgumentParser(
-        description="verl080 precision comparison — ON vs OFF (2D restored)",
+        description="verl080 precision comparison — ON vs OFF (packed + 2D)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -327,24 +312,27 @@ def main():
     ap.add_argument("--dir-off2", default=None,
                     help="Second OFF dir for OFF-vs-OFF baseline")
     ap.add_argument("--tag", required=True,
-                    help="File tag (old / train) — logprobs_{tag}.pt, mask_{tag}.pt")
+                    help="2D file tag (old / train) — logprobs_{tag}.pt, mask_{tag}.pt")
     ap.add_argument("--mask", choices=["label", "attention", "none"],
-                    default="label", help="Mask type (default: label)")
+                    default="label", help="2D mask type (default: label)")
+    ap.add_argument("--layer", type=int, default=None,
+                    help="Compare specific attn layer 1-indexed (default: all)")
     ap.add_argument("--atol", type=float, default=1e-5,
-                    help="Absolute tolerance (default: 1e-5)")
+                    help="Absolute tolerance for 2D (default: 1e-5)")
     ap.add_argument("--topk", type=int, default=0,
-                    help="Print top-K worst positions (0 = disabled)")
+                    help="2D top-K worst positions (0 = disabled)")
     ap.add_argument("--sort-err", choices=["abs", "rel", "val"], default="abs",
-                    help="Sort top-K by abs / rel / val (default: abs)")
+                    help="2D top-K sort: abs / rel / val (default: abs)")
     ap.add_argument("--output", "-o", default=None, help="Save report as JSON")
     args = ap.parse_args()
 
-    _print_header(args.dir_on, args.dir_off, args.dir_off2, args.tag, args.mask)
+    _print_header(args.dir_on, args.dir_off, args.dir_off2,
+                  args.tag, args.mask, args.layer)
 
-    # ── shape diagnostics：直接暴露 ON/OFF 各文件 shape，mismatch 根因第一手信息 ──
+    # ── shape diagnostics：直接暴露 ON/OFF 各文件 shape ──
     _print_shapes(args.dir_on, args.dir_off, args.tag)
 
-    # ── resolve mask（以 OFF logprobs shape 为参考校验） ──
+    # ── resolve 2D mask（以 OFF logprobs shape 为参考校验） ──
     ref = _load_tensor(args.dir_off, f"logprobs_{args.tag}.pt")
     mask = None
     if ref is not None:
@@ -355,7 +343,24 @@ def main():
 
     all_results: list[CheckResult] = []
 
-    # ── logprobs + entropy 2D 对比 ──
+    # ── packed: attention_output per-layer cos（suffix 对齐，复用 cmp_diag） ──
+    r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)
+    if r:
+        all_results.append(r)
+        _print_per_layer(r)
+
+    # ── packed: first_token（attn[0] + logits[0]，packed[0] 直接对比） ──
+    for r in cmp_first_token(args.dir_on, args.dir_off):
+        all_results.append(r)
+        _print_first_token(r)
+
+    # ── packed: logits（suffix 对齐，per-token cosine） ──
+    r = cmp_logits_packed(args.dir_on, args.dir_off)
+    if r:
+        all_results.append(r)
+        _print_logits_packed(r)
+
+    # ── 2D: logprobs + entropy（v080 restore 后，直接逐元素对比） ──
     for fname, cname in [("logprobs", "logp"), ("entropy", "entropy")]:
         fn = f"{fname}_{args.tag}.pt"
         r, t1, t2 = cmp_2d(args.dir_on, args.dir_off, fn,
@@ -367,7 +372,7 @@ def main():
             _print_topk_2d(t1.cpu(), t2.cpu(), mask, args.topk,
                            args.sort_err, r.name)
 
-    # ── OFF vs OFF baseline（自然噪声底） ──
+    # ── OFF vs OFF baseline（2D 噪声底） ──
     if args.dir_off2:
         print(_SEP_DOUBLE + "\n  [BASELINE]  OFF vs OFF2 Noise Floor\n" + _SEP_DOUBLE)
         for fname, cname in [("logprobs", "logp"), ("entropy", "entropy")]:

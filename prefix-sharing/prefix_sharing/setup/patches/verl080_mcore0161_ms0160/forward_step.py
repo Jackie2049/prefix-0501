@@ -128,7 +128,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                 dump_meta_verl080,
                 dump_attention_mask_verl080, dump_label_mask_verl080,
                 build_attention_mask_2d, build_label_mask_2d,
-                nested_to_2d_full, nested_offsets_to_cu,
+                nested_offsets_to_cu,
             )
             from prefix_sharing.integrations.verl_mcore import _is_nested_tensor
             _ids_nested = batch_for_forward["input_ids"]
@@ -143,21 +143,34 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     _prefix_lens = [0] * len(_orig_lens)
                 dump_meta_verl080(_prefix_lens, nested_offsets_to_cu(_ids_nested))
                 # attention_mask + label_mask：两种 log_probs 对比范围，都不含越界预测位
-                # （POS L_i-1，其 logp 预测不存在的 token[L_i]）。都用原始 batch 完整数据，
-                # 对齐 restore 后 log_probs 的 [B, L_max] 坐标系。
+                # （POS L_i-1，其 logp 预测不存在的 token[L_i]）。对齐 restore 后 log_probs
+                # 的 [B, L_max] 紧凑坐标系。
                 #   attention_mask：[0:L_i-1) prompt 区+prompt-last+response 区（整体 restore 验证）
-                #   label_mask：[prompt-last:L_i-1) prompt-last+response 区（PPO loss 范围，聚焦 restore 关键位）
-                _lm_nested = original_batch.get("loss_mask")
-                if _is_nested_tensor(_lm_nested):
-                    _Lmax_lm = max(_orig_lens) if _orig_lens else 0
-                    _loss_2d = nested_to_2d_full(_lm_nested, _orig_lens, _Lmax_lm)
-                    # tag 与 logprobs 一致（接入点2 用 model.training 区分 old/train），
-                    # 保证 mask 和 logprobs_{tag} 来自同一 forward（同 batch、同 L_max）。
-                    _tag_lm = "train" if model.training else "old"
-                    dump_attention_mask_verl080(
-                        build_attention_mask_2d(_orig_lens, _Lmax_lm), _tag_lm)
+                #   label_mask：[prompt-last:L_i-1) prompt-last+response 区（PPO loss 范围）
+                _Lmax_lm = max(_orig_lens) if _orig_lens else 0
+                # tag 与 logprobs 一致（接入点2 用 model.training 区分 old/train），
+                # 保证 mask 和 logprobs_{tag} 来自同一 forward（同 batch、同 L_max）。
+                _tag_lm = "train" if model.training else "old"
+                # attention_mask 仅依赖 _orig_lens，不需要 loss_mask。
+                dump_attention_mask_verl080(
+                    build_attention_mask_2d(_orig_lens, _Lmax_lm), _tag_lm)
+                # label_mask 用 response_lens（每行 response token 数）。verl080 padding 后
+                # loss_mask = response_mask 是 2D left-right padded（非 NestedTensor，见
+                # verl padding.py:71），不能走 nested_to_2d_full；但 response token 数 =
+                # loss_mask 行 sum，与坐标系无关，据此推 prompt_len 最稳（2D/NestedTensor 均适用）。
+                _lm = original_batch.get("loss_mask")
+                if _lm is not None:
+                    if _is_nested_tensor(_lm):
+                        _lm_off = _lm.offsets()
+                        _lm_val = _lm.values()
+                        _response_lens = [
+                            int(_lm_val[_lm_off[i]:_lm_off[i + 1]].sum())
+                            for i in range(len(_orig_lens))]
+                    else:
+                        _response_lens = _lm.sum(dim=-1).to(torch.long).tolist()
                     dump_label_mask_verl080(
-                        build_label_mask_2d(_loss_2d, _orig_lens, _Lmax_lm), _tag_lm)
+                        build_label_mask_2d(_response_lens, _orig_lens, _Lmax_lm),
+                        _tag_lm)
         # ##### [PS-diag] dump 元数据 + masks end #####
 
         # ── 构造修改后的 iterator 喂回原始 forward_step ──

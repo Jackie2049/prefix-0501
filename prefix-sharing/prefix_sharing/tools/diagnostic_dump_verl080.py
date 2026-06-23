@@ -93,30 +93,32 @@ def build_attention_mask_2d(original_lengths: list[int], L_max: int) -> torch.Te
 
 
 def build_label_mask_2d(
-    loss_mask_2d: torch.Tensor,
+    response_lens: list[int],
     original_lengths: list[int],
     L_max: int,
 ) -> torch.Tensor:
     """构造 label_mask 2D ``[B, L_max]``：``[prompt-last : L_i-1)``，不含 response 末尾。
 
-    从 ``loss_mask``（response 区指示）找每行 response 起点（第一个 True），
-    label_mask = ``[起点-1 : L_i-1)``：
-      - ``起点-1`` = prompt-last（预测 response_0 的位置，prefix-sharing restore 关键重算点）
-      - ``L_i-1`` 开区间 = 不含 response 最后一个 token（POS L_i-1 无 next token，
-        predict 它的 logp 越界，不该参与比较）
+    从 ``response_lens``（每行 response token 数）+ ``original_lengths`` 推 prompt_len：
+      ``prompt_len_i = original_lengths[i] - response_lens[i]``
+      ``start = prompt_len_i - 1``（prompt-last，预测 response_0 的位置，prefix-sharing
+        restore 关键重算点）
+      ``end = original_lengths[i] - 1``（开区间，不含 response 最后一个 token；
+        POS L_i-1 无 next token，predict 它的 logp 越界）
 
-    dump 的就是最终比较范围，**不依赖 cmp_diag 的 trim**。用 cmp_diag 时加 ``--no-trim``
-    （否则 cmp_diag 默认 ``_trim_last_true_per_row`` 会再多砍一位 response 倒数第二）。
+    用 response_lens 而非 loss_mask 位置：verl080 padding 后 loss_mask = response_mask
+    是 2D left-right padded，坐标系与 restore 后 ``[B, L_max]`` 紧凑坐标系不同；但
+    response token 数（= loss_mask 行 sum）与坐标系无关，据此推 prompt_len 最稳。
+    dump 的就是最终比较范围，**不依赖 cmp_diag 的 trim**。
     """
     B = len(original_lengths)
     mask = torch.zeros(B, L_max, dtype=torch.bool)
     for i in range(B):
-        trues = loss_mask_2d[i].nonzero(as_tuple=True)[0]
-        if len(trues) > 0 and int(trues[0]) > 0:
-            start = int(trues[0]) - 1        # prompt-last（预测 response_0 的位置）
-            end = original_lengths[i] - 1    # 不含 response 最后一个 token（越界 predict）
-            if end > start:
-                mask[i, start:end] = True
+        prompt_len_i = original_lengths[i] - response_lens[i]
+        start = prompt_len_i - 1            # prompt-last（预测 response_0 的位置）
+        end = original_lengths[i] - 1        # 不含 response 最后一个 token（越界 predict）
+        if end > start >= 0:
+            mask[i, start:end] = True
     return mask
 
 
@@ -176,9 +178,9 @@ def dump_attention_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
 def dump_label_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
     """存 2D label_mask ``[B, L_max]``（bool），文件名 ``label_mask_{tag}.pt``。
 
-    来源：原始 batch 的 ``loss_mask``（verl080 已算好 response 有效位语义）展开到
-    ``[B, L_max]``。范围 ``[prompt-last : L_i-1)``，不含 response 末尾，dump 的就是
-    最终比较范围，用 cmp_diag 时加 ``--no-trim``。
+    范围 ``[prompt-last : L_i-1)``，不含 response 末尾（由 :func:`build_label_mask_2d`
+    据 response_lens 构造，见该函数 docstring）。dump 的就是最终比较范围，
+    cmp_diag_verl080 直接用，无需额外参数。
 
     带 tag：mask 必须和 logprobs_{tag} 来自同一 forward（同 batch、同 L_max），
     否则 shape 不匹配。tag 与 logprobs 一致（``"old"`` / ``"train"``）。
