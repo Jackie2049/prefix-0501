@@ -73,16 +73,22 @@ def nested_offsets_to_cu(nested: Any) -> torch.Tensor:
 
 
 def build_attention_mask_2d(original_lengths: list[int], L_max: int) -> torch.Tensor:
-    """构造 attention_mask 2D ``[B, L_max]``：每行 ``[0:L_i]`` 为 True（所有有效 token）。
+    """构造 attention_mask 2D ``[B, L_max]``：每行 ``[0:L_i-1)`` 为 True。
 
-    用于"整体对比"——验证 restore 后所有有效位置（prompt + response）是否都对。
-    cmp_diag 用法：``--mask-file dump_off/attention_mask.pt --no-trim``。
+    范围 = 所有 predict 有效的位置。``log_probs[i, j]`` 预测 ``token[j+1]``，故 ``j``
+    只有 ``< L_i-1`` 时才有意义——``j=L_i-1`` 预测越界的 ``token[L_i]``（序列到此结束，
+    该 token 不存在，PPO loss_mask 也排除此位）。
+
+    用于 log_probs/entropy 的"整体对比"——验证 restore 后 prompt 区 + prompt-last +
+    response 区所有 predict 有效位置是否都对（含 interior 复制 + prefix-last 重算 +
+    response forward）。与 :func:`build_label_mask_2d` 的区别仅是范围更宽（多覆盖
+    prompt 区 predict），两者都不含越界预测位 POS ``L_i-1``。
     """
     B = len(original_lengths)
     mask = torch.zeros(B, L_max, dtype=torch.bool)
     for i, L in enumerate(original_lengths):
-        if L > 0:
-            mask[i, :L] = True
+        if L > 1:  # L-1>0：至少 2 个 token 才存在 predict
+            mask[i, :L - 1] = True
     return mask
 
 
@@ -91,26 +97,26 @@ def build_label_mask_2d(
     original_lengths: list[int],
     L_max: int,
 ) -> torch.Tensor:
-    """构造 label_mask 2D ``[B, L_max]``：prompt-last 到 response 结束（含末尾 token）。
+    """构造 label_mask 2D ``[B, L_max]``：``[prompt-last : L_i-1)``，不含 response 末尾。
 
     从 ``loss_mask``（response 区指示）找每行 response 起点（第一个 True），
-    label_mask = ``[起点-1 : L_i]``，即 prompt-last 预测位 到 序列末尾（含末尾）。
+    label_mask = ``[起点-1 : L_i-1)``：
+      - ``起点-1`` = prompt-last（预测 response_0 的位置，prefix-sharing restore 关键重算点）
+      - ``L_i-1`` 开区间 = 不含 response 最后一个 token（POS L_i-1 无 next token，
+        predict 它的 logp 越界，不该参与比较）
 
-    **含末尾 dump** 是为了让 cmp_diag 默认 ``_trim_last_true_per_row`` 砍掉后正好得到
-    ``[prompt-last : response-去-最后]``，即"prompt 最后一个词到 response 结束、去掉
-    response 最后一位"，无需调用方记 ``--no-trim``。
-
-    prompt-last 位置（预测 response_0 的那个 token）是 prefix-sharing restore 的
-    关键重算点，含它才能看出 prefix-last 是否插对。
+    dump 的就是最终比较范围，**不依赖 cmp_diag 的 trim**。用 cmp_diag 时加 ``--no-trim``
+    （否则 cmp_diag 默认 ``_trim_last_true_per_row`` 会再多砍一位 response 倒数第二）。
     """
     B = len(original_lengths)
     mask = torch.zeros(B, L_max, dtype=torch.bool)
     for i in range(B):
         trues = loss_mask_2d[i].nonzero(as_tuple=True)[0]
         if len(trues) > 0 and int(trues[0]) > 0:
-            start = int(trues[0]) - 1   # prompt-last（预测 response_0 的位置）
-            L_i = original_lengths[i]
-            mask[i, start:L_i] = True
+            start = int(trues[0]) - 1        # prompt-last（预测 response_0 的位置）
+            end = original_lengths[i] - 1    # 不含 response 最后一个 token（越界 predict）
+            if end > start:
+                mask[i, start:end] = True
     return mask
 
 
@@ -152,31 +158,35 @@ def dump_logprobs_2d_verl080(logp_2d: torch.Tensor, tag: str) -> None:
     _save_tensor(f"logprobs_{tag}.pt", logp_2d, dump_dir)
 
 
-def dump_attention_mask_verl080(mask_2d: torch.Tensor) -> None:
-    """存 2D attention_mask ``[B, L_max]``（bool），文件名 ``attention_mask.pt``。
+def dump_attention_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
+    """存 2D attention_mask ``[B, L_max]``（bool），文件名 ``attention_mask_{tag}.pt``。
 
     全有效位 mask（prompt + response，去 padding）。cmp_diag 里作外部 mask：
-    ``--mask-file dump_off/attention_mask.pt --no-trim``（用 --no-trim 保留全部有效位）。
+    ``--mask-file dump_off/attention_mask_{tag}.pt --no-trim``。
+
+    带 tag：mask 必须和 logprobs_{tag} 来自同一 forward（同 batch、同 L_max），
+    否则 shape 不匹配。tag 与 logprobs 一致（``"old"`` / ``"train"``）。
     """
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _save_tensor("attention_mask.pt", mask_2d.to(torch.bool), dump_dir)
+    _save_tensor(f"attention_mask_{tag}.pt", mask_2d.to(torch.bool), dump_dir)
 
 
-def dump_label_mask_verl080(mask_2d: torch.Tensor) -> None:
-    """存 2D label_mask ``[B, L_max]``（bool），文件名 ``label_mask.pt``。
+def dump_label_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
+    """存 2D label_mask ``[B, L_max]``（bool），文件名 ``label_mask_{tag}.pt``。
 
     来源：原始 batch 的 ``loss_mask``（verl080 已算好 response 有效位语义）展开到
-    ``[B, L_max]``。cmp_diag 加载后自动 ``_trim_last_true_per_row``（每行最后 True→False）。
+    ``[B, L_max]``。范围 ``[prompt-last : L_i-1)``，不含 response 末尾，dump 的就是
+    最终比较范围，用 cmp_diag 时加 ``--no-trim``。
 
-    必须用**裁剪前**原始 batch 的 loss_mask：restore 后的 log_probs 是完整
-    original_lengths 的，label_mask 坐标系要与之对齐（不能用物理裁剪后的 loss_mask）。
+    带 tag：mask 必须和 logprobs_{tag} 来自同一 forward（同 batch、同 L_max），
+    否则 shape 不匹配。tag 与 logprobs 一致（``"old"`` / ``"train"``）。
     """
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _save_tensor("label_mask.pt", mask_2d.to(torch.bool), dump_dir)
+    _save_tensor(f"label_mask_{tag}.pt", mask_2d.to(torch.bool), dump_dir)
 
 
 def dump_entropy_2d_verl080(ent_2d: torch.Tensor | None, tag: str) -> None:
