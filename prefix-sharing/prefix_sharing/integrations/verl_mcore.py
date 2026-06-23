@@ -240,9 +240,9 @@ def build_prefix_sharing_micro_batch_verl070(
 
 def restore_reuser_prefix_columns_2d(
     output: dict[str, Any],
+    label_2d: Any,
     vocab_parallel_log_probs_fn: Any,
     vocab_parallel_entropy_fn: Any = None,
-    label_2d: Any = None,
 ) -> dict[str, Any]:
     """Restore reuser prefix columns in 2D space after postprocess_packed_seqs.
 
@@ -269,18 +269,21 @@ def restore_reuser_prefix_columns_2d(
     Args:
         output: Output dict from forward, with ``log_probs`` [B, L] and
             optionally ``entropy`` [B, L] in 2D space.
+        label_2d: Original 2D label ``[B, L]`` or ``None``. Fallback label
+            source for prefix-last recompute when ``index.label_value < 0``;
+            ignored whenever ``index.label_value >= 0`` (the common path —
+            the per-index label is populated framework-agnostically by the
+            context for both v070 and v080). Pass ``None`` when every restore
+            index carries a valid ``label_value`` (verl080 path — avoids
+            materialising a dense ``[B, L_max]`` long tensor just to look up
+            a handful of entries). **Position 2 (required, no default)** to
+            match v070's positional-arg call site
+            ``(output, label, log_probs_fn, entropy_fn)``.
         vocab_parallel_log_probs_fn: Function to compute logprob from
             packed logits [1, 1, V//tp] and label [1, 1] → scalar.
             Typically :func:`verl.utils.megatron.tensor_parallel.vocab_parallel_log_probs_from_logits`.
         vocab_parallel_entropy_fn: Optional function to compute entropy
             from packed logits [1, V//tp] → scalar.
-        label_2d: Optional original 2D label [B, L]. Only used as a fallback
-            when an index lacks ``label_value``; ignored whenever
-            ``index.label_value >= 0`` (the common path — the per-index label
-            is populated framework-agnostically by the context for both v070
-            and v080). May be ``None`` when every restore index carries a
-            valid ``label_value`` (avoids materialising a dense ``[B, L_max]``
-            long tensor just to look up a handful of entries).
 
     Returns:
         ``output`` with ``log_probs`` and ``entropy`` mutated in-place.
@@ -473,6 +476,7 @@ def restore_via_2d_unfold_verl080(
         output_2d["entropy"] = entropy_2d
     output_2d = restore_reuser_prefix_columns_2d(
         output_2d,
+        None,  # label_2d — verl080 用 index.label_value 透传，不构造 dense label 表
         vocab_parallel_log_probs_fn,
         vocab_parallel_entropy_fn,
     )
