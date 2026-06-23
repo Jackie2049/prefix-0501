@@ -542,7 +542,13 @@ def _shape_of(dir_path: str, filename: str) -> str:
     if not os.path.exists(fp):
         return "(missing)"
     try:
-        return str(tuple(torch.load(fp, weights_only=True).shape))
+        obj = torch.load(fp, weights_only=True)
+        if isinstance(obj, dict):
+            # per-layer dict（attn_outputs / rope_freqs_*）：显示层数 + 首层 shape
+            sample = next(iter(obj.values())) if obj else None
+            sample_shape = f",{tuple(sample.shape)}" if sample is not None else ""
+            return f"(dict,{len(obj)}L{sample_shape})"
+        return str(tuple(obj.shape))
     except Exception:
         return "(error)"
 
