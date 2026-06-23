@@ -25,6 +25,8 @@ dump 文件约定（``diagnostic_dump_verl080``）::
     label_mask_{tag}.pt     [B, L_max] bool  [prompt-last,L_i-1) PPO loss 范围
     logits.pt               [N, V//tp]       packed logits（ON 裁剪后 / OFF 完整）
     attn_outputs.pt         dict {layer: [N, hidden]}  per-layer packed attn output
+    rope_freqs_on.pt        dict {layer: [T_on,1,1,D]} ON per-token RoPE 角度
+    rope_freqs_off.pt       dict {layer: [L0,1,1,D]}   OFF raw 角度表（freqs[p]=p*inv_freq）
     prefix_lens.pt          [B]              ON=plan.prefix_lens / OFF=全0
     cu_seqlens_q.pt         [B+1]            NestedTensor offsets（ON 裁剪后 / OFF 完整）
     cu_seqlens_q_logits.pt  [B+1]            logits packed 边界（同上）
@@ -376,6 +378,88 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
                                 "cos_avg": cos_avg, "cos_min": cos_min})
 
 
+def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
+    """对比 pre-RoPE 角度表（angle table，非 cos/sin）— suffix 对齐。
+
+    ON  ``rope_freqs_on.pt``:  per-token 角度 dict {layer: [T_on, 1, 1, D]}
+        （已 index_select 到 packed_position_ids，每 token 实际旋转角度）
+    OFF ``rope_freqs_off.pt``: raw 角度表 dict {layer: [L0, 1, 1, D]}
+        （freqs[p] = p * inv_freq，未切片）
+
+    OFF per-token 角度从 raw 表按 cu_seqlens_off 重建（每段取 ``[:seg_len]``），
+    再与 ON 用同一 suffix 对齐（cu_seqlens + prefix_lens）后逐元素比 max_diff。
+    角度是 RoPE 的输入，应精确相等（``max_diff == 0``）。
+    """
+    fa = os.path.join(dir_on, "rope_freqs_on.pt")
+    fb = os.path.join(dir_off, "rope_freqs_off.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    on_dict = torch.load(fa, weights_only=True)
+    off_dict = torch.load(fb, weights_only=True)
+    if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
+        return None
+
+    la, lb = set(on_dict.keys()), set(off_dict.keys())
+    if la != lb:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "layer set mismatch",
+                                    "on_layers": sorted(la),
+                                    "off_layers": sorted(lb)})
+
+    mb = _load_packed_meta(dir_off)
+    if mb is None:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "OFF cu_seqlens missing"})
+    cu_off = mb["cu_seqlens"]
+    T_off = int(cu_off[-1]) if cu_off.numel() > 0 else 0
+
+    ma = _load_packed_meta(dir_on)
+    if ma is None:
+        return CheckResult(name="rope_freqs", passed=False,
+                           metrics={"error": "ON prefix_lens missing"})
+    align_mask = _build_alignment_mask(cu_off, ma["prefix_lens"], T_off)
+
+    seqlens = (cu_off[1:] - cu_off[:-1]).tolist()
+
+    max_diff = 0.0
+    mismatches: list[dict] = []
+    for lyr in sorted(la):
+        on_freqs = on_dict[lyr]                            # [T_on, 1, 1, D]
+        # 从 raw 表重建 OFF per-token：每段 [:seg_len]
+        off_freqs = torch.cat(
+            [off_dict[lyr][:s, :, :, :] for s in seqlens], dim=0)  # [T_off, 1, 1, D]
+
+        try:
+            on_aligned, off_aligned = _align_packed(
+                on_freqs, off_freqs, align_mask)
+        except ValueError as e:
+            return CheckResult(name="rope_freqs", passed=False,
+                               metrics={"error": f"align failed L{lyr}: {e}"})
+
+        diff = (on_aligned - off_aligned).abs()            # [N, 1, 1, D]
+        md = float(diff.max())
+        max_diff = max(max_diff, md)
+
+        if md > 0:
+            token_diff = diff.squeeze(1).squeeze(1).max(dim=-1)  # values [N], indices [N]
+            bad_mask = token_diff.values > 0
+            for t in bad_mask.nonzero(as_tuple=True)[0].tolist():
+                t = int(t)
+                d = int(token_diff.indices[t])
+                mismatches.append({
+                    "layer": lyr, "token_idx": t, "dim": d,
+                    "on_val": float(on_aligned[t, 0, 0, d]),
+                    "off_val": float(off_aligned[t, 0, 0, d]),
+                    "diff": float(token_diff.values[t]),
+                })
+
+    metrics: dict = {"max_diff": max_diff, "num_layers": len(la)}
+    if mismatches:
+        metrics["mismatches"] = mismatches[:20]
+        metrics["total_mismatches"] = len(mismatches)
+    return CheckResult(name="rope_freqs", passed=max_diff == 0.0, metrics=metrics)
+
+
 # ════════════════════════════════════════════════════════════════
 #  2D mask loading
 # ════════════════════════════════════════════════════════════════
@@ -506,6 +590,31 @@ def _print_header(dir_on, dir_off, dir_off2, tag, mask_kind, layer):
         detail += f"    LAYER: {layer}"
     print(f"  {detail}")
     print(_SEP_DOUBLE + "\n")
+
+
+def _print_rope_freqs(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [rope_freqs]  {_CHECK if r.passed else _CROSS} "
+          f"{'PASS' if r.passed else 'FAIL'}")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {m['error']}")
+    else:
+        print(f"  layers: {m.get('num_layers', '—')}  "
+              f"max_diff: {m.get('max_diff', '—')}")
+        total = m.get("total_mismatches", 0)
+        if total > 0:
+            print(f"  mismatched tokens: {total}"
+                  f"{' (showing first 20)' if total > 20 else ''}")
+            print(f"  {'Layer':>6s} {'Token':>6s} {'Dim':>6s}  "
+                  f"{'ON_val':>14s}  {'OFF_val':>14s}  {'Abs_err':>12s}")
+            for mm in m.get("mismatches", []):
+                print(f"  {mm['layer']:>6d} {mm['token_idx']:>6d} {mm['dim']:>6d}  "
+                      f"{mm['on_val']:>14.6e}  {mm['off_val']:>14.6e}  "
+                      f"{mm['diff']:>12.6e}")
+    if not r.passed:
+        print(f"  {_CROSS} CRITICAL — STOP.")
+    print()
 
 
 def _print_per_layer(r: CheckResult):
@@ -705,6 +814,12 @@ def main():
                   f"active={int(mask.sum())}\n")
 
     all_results: list[CheckResult] = []
+
+    # ── packed: rope 角度（suffix 对齐，应精确相等 max_diff==0） ──
+    r = cmp_rope_freqs(args.dir_on, args.dir_off)
+    if r:
+        all_results.append(r)
+        _print_rope_freqs(r)
 
     # ── packed: attention_output per-layer cos ──
     r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)
