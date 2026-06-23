@@ -1,8 +1,11 @@
-"""verl080 精度比较 — ON vs OFF（packed + 2D 整合对比）。
+"""verl080 精度比较 — ON vs OFF（自包含，不依赖 v070 cmp_diag）。
+
+本文件**完全自包含**，不从 ``cmp_diag`` / ``diagnostic_dump`` import 任何东西，
+便于将来独立维护（verl070 对应文件可能被废弃）。
 
 对比项分两类：
 
-  **packed（suffix 对齐，复用 v070 cmp_diag）**
+  **packed（suffix 对齐）**
     - attention_output per-layer cos   每层 attention 输出余弦相似度
     - first_token                       packed[0]（attn[0] + logits[0]）
     - logits packed                     全 packed logits suffix 对齐对比
@@ -10,21 +13,11 @@
   **2D（v080 特有，restore 后 ``[B, L_max]``）**
     - logprobs / entropy                直接逐元素对比（ON/OFF 同坐标系）
 
-为什么 packed 部分能直接复用 v070 ``cmp_diag``：
-  v080 的 attn/logits dump 沿用 ``diagnostic_dump.py`` 的 ``dump_attn_on/off`` /
-  ``dump_logits``，文件格式与 v070 完全一致（packed ``[N,…]`` + ``cu_seqlens_q.pt`` +
-  ``prefix_lens.pt``）。suffix 对齐逻辑（OFF 的 cu_seqlens + ON 的 prefix_lens 构建
-  1D mask，从 OFF 完整 packed 提取 ON suffix 对应段）通用，直接 import ``cmp_diag``
-  的对比函数即可。
+suffix 对齐逻辑（v080）：ON 物理裁剪后 packed 只含 suffix 区段，OFF 含完整序列。
+用 OFF 的 ``cu_seqlens_q.pt`` + ON 的 ``prefix_lens.pt`` 构建 1D suffix mask，
+从 OFF 完整 packed 提取与 ON 对应的 suffix 段，再逐 token 比对。
 
-为什么 2D 部分要新写：
-  v080 的 logprobs/entropy 是 restore 后展成的 2D ``[B, L_max]``（ON=restore 后含
-  完整 prompt+response / OFF=原始 forward），ON/OFF 同 shape 同坐标系，直接逐元素
-  对比，**不需要 suffix 对齐**。v070 ``cmp_diag.cmp_2d`` 没有 shape diagnostics，
-  v080 场景下 shape 可能不一致（dump 端坐标系错配），需要增强：开头打印 ON/OFF
-  所有文件 shape 定位根因，shape 不匹配时不 crash 而是报告。
-
-dump 文件约定（``diagnostic_dump_verl080`` + ``diagnostic_dump``）::
+dump 文件约定（``diagnostic_dump_verl080``）::
 
     logprobs_{tag}.pt       [B, L_max]       restore 后 2D log_probs
     entropy_{tag}.pt        [B, L_max]       2D entropy
@@ -34,6 +27,7 @@ dump 文件约定（``diagnostic_dump_verl080`` + ``diagnostic_dump``）::
     attn_outputs.pt         dict {layer: [N, hidden]}  per-layer packed attn output
     prefix_lens.pt          [B]              ON=plan.prefix_lens / OFF=全0
     cu_seqlens_q.pt         [B+1]            NestedTensor offsets（ON 裁剪后 / OFF 完整）
+    cu_seqlens_q_logits.pt  [B+1]            logits packed 边界（同上）
 
 Usage:
     # 完整对比（attn per-layer + first_token + logits + logprobs + entropy）
@@ -43,7 +37,7 @@ Usage:
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag old --layer 12
 
-    # 2D top-K 误差最大位置
+    # top-K 误差最大位置（2D + first_token）
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag old --topk 20
 
@@ -59,38 +53,57 @@ Parameters:
     --mask       (可选) 2D 对比 mask: label(默认) / attention / none
     --layer      (可选) 只对比指定层 attention (1-indexed)，不传则所有层
     --atol       (可选) 2D 对比绝对容差，默认 1e-5
-    --topk       (可选) 2D top-K 误差位置（0=关闭）
-    --sort-err   (可选) 2D top-K 排序: abs(默认) / rel / val
+    --topk       (可选) top-K 误差位置（0=关闭）
+    --sort-err   (可选) top-K 排序: abs(默认) / rel / val
     -o, --output (可选) JSON 报告
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+from dataclasses import dataclass, field
 
 import torch
 
-# packed 对比（attn / logits / first_token）复用 v070 cmp_diag —— v080 的 attn/logits
-# dump 沿用 diagnostic_dump.py 的 dump_attn_on/off / dump_logits，文件格式与 v070 一致
-# （packed [N,…] + cu_seqlens_q.pt + prefix_lens.pt），suffix 对齐逻辑通用。
-from prefix_sharing.tools.cmp_diag import (
-    CheckResult,
-    _SEP_DOUBLE, _SEP_THIN, _CHECK, _CROSS,
-    # packed 对比函数
-    cmp_attn_layer, cmp_first_token, cmp_logits_packed,
-    # packed 结果打印
-    _print_per_layer, _print_first_token, _print_logits_packed,
-    # 通用输出（兼容 packed + 2D 混合结果）
-    _print_summary, _dump_json,
-    # 通用 loader
-    _load_tensor,
-)
+_SEP_DOUBLE = "=" * 70
+_SEP_SINGLE = "-" * 70
+_SEP_THIN = "─" * 70
+_CHECK = "✓"
+_CROSS = "✗"
+
+# attn per-layer cos 通过阈值（logits/attn 向量级）
+_COS_AVG_PASS = 0.9999
+_COS_MIN_PASS = 0.999
+
+
+@dataclass
+class CheckResult:
+    name: str
+    passed: bool = True
+    metrics: dict = field(default_factory=dict)
 
 
 # ════════════════════════════════════════════════════════════════
-#  2D metric helpers（logprobs/entropy 标量逐元素对比）
+#  Metric helpers
 # ════════════════════════════════════════════════════════════════
+
+def _cosine_sim(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Cosine similarity along ``dim``，promote 到 float32 避免 bf16 噪声。
+
+    Near-zero 向量（两范数都 < sqrt(eps)）视为相同，返回 1.0。
+    """
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
+    eps = 1e-8
+    na = a.norm(dim=dim)
+    nb = b.norm(dim=dim)
+    denom = (na * nb).clamp(min=eps)
+    cos = (a * b).sum(dim=dim) / denom
+    near_zero = (na < eps ** 0.5) & (nb < eps ** 0.5)
+    return torch.where(near_zero, torch.ones_like(cos), cos)
+
 
 def _error_abs_rel(a: torch.Tensor, b: torch.Tensor,
                    mask: torch.Tensor | None = None) -> dict:
@@ -115,6 +128,252 @@ def _pearson_r(t1: torch.Tensor, t2: torch.Tensor,
     sx = ((x - mx) ** 2).sum().sqrt()
     sy = ((y - my) ** 2).sum().sqrt()
     return float("nan") if sx == 0 or sy == 0 else float(cov / (sx * sy))
+
+
+def _first_token_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
+    err = _error_abs_rel(a_vec, b_vec)
+    cos = float(_cosine_sim(a_vec, b_vec, dim=-1))
+    pr = _pearson_r(a_vec, b_vec)
+    return {"mean_abs": err["abs_mean"], "max_abs": err["abs_max"],
+            "rel_max": err["rel_max"], "rel_mean": err["rel_mean"],
+            "cos": cos, "pearson": pr}
+
+
+# ════════════════════════════════════════════════════════════════
+#  Loading helpers
+# ════════════════════════════════════════════════════════════════
+
+def _load_tensor(dir_path: str, filename: str) -> torch.Tensor | None:
+    fp = os.path.join(dir_path, filename)
+    return torch.load(fp, weights_only=True).float() if os.path.exists(fp) else None
+
+
+def _load_packed_meta(dir_path: str,
+                      cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
+    """加载 cu_seqlens + prefix_lens（suffix 对齐所需）。"""
+    fp = os.path.join(dir_path, cu_fname)
+    if not os.path.exists(fp):
+        fp = os.path.join(dir_path, "cu_seqlens_q.pt")
+        if not os.path.exists(fp):
+            return None
+    pl_fp = os.path.join(dir_path, "prefix_lens.pt")
+    if not os.path.exists(pl_fp):
+        return None
+    return {"cu_seqlens": torch.load(fp, weights_only=True),
+            "prefix_lens": torch.load(pl_fp, weights_only=True)}
+
+
+def _load_attn_output(dir_path: str, layer: int) -> torch.Tensor | None:
+    """加载单层 attn_output（attn_outputs.pt = dict {layer: tensor}）。"""
+    fp = os.path.join(dir_path, "attn_outputs.pt")
+    if not os.path.exists(fp):
+        return None
+    d = torch.load(fp, weights_only=True)
+    return d.get(layer) if isinstance(d, dict) else None
+
+
+def _get_num_layers(dir_path: str) -> int:
+    fp = os.path.join(dir_path, "attn_outputs.pt")
+    if not os.path.exists(fp):
+        return 0
+    d = torch.load(fp, weights_only=True)
+    return max(d.keys()) if isinstance(d, dict) and d else 0
+
+
+# ════════════════════════════════════════════════════════════════
+#  Packed suffix alignment
+# ════════════════════════════════════════════════════════════════
+
+def _build_alignment_mask(cu_seqlens: torch.Tensor,
+                          prefix_lens: torch.Tensor,
+                          total_tokens: int) -> torch.Tensor:
+    """构建 1D suffix mask ``[total_tokens]``：True = suffix token。
+
+    用 OFF 的 cu_seqlens + ON 的 prefix_lens：每行 ``[cu[i]+prefix_len[i] : cu[i+1]]``
+    为 suffix 区段。应用于 OFF 完整 packed 提取与 ON（裁剪后只含 suffix）对应的段。
+
+    例：cu=[0,7,13], prefix_lens=[3,4], total=13 → [0,0,0,1,1,1,1, 0,0,0,0,1,1]
+    """
+    mask = torch.zeros(total_tokens, dtype=torch.bool)
+    for i in range(cu_seqlens.shape[0] - 1):
+        pf = int(prefix_lens[i])
+        start = int(cu_seqlens[i]) + pf
+        end = int(cu_seqlens[i + 1])
+        mask[start:end] = True
+    return mask
+
+
+def _align_packed(on_tensor: torch.Tensor, off_tensor: torch.Tensor,
+                  alignment_mask: torch.Tensor
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """ON（suffix-only）与 OFF（full-packed）按 alignment_mask 对齐。
+
+    返回 ``(on, off_suffix)``，其中 ``off_suffix = off[alignment_mask]``，
+    shape[0] == on_tensor.shape[0]。
+    """
+    T = off_tensor.shape[0]
+    n_suffix = int(alignment_mask.sum())
+    if alignment_mask.shape[0] != T:
+        raise ValueError(
+            f"alignment_mask len {alignment_mask.shape[0]} != OFF tokens {T}")
+    if on_tensor.shape[0] != n_suffix:
+        raise ValueError(
+            f"ON tokens {on_tensor.shape[0]} != alignment True count {n_suffix}")
+    return on_tensor, off_tensor[alignment_mask]
+
+
+# ════════════════════════════════════════════════════════════════
+#  Logits helpers
+# ════════════════════════════════════════════════════════════════
+
+def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+    """取 packed[0] 的 full-vocab 向量（logits 词表恒在最后一维）。"""
+    lo_2d = lo.reshape(-1, lo.size(-1))
+    lf_2d = lf.reshape(-1, lf.size(-1))
+    return lo_2d[0, :].contiguous(), lf_2d[0, :].contiguous()
+
+
+def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
+                               ) -> tuple[torch.Tensor, torch.Tensor]:
+    """确保 logits 为 2D [N, V]（token-major），vocab 在最后一维。"""
+    return (lo.reshape(-1, lo.size(-1)).contiguous(),
+            lf.reshape(-1, lf.size(-1)).contiguous())
+
+
+# ════════════════════════════════════════════════════════════════
+#  Packed compare: attention_output / first_token / logits
+# ════════════════════════════════════════════════════════════════
+
+def _cos_for_layer(a: torch.Tensor, b: torch.Tensor,
+                   align_mask: torch.Tensor | None = None) -> dict:
+    """单层 attn_output 对齐 + per-token cosine。"""
+    if a.dim() == 3:
+        a, b = a.squeeze(1), b.squeeze(1)
+    if align_mask is not None and a.shape[0] != b.shape[0]:
+        a, b = _align_packed(a, b, align_mask)
+    cos = _cosine_sim(a, b, dim=-1)
+    return {"cos_avg": float(cos.mean()), "cos_min": float(cos.min()),
+            "n_tokens": a.shape[0]}
+
+
+def _build_attn_align_mask(dir_on: str, dir_off: str) -> torch.Tensor | None:
+    """从 OFF cu_seqlens + ON prefix_lens 构建 suffix 对齐 mask（None=无法构建）。"""
+    ma = _load_packed_meta(dir_on)
+    mb = _load_packed_meta(dir_off)
+    if ma is None or mb is None:
+        return None
+    cu_off = mb["cu_seqlens"]
+    T = int(cu_off[-1]) if cu_off.numel() > 0 else 0
+    if T == 0:
+        return None
+    return _build_alignment_mask(cu_off, ma["prefix_lens"], T)
+
+
+def cmp_attn_layer(dir_on: str, dir_off: str,
+                   layer: int | None) -> CheckResult | None:
+    """attention_output per-layer cos（suffix 对齐）。
+
+    单层模式（layer 给定）：返回该层 cos。全层模式：返回所有层 cos 汇总。
+    """
+    align_mask = _build_attn_align_mask(dir_on, dir_off)
+
+    if layer is not None:
+        a = _load_attn_output(dir_on, layer)
+        b = _load_attn_output(dir_off, layer)
+        if a is None or b is None:
+            return None
+        need = align_mask is not None and a.shape[0] != b.shape[0]
+        try:
+            d = _cos_for_layer(a, b, align_mask if need else None)
+        except ValueError as e:
+            return CheckResult(name=f"attn_L{layer}", passed=False,
+                               metrics={"error": str(e)})
+        d["layer"] = layer
+        return CheckResult(name=f"attn_L{layer}",
+                           passed=d["cos_avg"] > _COS_AVG_PASS
+                           and d["cos_min"] > _COS_MIN_PASS, metrics=d)
+
+    fa = os.path.join(dir_on, "attn_outputs.pt")
+    fb = os.path.join(dir_off, "attn_outputs.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    da = torch.load(fa, weights_only=True)
+    db = torch.load(fb, weights_only=True)
+    if not isinstance(da, dict) or not isinstance(db, dict):
+        return None
+
+    results = {}
+    for lyr in sorted(set(da.keys()) & set(db.keys())):
+        a, b = da[lyr], db[lyr]
+        need = align_mask is not None and a.shape[0] != b.shape[0]
+        try:
+            results[lyr] = _cos_for_layer(a, b, align_mask if need else None)
+        except ValueError as e:
+            results[lyr] = {"error": str(e)}
+    return CheckResult(name="attn_per_layer", passed=True,
+                       metrics={"layers": results})
+
+
+def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
+    """packed[0] 对比：最后一层 attn[0] + logits[0]。
+
+    第一个序列（row 0）永远是 provider（完整序列），packed[0] 是完整 suffix token，
+    可直接对比无需对齐。
+    """
+    results: list[CheckResult] = []
+    last = _get_num_layers(dir_on) or _get_num_layers(dir_off)
+
+    if last:
+        a = _load_attn_output(dir_on, last)
+        b = _load_attn_output(dir_off, last)
+        if a is not None and b is not None:
+            a0 = a.squeeze(1) if a.dim() == 3 else a
+            b0 = b.squeeze(1) if b.dim() == 3 else b
+            results.append(CheckResult(
+                name="first_token_attn",
+                metrics=_first_token_metrics(a0[0], b0[0])))
+
+    lo = _load_tensor(dir_on, "logits.pt")
+    lf = _load_tensor(dir_off, "logits.pt")
+    if lo is not None and lf is not None:
+        lo_first, lf_first = _logits_first_token(lo, lf)
+        results.append(CheckResult(
+            name="first_token_logits",
+            metrics=_first_token_metrics(lo_first, lf_first)))
+    return results
+
+
+def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
+    """全 packed logits suffix 对齐 + per-token cosine。"""
+    lo = _load_tensor(dir_on, "logits.pt")
+    lf = _load_tensor(dir_off, "logits.pt")
+    if lo is None or lf is None:
+        return None
+    lo, lf = _logits_ensure_token_major(lo, lf)
+
+    ma = _load_packed_meta(dir_on, "cu_seqlens_q_logits.pt")
+    mb = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    if ma is None or mb is None:
+        return None
+    T_off = int(mb["cu_seqlens"][-1]) if mb["cu_seqlens"].numel() > 0 else 0
+    if T_off == 0 or lo.shape[0] == 0 or lf.shape[0] == 0:
+        return None
+
+    align_mask = _build_alignment_mask(mb["cu_seqlens"], ma["prefix_lens"], T_off)
+    try:
+        on_aligned, off_aligned = _align_packed(lo, lf, align_mask)
+    except ValueError as e:
+        return CheckResult(name="logits", passed=False,
+                           metrics={"error": str(e),
+                                    "n_on": lo.shape[0], "n_off": lf.shape[0]})
+
+    cos = _cosine_sim(on_aligned, off_aligned, dim=-1)
+    cos_avg, cos_min = float(cos.mean()), float(cos.min())
+    return CheckResult(name="logits",
+                       passed=cos_avg > _COS_AVG_PASS and cos_min > _COS_MIN_PASS,
+                       metrics={"n_tokens": on_aligned.shape[0],
+                                "cos_avg": cos_avg, "cos_min": cos_min})
 
 
 # ════════════════════════════════════════════════════════════════
@@ -153,7 +412,7 @@ def _resolve_mask(dir_off: str, mask_kind: str, tag: str,
 
 
 # ════════════════════════════════════════════════════════════════
-#  2D comparison（v080 增强：返回 tensors + shape mismatch 不 crash）
+#  2D comparison（logprobs / entropy）
 # ════════════════════════════════════════════════════════════════
 
 def cmp_2d(dir_on: str, dir_off: str, filename: str, name: str,
@@ -191,7 +450,7 @@ def cmp_2d(dir_on: str, dir_off: str, filename: str, name: str,
 
 
 # ════════════════════════════════════════════════════════════════
-#  Shape diagnostics（v080 特有：定位 mismatch 根因）
+#  Shape diagnostics
 # ════════════════════════════════════════════════════════════════
 
 def _shape_of(dir_path: str, filename: str) -> str:
@@ -205,13 +464,9 @@ def _shape_of(dir_path: str, filename: str) -> str:
 
 
 def _print_shapes(dir_on: str, dir_off: str, tag: str):
-    """打印 ON/OFF 各 .pt 文件 shape —— 定位 shape mismatch 根因的第一手信息。
-
-    logprobs ON vs OFF shape 不同，通常意味着 dump 端两侧坐标系不一致
-    （例如 ON restore 后含完整 prompt+response，OFF 只 dump 了 response 段）。
-    """
-    print("-" * 70 + "\n  [shapes]  ON vs OFF dump shapes")
-    print("-" * 70)
+    """打印 ON/OFF 各 .pt 文件 shape —— 定位 shape mismatch 根因的第一手信息。"""
+    print(_SEP_SINGLE + "\n  [shapes]  ON vs OFF dump shapes")
+    print(_SEP_SINGLE)
     files = [
         f"logprobs_{tag}.pt",
         f"entropy_{tag}.pt",
@@ -237,7 +492,7 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str):
 
 
 # ════════════════════════════════════════════════════════════════
-#  Output（2D 结果 + header + top-K）
+#  Output
 # ════════════════════════════════════════════════════════════════
 
 def _print_header(dir_on, dir_off, dir_off2, tag, mask_kind, layer):
@@ -251,6 +506,62 @@ def _print_header(dir_on, dir_off, dir_off2, tag, mask_kind, layer):
         detail += f"    LAYER: {layer}"
     print(f"  {detail}")
     print(_SEP_DOUBLE + "\n")
+
+
+def _print_per_layer(r: CheckResult):
+    print(_SEP_SINGLE + "\n  [attn_output]  Per-Layer Cosine Similarity")
+    print(_SEP_SINGLE)
+    layers = r.metrics.get("layers")
+    if isinstance(layers, dict):
+        print(f"  {'LAYER':>6s}  {'COS_AVG':>14s}  {'COS_MIN':>14s}  "
+              f"{'TOKENS':>8s}  {'STATUS':>8s}")
+        print(f"  {'─' * 6}  {'─' * 14}  {'─' * 14}  {'─' * 8}  {'─' * 8}")
+        bad = []
+        for lyr in sorted(layers.keys()):
+            d = layers[lyr]
+            if "error" in d:
+                print(f"  {lyr:>6d}  {d['error']}")
+                bad.append(lyr)
+                continue
+            ok = d["cos_avg"] > _COS_AVG_PASS and d["cos_min"] > _COS_MIN_PASS
+            print(f"  {lyr:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
+                  f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
+            if not ok:
+                bad.append(lyr)
+        if bad:
+            print(f"\n  ⚠ First deviating layer: {bad[0]}")
+    elif "cos_avg" in r.metrics:
+        d = r.metrics
+        ok = d["cos_avg"] > _COS_AVG_PASS and d["cos_min"] > _COS_MIN_PASS
+        print(f"  L{d['layer']}  cos_avg={d['cos_avg']:.6e}  "
+              f"cos_min={d['cos_min']:.6e}  {'PASS' if ok else 'WARN'}")
+    elif "error" in r.metrics:
+        print(f"  {_CROSS} {r.metrics['error']}")
+    print()
+
+
+def _print_first_token(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [first_token]  {r.name}  (packed position [0])")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    for k in ["mean_abs", "max_abs", "rel_max", "rel_mean", "cos", "pearson"]:
+        v = m.get(k)
+        if v is not None:
+            print(f"  {k:>12s}  {v:>14.6e}")
+    print()
+
+
+def _print_logits_packed(r: CheckResult):
+    print(_SEP_SINGLE + "\n  [logits]  packed alignment (suffix aligned)")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}")
+    else:
+        print(f"  n_tokens={m.get('n_tokens', '—')}  "
+              f"cos_avg={m.get('cos_avg', 0):.6e}  cos_min={m.get('cos_min', 0):.6e}  "
+              f"{_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print()
 
 
 def _print_2d_result(r: CheckResult):
@@ -270,9 +581,30 @@ def _print_2d_result(r: CheckResult):
     print()
 
 
+def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
+                    topk: int, sort_by: str, label: str):
+    """1D 向量 top-K（first_token per-dim）。"""
+    abs_err = (on_vec - off_vec).abs()
+    rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
+    if sort_by == "abs":
+        sort_key = abs_err
+    elif sort_by == "rel":
+        sort_key = rel_err
+    else:  # "val"
+        sort_key = torch.maximum(on_vec.abs(), off_vec.abs())
+    _, idx = sort_key.topk(min(topk, sort_key.numel()))
+    idx = idx.to(torch.long)
+    print(f"\n  [{label}]  top-{topk} dims (sort by {sort_by})")
+    print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}  {'REL_ERR':>12s}")
+    for i in idx.tolist():
+        print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
+              f"  {float(abs_err[i]):>12.6e}  {float(rel_err[i]):>12.6e}")
+
+
 def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
                    mask: torch.Tensor | None, topk: int, sort_by: str,
                    label: str):
+    """2D [B, L_max] top-K 位置（logp/entropy）。"""
     abs_err = (on_t - off_t).abs()
     rel_err = abs_err / torch.maximum(on_t.abs(), off_t.abs()).clamp(min=1e-8)
     if sort_by == "abs":
@@ -297,13 +629,44 @@ def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
               f"{float(rel_err[r, c]):>12.6e}")
 
 
+def _print_summary(results: list[CheckResult]):
+    print(_SEP_DOUBLE + "\n  SUMMARY")
+    print(_SEP_DOUBLE)
+    hdr = (f"  {'NAME':<20s} {'SHAPE':<16s} {'ABS_MAX':>12s}  {'REL_MAX':>10s}  "
+           f"{'PEARSON_R':>10s}  {'STATUS':>8s}")
+    print(hdr + "\n  " + "─" * (len(hdr) - 2))
+    for r in results:
+        m = r.metrics
+        shape = str(m.get("shape", m.get("error", "—")))
+        am = f"{m['abs_max']:.6e}" if "abs_max" in m else "—"
+        rm = f"{m['rel_max']:.6e}" if "rel_max" in m else "—"
+        pr = f"{m['pearson_r']:.6f}" if m.get("pearson_r") is not None else "—"
+        s = f"  {_CHECK} PASS" if r.passed else f"  {_CROSS} FAIL"
+        print(f"  {r.name:<20s} {shape:<16s} {am:>12s}  {rm:>10s}  {pr:>10s}  {s}")
+    print(_SEP_DOUBLE + "\n")
+
+
+def _dump_json(results: list[CheckResult], path: str,
+               dir_on: str, dir_off: str, tag: str, dir_off2: str | None):
+    record: dict = {"dir_on": dir_on, "dir_off": dir_off, "tag": tag}
+    if dir_off2:
+        record["dir_off2"] = dir_off2
+    record["results"] = [{**r.metrics, "name": r.name, "passed": r.passed}
+                         for r in results]
+    record["all_passed"] = all(r.passed for r in results)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+    print(f"  Report saved to: {path}\n")
+
+
 # ════════════════════════════════════════════════════════════════
 #  Main
 # ════════════════════════════════════════════════════════════════
 
 def main():
     ap = argparse.ArgumentParser(
-        description="verl080 precision comparison — ON vs OFF (packed + 2D)",
+        description="verl080 precision comparison — ON vs OFF (packed + 2D, self-contained)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -320,19 +683,19 @@ def main():
     ap.add_argument("--atol", type=float, default=1e-5,
                     help="Absolute tolerance for 2D (default: 1e-5)")
     ap.add_argument("--topk", type=int, default=0,
-                    help="2D top-K worst positions (0 = disabled)")
+                    help="top-K worst positions (0 = disabled)")
     ap.add_argument("--sort-err", choices=["abs", "rel", "val"], default="abs",
-                    help="2D top-K sort: abs / rel / val (default: abs)")
+                    help="top-K sort: abs / rel / val (default: abs)")
     ap.add_argument("--output", "-o", default=None, help="Save report as JSON")
     args = ap.parse_args()
 
     _print_header(args.dir_on, args.dir_off, args.dir_off2,
                   args.tag, args.mask, args.layer)
 
-    # ── shape diagnostics：直接暴露 ON/OFF 各文件 shape ──
+    # ── shape diagnostics ──
     _print_shapes(args.dir_on, args.dir_off, args.tag)
 
-    # ── resolve 2D mask（以 OFF logprobs shape 为参考校验） ──
+    # ── resolve 2D mask ──
     ref = _load_tensor(args.dir_off, f"logprobs_{args.tag}.pt")
     mask = None
     if ref is not None:
@@ -343,24 +706,41 @@ def main():
 
     all_results: list[CheckResult] = []
 
-    # ── packed: attention_output per-layer cos（suffix 对齐，复用 cmp_diag） ──
+    # ── packed: attention_output per-layer cos ──
     r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)
     if r:
         all_results.append(r)
         _print_per_layer(r)
 
-    # ── packed: first_token（attn[0] + logits[0]，packed[0] 直接对比） ──
-    for r in cmp_first_token(args.dir_on, args.dir_off):
+    # ── packed: first_token（attn[0] + logits[0]） ──
+    ft_results = cmp_first_token(args.dir_on, args.dir_off)
+    for r in ft_results:
         all_results.append(r)
         _print_first_token(r)
+    # first_token top-K（per-dim）
+    if args.topk > 0 and ft_results:
+        last = _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off)
+        if last:
+            a = _load_attn_output(args.dir_on, last)
+            b = _load_attn_output(args.dir_off, last)
+            if a is not None and b is not None:
+                a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
+                b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
+                _print_topk_vec(a0, b0, args.topk, "val", "first_token_attn")
+        lo = _load_tensor(args.dir_on, "logits.pt")
+        lf = _load_tensor(args.dir_off, "logits.pt")
+        if lo is not None and lf is not None:
+            lo_f, lf_f = _logits_first_token(lo, lf)
+            _print_topk_vec(lo_f.cpu(), lf_f.cpu(), args.topk,
+                            args.sort_err, "first_token_logits")
 
-    # ── packed: logits（suffix 对齐，per-token cosine） ──
+    # ── packed: logits（suffix 对齐） ──
     r = cmp_logits_packed(args.dir_on, args.dir_off)
     if r:
         all_results.append(r)
         _print_logits_packed(r)
 
-    # ── 2D: logprobs + entropy（v080 restore 后，直接逐元素对比） ──
+    # ── 2D: logprobs + entropy ──
     for fname, cname in [("logprobs", "logp"), ("entropy", "entropy")]:
         fn = f"{fname}_{args.tag}.pt"
         r, t1, t2 = cmp_2d(args.dir_on, args.dir_off, fn,
@@ -372,7 +752,7 @@ def main():
             _print_topk_2d(t1.cpu(), t2.cpu(), mask, args.topk,
                            args.sort_err, r.name)
 
-    # ── OFF vs OFF baseline（2D 噪声底） ──
+    # ── OFF vs OFF baseline ──
     if args.dir_off2:
         print(_SEP_DOUBLE + "\n  [BASELINE]  OFF vs OFF2 Noise Floor\n" + _SEP_DOUBLE)
         for fname, cname in [("logprobs", "logp"), ("entropy", "entropy")]:
