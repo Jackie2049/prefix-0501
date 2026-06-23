@@ -167,7 +167,9 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                             int(_lm_val[_lm_off[i]:_lm_off[i + 1]].sum())
                             for i in range(len(_orig_lens))]
                     else:
-                        _response_lens = _lm.sum(dim=-1).to(torch.long).tolist()
+                        # .long() 免 import torch（本文件顶部未导入 torch）；
+                        # .cpu() 防御 on-device tensor 的 tolist()
+                        _response_lens = _lm.sum(dim=-1).long().cpu().tolist()
                     dump_label_mask_verl080(
                         build_label_mask_2d(_response_lens, _orig_lens, _Lmax_lm),
                         _tag_lm)
