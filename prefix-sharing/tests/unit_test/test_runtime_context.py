@@ -72,87 +72,73 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
         assert ctx.stats.kept_padded_tokens == 8
 
 
-def _chain_reuse_runtime_state():
-    """Chain-reuse: row0=provider, row1=reuse(0,prefix=3), row2=reuse(1,prefix=3).
+def test_chain_reuse_resolves_position_to_provider_with_matching_label():
+    """Chain-reuse must route a deeper reuser to the provider whose
+    *continuation* matches, not the root.
 
-    Row2's prefix-last predict position (prefix_len-1 = 2) falls on row1's
-    keep_start-1 (row1 keep_start=3).  Under v080 physical trimming row1's
-    packed region has no slot for position 2, so the prefix-last logits must
-    be fetched from the chain ancestor row0 whose packed region strictly
-    contains position 2 (keep_start=0 <= 2 < keep_end=8).
+    Trie detection produces a natural chain here:
+        seq0: [1, 2, 3, 4, 5]   provider (root)
+        seq1: [1, 2, 3, 7, 8]   reuse(seq0), shared prefix [1,2,3] (len 3)
+        seq2: [1, 2, 3, 7, 9]   reuse(seq1), shared prefix [1,2,3,7] (len 4)
 
-    The chain is forced via a hand-built PrefixDetectionResult (the trie
-    detector naturally routes row2 to row0 because it records the *first*
-    inserter as provider at each depth; we need the transitive edge
-    row2->row1 specifically to exercise the keep_start-1 miss path).
+    The trie routes seq2 to seq1 (not seq0): at position 3 both seq1 and seq2
+    hold token 7, whereas seq0 holds 4.  So seq2's restore for position 2
+    (token "3", which predicts token 7) must reference seq1 — whose label at
+    that position is 7 — rather than seq0, whose label there is 4.
+
+    The keep_start-1 extension in ``_resolve_provider_for_position`` keeps the
+    boundary position on the direct provider seq1 (seq1 keeps [3, 5), so
+    keep_start-1 = 2 covers position 2).  Positions shared identically with
+    the root (0, 1) walk up to seq0.  The prefix-last (position 3) lands on a
+    real packed slot of seq1 because seq1's kept range [3, 5) contains it.
     """
-    from prefix_sharing.core.prefix_detector import (
-        PrefixDetectionResult,
-        PrefixReuseSpec,
-    )
-
     planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2))
-    sequences = [
-        [100, 101, 102, 103, 104, 105, 106, 107],   # row0 provider, len 8
-        [100, 101, 102, 108, 109, 110],              # row1 reuse(0) prefix=3, len 6
-        [100, 101, 102, 111, 112, 113],              # row2 reuse(1) prefix=3, len 6
-    ]
-    detection = PrefixDetectionResult(
-        batch_size=3,
-        reuse_specs=(
-            PrefixReuseSpec(reuse_idx_in_batch=1, provider_idx_in_batch=0, prefix_len=3),
-            PrefixReuseSpec(reuse_idx_in_batch=2, provider_idx_in_batch=1, prefix_len=3),
-        ),
-        groups=(),
-        group_ids=[0, 0, 1],
-        provider_index=[0, 0, 1],
-        prefix_lens=[0, 3, 3],
-        is_provider=[True, False, False],
+    plan = planner.plan(
+        [[1, 2, 3, 4, 5], [1, 2, 3, 7, 8], [1, 2, 3, 7, 9]],
+        forward_id=10,
+        micro_batch_id=20,
     )
-    prefix_sharing_plan = planner.plan_from_detection(
-        sequences, detection, forward_id=10, micro_batch_id=20,
-    )
-    # Sanity: the chain is row2 -> row1 -> row0 with prefix_len 3 each.
-    assert prefix_sharing_plan.provider_index[1] == 0
-    assert prefix_sharing_plan.provider_index[2] == 1
-    assert prefix_sharing_plan.prefix_lens[1] == 3
-    assert prefix_sharing_plan.prefix_lens[2] == 3
-    return PrefixSharingRuntimeState(
-        prefix_sharing_plan=prefix_sharing_plan,
+    # Chain: seq2 -> seq1 -> seq0; seq2 shares the longer prefix [1,2,3,7].
+    assert plan.provider_index == [0, 0, 1]
+    assert plan.prefix_lens == [0, 3, 4]
+
+    runtime_state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=plan,
         attention_backend=None,
-        packed_batch_layout=PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q),
+        packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(),
     )
-
-
-def test_prefix_last_in_chain_reuse_resolves_to_ancestor_with_packed_slot():
-    """Regression: prefix-last in chain-reuse must fetch logits from the
-    chain ancestor whose packed region strictly contains the predict position,
-    not the intermediate reuser whose keep_start-1 has no packed slot.
-
-    Before the fix _build_prefix_last_restore_indices left provider_1d_pos=-1
-    (sentinel) for such specs, causing vocab_logprobs save to skip them and
-    the downstream restore to KeyError on the saved-logits lookup.
-    """
-    runtime_state = _chain_reuse_runtime_state()
     with prefix_sharing_runtime_context(runtime_state) as ctx:
-        # Collect prefix-last (non-interior) indices for row2 (reuse_idx=2).
-        row2_plast = [
-            idx for idx in ctx.prefix_last_restore_indices
-            if idx.reuse_idx_in_batch == 2 and not idx.is_shared_prefix_interior
-        ]
-        assert len(row2_plast) == 1, "row2 should have exactly one prefix-last restore"
-        spec = row2_plast[0]
+        seq2 = {
+            idx.target_2d_pos: idx
+            for idx in ctx.prefix_last_restore_indices
+            if idx.reuse_idx_in_batch == 2
+        }
 
-        # target_2d_pos = prefix_len-1 = 2 (prefix-last predict position).
-        assert spec.target_2d_pos == 2
-        # The fix: provider_1d_pos must NOT be the -1 sentinel. It must point
-        # into row0's packed region (row0 has 8 tokens, position 2 → packed
-        # index 2 since row0 starts at offset 0 in the packed tensor).
-        assert spec.provider_1d_pos != -1, (
-            "prefix-last in chain-reuse must resolve provider_1d_pos to a "
-            "chain ancestor with a real packed slot, not the -1 sentinel"
+        # Positions 0, 1 (tokens 1, 2): labels 2, 3 are identical across all
+        # rows, so they resolve up the chain to the root seq0.
+        assert seq2[0].provider_idx_in_batch == 0
+        assert seq2[0].label_value == 2
+        assert seq2[1].provider_idx_in_batch == 0
+        assert seq2[1].label_value == 3
+
+        # Position 2 (token "3"): seq2/seq1 predict 7 here, seq0 predicts 4.
+        # Must resolve to the direct provider seq1 (matching label 7), and
+        # stay there via the keep_start-1 extension — NOT walk up to seq0.
+        assert seq2[2].provider_idx_in_batch == 1, (
+            "seq2 position 2 (token 3 -> label 7) must resolve to seq1 "
+            "(matching continuation 7), not seq0 (continuation 4)"
         )
-        assert spec.provider_1d_pos == 2, (
-            f"expected packed index 2 (row0 offset 0 + pos 2), got {spec.provider_1d_pos}"
+        assert seq2[2].label_value == 7
+
+        # Prefix-last (position 3, predicts token 9): seq1 keeps [3, 5) which
+        # strictly contains position 3, so it resolves to a real packed slot
+        # on seq1 (not the -1 sentinel).
+        plast = seq2[3]
+        assert plast.is_shared_prefix_interior is False
+        assert plast.provider_idx_in_batch == 1
+        assert plast.label_value == 9
+        assert plast.provider_1d_pos != -1, (
+            "prefix-last must resolve to a real packed slot on the direct "
+            "provider seq1, not the -1 sentinel"
         )
