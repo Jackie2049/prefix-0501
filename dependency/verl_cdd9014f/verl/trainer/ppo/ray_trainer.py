@@ -1336,6 +1336,26 @@ class RayPPOTrainer:
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
+        #####prefix-sharing：inject data########
+        # Replace rollout generation with fixed data when USE_FIXED_ROLLOUT env is set
+        json_path = os.environ.get("USE_FIXED_ROLLOUT", None)
+        if json_path:
+            from prefix_sharing.tools.inject_fixed_rollout import patch_fixed_rollout
+            patch_fixed_rollout(self, json_path=json_path)
+
+        # Inject synthetic prefix data when USE_SYNTHETIC_PREFIX env is set
+        synthetic_json = os.environ.get("USE_SYNTHETIC_PREFIX", None)
+        if synthetic_json:
+            from prefix_sharing.tools.inject_synthetic_prefix import patch_synthetic_prefix
+            patch_synthetic_prefix(
+                self,
+                json_path=synthetic_json,
+                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+            )
+        #####prefix-sharing：inject data########
+
         current_epoch = self.global_steps // len(self.train_dataloader)
 
         # perform validation before training

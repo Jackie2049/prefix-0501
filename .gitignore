@@ -37,3 +37,6 @@ log/
 
 # Backup git directories
 .git.bak/
+
+# Local tool dirs
+.codebuddy/
