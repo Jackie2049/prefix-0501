@@ -80,11 +80,9 @@ def test_build_prefix_sharing_micro_batch_verl070_trims_reuser_mask_and_context_
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
-        # 3 restore indices: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        # 1 prefix-last index (interior is bulk-sliced, not indexed)
+        assert len(ctx.prefix_last_restore_indices) == 1
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2  # prefix-last, provider seq0 offset 2
     assert current_prefix_sharing_context() is None
 
 
@@ -153,20 +151,16 @@ def test_build_prefix_sharing_micro_batch_verl070_builds_common_tp_padded_layout
     assert layout.packed_position_ids.tolist() == expected_positions
     assert layout.valid_token_mask.tolist() == expected_mask
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        # 3 restore indices: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        # 1 prefix-last index (interior is bulk-sliced, not indexed)
+        assert len(ctx.prefix_last_restore_indices) == 1
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2  # prefix-last, provider seq0 offset 2
 
 
 def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
-    # prefix-last-only case (no interior response).
-    # input: [[1,2,3,10,11], [1,2,3,20,21]] → prefix_len=3, prompt_len=3
-    # Planner emits 3 specs (2 interior + 1 prefix-last); here we focus on the
-    # prefix-last spec at index 2: provider_predict_pos=2, target_2d_pos=2.
-    # Reuser's first suffix token at target_2d_pos=2 differs from provider's,
-    # so logprob must be recomputed from saved provider logits.
+    # input: [[1,2,3,10,11], [1,2,3,20,21]] → prefix_len=3, prompt_len=3.
+    # Only the prefix-last spec is indexed (interior is bulk-sliced in the
+    # restore). Reuser's first suffix token at target_2d_pos=2 differs from
+    # provider's, so its logprob must be recomputed from saved provider logits.
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]]),
         "attention_mask": torch.ones(2, 5, dtype=torch.bool),
@@ -196,24 +190,20 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
         ).squeeze(-1)
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        # 3 restore specs: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        index = ctx.prefix_last_restore_indices[2]  # prefix-last spec
-        assert not index.is_shared_prefix_interior
+        # 1 prefix-last spec (interior bulk-sliced, not indexed)
+        assert len(ctx.prefix_last_restore_indices) == 1
+        index = ctx.prefix_last_restore_indices[0]  # prefix-last spec
 
         # Simulate 2D postprocess: output dict with [B, L] log_probs.
         log_probs_2d = torch.zeros(2, 5)
         output = {"log_probs": log_probs_2d}
 
-        # 2D label: label[p] = token at p+1 (verl convention).
-        label_2d = torch.tensor([[0, 0, 0, 10, 11], [0, 0, 0, 20, 21]])
-
         # Saved provider packed logits for prefix-last recompute.
         saved_logits = torch.randn(1, 32, requires_grad=True)
         ctx.prefix_last_logits_saved[(index.reuse_idx_in_batch, index.target_2d_pos)] = saved_logits
 
-        output = restore_reuser_prefix_columns_2d(output, label_2d, gather_fn)
-        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 3
+        output = restore_reuser_prefix_columns_2d(output, gather_fn)
+        assert ctx.stats.actual_restore_count == ctx.stats.expected_restore_count == 1
 
         restored_val = output["log_probs"][index.reuse_idx_in_batch, index.target_2d_pos]
 
@@ -267,10 +257,8 @@ def test_build_prefix_sharing_micro_batch_verl070_keeps_global_layout_with_seque
     assert layout.cu_seqlens == expected_cu_seqlens
     assert layout.total_padded_length == expected_cu_seqlens[-1]
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        # 3 restore specs: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        # 1 prefix-last index (interior bulk-sliced, not indexed)
+        assert len(ctx.prefix_last_restore_indices) == 1
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
@@ -349,9 +337,8 @@ def test_build_prefix_sharing_micro_batch_verl070_combines_tp_padding_with_physi
     assert prefix_sharing_runtime_state.parallel_info.pp_size == pp_size
     assert prefix_sharing_runtime_state.packed_batch_layout.cu_seqlens == expected_cu_seqlens
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
-        # 3 restore specs: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        # 1 prefix-last index (interior bulk-sliced, not indexed)
+        assert len(ctx.prefix_last_restore_indices) == 1
 
 
 def test_attention_hook_rejects_sp_local_shard_token_length():

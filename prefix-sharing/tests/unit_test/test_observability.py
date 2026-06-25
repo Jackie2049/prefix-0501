@@ -33,7 +33,9 @@ def test_prefix_sharing_stats_from_plan_records_expected_reuse_summary():
     assert stats.sharing_group_count == 1
     assert stats.expected_reused_counts_per_layer == 1
     assert stats.expected_reused_prefix_tokens_per_layer == 3
-    assert stats.expected_restore_count == 3
+    # expected_restore_count now counts reuser rows (interior is bulk-sliced,
+    # no longer one-index-per-position), so it equals the reuser count.
+    assert stats.expected_restore_count == 1
     assert stats.actual_restore_count == 0
 
 

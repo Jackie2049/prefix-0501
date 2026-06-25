@@ -61,49 +61,35 @@ from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReu
 
 @dataclass(frozen=True)
 class PrefixLastRestoreSpec:
-    """Plan for one reuse row's logprob restore.
+    """Plan for one reuse row's prefix-last logprob restore.
 
-    Two kinds of restore exist:
+    A reuser's first suffix token is predicted from the shared prefix-last
+    position (``logits[prefix_len - 1]`` predicting ``input_ids[prefix_len]``).
+    Since different reusers may have different first suffix labels, the
+    provider's full logits at ``prefix_len - 1`` must be stored and the logprob
+    recomputed per reuser using that reuser's label.
 
-    * **Prefix-last restore** (``is_shared_prefix_interior=False``, default): the
-      reuser's first suffix token is predicted from the shared prefix-last
-      position. Since different reusers may have different first suffix labels,
-      the provider's full logits at ``prefix_len - 1`` must be stored and the
-      logprob computed per reuser using that reuser's label.
-
-    * **Shared-prefix interior restore** (``is_shared_prefix_interior=True``):
-      a token that lives strictly inside the shared prefix. Its
-      logprob is ``log_softmax(logits[pos-1])[label=pos]``, where both the
-      logits position and the label belong to the shared prefix. The logprob
-      is therefore **identical for all reusers** and can be computed once from
-      the provider's logits, stored as a non-detached scalar tensor, and
-      reused for every reuser without re-reading logits.
+    Interior prefix positions (``[0, prefix_len - 2]``) are **not** represented
+    here: their logprob is identical across the shared prefix (same logits +
+    same labels), so the 2D restore bulk-slices the whole interval off the
+    direct provider's already-restored row — no per-position spec is needed.
     """
 
     reuse_idx_in_batch: int
     provider_idx_in_batch: int
-    provider_predict_pos: int
-    """Logits position in provider used for this restore (logits[p] predicts
-    token at p+1). Equals ``target_2d_pos`` numerically; kept as a separate
-    field to document the provider-side lookup semantic and to drive provider
-    chain resolution in ``context.py``."""
-    reuse_first_suffix_label_pos: int
     group_id: int
-    is_shared_prefix_interior: bool = False
     target_2d_pos: int = -1
-    """Absolute 2D position in output tensor where restored logprob belongs.
-    
-    This is the label position in the original (untrimmed) sequence:
-      log_probs[i] = log_softmax(logits[i])[label[i]]
-    For shared-prefix interior: ``target_2d_pos = prefix_label_pos - 1`` (label index).
-    For prefix-last:    ``target_2d_pos = prefix_len - 1`` (first-suffix label index).
+    """The prefix-last position (``prefix_len - 1``): the last token of the
+    shared prefix. By the log_probs layout invariant
+    (``log_probs[i] = log_softmax(logits[i])[label[i+1]]``) this single index
+    is **both** the provider logits row that predicts the reuser's first
+    suffix token (read side) and the output column the recomputed logprob is
+    written to (write side) — so one field covers both roles.
     """
     label_value: int = -1
-    """The actual token ID used as label for logprob computation.
-    
-    For shared-prefix interior: token at ``prefix_label_pos`` (shared prefix, same for provider/reuser).
-    For prefix-last: token at ``prefix_len`` (reuser's first suffix token).
-    This value is needed because trimmed packed labels don't contain these positions.
+    """The reuser's first suffix token ID (``input_ids[prefix_len]``), used as
+    the label for logprob recompute. Needed because the trimmed packed labels
+    don't contain this position.
     """
 
 
@@ -282,47 +268,20 @@ class PrefixSharingPlanner:
                 kept_len = suffix_len
                 q_offset = prefix_len
 
-                # --- Shared-prefix interior token restore ---
-                # Response tokens inside the shared prefix (positions
-                # 1 .. prefix_len-1) are trimmed from the Q path but
-                # still need logprob entries for PPO loss. Their labels are
-                # inside the shared prefix so the logprob is identical for
-                # provider and reuser: compute once from provider logits,
-                # store as a non-detached scalar tensor.
-                # Note: prompt positions (0..prompt_len-1) are also
-                # restored, but downstream label_mask is False for them
-                # so they don't affect loss — restoring the whole prefix
-                # column uniformly keeps planning simple.
-                for prefix_label_pos in range(1, prefix_len):
-                    # Shared-prefix interior token logprob: computed from
-                    # logits[prefix_label_pos-1] predicting token at
-                    # prefix_label_pos. Writes to 2D position
-                    # prefix_label_pos - 1 (the label position).
-                    restore_specs.append(
-                        PrefixLastRestoreSpec(
-                            reuse_idx_in_batch=index,
-                            provider_idx_in_batch=provider_index[index],
-                            provider_predict_pos=prefix_label_pos - 1,
-                            reuse_first_suffix_label_pos=prefix_label_pos,
-                            group_id=group_ids[index],
-                            is_shared_prefix_interior=True,
-                            target_2d_pos=prefix_label_pos - 1,
-                            label_value=input_ids[index][prefix_label_pos],
-                        )
-                    )
-
                 # --- Prefix-last restore (first suffix token) ---
+                # Interior prefix positions [0, prefix_len-2] are restored by
+                # the 2D restore, which bulk-slices them off the direct
+                # provider's already-restored row (identical across the shared
+                # prefix), so the planner only emits the prefix-last token.
                 # The logits at position prefix_len-1 predict the first suffix
                 # token whose label is input_ids[prefix_len] (differs per
-                # reuser). The restored logprob is written to 2D position
+                # reuser); the restored logprob is written to 2D position
                 # prefix_len - 1 (the label slot for first-suffix prediction).
                 if prefix_len > 0 and suffix_len > 0:
                     restore_specs.append(
                         PrefixLastRestoreSpec(
                             reuse_idx_in_batch=index,
                             provider_idx_in_batch=provider_index[index],
-                            provider_predict_pos=prefix_len - 1,
-                            reuse_first_suffix_label_pos=prefix_len,
                             group_id=group_ids[index],
                             target_2d_pos=prefix_len - 1,
                             label_value=input_ids[index][prefix_len],
