@@ -246,21 +246,22 @@ def restore_reuser_prefix_columns_2d(
     off the **direct provider's already-restored 2D row** and only the single
     prefix-last logprob is recomputed.
 
-    Per reuser row ``i`` with direct provider ``p = provider_index[i]`` and
-    ``P = prefix_lens[i]`` (columns are identity-mapped in the unfolded 2D
-    tensor, so ``target_2d_pos`` == column):
+    Per ``reuser_idx`` with direct provider ``provider_idx = provider_index[reuser_idx]``
+    and ``P = prefix_lens[reuser_idx]`` (columns are identity-mapped in the
+    unfolded 2D tensor, so ``target_2d_pos`` == column):
 
-    - **interior ``[0, P-2]``**: ``log_probs[i, 0:P-1] = log_probs[p, 0:P-1]``
+    - **interior ``[0, P-2]``**: ``log_probs[reuser_idx, 0:P-1] = log_probs[provider_idx, 0:P-1]``
       (bulk copy). Identical across the shared prefix (same logits + labels),
-      and ``p`` was restored earlier in the batch-order loop, so its row already
-      holds correct values — no per-position provider resolution needed.
-    - **prefix-last ``P-1``**: recompute ``log_probs[i, P-1]`` from the saved
-      provider logits + the reuser's own first-suffix label (differs from the
-      provider's). When the reuser has no suffix (``suffix_len == 0``) the
+      and ``provider_idx`` was restored earlier in the batch-order loop, so its
+      row already holds correct values — no per-position provider resolution
+      needed.
+    - **prefix-last ``P-1``**: recompute ``log_probs[reuser_idx, P-1]`` from the
+      saved provider logits + the reuser's own first-suffix label (differs from
+      the provider's). When the reuser has no suffix (``suffix_len == 0``) the
       planner emits no prefix-last spec; that column is masked downstream, so
       the provider's value is copied as a safe placeholder.
-    - **entropy ``[0, P-1]``**: ``entropy[i, 0:P] = entropy[p, 0:P]`` (whole
-      prefix copied, including prefix-last — entropy is label-independent).
+    - **entropy ``[0, P-1]``**: ``entropy[reuser_idx, 0:P] = entropy[provider_idx, 0:P]``
+      (whole prefix copied, including prefix-last — entropy is label-independent).
 
     Rows are visited in ``range(B)`` order so a provider is always restored
     before any reuser that reads it (the same online-detector invariant
@@ -299,45 +300,44 @@ def restore_reuser_prefix_columns_2d(
     provider_index = plan.provider_index
     prefix_lens = plan.prefix_lens
 
-    # prefix-last lookup keyed by reuser row. ``prefix_last_restore_indices``
-    # now carries only prefix-last entries (one per reuser-with-suffix);
-    # interior is handled by the bulk slice below.
-    prefix_last_by_row = {
-        idx.reuse_idx_in_batch: idx for idx in ctx.prefix_last_restore_indices
+    # reuser row → its prefix-last restore spec (one per reuser-with-suffix;
+    # interior positions have no spec — they are bulk-sliced below).
+    prefix_last_spec_by_reuser = {
+        spec.reuse_idx_in_batch: spec for spec in ctx.prefix_last_restore_indices
     }
 
     restored_reusers = 0
     # Row 0 is always a provider (nothing precedes it to reuse), so start at 1.
     # A reuser's provider always has a smaller batch index (online-detector
-    # invariant), so it is already restored when we reach row i.
-    for i in range(1, len(prefix_lens)):
-        prefix_len = prefix_lens[i]
-        if provider_index[i] == i or prefix_len <= 0:
+    # invariant), so it is already restored when we reach reuser_idx.
+    for reuser_idx in range(1, len(prefix_lens)):
+        prefix_len = prefix_lens[reuser_idx]
+        if provider_index[reuser_idx] == reuser_idx or prefix_len <= 0:
             continue  # provider / non-reuser: row already complete
-        provider = provider_index[i]
+        provider_idx = provider_index[reuser_idx]
 
         # interior [0, prefix_len-2]: bulk-copy from the provider's restored row.
         if prefix_len - 1 > 0:
-            log_probs[i, 0:prefix_len - 1] = log_probs[provider, 0:prefix_len - 1]
+            log_probs[reuser_idx, 0:prefix_len - 1] = log_probs[provider_idx, 0:prefix_len - 1]
 
         # prefix-last (position prefix_len-1): recompute with the reuser's label.
-        idx = prefix_last_by_row.get(i)
-        if idx is not None:
-            saved_key = (i, idx.target_2d_pos)
-            provider_logits = ctx.prefix_last_logits_saved[saved_key]  # [1, V//tp]
+        prefix_last_spec = prefix_last_spec_by_reuser.get(reuser_idx)
+        if prefix_last_spec is not None:
+            saved_logits_key = (reuser_idx, prefix_last_spec.target_2d_pos)
+            saved_provider_logits = ctx.prefix_last_logits_saved[saved_logits_key]  # [1, V//tp]
             reuser_label = torch.tensor(
-                [idx.label_value], dtype=torch.long, device=log_probs.device,
+                [prefix_last_spec.label_value], dtype=torch.long, device=log_probs.device,
             )  # [1]
-            log_probs[i, prefix_len - 1] = vocab_parallel_log_probs_fn(
-                provider_logits, reuser_label,
+            log_probs[reuser_idx, prefix_len - 1] = vocab_parallel_log_probs_fn(
+                saved_provider_logits, reuser_label,
             ).reshape(())
         else:
             # suffix_len == 0: no prefix-last spec; column is masked downstream.
-            log_probs[i, prefix_len - 1] = log_probs[provider, prefix_len - 1]
+            log_probs[reuser_idx, prefix_len - 1] = log_probs[provider_idx, prefix_len - 1]
 
         # entropy [0, prefix_len-1]: whole prefix copied (label-independent).
         if entropy is not None:
-            entropy[i, 0:prefix_len] = entropy[provider, 0:prefix_len]
+            entropy[reuser_idx, 0:prefix_len] = entropy[provider_idx, 0:prefix_len]
 
         restored_reusers += 1
 
@@ -415,7 +415,7 @@ def restore_via_2d_unfold_verl080(
     device = log_probs_nested.values().device
 
     # --- Step 1: 展开裁剪后 NestedTensor → 完整 2D [B, L_max] ---
-    logp_2d, entropy_2d = _unfold_trimmed_nested_to_2d(
+    log_probs_2d, entropy_2d = _unfold_trimmed_nested_to_2d(
         log_probs_nested,
         entropy_nested if has_entropy else None,
         original_lengths,
@@ -428,7 +428,7 @@ def restore_via_2d_unfold_verl080(
     # build_kv 式区间拼接：interior 整段从直接 provider 的已恢复 2D 行切片，
     # prefix-last 用 index.label_value + saved logits 重算。identity 列映射
     # （target_2d_pos 即 2D 列号，无 left padding）。
-    output_2d: dict[str, Any] = {"log_probs": logp_2d}
+    output_2d: dict[str, Any] = {"log_probs": log_probs_2d}
     if entropy_2d is not None:
         output_2d["entropy"] = entropy_2d
     output_2d = restore_reuser_prefix_columns_2d(
@@ -442,10 +442,10 @@ def restore_via_2d_unfold_verl080(
     if entropy_2d is not None:
         output["entropy"] = _fold_2d_to_nested(output_2d["entropy"], original_lengths)
 
-    _n_prefix_last = len(ctx.prefix_last_restore_indices)
+    num_prefix_last = len(ctx.prefix_last_restore_indices)
     print(
         f"[PS][restore_verl080] unfolded B={B} L_max={L_max}, "
-        f"restored reusers={_n_prefix_last} (prefix-last entries; "
+        f"restored reusers={num_prefix_last} (prefix-last entries; "
         f"interior handled by bulk slice)",
         flush=True,
     )
@@ -472,29 +472,29 @@ def _unfold_trimmed_nested_to_2d(
     """
     import torch
 
-    lp_offsets = log_probs_nested.offsets()
-    lp_values = log_probs_nested.values()
+    log_probs_offsets = log_probs_nested.offsets()
+    log_probs_values = log_probs_nested.values()
     if entropy_nested is not None:
-        ent_offsets = entropy_nested.offsets()
-        ent_values = entropy_nested.values()
+        entropy_offsets = entropy_nested.offsets()
+        entropy_values = entropy_nested.values()
 
-    logp_rows: list[Any] = []
-    ent_rows: list[Any] | None = [] if entropy_nested is not None else None
+    log_probs_rows: list[Any] = []
+    entropy_rows: list[Any] | None = [] if entropy_nested is not None else None
 
-    for i in range(B):
-        orig_len = original_lengths[i]
-        prefix_len = input_keep_ranges[i][0]
+    for seq_idx in range(B):
+        orig_len = original_lengths[seq_idx]
+        prefix_len = input_keep_ranges[seq_idx][0]
 
-        lp_suffix = lp_values[lp_offsets[i]:lp_offsets[i + 1]]
-        logp_rows.append(_build_padded_row(lp_suffix, prefix_len, orig_len, L_max))
+        log_probs_suffix = log_probs_values[log_probs_offsets[seq_idx]:log_probs_offsets[seq_idx + 1]]
+        log_probs_rows.append(_build_padded_row(log_probs_suffix, prefix_len, orig_len, L_max))
 
         if entropy_nested is not None:
-            ent_suffix = ent_values[ent_offsets[i]:ent_offsets[i + 1]]
-            ent_rows.append(_build_padded_row(ent_suffix, prefix_len, orig_len, L_max))
+            entropy_suffix = entropy_values[entropy_offsets[seq_idx]:entropy_offsets[seq_idx + 1]]
+            entropy_rows.append(_build_padded_row(entropy_suffix, prefix_len, orig_len, L_max))
 
-    logp_2d = torch.stack(logp_rows, dim=0)
-    entropy_2d = torch.stack(ent_rows, dim=0) if ent_rows else None
-    return logp_2d, entropy_2d
+    log_probs_2d = torch.stack(log_probs_rows, dim=0)
+    entropy_2d = torch.stack(entropy_rows, dim=0) if entropy_rows else None
+    return log_probs_2d, entropy_2d
 
 
 def _build_padded_row(
@@ -521,7 +521,7 @@ def _fold_2d_to_nested(tensor_2d: Any, original_lengths: list[int]) -> Any:
     """完整 2D [B, L_max] → NestedTensor (jagged)，按各 original_lengths 切片。"""
     import torch
 
-    rows = [tensor_2d[i, :original_lengths[i]] for i in range(len(original_lengths))]
+    rows = [tensor_2d[seq_idx, :original_lengths[seq_idx]] for seq_idx in range(len(original_lengths))]
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 

@@ -8,9 +8,10 @@
 仍在、context 激活时，把 prefix-last 重算所需的 provider logits 保存到
 ``ctx.prefix_last_logits_saved``，供后续 restore 使用。
 
-保存条件：``ctx.prefix_last_restore_indices`` 现仅含 prefix-last（每 reuser 一条），
-interior 由 restore 侧 build_kv 式 bulk 切片处理，不读 logits。逐条保存 provider
-直接对应位置的 vocab 维 logits。
+保存条件：``ctx.prefix_last_restore_indices`` 每条对应一个 reuser 的 prefix-last
+（每 reuser 一条）。逐条保存其 provider 直接对应位置的 vocab 维 logits，供 restore
+侧重算 prefix-last logprob 使用（interior 区段由 restore 侧 build_kv 式 bulk 切片处理，
+不读 logits）。
 """
 
 from __future__ import annotations
@@ -69,8 +70,7 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
             # ##### [PS-diag] 验证 packed 坐标对齐 end #####
 
             for index in ctx.prefix_last_restore_indices:
-                # prefix_last_restore_indices 现在只含 prefix-last（interior 由
-                # restore 侧 bulk 切片处理），逐条保存其 provider 的 vocab 维 logits。
+                # 每条对应一个 reuser 的 prefix-last，逐条保存其 provider 的 vocab 维 logits。
                 pos = index.provider_1d_pos
                 key = (index.reuse_idx_in_batch, index.target_2d_pos)
                 if pos < 0:
