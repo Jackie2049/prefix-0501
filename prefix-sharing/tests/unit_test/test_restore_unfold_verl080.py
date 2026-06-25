@@ -179,7 +179,7 @@ def test_restore_copies_interior_and_recomputes_prefix_last():
         assert len(ctx.prefix_last_restore_indices) == 3
         prefix_last_idx = [
             i for i in ctx.prefix_last_restore_indices
-            if not i.is_shared_prefix_interior
+            if i.restore_type != "restore_prefix_interior"
         ][0]
         assert prefix_last_idx.target_2d_pos == 2
         assert prefix_last_idx.label_value == 20  # input_ids[1][3]
@@ -231,7 +231,7 @@ def test_restore_with_entropy_copies_both_logp_and_entropy():
     with prefix_sharing_runtime_context(state) as ctx:
         prefix_last_idx = [
             i for i in ctx.prefix_last_restore_indices
-            if not i.is_shared_prefix_interior
+            if i.restore_type != "restore_prefix_interior"
         ][0]
         ctx.prefix_last_logits_saved[
             (prefix_last_idx.reuse_idx_in_batch, prefix_last_idx.target_2d_pos)
@@ -267,7 +267,7 @@ def test_restore_clears_saved_logits_is_callers_responsibility():
     with prefix_sharing_runtime_context(state) as ctx:
         prefix_last_idx = [
             i for i in ctx.prefix_last_restore_indices
-            if not i.is_shared_prefix_interior
+            if i.restore_type != "restore_prefix_interior"
         ][0]
         key = (prefix_last_idx.reuse_idx_in_batch, prefix_last_idx.target_2d_pos)
         ctx.prefix_last_logits_saved[key] = torch.tensor([[0.5, 0.3, 0.1, 0.1]])

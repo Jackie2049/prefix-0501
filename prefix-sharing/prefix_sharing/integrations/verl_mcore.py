@@ -118,7 +118,7 @@ def build_prefix_sharing_micro_batch_verl070(
     print(
         f"[PS][prepare] prefix_sharing_plan result: has_sharing={prefix_sharing_plan.has_sharing}, "
         f"keep_ranges={prefix_sharing_plan.input_keep_ranges}, "
-        f"prefix_last_restore={prefix_sharing_plan.prefix_last_restore}"
+        f"prefix_restore_specs={prefix_sharing_plan.prefix_restore_specs}"
     )
 
     # --- Path 5: no sharing found ---
@@ -231,7 +231,7 @@ def restore_reuser_prefix_columns_2d(
     """
 
     ctx = current_prefix_sharing_context()
-    if ctx is None or not ctx.prefix_last_restore_indices:
+    if ctx is None or not ctx.prefix_restore_indices:
         return output
 
     import torch
@@ -262,10 +262,10 @@ def restore_reuser_prefix_columns_2d(
     _saved_keys = sorted(ctx.prefix_last_logits_saved.keys())
     _expected_keys = sorted(
         (i.reuse_idx_in_batch, i.target_2d_pos)
-        for i in ctx.prefix_last_restore_indices
-        if not i.is_shared_prefix_interior
+        for i in ctx.prefix_restore_indices
+        if i.restore_type != "restore_prefix_interior"
     )
-    _interior_n = len(ctx.prefix_last_restore_indices) - len(_expected_keys)
+    _interior_n = len(ctx.prefix_restore_indices) - len(_expected_keys)
     print(
         f"[PS][diag] prefix_last_logits_saved keys ({len(_saved_keys)})="
         f"{_saved_keys}",
@@ -278,7 +278,7 @@ def restore_reuser_prefix_columns_2d(
     )
 
     non_interior_count = 0
-    for index in ctx.prefix_last_restore_indices:
+    for index in ctx.prefix_restore_indices:
         reuser_row = index.reuse_idx_in_batch
         provider_row = index.provider_idx_in_batch
         valid_col = index.target_2d_pos
@@ -288,7 +288,7 @@ def restore_reuser_prefix_columns_2d(
         provider_col = _map_2d_col(provider_row, valid_col)
         reuser_col = _map_2d_col(reuser_row, valid_col)
 
-        if index.is_shared_prefix_interior:
+        if index.restore_type == "restore_prefix_interior":
             # Shared-prefix interior: token is in shared prefix → logprob and entropy
             # are identical to the provider's (same label, same logits).
             log_probs[reuser_row, reuser_col] = log_probs[provider_row, provider_col]
@@ -329,7 +329,7 @@ def restore_reuser_prefix_columns_2d(
             ).reshape(())
 
     if ctx.stats is not None:
-        ctx.stats.record_restore(len(ctx.prefix_last_restore_indices))
+        ctx.stats.record_restore(len(ctx.prefix_restore_indices))
     return output
 
 
@@ -379,7 +379,7 @@ def restore_via_2d_unfold_verl080(
     import torch
 
     ctx = current_prefix_sharing_context()
-    if ctx is None or not ctx.prefix_last_restore_indices:
+    if ctx is None or not ctx.prefix_restore_indices:
         return output
 
     log_probs_nested = output.get("log_probs")
@@ -427,8 +427,8 @@ def restore_via_2d_unfold_verl080(
     if entropy_2d is not None:
         output["entropy"] = _fold_2d_to_nested(output_2d["entropy"], original_lengths)
 
-    _n_total = len(ctx.prefix_last_restore_indices)
-    _n_interior = sum(1 for i in ctx.prefix_last_restore_indices if i.is_shared_prefix_interior)
+    _n_total = len(ctx.prefix_restore_indices)
+    _n_interior = sum(1 for i in ctx.prefix_restore_indices if i.restore_type == "restore_prefix_interior")
     print(
         f"[PS][restore_verl080] unfolded B={B} L_max={L_max}, "
         f"restored {_n_total} indices "

@@ -115,7 +115,7 @@ class PrefixSharingStats:
             expected_reused_prefix_tokens_per_layer=sum(
                 prefix_sharing_plan.prefix_lens[index] for index in reuser_indices
             ),
-            expected_restore_count=len(prefix_sharing_plan.prefix_last_restore),
+            expected_restore_count=len(prefix_sharing_plan.prefix_restore_specs),
         )
 
     def layer(self, layer_id: int) -> PrefixSharingLayerStats:

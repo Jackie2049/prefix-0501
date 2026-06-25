@@ -1,3 +1,5 @@
+import pytest
+
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
@@ -103,7 +105,7 @@ def _chain_reuse_runtime_state():
             PrefixReuseSpec(reuse_idx_in_batch=1, provider_idx_in_batch=0, prefix_len=3),
             PrefixReuseSpec(reuse_idx_in_batch=2, provider_idx_in_batch=1, prefix_len=3),
         ),
-        groups=(),
+        prefix_groups=(),
         group_ids=[0, 0, 1],
         provider_index=[0, 0, 1],
         prefix_lens=[0, 3, 3],
@@ -139,7 +141,7 @@ def test_prefix_last_in_chain_reuse_resolves_to_ancestor_with_packed_slot():
         # Collect prefix-last (non-interior) indices for row2 (reuse_idx=2).
         row2_plast = [
             idx for idx in ctx.prefix_last_restore_indices
-            if idx.reuse_idx_in_batch == 2 and not idx.is_shared_prefix_interior
+            if idx.reuse_idx_in_batch == 2 and idx.restore_type != "restore_prefix_interior"
         ]
         assert len(row2_plast) == 1, "row2 should have exactly one prefix-last restore"
         spec = row2_plast[0]

@@ -23,14 +23,14 @@ Monkey-patch activation:
 
 from prefix_sharing.core.config import PrefixSharingConfig, PrefixSharingConfigError
 from prefix_sharing.core.prefix_detector import PrefixReuseSpec, TriePrefixDetector
-from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
+from prefix_sharing.core.planner import PrefixRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
 
 
 __all__ = [
     "PrefixSharingPlan",
     "PrefixSharingConfig",
     "PrefixSharingConfigError",
-    "PrefixLastRestoreSpec",
+    "PrefixRestoreSpec",
     "PrefixReuseSpec",
     "PrefixSharingPlanner",
     "TriePrefixDetector",

@@ -21,12 +21,12 @@ _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
 
 
 @dataclass
-class PackedPrefixLastRestoreIndex:
+class PackedPrefixRestoreIndex:
     reuse_idx_in_batch: int
     provider_idx_in_batch: int
     provider_1d_pos: int
     reuse_1d_pos: int
-    is_shared_prefix_interior: bool = False
+    restore_type: str = "restore_prefix_last"
     target_2d_pos: int = -1
     """Absolute 2D position in output where restored logprob is written."""
     label_value: int = -1
@@ -41,7 +41,7 @@ class PrefixSharingRuntimeContext:
     store: PrefixAttentionStore
     attention_backend: Any | None = None
     kept_position_ids: Any | None = None
-    prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
+    prefix_restore_indices: list[PackedPrefixRestoreIndex] = field(default_factory=list)
     prefix_last_logits_saved: dict[tuple[int, int], Any] = field(default_factory=dict)
     """Saved provider packed logits for prefix-last logprob recompute in 2D space.
 
@@ -64,7 +64,7 @@ class PrefixSharingRuntimeContext:
         self.store = store
         self.attention_backend = runtime_state.attention_backend
         self.kept_position_ids = getattr(runtime_state, "kept_position_ids", None)
-        self.prefix_last_restore_indices = _build_prefix_last_restore_indices(
+        self.prefix_restore_indices = _build_prefix_restore_indices(
             runtime_state.prefix_sharing_plan,
             runtime_state.packed_batch_layout,
         )
@@ -125,12 +125,12 @@ def _resolve_provider_for_position(
             return provider_idx
 
 
-def _build_prefix_last_restore_indices(
+def _build_prefix_restore_indices(
     prefix_sharing_plan: PrefixSharingPlan,
     packed_batch_layout: PackedBatchLayout,
-) -> list[PackedPrefixLastRestoreIndex]:
+) -> list[PackedPrefixRestoreIndex]:
     indices = []
-    for spec in prefix_sharing_plan.prefix_last_restore:
+    for spec in prefix_sharing_plan.prefix_restore_specs:
         reuse_idx = spec.reuse_idx_in_batch
         # Resolve through chain reuse to the nearest provider whose
         # packed layout contains provider_predict_pos.
@@ -157,12 +157,12 @@ def _build_prefix_last_restore_indices(
         reuse_1d = -1  # sentinel: no slot in reuser packed region
 
         indices.append(
-            PackedPrefixLastRestoreIndex(
+            PackedPrefixRestoreIndex(
                 reuse_idx_in_batch=reuse_idx,
                 provider_idx_in_batch=resolved_provider,
                 provider_1d_pos=pos_1d_in_provider,
                 reuse_1d_pos=reuse_1d,
-                is_shared_prefix_interior=spec.is_shared_prefix_interior,
+                restore_type=spec.restore_type,
                 target_2d_pos=spec.target_2d_pos,
                 label_value=spec.label_value,
             )

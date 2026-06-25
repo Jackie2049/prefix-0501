@@ -42,7 +42,7 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
         # 调用后 logits 已变成 exp(L-max) 废值。若在 original_fn 之后 clone，存的是废值，
         # restore 侧重算 logp(exp(L-max), label) ≠ logp(L, label)，logp 会完全错。
         # 必须在 original_fn 之前 clone 原始 logits（dump 同理）。
-        if ctx is not None and ctx.prefix_last_restore_indices:
+        if ctx is not None and ctx.prefix_restore_indices:
             # logits 形态可能是 [N, V//tp] 或 [N, 1, V//tp]，统一 view 成 2D。
             # N = 裁剪后 packed 1D 总长度（provider 行完整含 prefix-last token）。
             logits_2d = logits.view(-1, logits.size(-1))
@@ -57,8 +57,8 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
                     f"has_padding={_layout.has_padding}",
                     flush=True,
                 )
-                for _idx in ctx.prefix_last_restore_indices:
-                    if _idx.is_shared_prefix_interior:
+                for _idx in ctx.prefix_restore_indices:
+                    if _idx.restore_type == "restore_prefix_interior":
                         continue
                     print(
                         f"[PS-diag][packed-align] reuser={_idx.reuse_idx_in_batch} "
@@ -69,9 +69,9 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
                     )
             # ##### [PS-diag] 验证 packed 坐标对齐 end #####
 
-            for index in ctx.prefix_last_restore_indices:
+            for index in ctx.prefix_restore_indices:
                 # interior 走 2D 复制路径，不需要 logits；只保存 prefix-last。
-                if index.is_shared_prefix_interior:
+                if index.restore_type == "restore_prefix_interior":
                     continue
                 pos = index.provider_1d_pos
                 key = (index.reuse_idx_in_batch, index.target_2d_pos)

@@ -44,7 +44,7 @@ def test_planner_builds_phase_one_prefix_sharing_plan_and_restore_specs():
 
     # Row 1 prefix-last spec (index 2: after 2 interior specs)
     spec1 = all_specs[2]
-    assert not spec1.is_shared_prefix_interior
+    assert spec1.restore_type == "restore_prefix_last"
     assert spec1.reuse_idx_in_batch == 1
     assert spec1.provider_idx_in_batch == 0
     assert spec1.provider_predict_pos == 2  # prefix_len - 1 = 2
@@ -54,7 +54,7 @@ def test_planner_builds_phase_one_prefix_sharing_plan_and_restore_specs():
 
     # Row 2 prefix-last spec (index 7: after 4 interior specs)
     spec2 = all_specs[7]
-    assert not spec2.is_shared_prefix_interior
+    assert spec2.restore_type == "restore_prefix_last"
     assert spec2.reuse_idx_in_batch == 2
     assert spec2.provider_idx_in_batch == 0
     assert spec2.provider_predict_pos == 4  # prefix_len - 1 = 4
@@ -97,7 +97,7 @@ def test_planner_generates_interior_response_restore_specs():
     assert len(plan.prefix_last_restore) == 4
 
     interior_spec = plan.prefix_last_restore[2]  # prefix_label_pos=3 (prompt_len area, was the old single interior)
-    assert interior_spec.is_shared_prefix_interior
+    assert interior_spec.restore_type == "restore_prefix_interior"
     assert interior_spec.reuse_idx_in_batch == 1
     assert interior_spec.provider_idx_in_batch == 0
     assert interior_spec.provider_predict_pos == 2  # logits[2]
@@ -106,7 +106,7 @@ def test_planner_generates_interior_response_restore_specs():
     assert interior_spec.label_value == 4  # input_ids[1][3] = token A
 
     prefix_last_spec = plan.prefix_last_restore[3]
-    assert not prefix_last_spec.is_shared_prefix_interior
+    assert prefix_last_spec.restore_type == "restore_prefix_last"
     assert prefix_last_spec.reuse_idx_in_batch == 1
     assert prefix_last_spec.provider_idx_in_batch == 0
     assert prefix_last_spec.provider_predict_pos == 3  # logits[3] = prefix-last
@@ -134,4 +134,4 @@ def test_planner_generates_interior_restore_with_minimal_args():
     assert len(plan.prefix_last_restore) == 4
     # prefix-last spec at index 3 (last one)
     spec = plan.prefix_last_restore[3]
-    assert not spec.is_shared_prefix_interior
+    assert spec.restore_type == "restore_prefix_last"

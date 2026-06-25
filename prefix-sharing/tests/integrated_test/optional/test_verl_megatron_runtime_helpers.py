@@ -199,7 +199,7 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
         # 3 restore specs: 2 interior + 1 prefix-last
         assert len(ctx.prefix_last_restore_indices) == 3
         index = ctx.prefix_last_restore_indices[2]  # prefix-last spec
-        assert not index.is_shared_prefix_interior
+        assert index.restore_type == "restore_prefix_last"
 
         # Simulate 2D postprocess: output dict with [B, L] log_probs.
         log_probs_2d = torch.zeros(2, 5)

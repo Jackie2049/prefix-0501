@@ -17,7 +17,7 @@ Core Responsibilities:
        seqlens, and keep ranges inside ``PrefixSharingPlan``.
     2. Set ``q_position_offsets`` so reuser rows preserve correct absolute positions
        when the Q path only packs the suffix after a shared prefix.
-    3. Emit :class:`PrefixLastRestoreSpec` entries when a reuser has both a
+    3. Emit :class:`PrefixRestoreSpec` entries when a reuser has both a
        non-zero prefix and a non-empty suffix.
 
 Key Concepts:
@@ -60,18 +60,18 @@ from prefix_sharing.core.prefix_detector import PrefixDetectionResult, PrefixReu
 
 
 @dataclass(frozen=True)
-class PrefixLastRestoreSpec:
+class PrefixRestoreSpec:
     """Plan for one reuse row's logprob restore.
 
     Two kinds of restore exist:
 
-    * **Prefix-last restore** (``is_shared_prefix_interior=False``, default): the
-      reuser's first suffix token is predicted from the shared prefix-last
+    * **Prefix-last restore** (``restore_type='restore_prefix_last'``, default):
+      the reuser's first suffix token is predicted from the shared prefix-last
       position. Since different reusers may have different first suffix labels,
       the provider's full logits at ``prefix_len - 1`` must be stored and the
       logprob computed per reuser using that reuser's label.
 
-    * **Shared-prefix interior restore** (``is_shared_prefix_interior=True``):
+    * **Shared-prefix interior restore** (``restore_type='restore_prefix_interior'``):
       a token that lives strictly inside the shared prefix. Its
       logprob is ``log_softmax(logits[pos-1])[label=pos]``, where both the
       logits position and the label belong to the shared prefix. The logprob
@@ -89,7 +89,7 @@ class PrefixLastRestoreSpec:
     chain resolution in ``context.py``."""
     reuse_first_suffix_label_pos: int
     group_id: int
-    is_shared_prefix_interior: bool = False
+    restore_type: str = "restore_prefix_last"
     target_2d_pos: int = -1
     """Absolute 2D position in output tensor where restored logprob belongs.
     
@@ -146,7 +146,7 @@ class PrefixSharingPlan:
     loss_mask_keep_ranges: list[Range]         # loss_mask保留范围
 
     # 恢复点信息（用于logprob恢复）
-    prefix_last_restore: list[PrefixLastRestoreSpec] = field(default_factory=list)  # reuser的suffix-first位置恢复规范
+    prefix_restore_specs: list[PrefixRestoreSpec] = field(default_factory=list)  # reuser的prefix相关位置恢复规范
 
     def __post_init__(self) -> None:
         expected = self.batch_size
@@ -186,8 +186,8 @@ class PrefixSharingPlan:
     def kv_range_for_batch(self, idx_in_batch: int) -> Range:
         return self.cu_seqlens_kv[idx_in_batch], self.cu_seqlens_kv[idx_in_batch + 1]
 
-    def restore_for_reuse(self, idx_in_batch: int) -> PrefixLastRestoreSpec | None:
-        for spec in self.prefix_last_restore:
+    def restore_for_reuse(self, idx_in_batch: int) -> PrefixRestoreSpec | None:
+        for spec in self.prefix_restore_specs:
             if spec.reuse_idx_in_batch == idx_in_batch:
                 return spec
         return None
@@ -225,10 +225,10 @@ class PrefixSharingPlanner:
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> PrefixSharingPlan:
-        detection = self.detector.detect(sequences)
+        detect_result = self.detector.detect(sequences)
         return self.plan_from_detection(
             sequences,
-            detection,
+            detect_result,
             forward_id=forward_id,
             micro_batch_id=micro_batch_id,
         )
@@ -236,12 +236,12 @@ class PrefixSharingPlanner:
     def plan_from_detection(
         self,
         sequences: Sequence[Sequence[int]],
-        detection: PrefixDetectionResult,
+        detect_result: PrefixDetectionResult,
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> PrefixSharingPlan:
-        if len(sequences) != detection.batch_size:
+        if len(sequences) != detect_result.batch_size:
             raise ValueError("sequences batch size does not match detection result")
         if forward_id is None:
             forward_id = next(_forward_ids)
@@ -249,14 +249,16 @@ class PrefixSharingPlanner:
             self._micro_batch_counter += 1
             micro_batch_id = self._micro_batch_counter
 
+        # 来自 PrefixDetectionResult 的信息
         batch_size = len(sequences)
         original_lengths = [len(seq) for seq in sequences]
-        group_ids = list(detection.group_ids)
-        is_provider = list(detection.is_provider)
-        provider_index = list(detection.provider_index)
-        prefix_lens = list(detection.prefix_lens)
-        reuse_specs = list(detection.reuse_specs)
+        group_ids = list(detect_result.group_ids)
+        is_provider = list(detect_result.is_provider)
+        provider_index = list(detect_result.provider_index)
+        prefix_lens = list(detect_result.prefix_lens)
+        reuse_specs = list(detect_result.reuse_specs)
 
+        # PrefixSharingPlan 需要的额外信息
         suffix_lens: list[int] = []
         kept_lengths_q: list[int] = []
         expanded_lengths_kv: list[int] = []
@@ -265,23 +267,28 @@ class PrefixSharingPlanner:
         input_keep_ranges: list[tuple[int, int]] = []
         label_keep_ranges: list[tuple[int, int]] = []
         loss_mask_keep_ranges: list[tuple[int, int]] = []
-        restore_specs: list[PrefixLastRestoreSpec] = []
+        restore_specs: list[PrefixRestoreSpec] = []
 
-        for index, original_len in enumerate(original_lengths):
-            prefix_len = prefix_lens[index]
+        for seq_idx, original_len in enumerate(original_lengths):
+            prefix_len = prefix_lens[seq_idx]
             if prefix_len > original_len:
-                raise ValueError(f"prefix_len exceeds sequence length for batch index {index}")
-            is_reuser = provider_index[index] != index and prefix_len > 0
+                raise ValueError(f"prefix_len exceeds sequence length for batch index {seq_idx}")
+            is_reuser = provider_index[seq_idx] != seq_idx and prefix_len > 0
             suffix_len = original_len - prefix_len if is_reuser else original_len
             suffix_lens.append(suffix_len)
             expanded_lengths_kv.append(original_len)
 
             if is_reuser:
-                keep_start = prefix_len
-                keep_end = original_len
+                # 1 - 为输入数据的预处理做准备：输入阶段要对 reuser 进行序列裁剪
+                #   - 只需保留suffix部分
+                #   - prefix 部分
+                #       - KV 激活值：在 attention 时候读取缓存并进行拼接即可
+                #       - logp：可以在后处理阶段直接从provider复制得到
+                keep_start, keep_end = prefix_len, original_len
                 kept_len = suffix_len
                 q_offset = prefix_len
 
+                # 2 - 为输出数据的后处理做准备：输出阶段要为 reuser 恢复没有计算的前缀部分的 logp 和 entropy
                 # --- Shared-prefix interior token restore ---
                 # Response tokens inside the shared prefix (positions
                 # 1 .. prefix_len-1) are trimmed from the Q path but
@@ -299,15 +306,15 @@ class PrefixSharingPlanner:
                     # prefix_label_pos. Writes to 2D position
                     # prefix_label_pos - 1 (the label position).
                     restore_specs.append(
-                        PrefixLastRestoreSpec(
-                            reuse_idx_in_batch=index,
-                            provider_idx_in_batch=provider_index[index],
+                        PrefixRestoreSpec(
+                            reuse_idx_in_batch=seq_idx,
+                            provider_idx_in_batch=provider_index[seq_idx],
                             provider_predict_pos=prefix_label_pos - 1,
                             reuse_first_suffix_label_pos=prefix_label_pos,
-                            group_id=group_ids[index],
-                            is_shared_prefix_interior=True,
+                            group_id=group_ids[seq_idx],
+                            restore_type="restore_prefix_interior",
                             target_2d_pos=prefix_label_pos - 1,
-                            label_value=sequences[index][prefix_label_pos],
+                            label_value=sequences[seq_idx][prefix_label_pos],
                         )
                     )
 
@@ -318,19 +325,18 @@ class PrefixSharingPlanner:
                 # prefix_len - 1 (the label slot for first-suffix prediction).
                 if prefix_len > 0 and suffix_len > 0:
                     restore_specs.append(
-                        PrefixLastRestoreSpec(
-                            reuse_idx_in_batch=index,
-                            provider_idx_in_batch=provider_index[index],
+                        PrefixRestoreSpec(
+                            reuse_idx_in_batch=seq_idx,
+                            provider_idx_in_batch=provider_index[seq_idx],
                             provider_predict_pos=prefix_len - 1,
                             reuse_first_suffix_label_pos=prefix_len,
-                            group_id=group_ids[index],
+                            group_id=group_ids[seq_idx],
                             target_2d_pos=prefix_len - 1,
-                            label_value=sequences[index][prefix_len],
+                            label_value=sequences[seq_idx][prefix_len],
                         )
                     )
             else:
-                keep_start = 0
-                keep_end = original_len
+                keep_start, keep_end = 0, original_len
                 kept_len = original_len
                 q_offset = 0
 
@@ -367,5 +373,5 @@ class PrefixSharingPlanner:
             input_keep_ranges=input_keep_ranges,
             label_keep_ranges=label_keep_ranges,
             loss_mask_keep_ranges=loss_mask_keep_ranges,
-            prefix_last_restore=restore_specs,
+            prefix_restore_specs=restore_specs,
         )

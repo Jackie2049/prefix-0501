@@ -54,7 +54,7 @@ class GpuFlashAttentionBackend(FlashAttentionMixin):
         supports_cuda=True,
         supports_cann=False,
         supports_different_q_kv_lengths=True,
-        supports_prefix_last_restore=True,
+        supports_prefix_restore=True,
         supports_flash_attention=True,
     )
 
