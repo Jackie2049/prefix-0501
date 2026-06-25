@@ -99,3 +99,31 @@ def test_trie_detector_respects_min_group_size_for_relation_threshold():
     ]
     assert result.provider_index == (0, 1, 0)
     assert result.prefix_lens == (0, 0, 2)
+
+
+def test_detect_handles_prefix_mismatch_then_inserts_suffix():
+    """单次遍历实现必须确保：匹配阶段断裂后，后续 token 仍被完整插入 trie。
+
+    场景：
+    - seq0: [1,2,3,4] (provider)
+    - seq1: [1,2,5,6] (匹配 [1,2] 后断裂，matched_prefix_len=2; [5,6] 仍需插入)
+    - seq2: [1,2,5,7] (应匹配到 seq1 的 [1,2,5]，prefix_len=3)
+    """
+    # min_group_size=2 下，seq1 会 reuse seq0（prefix=2），seq2 会 reuse seq1（prefix=3）
+    # 关键验证点：seq2 能够匹配到 seq1 插入的 [1,2,5] 路径，证明"中途断裂后插入"成功
+    detector = TriePrefixDetector(min_prefix_len=2, min_group_size=2)
+    result = detector.detect(
+        [
+            [1, 2, 3, 4],      # 0: provider
+            [1, 2, 5, 6],      # 1: 匹配到 [1,2] 后断裂，matched_prefix_len=2
+            [1, 2, 5, 7],      # 2: 应 reuse seq1 的 [1,2,5]，prefix_len=3
+        ]
+    )
+
+    # seq1 reuse seq0, seq2 reuse seq1
+    assert [(s.reuse_idx_in_batch, s.provider_idx_in_batch, s.prefix_len) for s in result.reuse_specs] == [
+        (1, 0, 2),
+        (2, 1, 3),
+    ]
+    assert result.provider_index == (0, 0, 1)
+    assert result.prefix_lens == (0, 2, 3)

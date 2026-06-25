@@ -101,7 +101,7 @@ class PrefixReuseSpec:
 
 @dataclass(frozen=True)
 class PrefixDetectionResult:
-    """Per-batch detection output with per-sample reuse relations.
+    """Per-batch detection output with per-sample reuse relations (reuse_specs).
 
     ``reuse_specs`` is the semantic source of truth. The tuple fields
     ``group_ids``, ``provider_index``, ``prefix_lens``, and ``is_provider`` are
@@ -133,7 +133,7 @@ class PrefixDetectionResult:
     """
 
     batch_size: int
-    reuse_specs: tuple[PrefixReuseSpec, ...]
+    reuse_specs: tuple[PrefixReuseSpec, ...] # 复用关系列表，每个元素是一对 reuser => provider 的复用关系
     prefix_groups: tuple[PrefixGroup, ...]
     group_ids: tuple[int, ...]
     provider_index: tuple[int, ...]
@@ -179,13 +179,14 @@ class TriePrefixDetector(PrefixDetector):
         group_key_to_id: dict[tuple[int, int], int] = {}
         group_members: dict[int, list[int]] = {}
 
-        # 遍历所有序列，构建前缀树
+        # 遍历所有序列，构建前缀树，一次Trie遍历同时完成：前缀匹配 + 新节点插入
         root = _TrieNode()
         for seq_idx, seq in enumerate(sequences):
             node = root
             matched_prefix_len = 0
             matched_provider_idx = -1
             matched_group_size = 0
+            detect_status = "prefix_matching"  # 前缀匹配阶段
 
             # 遍历序列中的每个 token，前缀树继续生长
             for token in seq:
@@ -193,14 +194,21 @@ class TriePrefixDetector(PrefixDetector):
 
                 # 达到最长匹配
                 if child is None:
-                    break
+                    # 前缀匹配阶段结束，切换为 Trie 构建阶段
+                    detect_status = "trie_growing"
+                    child = _TrieNode(node.depth + 1)
+                    child.provider_index = seq_idx
+                    node.children[token] = child
 
                 # 还没达到最长匹配，继续匹配
                 node = child
-                matched_prefix_len += 1
-                if node.provider_index >= 0: # 将父亲的 provider 传递给儿子
-                    matched_provider_idx = node.provider_index
-                    matched_group_size = len(node.indices) + 1
+                if detect_status == "prefix_matching":
+                    matched_prefix_len += 1
+                    if node.provider_index >= 0:
+                        matched_provider_idx = node.provider_index # 将父亲的 provider 传递给儿子
+                        matched_group_size = len(node.indices) + 1 # 此时 node.indices 尚未包含当前 seq_idx
+
+                node.indices.append(seq_idx)
 
             # 前缀检测已完成，记录复用关系
             if (
@@ -226,18 +234,6 @@ class TriePrefixDetector(PrefixDetector):
                 if group_id not in group_members:
                     group_members[group_id] = [matched_provider_idx]
                 group_members[group_id].append(seq_idx)
-
-            node = root
-            node.indices.append(seq_idx)
-            for token in seq:
-                token = int(token)
-                child = node.children.get(token)
-                if child is None:
-                    child = _TrieNode(node.depth + 1)
-                    child.provider_index = seq_idx
-                    node.children[token] = child
-                node = child
-                node.indices.append(seq_idx)
 
         # 构造 PrefixGroup（在当前版本中暂时没有实际用途）
         groups = [

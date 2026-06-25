@@ -63,7 +63,7 @@
 **定义**：一组具有相同 provider 和相同 prefix_len 的复用关系形成的调试/统计视图。
 
 **说明**：
-- Prefix Group 不再是 Phase 1 的核心语义
+- Prefix Group 不再是 Phase 1 的核心语义，在prefix-sharing运行时中并没有实际用途
 - 同一个 provider 可出现在多个 Prefix Group 中，分别对应不同 `prefix_len`
 - 单个 `group_id` 不能完整表达 provider 的所有复用关系
 - 执行计划以 `PrefixReuseSpec`、`provider_index`、`prefix_lens` 为准
