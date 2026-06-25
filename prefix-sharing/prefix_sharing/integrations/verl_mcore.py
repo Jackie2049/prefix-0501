@@ -587,43 +587,41 @@ def build_prefix_sharing_micro_batch_verl080(
     use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
     ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
 
-    # ── 阶段 2: 拒绝不支持的特性 ──
+    # ── 阶段 2: 拒绝不支持的特性: use_fused_kernels, dynamic_context_parallel ──
     try:
         from verl.utils import tensordict_utils as tu
-        use_fused = tu.get_non_tensor_data(batch, "use_fused_kernels", default=False)
+        use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
     except Exception:
-        use_fused = False
-    if use_fused:
+        use_fused_kernels = False
+    if use_fused_kernels:
         raise RuntimeError("prefix sharing phase 1 requires fused kernels disabled")
     if getattr(engine_self.engine_config, "dynamic_context_parallel", False):
         raise RuntimeError("prefix sharing phase 1 does not support dynamic context parallel")
 
     # ── 阶段 3: 从 batch 提取序列 ──
-    # NestedTensor → 从 offsets/values 提取
-    # Plain 2D → 从 attention_mask.nonzero() 提取
+    # verl080 的 THD 格式使用 NestedTensor → 从 offsets/values 提取
+    # verl080 的 BSHD 格式仍使用 plain padded 2D tensor → 从 attention_mask.nonzero() 提取
     # 同时保留 attention_mask_bool，供阶段 6 的 _collect_kept_position_rows 使用。
+    # 举例：
+    #   THD (NestedTensor): input_ids offsets=[0,4,7] values=[1,2,3,4,5,6,7]
+    #                       → sequences = [[1,2,3,4], [5,6,7]]
+    #   BSHD (2D + mask):   input_ids=[[1,2,3,4,0,0],[5,6,7,0,0,0]], mask=[[1,1,1,1,0,0],[1,1,1,0,0,0]]
+    #                       → sequences = [[1,2,3,4], [5,6,7]]
     input_ids = batch["input_ids"]
     is_nested_tensor = _is_nested_tensor(input_ids)
-    attention_mask_bool_for_layout = None
 
-    if is_nested_tensor:
+    if is_nested_tensor: # verl080 THD格式
         sequences = _extract_seq_from_nested_tensor(input_ids)
-    else:
-        # plain 2D tensor（需要 attention_mask）
+        attention_mask_bool_for_layout = None
+    else: # verl080 BSHD格式
+        # plain padded 2D tensor 需要通过 attention_mask 提出 valid token
         attention_mask = batch.get("attention_mask")
-        if attention_mask is None:
+        sequences, attention_mask_bool_for_layout = _extract_seq_from_padded_2d_tensor(
+            input_ids, attention_mask
+        )
+        if sequences is None:
             print("[PS][prepare] PATH 4: plain 2D batch without attention_mask")
             return batch, None
-        attention_mask_bool = attention_mask.to(bool)
-        attention_mask_bool_for_layout = attention_mask_bool  # 供阶段 6 使用
-        valid_indices = [
-            attention_mask_bool[row].nonzero(as_tuple=False).flatten()
-            for row in range(input_ids.shape[0])
-        ]
-        sequences = [
-            input_ids[row, indices].detach().cpu().tolist()
-            for row, indices in enumerate(valid_indices)
-        ]
 
     # ── 阶段 4: 前缀共享规划 ──
     plan = PrefixSharingPlanner(ps_config).plan(sequences)
@@ -895,3 +893,21 @@ def _extract_seq_from_nested_tensor(nested_tensor: Any) -> list[list[int]]:
         values[offsets[i]:offsets[i + 1]].detach().cpu().tolist()
         for i in range(offsets.diff().shape[0])
     ]
+
+
+def _extract_seq_from_padded_2d_tensor(
+    input_ids: Any, attention_mask: Any
+) -> tuple[list[list[int]] | None, Any | None]:
+    """从 plain 2D tensor + attention_mask 中提取序列，并返回 attention_mask_bool 供布局计算使用。"""
+    if attention_mask is None:
+        return None, None
+    attention_mask_bool = attention_mask.to(bool)
+    valid_indices = [
+        attention_mask_bool[row].nonzero(as_tuple=False).flatten()
+        for row in range(input_ids.shape[0])
+    ]
+    sequences = [
+        input_ids[row, indices].detach().cpu().tolist()
+        for row, indices in enumerate(valid_indices)
+    ]
+    return sequences, attention_mask_bool

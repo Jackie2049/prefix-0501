@@ -220,14 +220,14 @@ class PrefixSharingPlanner:
 
     def plan(
         self,
-        input_ids: Sequence[Sequence[int]],
+        sequences: Sequence[Sequence[int]],
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> PrefixSharingPlan:
-        detection = self.detector.detect(input_ids)
+        detection = self.detector.detect(sequences)
         return self.plan_from_detection(
-            input_ids,
+            sequences,
             detection,
             forward_id=forward_id,
             micro_batch_id=micro_batch_id,
@@ -235,22 +235,22 @@ class PrefixSharingPlanner:
 
     def plan_from_detection(
         self,
-        input_ids: Sequence[Sequence[int]],
+        sequences: Sequence[Sequence[int]],
         detection: PrefixDetectionResult,
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> PrefixSharingPlan:
-        if len(input_ids) != detection.batch_size:
-            raise ValueError("input_ids batch size does not match detection result")
+        if len(sequences) != detection.batch_size:
+            raise ValueError("sequences batch size does not match detection result")
         if forward_id is None:
             forward_id = next(_forward_ids)
         if micro_batch_id is None:
             self._micro_batch_counter += 1
             micro_batch_id = self._micro_batch_counter
 
-        batch_size = len(input_ids)
-        original_lengths = [len(seq) for seq in input_ids]
+        batch_size = len(sequences)
+        original_lengths = [len(seq) for seq in sequences]
         group_ids = list(detection.group_ids)
         is_provider = list(detection.is_provider)
         provider_index = list(detection.provider_index)
@@ -307,13 +307,13 @@ class PrefixSharingPlanner:
                             group_id=group_ids[index],
                             is_shared_prefix_interior=True,
                             target_2d_pos=prefix_label_pos - 1,
-                            label_value=input_ids[index][prefix_label_pos],
+                            label_value=sequences[index][prefix_label_pos],
                         )
                     )
 
                 # --- Prefix-last restore (first suffix token) ---
                 # The logits at position prefix_len-1 predict the first suffix
-                # token whose label is input_ids[prefix_len] (differs per
+                # token whose label is sequences[prefix_len] (differs per
                 # reuser). The restored logprob is written to 2D position
                 # prefix_len - 1 (the label slot for first-suffix prediction).
                 if prefix_len > 0 and suffix_len > 0:
@@ -325,7 +325,7 @@ class PrefixSharingPlanner:
                             reuse_first_suffix_label_pos=prefix_len,
                             group_id=group_ids[index],
                             target_2d_pos=prefix_len - 1,
-                            label_value=input_ids[index][prefix_len],
+                            label_value=sequences[index][prefix_len],
                         )
                     )
             else:

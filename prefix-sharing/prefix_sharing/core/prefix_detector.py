@@ -134,7 +134,7 @@ class PrefixDetectionResult:
 
     batch_size: int
     reuse_specs: tuple[PrefixReuseSpec, ...]
-    groups: tuple[PrefixGroup, ...]
+    prefix_groups: tuple[PrefixGroup, ...]
     group_ids: tuple[int, ...]
     provider_index: tuple[int, ...]
     prefix_lens: tuple[int, ...]
@@ -169,66 +169,77 @@ class TriePrefixDetector(PrefixDetector):
         self.min_prefix_len = min_prefix_len
         self.min_group_size = min_group_size
 
-    def detect(self, input_ids: Sequence[TokenSequence]) -> PrefixDetectionResult:
-        batch_size = len(input_ids)
-        root = _TrieNode()
+    def detect(self, sequences: Sequence[TokenSequence]) -> PrefixDetectionResult:
+        batch_size = len(sequences)
         group_ids = [-1] * batch_size
-        provider_index = list(range(batch_size))
-        prefix_lens = [0] * batch_size
-        is_provider = [True] * batch_size
+        prefix_lens = [0] * batch_size # 没有找到可复用前缀前，所有序列的要复用的前缀长度都是 0
+        # 没有找到可复用前缀前，所有序列都是 provider，其 provider 索引是自己
+        is_provider, provider_index = [True] * batch_size, list(range(batch_size))
         reuse_specs: list[PrefixReuseSpec] = []
         group_key_to_id: dict[tuple[int, int], int] = {}
         group_members: dict[int, list[int]] = {}
 
-        for index, seq in enumerate(input_ids):
+        # 遍历所有序列，构建前缀树
+        root = _TrieNode()
+        for seq_idx, seq in enumerate(sequences):
             node = root
-            matched = 0
-            matched_provider = -1
+            matched_prefix_len = 0
+            matched_provider_idx = -1
             matched_group_size = 0
+
+            # 遍历序列中的每个 token，前缀树继续生长
             for token in seq:
                 child = node.children.get(int(token))
+
+                # 达到最长匹配
                 if child is None:
                     break
+
+                # 还没达到最长匹配，继续匹配
                 node = child
-                matched += 1
-                if node.provider_index >= 0:
-                    matched_provider = node.provider_index
+                matched_prefix_len += 1
+                if node.provider_index >= 0: # 将父亲的 provider 传递给儿子
+                    matched_provider_idx = node.provider_index
                     matched_group_size = len(node.indices) + 1
 
+            # 前缀检测已完成，记录复用关系
             if (
-                matched >= self.min_prefix_len
-                and matched_provider >= 0
+                matched_prefix_len >= self.min_prefix_len
                 and matched_group_size >= self.min_group_size
+                and matched_provider_idx >= 0
             ):
-                spec = PrefixReuseSpec(
-                    reuse_idx_in_batch=index,
-                    provider_idx_in_batch=matched_provider,
-                    prefix_len=matched,
+                # 为该序列记录复用关系
+                provider_index[seq_idx] = matched_provider_idx
+                prefix_lens[seq_idx] = matched_prefix_len
+                is_provider[seq_idx] = False
+                this_reuse_spec = PrefixReuseSpec(
+                    reuse_idx_in_batch=seq_idx,
+                    provider_idx_in_batch=matched_provider_idx,
+                    prefix_len=matched_prefix_len,
                 )
-                reuse_specs.append(spec)
-                provider_index[index] = matched_provider
-                prefix_lens[index] = matched
-                is_provider[index] = False
+                reuse_specs.append(this_reuse_spec)
 
-                group_key = (matched_provider, matched)
+                # 用于后续构造 PrefixGroup（在当前版本中暂时没有实际用途）
+                group_key = (matched_provider_idx, matched_prefix_len)
                 group_id = group_key_to_id.setdefault(group_key, len(group_key_to_id))
-                group_ids[index] = group_id
+                group_ids[seq_idx] = group_id
                 if group_id not in group_members:
-                    group_members[group_id] = [matched_provider]
-                group_members[group_id].append(index)
+                    group_members[group_id] = [matched_provider_idx]
+                group_members[group_id].append(seq_idx)
 
             node = root
-            node.indices.append(index)
+            node.indices.append(seq_idx)
             for token in seq:
                 token = int(token)
                 child = node.children.get(token)
                 if child is None:
                     child = _TrieNode(node.depth + 1)
-                    child.provider_index = index
+                    child.provider_index = seq_idx
                     node.children[token] = child
                 node = child
-                node.indices.append(index)
+                node.indices.append(seq_idx)
 
+        # 构造 PrefixGroup（在当前版本中暂时没有实际用途）
         groups = [
             PrefixGroup(
                 group_id=group_id,
@@ -242,10 +253,11 @@ class TriePrefixDetector(PrefixDetector):
             for members in (group_members[group_id],)
         ]
 
+        # 汇总整个 batch 的前缀复用关系
         return PrefixDetectionResult(
             batch_size=batch_size,
             reuse_specs=tuple(reuse_specs),
-            groups=tuple(groups),
+            prefix_groups=tuple(groups),
             group_ids=tuple(group_ids),
             provider_index=tuple(provider_index),
             prefix_lens=tuple(prefix_lens),
