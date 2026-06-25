@@ -191,7 +191,7 @@ def restore_reuser_prefix_columns_2d(
     consolidating the previous three-phase approach (packed compute →
     cache → 2D inject) into a single post-forward step.
 
-    For each :class:`PackedPrefixLastRestoreIndex` in the runtime context:
+    For each :class:`PackedPrefixRestoreIndex` in the runtime context:
 
     - **Interior response** (shared-prefix token): logprob and entropy
       are identical between provider and reuser because the label is the

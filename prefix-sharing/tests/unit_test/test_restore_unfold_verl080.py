@@ -77,18 +77,18 @@ def test_non_nested_log_probs_returns_unchanged():
 
 
 def test_empty_restore_indices_returns_unchanged():
-    """ctx.prefix_last_restore_indices 为空时 early return（无 restore 需求）。"""
+    """ctx.prefix_restore_indices 为空时 early return（无 restore 需求）。"""
     state = _make_state([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]])
     nested = torch.nested.nested_tensor(
         [torch.tensor([1.0, 2.0]), torch.tensor([3.0])], layout=torch.jagged
     )
     output = {"log_probs": nested}
     with prefix_sharing_runtime_context(state) as ctx:
-        saved_indices = ctx.prefix_last_restore_indices[:]
-        ctx.prefix_last_restore_indices.clear()
+        saved_indices = ctx.prefix_restore_indices[:]
+        ctx.prefix_restore_indices.clear()
         result = restore_via_2d_unfold_verl080(output, _mock_vocab_log_probs_fn)
         assert result is output
-        ctx.prefix_last_restore_indices.extend(saved_indices)
+        ctx.prefix_restore_indices.extend(saved_indices)
 
 
 # ═══════════════════════════════════════
@@ -176,9 +176,9 @@ def test_restore_copies_interior_and_recomputes_prefix_last():
     output = {"log_probs": nested_logp}
 
     with prefix_sharing_runtime_context(state) as ctx:
-        assert len(ctx.prefix_last_restore_indices) == 3
+        assert len(ctx.prefix_restore_indices) == 3
         prefix_last_idx = [
-            i for i in ctx.prefix_last_restore_indices
+            i for i in ctx.prefix_restore_indices
             if i.restore_type != "restore_prefix_interior"
         ][0]
         assert prefix_last_idx.target_2d_pos == 2
@@ -230,7 +230,7 @@ def test_restore_with_entropy_copies_both_logp_and_entropy():
 
     with prefix_sharing_runtime_context(state) as ctx:
         prefix_last_idx = [
-            i for i in ctx.prefix_last_restore_indices
+            i for i in ctx.prefix_restore_indices
             if i.restore_type != "restore_prefix_interior"
         ][0]
         ctx.prefix_last_logits_saved[
@@ -266,7 +266,7 @@ def test_restore_clears_saved_logits_is_callers_responsibility():
 
     with prefix_sharing_runtime_context(state) as ctx:
         prefix_last_idx = [
-            i for i in ctx.prefix_last_restore_indices
+            i for i in ctx.prefix_restore_indices
             if i.restore_type != "restore_prefix_interior"
         ][0]
         key = (prefix_last_idx.reuse_idx_in_batch, prefix_last_idx.target_2d_pos)

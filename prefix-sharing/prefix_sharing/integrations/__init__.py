@@ -1,7 +1,7 @@
 """Framework patch integrations."""
 
 from prefix_sharing.integrations.context import (
-    PackedPrefixLastRestoreIndex,
+    PackedPrefixRestoreIndex,
     PrefixSharingRuntimeContext,
     current_prefix_sharing_context,
     prefix_sharing_runtime_context,
@@ -21,7 +21,7 @@ from prefix_sharing.integrations.megatron_runtime import (
 
 __all__ = [
     "PackedBatchLayout",
-    "PackedPrefixLastRestoreIndex",
+    "PackedPrefixRestoreIndex",
     "MegatronParallelInfo",
     "PrefixSharingRuntimeContext",
     "PrefixSharingRuntimeState",

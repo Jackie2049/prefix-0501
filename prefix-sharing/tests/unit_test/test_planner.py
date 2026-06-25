@@ -35,11 +35,11 @@ def test_planner_builds_phase_one_prefix_sharing_plan_and_restore_specs():
     assert prefix_sharing_plan.q_position_offsets == [0, 3, 5, 0]
     assert prefix_sharing_plan.kv_position_offsets == [0, 0, 0, 0]
 
-    # prefix_last_restore: reuser Q skips prefix; ALL prefix columns need restore.
+    # prefix_restore_specs: reuser Q skips prefix; ALL prefix columns need restore.
     # Row 1 (prefix_len=3): interior positions 1..2 (2 specs) + prefix-last (1 spec) = 3
     # Row 2 (prefix_len=5): interior positions 1..4 (4 specs) + prefix-last (1 spec) = 5
     # Total: 3 + 5 = 8 specs.
-    all_specs = prefix_sharing_plan.prefix_last_restore
+    all_specs = prefix_sharing_plan.prefix_restore_specs
     assert len(all_specs) == 8
 
     # Row 1 prefix-last spec (index 2: after 2 interior specs)
@@ -71,7 +71,7 @@ def test_planner_no_shared_prefix_keeps_original_shapes():
     assert prefix_sharing_plan.group_ids == [-1, -1, -1]
     assert prefix_sharing_plan.input_keep_ranges == [(0, 2), (0, 2), (0, 2)]
     assert prefix_sharing_plan.reuse_specs == []
-    assert prefix_sharing_plan.prefix_last_restore == []
+    assert prefix_sharing_plan.prefix_restore_specs == []
 
 
 def test_planner_generates_interior_response_restore_specs():
@@ -94,9 +94,9 @@ def test_planner_generates_interior_response_restore_specs():
     #   prefix_label_pos=3: provider_predict_pos=2, target_2d_pos=2
     # + prefix-last
     # Total: 4 specs.
-    assert len(plan.prefix_last_restore) == 4
+    assert len(plan.prefix_restore_specs) == 4
 
-    interior_spec = plan.prefix_last_restore[2]  # prefix_label_pos=3 (prompt_len area, was the old single interior)
+    interior_spec = plan.prefix_restore_specs[2]  # prefix_label_pos=3 (prompt_len area, was the old single interior)
     assert interior_spec.restore_type == "restore_prefix_interior"
     assert interior_spec.reuse_idx_in_batch == 1
     assert interior_spec.provider_idx_in_batch == 0
@@ -105,7 +105,7 @@ def test_planner_generates_interior_response_restore_specs():
     assert interior_spec.target_2d_pos == 2  # label position prefix_label_pos-1
     assert interior_spec.label_value == 4  # input_ids[1][3] = token A
 
-    prefix_last_spec = plan.prefix_last_restore[3]
+    prefix_last_spec = plan.prefix_restore_specs[3]
     assert prefix_last_spec.restore_type == "restore_prefix_last"
     assert prefix_last_spec.reuse_idx_in_batch == 1
     assert prefix_last_spec.provider_idx_in_batch == 0
@@ -131,7 +131,7 @@ def test_planner_generates_interior_restore_with_minimal_args():
     plan = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 
     # Interior positions 1..3 (3 specs) + prefix-last (1 spec) = 4 specs
-    assert len(plan.prefix_last_restore) == 4
+    assert len(plan.prefix_restore_specs) == 4
     # prefix-last spec at index 3 (last one)
-    spec = plan.prefix_last_restore[3]
+    spec = plan.prefix_restore_specs[3]
     assert spec.restore_type == "restore_prefix_last"

@@ -95,7 +95,7 @@ def _make_plan(batch_sizes: list[int], prefix_lens: list[int]) -> Any:
     object.__setattr__(plan, "provider_index", [0] * len(batch_sizes))
     object.__setattr__(plan, "is_provider", [p == 0 for p in prefix_lens])
     object.__setattr__(plan, "reuse_specs", ())
-    object.__setattr__(plan, "prefix_last_restore", [])
+    object.__setattr__(plan, "prefix_restore_specs", [])
     return plan
 
 def _make_layout(kept_lengths_q: list[int]) -> PackedBatchLayout:

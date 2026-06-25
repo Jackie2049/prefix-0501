@@ -81,10 +81,10 @@ def test_build_prefix_sharing_micro_batch_verl070_trims_reuser_mask_and_context_
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
         # 3 restore indices: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        assert len(ctx.prefix_restore_indices) == 3
+        assert ctx.prefix_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_restore_indices[2].provider_1d_pos == 2  # prefix-last
+        assert ctx.prefix_restore_indices[0].reuse_1d_pos == -1  # sentinel
     assert current_prefix_sharing_context() is None
 
 
@@ -154,10 +154,10 @@ def test_build_prefix_sharing_micro_batch_verl070_builds_common_tp_padded_layout
     assert layout.valid_token_mask.tolist() == expected_mask
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         # 3 restore indices: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_last_restore_indices[2].provider_1d_pos == 2  # prefix-last
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        assert len(ctx.prefix_restore_indices) == 3
+        assert ctx.prefix_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_restore_indices[2].provider_1d_pos == 2  # prefix-last
+        assert ctx.prefix_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
 def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
@@ -197,8 +197,8 @@ def test_restore_reuser_prefix_columns_2d_prefix_last_keeps_autograd():
 
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         # 3 restore specs: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        index = ctx.prefix_last_restore_indices[2]  # prefix-last spec
+        assert len(ctx.prefix_restore_indices) == 3
+        index = ctx.prefix_restore_indices[2]  # prefix-last spec
         assert index.restore_type == "restore_prefix_last"
 
         # Simulate 2D postprocess: output dict with [B, L] log_probs.
@@ -268,9 +268,9 @@ def test_build_prefix_sharing_micro_batch_verl070_keeps_global_layout_with_seque
     assert layout.total_padded_length == expected_cu_seqlens[-1]
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         # 3 restore specs: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        assert len(ctx.prefix_restore_indices) == 3
+        assert ctx.prefix_restore_indices[0].provider_1d_pos == 0  # interior pos1
+        assert ctx.prefix_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
@@ -350,8 +350,8 @@ def test_build_prefix_sharing_micro_batch_verl070_combines_tp_padding_with_physi
     assert prefix_sharing_runtime_state.packed_batch_layout.cu_seqlens == expected_cu_seqlens
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         # 3 restore specs: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_last_restore_indices) == 3
-        assert ctx.prefix_last_restore_indices[0].reuse_1d_pos == -1  # sentinel
+        assert len(ctx.prefix_restore_indices) == 3
+        assert ctx.prefix_restore_indices[0].reuse_1d_pos == -1  # sentinel
 
 
 def test_attention_hook_rejects_sp_local_shard_token_length():
