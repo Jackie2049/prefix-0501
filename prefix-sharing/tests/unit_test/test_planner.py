@@ -35,31 +35,26 @@ def test_planner_builds_phase_one_prefix_sharing_plan_and_restore_specs():
     assert prefix_sharing_plan.q_position_offsets == [0, 3, 5, 0]
     assert prefix_sharing_plan.kv_position_offsets == [0, 0, 0, 0]
 
-    # prefix_last_restore: reuser Q skips prefix; ALL prefix columns need restore.
-    # Row 1 (prefix_len=3): interior positions 1..2 (2 specs) + prefix-last (1 spec) = 3
-    # Row 2 (prefix_len=5): interior positions 1..4 (4 specs) + prefix-last (1 spec) = 5
-    # Total: 3 + 5 = 8 specs.
+    # prefix_last_restore: reuser Q skips prefix; only the prefix-last token
+    # needs a spec (interior columns are bulk-sliced by the 2D restore).
+    # Row 1 (prefix_len=3): 1 prefix-last spec.
+    # Row 2 (prefix_len=5): 1 prefix-last spec.
+    # Total: 2 specs.
     all_specs = prefix_sharing_plan.prefix_last_restore
-    assert len(all_specs) == 8
+    assert len(all_specs) == 2
 
-    # Row 1 prefix-last spec (index 2: after 2 interior specs)
-    spec1 = all_specs[2]
-    assert not spec1.is_shared_prefix_interior
+    # Row 1 prefix-last spec
+    spec1 = all_specs[0]
     assert spec1.reuse_idx_in_batch == 1
     assert spec1.provider_idx_in_batch == 0
-    assert spec1.provider_predict_pos == 2  # prefix_len - 1 = 2
-    assert spec1.reuse_first_suffix_label_pos == 3  # prefix_len = 3
-    assert spec1.target_2d_pos == 2
+    assert spec1.target_2d_pos == 2  # prefix_len - 1
     assert spec1.label_value == 20  # input_ids[1][3], the first suffix token
 
-    # Row 2 prefix-last spec (index 7: after 4 interior specs)
-    spec2 = all_specs[7]
-    assert not spec2.is_shared_prefix_interior
+    # Row 2 prefix-last spec
+    spec2 = all_specs[1]
     assert spec2.reuse_idx_in_batch == 2
     assert spec2.provider_idx_in_batch == 0
-    assert spec2.provider_predict_pos == 4  # prefix_len - 1 = 4
-    assert spec2.reuse_first_suffix_label_pos == 5  # prefix_len = 5
-    assert spec2.target_2d_pos == 4
+    assert spec2.target_2d_pos == 4  # prefix_len - 1
     assert spec2.label_value == 30  # input_ids[2][5], the first suffix token
 
 
@@ -74,11 +69,12 @@ def test_planner_no_shared_prefix_keeps_original_shapes():
     assert prefix_sharing_plan.prefix_last_restore == []
 
 
-def test_planner_generates_interior_response_restore_specs():
+def test_planner_emits_only_prefix_last_not_interior():
     # seq1 (provider): [1,2,3 | A,B,C]   prompt=[1,2,3], response=[A,B,C]
     # seq2 (reuser):   [1,2,3 | A,D,E]   prompt=[1,2,3], response=[A,D,E]
-    # Shared prefix: [1,2,3,A] (len 4). A is a response token in both,
-    # so it needs shared-prefix interior logprob restore.
+    # Shared prefix: [1,2,3,A] (len 4). A is a response token in both, so the
+    # prefix spans response positions — but interior columns are now bulk-sliced
+    # by the 2D restore; the planner only emits the single prefix-last spec.
     input_ids = [
         [1, 2, 3, 4, 5, 6],     # 1,2,3,A,B,C
         [1, 2, 3, 4, 7, 8],     # 1,2,3,A,D,E
@@ -88,30 +84,14 @@ def test_planner_generates_interior_response_restore_specs():
     )
     plan = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 
-    # Interior restore covers all prefix columns 1..prefix_len-1:
-    #   prefix_label_pos=1: provider_predict_pos=0, target_2d_pos=0
-    #   prefix_label_pos=2: provider_predict_pos=1, target_2d_pos=1
-    #   prefix_label_pos=3: provider_predict_pos=2, target_2d_pos=2
-    # + prefix-last
-    # Total: 4 specs.
-    assert len(plan.prefix_last_restore) == 4
+    # Only the prefix-last spec is emitted (interior is handled by the restore).
+    # Total: 1 spec.
+    assert len(plan.prefix_last_restore) == 1
 
-    interior_spec = plan.prefix_last_restore[2]  # prefix_label_pos=3 (prompt_len area, was the old single interior)
-    assert interior_spec.is_shared_prefix_interior
-    assert interior_spec.reuse_idx_in_batch == 1
-    assert interior_spec.provider_idx_in_batch == 0
-    assert interior_spec.provider_predict_pos == 2  # logits[2]
-    assert interior_spec.reuse_first_suffix_label_pos == 3  # label pos 3 = A
-    assert interior_spec.target_2d_pos == 2  # label position prefix_label_pos-1
-    assert interior_spec.label_value == 4  # input_ids[1][3] = token A
-
-    prefix_last_spec = plan.prefix_last_restore[3]
-    assert not prefix_last_spec.is_shared_prefix_interior
+    prefix_last_spec = plan.prefix_last_restore[0]
     assert prefix_last_spec.reuse_idx_in_batch == 1
     assert prefix_last_spec.provider_idx_in_batch == 0
-    assert prefix_last_spec.provider_predict_pos == 3  # logits[3] = prefix-last
-    assert prefix_last_spec.reuse_first_suffix_label_pos == 4  # label pos 4 = D
-    assert prefix_last_spec.target_2d_pos == 3  # prefix_len-1 label position
+    assert prefix_last_spec.target_2d_pos == 3  # prefix_len - 1
     assert prefix_last_spec.label_value == 7  # input_ids[1][4] = first suffix token D
 
     # Trimming still at prefix_len
@@ -119,8 +99,8 @@ def test_planner_generates_interior_response_restore_specs():
     assert plan.kept_lengths_q == [6, 2]
 
 
-def test_planner_generates_interior_restore_with_minimal_args():
-    """Shared-prefix interior restore covers all prefix columns using only input_ids."""
+def test_planner_emits_prefix_last_with_minimal_args():
+    """Only the prefix-last spec is emitted; interior needs no spec."""
     input_ids = [
         [1, 2, 3, 4, 5],
         [1, 2, 3, 4, 6],
@@ -130,8 +110,7 @@ def test_planner_generates_interior_restore_with_minimal_args():
     )
     plan = planner.plan(input_ids, forward_id=1, micro_batch_id=1)
 
-    # Interior positions 1..3 (3 specs) + prefix-last (1 spec) = 4 specs
-    assert len(plan.prefix_last_restore) == 4
-    # prefix-last spec at index 3 (last one)
-    spec = plan.prefix_last_restore[3]
-    assert not spec.is_shared_prefix_interior
+    # Only the prefix-last spec is emitted (interior handled by the restore).
+    assert len(plan.prefix_last_restore) == 1
+    spec = plan.prefix_last_restore[0]
+    assert spec.reuse_idx_in_batch == 1

@@ -145,11 +145,17 @@ def dump_meta_verl080(prefix_lens: list[int], cu_seqlens: torch.Tensor) -> None:
 
 
 def dump_logits_verl080(logits: torch.Tensor) -> None:
-    """存 packed logits ``[N, V//tp]``（vocab 在最后一维，v070 约定）。"""
+    """存 packed logits，scope=``tp_vocab``：每个 tp rank 存自己的词表片。
+
+    纯 TP 下 logits 是 ``[N, V//tp]``，各 tp rank 不同（vocab 切分）。每个 tp
+    rank 存自己的 shard（文件名 ``logits_tp{r}.pt``；``tp_size==1`` 时退化为
+    ``logits.pt``，单卡零改动）。dump 路径不引入跨 rank 通信；cmp 侧按
+    ``parallel_info.json`` 把 ``_tp{0..tp-1}`` 拼回 full vocab 再比。
+    """
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _save_tensor("logits.pt", logits, dump_dir)
+    _save_tensor("logits.pt", logits, dump_dir, scope="tp_vocab")
 
 
 def dump_logprobs_2d_verl080(logp_2d: torch.Tensor, tag: str) -> None:

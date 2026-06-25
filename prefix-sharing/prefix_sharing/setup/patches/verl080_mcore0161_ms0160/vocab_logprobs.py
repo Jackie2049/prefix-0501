@@ -8,8 +8,9 @@
 仍在、context 激活时，把 prefix-last 重算所需的 provider logits 保存到
 ``ctx.prefix_last_logits_saved``，供后续 restore 使用。
 
-保存条件：仅非 interior（prefix-last）的 index。interior 走 2D 复制路径，
-不需要 logits。
+保存条件：``ctx.prefix_last_restore_indices`` 现仅含 prefix-last（每 reuser 一条），
+interior 由 restore 侧 build_kv 式 bulk 切片处理，不读 logits。逐条保存 provider
+直接对应位置的 vocab 维 logits。
 """
 
 from __future__ import annotations
@@ -58,8 +59,6 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
                     flush=True,
                 )
                 for _idx in ctx.prefix_last_restore_indices:
-                    if _idx.is_shared_prefix_interior:
-                        continue
                     print(
                         f"[PS-diag][packed-align] reuser={_idx.reuse_idx_in_batch} "
                         f"provider={_idx.provider_idx_in_batch} "
@@ -70,19 +69,18 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
             # ##### [PS-diag] 验证 packed 坐标对齐 end #####
 
             for index in ctx.prefix_last_restore_indices:
-                # interior 走 2D 复制路径，不需要 logits；只保存 prefix-last。
-                if index.is_shared_prefix_interior:
-                    continue
+                # prefix_last_restore_indices 现在只含 prefix-last（interior 由
+                # restore 侧 bulk 切片处理），逐条保存其 provider 的 vocab 维 logits。
                 pos = index.provider_1d_pos
                 key = (index.reuse_idx_in_batch, index.target_2d_pos)
                 if pos < 0:
-                    # 不应再发生：_build_prefix_last_restore_indices 已对 prefix-last
-                    # 二次 strict 解析到 packed 真含 target_pos 的祖先。若到这里说明
-                    # 解析逻辑有遗漏，直接 raise 暴露，避免下游 restore 静默 KeyError。
+                    # 不应发生：prefix-last 必落在直接 provider 的 packed 区段内
+                    # （见 _build_prefix_last_restore_indices 文档）。raise 暴露，避免
+                    # 下游 restore 静默 KeyError。
                     raise RuntimeError(
-                        f"[vocab_logprobs] prefix-last spec got provider_1d_pos<0 "
-                        f"after strict resolve; key={key} provider_1d_pos={pos}. "
-                        f"_build_prefix_last_restore_indices 解析逻辑可能有遗漏。"
+                        f"[vocab_logprobs] prefix-last spec got provider_1d_pos<0; "
+                        f"key={key} provider_1d_pos={pos}. "
+                        f"prefix-last 应在直接 provider 的 packed 区段内。"
                     )
                 # clone 保留 autograd 图（restore 重算 logp 要走反向传播，禁止 detach）。
                 saved = logits_2d[pos:pos + 1, :].clone()  # [1, V//tp]

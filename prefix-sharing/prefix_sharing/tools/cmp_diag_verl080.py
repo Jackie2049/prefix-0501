@@ -150,6 +150,46 @@ def _load_tensor(dir_path: str, filename: str) -> torch.Tensor | None:
     return torch.load(fp, weights_only=True).float() if os.path.exists(fp) else None
 
 
+def _load_manifest(dir_path: str) -> dict | None:
+    """Load ``parallel_info.json`` written by the dump layer (topology + scopes).
+
+    Returns None when absent (single-card or pre-manifest dumps) → callers fall
+    back to tp_size==1 behavior (plain filenames, single-card compatible).
+    """
+    fp = os.path.join(dir_path, "parallel_info.json")
+    if not os.path.exists(fp):
+        return None
+    try:
+        with open(fp, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _load_logits(dir_path: str, manifest: dict | None = None) -> torch.Tensor | None:
+    """Load packed logits, gathering tp vocab shards to full vocab when tp>1.
+
+    tp_size==1 (or no manifest) → single ``logits.pt`` (single-card compatible).
+    tp_size>1  → concat ``logits_tp{0..tp-1}.pt`` on the vocab (last) dim,
+                 reconstructing ``[N, V]`` so ON-vs-OFF compares on the same
+                 full-vocab coordinate system as single-card.  A missing shard
+                 aborts the reconstruction (returns None) rather than silently
+                 comparing partial vocab.
+    """
+    if manifest is None:
+        manifest = _load_manifest(dir_path)
+    tp_size = (manifest or {}).get("tp_size", 1)
+    if tp_size <= 1:
+        return _load_tensor(dir_path, "logits.pt")
+    shards = []
+    for t in range(tp_size):
+        s = _load_tensor(dir_path, f"logits_tp{t}.pt")
+        if s is None:
+            return None
+        shards.append(s)
+    return torch.cat(shards, dim=-1)
+
+
 def _load_packed_meta(dir_path: str,
                       cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
     """加载 cu_seqlens + prefix_lens（suffix 对齐所需）。"""
@@ -336,8 +376,8 @@ def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
                 name="first_token_attn",
                 metrics=_first_token_metrics(a0[0], b0[0])))
 
-    lo = _load_tensor(dir_on, "logits.pt")
-    lf = _load_tensor(dir_off, "logits.pt")
+    lo = _load_logits(dir_on)
+    lf = _load_logits(dir_off)
     if lo is not None and lf is not None:
         lo_first, lf_first = _logits_first_token(lo, lf)
         results.append(CheckResult(
@@ -348,8 +388,8 @@ def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
 
 def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     """全 packed logits suffix 对齐 + per-token cosine。"""
-    lo = _load_tensor(dir_on, "logits.pt")
-    lf = _load_tensor(dir_off, "logits.pt")
+    lo = _load_logits(dir_on)
+    lf = _load_logits(dir_off)
     if lo is None or lf is None:
         return None
     lo, lf = _logits_ensure_token_major(lo, lf)
@@ -553,7 +593,43 @@ def _shape_of(dir_path: str, filename: str) -> str:
         return "(error)"
 
 
-def _print_shapes(dir_on: str, dir_off: str, tag: str):
+def _logits_shape(dir_path: str, manifest: dict | None) -> str:
+    """Shape string for logits, manifest-aware: tp>1 → show shard shape tagged.
+
+    Under TP the file is sharded (``logits_tp{r}.pt``); report one shard's shape
+    prefixed with ``tp{N}×`` so the shapes table still flags mismatches without
+    pretending a plain ``logits.pt`` exists.
+    """
+    tp_size = (manifest or {}).get("tp_size", 1)
+    if tp_size <= 1:
+        return _shape_of(dir_path, "logits.pt")
+    s0 = _shape_of(dir_path, "logits_tp0.pt")
+    if s0 in ("(missing)", "(error)"):
+        return s0
+    return f"tp{tp_size}×{s0}"
+
+
+def _print_topology(manifest_on: dict | None, manifest_off: dict | None) -> None:
+    """Print ON/OFF parallel topology from manifests; warn on mismatch."""
+    def _topo(m):
+        if not m:
+            return "single-card (no manifest)"
+        return f"tp={m.get('tp_size', 1)} pp={m.get('pp_size', 1)} cp={m.get('cp_size', 1)}"
+    print(_SEP_SINGLE + "\n  [topology]  ON vs OFF parallel config")
+    print(_SEP_SINGLE)
+    print(f"  ON : {_topo(manifest_on)}")
+    print(f"  OFF: {_topo(manifest_off)}")
+    if manifest_on and manifest_off:
+        for key in ("tp_size", "pp_size", "cp_size"):
+            if manifest_on.get(key) != manifest_off.get(key):
+                print(f"  {_CROSS} MISMATCH on {key}: ON={manifest_on.get(key)} "
+                      f"OFF={manifest_off.get(key)} — comparison may be invalid")
+    print()
+
+
+def _print_shapes(dir_on: str, dir_off: str, tag: str,
+                  manifest_on: dict | None = None,
+                  manifest_off: dict | None = None):
     """打印 ON/OFF 各 .pt 文件 shape —— 定位 shape mismatch 根因的第一手信息。"""
     print(_SEP_SINGLE + "\n  [shapes]  ON vs OFF dump shapes")
     print(_SEP_SINGLE)
@@ -570,7 +646,12 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str):
     print(f"  {'FILE':<28s} {'ON':<16s} {'OFF':<16s} {'STATUS'}")
     print(f"  {'─' * 28} {'─' * 16} {'─' * 16} {'─' * 10}")
     for fname in files:
-        s_on, s_off = _shape_of(dir_on, fname), _shape_of(dir_off, fname)
+        if fname == "logits.pt":
+            # TP-sharded: per-rank logits_tp{r}.pt, not a plain logits.pt
+            s_on = _logits_shape(dir_on, manifest_on)
+            s_off = _logits_shape(dir_off, manifest_off)
+        else:
+            s_on, s_off = _shape_of(dir_on, fname), _shape_of(dir_off, fname)
         if s_on == "(missing)" or s_off == "(missing)":
             status = "—"
         elif s_on == s_off:
@@ -807,8 +888,13 @@ def main():
     _print_header(args.dir_on, args.dir_off, args.dir_off2,
                   args.tag, args.mask, args.layer)
 
+    # ── parallel topology (manifest-driven: TP shards, future SP/PP) ──
+    manifest_on = _load_manifest(args.dir_on)
+    manifest_off = _load_manifest(args.dir_off)
+    _print_topology(manifest_on, manifest_off)
+
     # ── shape diagnostics ──
-    _print_shapes(args.dir_on, args.dir_off, args.tag)
+    _print_shapes(args.dir_on, args.dir_off, args.tag, manifest_on, manifest_off)
 
     # ── resolve 2D mask ──
     ref = _load_tensor(args.dir_off, f"logprobs_{args.tag}.pt")
@@ -848,8 +934,8 @@ def main():
                 a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
                 b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
                 _print_topk_vec(a0, b0, args.topk, "val", "first_token_attn")
-        lo = _load_tensor(args.dir_on, "logits.pt")
-        lf = _load_tensor(args.dir_off, "logits.pt")
+        lo = _load_logits(args.dir_on)
+        lf = _load_logits(args.dir_off)
         if lo is not None and lf is not None:
             lo_f, lf_f = _logits_first_token(lo, lf)
             _print_topk_vec(lo_f.cpu(), lf_f.cpu(), args.topk,
