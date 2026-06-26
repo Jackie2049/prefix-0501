@@ -65,19 +65,123 @@ def _rank0_only() -> bool:
     return True
 
 
+# ── Parallel-topology-aware dumping (TP / SP / PP) ──────────────
+#
+# Each dumped tensor has a *rank-scope* describing how (if at all) it is split
+# across ranks.  The scope decides WHO dumps and under WHAT filename:
+#
+#   "global"    — identical on every rank that holds it → dumped once by the
+#                 representative rank (rank-0 under TP/DP; PP will need
+#                 stage-aware routing, left as a per-tensor concern then).
+#                 Plain filename, e.g. ``logprobs_old.pt``.
+#   "tp_vocab"  — vocab-sharded by TP → EVERY tp rank dumps its own shard as
+#                 ``<stem>_tp{r}.pt`` (no cross-rank comm on the dump path;
+#                 cmp reassembles offline).  tp_size==1 degrades to the plain
+#                 ``logits.pt`` so single-card dumps are unchanged.
+#
+# Future scopes (reserved, wired when SP/PP land):
+#   "tp_seq"    — sequence-sharded by SP (reduce-scatter) → ``_tp{r}``.
+#   "pp_stage"  — layer-partitioned by PP → ``_pp{r}``.
+#
+# The static name→scope map is written to ``parallel_info.json`` (manifest) so
+# cmp_diag knows how to gather each tensor without guessing.
+
+_TENSOR_SCOPES: dict[str, str] = {
+    "logits": "tp_vocab",   # packed logits [N, V//tp] — vocab-sharded under TP
+}
+
+_PARALLEL_INFO_CACHE: Any = None
+_MANIFEST_WRITTEN: set[str] = set()
+
+
+def _cached_parallel_info() -> Any:
+    """Read MegatronParallelInfo once and cache (tp/pp/cp ranks + sizes).
+
+    Returns None when distributed/Megatron isn't initialized (single-rank),
+    which the callers treat as the single-card case.
+    """
+    global _PARALLEL_INFO_CACHE
+    if _PARALLEL_INFO_CACHE is not None:
+        return _PARALLEL_INFO_CACHE
+    try:
+        from prefix_sharing.integrations.parallel_info import (
+            get_megatron_parallel_info,
+        )
+        _PARALLEL_INFO_CACHE = get_megatron_parallel_info()
+    except Exception:
+        _PARALLEL_INFO_CACHE = None
+    return _PARALLEL_INFO_CACHE
+
+
+def _with_suffix(name: str, suffix: str) -> str:
+    """Insert a rank suffix before the extension: logits.pt → logits_tp0.pt."""
+    if not suffix:
+        return name
+    stem, sep, ext = name.rpartition(".")
+    return f"{stem}{suffix}{sep}{ext}" if sep else f"{name}{suffix}"
+
+
+def _ensure_manifest(dump_dir: str, pi: Any) -> None:
+    """Write parallel_info.json once from rank-0: topology + scope map.
+
+    Content is global/identical, so a single writer avoids filesystem races.
+    Read by cmp_diag to gather per-rank files (e.g. concat logits_tp{0..tp-1}.pt
+    back to full vocab) and to validate ON/OFF topology match.
+    """
+    if dump_dir in _MANIFEST_WRITTEN:
+        return
+    _MANIFEST_WRITTEN.add(dump_dir)
+    if not _rank0_only():
+        return
+    import json
+    manifest = {
+        "tp_size": getattr(pi, "tp_size", 1) if pi else 1,
+        "pp_size": getattr(pi, "pp_size", 1) if pi else 1,
+        "cp_size": getattr(pi, "cp_size", 1) if pi else 1,
+        "global_rank_of_dumper": getattr(pi, "global_rank", 0) if pi else 0,
+        "scopes": dict(_TENSOR_SCOPES),
+    }
+    try:
+        with open(os.path.join(dump_dir, "parallel_info.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+        _log.warning("parallel_info.json saved (tp=%d pp=%d)",
+                     manifest["tp_size"], manifest["pp_size"])
+    except Exception as e:
+        _log.warning("parallel_info.json save failed: %s", e)
+
+
 # ── Generic helpers ─────────────────────────────────────────────
 
-def _save_tensor(name: str, tensor: torch.Tensor, dump_dir: str) -> bool:
-    """Save a tensor to dump_dir/name.pt, rank-0-only.  Returns True on success."""
-    if not _rank0_only():
-        return False
+def _save_tensor(name: str, tensor: torch.Tensor, dump_dir: str,
+                 scope: str = "global") -> bool:
+    """Save a tensor to ``dump_dir/<name>``, scope-aware. Returns True on success.
+
+    See the ``_TENSOR_SCOPES`` block above for the scope semantics.  ``scope``
+    defaults to ``"global"`` (rank-0-only, plain filename) so existing callers
+    are unchanged; per-rank tensors opt in via ``scope="tp_vocab"`` (etc.).
+    """
+    pi = _cached_parallel_info()
+    _ensure_manifest(dump_dir, pi)
+
+    if scope == "tp_vocab" and pi is not None and pi.tp_size > 1:
+        # Every tp rank dumps its own vocab shard; no rank-0 gate, no comm.
+        fname = _with_suffix(name, f"_tp{pi.tp_rank}")
+    else:
+        # global scope, OR tp_vocab with tp_size==1 (single shard == full):
+        # rank-0 dumps once under the plain name (single-card compatible).
+        if scope == "tp_vocab":
+            scope = "global"  # tp==1 → behaves as global for logging
+        if not _rank0_only():
+            return False
+        fname = name
     try:
-        path = os.path.join(dump_dir, name)
+        path = os.path.join(dump_dir, fname)
         torch.save(tensor.detach().cpu().clone(), path)
-        _log.warning("%s saved (%s)", name, tensor.shape)
+        _log.warning("%s saved (%s, scope=%s)", fname, tensor.shape, scope)
         return True
     except Exception as e:
-        _log.warning("%s save failed: %s", name, e)
+        _log.warning("%s save failed: %s", fname, e)
         return False
 
 

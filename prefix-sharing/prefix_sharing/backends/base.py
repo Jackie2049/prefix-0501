@@ -16,7 +16,7 @@ class BackendCapabilities:
     supports_cuda: bool
     supports_cann: bool
     supports_different_q_kv_lengths: bool
-    supports_prefix_restore: bool
+    supports_prefix_last_restore: bool
     supports_fused_rope: bool = False
     supports_context_parallel: bool = False
     supports_pipeline_parallel: bool = False

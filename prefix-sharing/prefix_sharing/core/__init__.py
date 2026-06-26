@@ -14,7 +14,7 @@ from prefix_sharing.core.prefix_store import (
     StoredAttentionKV,
     StoredDeltanetState,
 )
-from prefix_sharing.core.planner import PrefixRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
+from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
 
 __all__ = [
     "PrefixDetectionResult",
@@ -30,7 +30,7 @@ __all__ = [
     "PrefixSharingStats",
     "PrefixSharingConfig",
     "PrefixSharingConfigError",
-    "PrefixRestoreSpec",
+    "PrefixLastRestoreSpec",
     "PrefixSharingPlanner",
     "StoredAttentionKV",
     "StoredDeltanetState",

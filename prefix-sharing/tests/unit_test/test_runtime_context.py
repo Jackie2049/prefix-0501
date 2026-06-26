@@ -1,5 +1,3 @@
-import pytest
-
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlanner
@@ -29,11 +27,11 @@ def test_prefix_sharing_runtime_context_sets_and_clears_current_context():
     with prefix_sharing_runtime_context(prefix_sharing_runtime_state) as ctx:
         assert current_prefix_sharing_context() is ctx
         assert ctx.prefix_sharing_plan is prefix_sharing_runtime_state.prefix_sharing_plan
-        # 3 restore specs: 2 interior (provider_predict_pos=0,1) + 1 prefix-last (pos=2)
-        assert len(ctx.prefix_restore_indices) == 3
-        assert ctx.prefix_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_restore_indices[2].provider_1d_pos == 2  # prefix-last
-        assert ctx.prefix_restore_indices[0].reuse_1d_pos == -1  # sentinel: no slot in reuser packed region
+        # 1 prefix-last spec (interior is bulk-sliced in the restore, not indexed).
+        assert len(ctx.prefix_last_restore_indices) == 1
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2  # prefix-last, direct provider seq0 offset 2
+        assert ctx.prefix_last_restore_indices[0].target_2d_pos == 2
+        assert ctx.prefix_last_restore_indices[0].label_value == 20  # seq1[3]
         assert ctx.parallel_info is prefix_sharing_runtime_state.parallel_info
         assert ctx.parallel_info.pp_rank == 1
         assert ctx.parallel_info.pp_size == 2
@@ -66,96 +64,65 @@ def test_prefix_sharing_runtime_context_uses_padded_layout_for_restore_indices()
     )
 
     with prefix_sharing_runtime_context(runtime_state) as ctx:
-        # 3 restore specs: 2 interior + 1 prefix-last
-        assert len(ctx.prefix_restore_indices) == 3
-        assert ctx.prefix_restore_indices[0].provider_1d_pos == 0  # interior pos1
-        assert ctx.prefix_restore_indices[2].provider_1d_pos == 2  # prefix-last
-        assert ctx.prefix_restore_indices[0].reuse_1d_pos == -1  # sentinel: no slot in reuser packed region
+        # 1 prefix-last spec (interior bulk-sliced, not indexed).
+        assert len(ctx.prefix_last_restore_indices) == 1
+        assert ctx.prefix_last_restore_indices[0].provider_1d_pos == 2  # prefix-last, direct provider seq0 offset 2
         assert ctx.stats.kept_padded_tokens == 8
 
 
-def _chain_reuse_runtime_state():
-    """Chain-reuse: row0=provider, row1=reuse(0,prefix=3), row2=reuse(1,prefix=3).
+def test_chain_reuse_prefix_last_resolves_to_direct_provider():
+    """Chain reuse: a reuser's prefix-last index points at its **direct**
+    provider (not the root) and resolves to a real packed slot there.
 
-    Row2's prefix-last predict position (prefix_len-1 = 2) falls on row1's
-    keep_start-1 (row1 keep_start=3).  Under v080 physical trimming row1's
-    packed region has no slot for position 2, so the prefix-last logits must
-    be fetched from the chain ancestor row0 whose packed region strictly
-    contains position 2 (keep_start=0 <= 2 < keep_end=8).
+    Trie detection produces a natural chain:
+        seq0: [1, 2, 3, 4, 5]   provider (root)
+        seq1: [1, 2, 3, 7, 8]   reuse(seq0), shared prefix [1,2,3] (len 3)
+        seq2: [1, 2, 3, 7, 9]   reuse(seq1), shared prefix [1,2,3,7] (len 4)
 
-    The chain is forced via a hand-built PrefixDetectionResult (the trie
-    detector naturally routes row2 to row0 because it records the *first*
-    inserter as provider at each depth; we need the transitive edge
-    row2->row1 specifically to exercise the keep_start-1 miss path).
+    seq2's prefix-last is position 3 (predicts token 9). Chain reuse forces
+    prefix_len_reuser (4) > prefix_len_provider (3), so position 3 lands at
+    seq1's keep_start — inside seq1's computed suffix region. The prefix-last
+    logits therefore live on the direct provider seq1 and need no walk up to
+    seq0. Interior positions are no longer indexed: the restore bulk-slices
+    them from the provider's already-restored 2D row.
     """
-    from prefix_sharing.core.prefix_detector import (
-        PrefixDetectionResult,
-        PrefixReuseSpec,
-    )
-
     planner = PrefixSharingPlanner(PrefixSharingConfig(enable_prefix_sharing=True, min_prefix_len=2))
-    sequences = [
-        [100, 101, 102, 103, 104, 105, 106, 107],   # row0 provider, len 8
-        [100, 101, 102, 108, 109, 110],              # row1 reuse(0) prefix=3, len 6
-        [100, 101, 102, 111, 112, 113],              # row2 reuse(1) prefix=3, len 6
-    ]
-    detection = PrefixDetectionResult(
-        batch_size=3,
-        reuse_specs=(
-            PrefixReuseSpec(reuse_idx_in_batch=1, provider_idx_in_batch=0, prefix_len=3),
-            PrefixReuseSpec(reuse_idx_in_batch=2, provider_idx_in_batch=1, prefix_len=3),
-        ),
-        prefix_groups=(),
-        group_ids=[0, 0, 1],
-        provider_index=[0, 0, 1],
-        prefix_lens=[0, 3, 3],
-        is_provider=[True, False, False],
+    plan = planner.plan(
+        [[1, 2, 3, 4, 5], [1, 2, 3, 7, 8], [1, 2, 3, 7, 9]],
+        forward_id=10,
+        micro_batch_id=20,
     )
-    prefix_sharing_plan = planner.plan_from_detection(
-        sequences, detection, forward_id=10, micro_batch_id=20,
-    )
-    # Sanity: the chain is row2 -> row1 -> row0 with prefix_len 3 each.
-    assert prefix_sharing_plan.provider_index[1] == 0
-    assert prefix_sharing_plan.provider_index[2] == 1
-    assert prefix_sharing_plan.prefix_lens[1] == 3
-    assert prefix_sharing_plan.prefix_lens[2] == 3
-    return PrefixSharingRuntimeState(
-        prefix_sharing_plan=prefix_sharing_plan,
+    # Chain: seq2 -> seq1 -> seq0; seq2 shares the longer prefix [1,2,3,7].
+    assert plan.provider_index == [0, 0, 1]
+    assert plan.prefix_lens == [0, 3, 4]
+
+    runtime_state = PrefixSharingRuntimeState(
+        prefix_sharing_plan=plan,
         attention_backend=None,
-        packed_batch_layout=PackedBatchLayout.from_valid_lengths(prefix_sharing_plan.kept_lengths_q),
+        packed_batch_layout=PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q),
         parallel_info=MegatronParallelInfo(),
     )
-
-
-@pytest.mark.skip(reason="手构造的链式复用场景下 provider_1d_pos 计算存在问题，暂时跳过")
-def test_prefix_last_in_chain_reuse_resolves_to_ancestor_with_packed_slot():
-    """Regression: prefix-last in chain-reuse must fetch logits from the
-    chain ancestor whose packed region strictly contains the predict position,
-    not the intermediate reuser whose keep_start-1 has no packed slot.
-
-    Before the fix _build_prefix_restore_indices left provider_1d_pos=-1
-    (sentinel) for such specs, causing vocab_logprobs save to skip them and
-    the downstream restore to KeyError on the saved-logits lookup.
-    """
-    runtime_state = _chain_reuse_runtime_state()
     with prefix_sharing_runtime_context(runtime_state) as ctx:
-        # Collect prefix-last (non-interior) indices for row2 (reuse_idx=2).
-        row2_plast = [
-            idx for idx in ctx.prefix_restore_indices
-            if idx.reuse_idx_in_batch == 2 and idx.restore_type != "restore_prefix_interior"
-        ]
-        assert len(row2_plast) == 1, "row2 should have exactly one prefix-last restore"
-        spec = row2_plast[0]
+        # One prefix-last index per reuser-with-suffix (seq1, seq2); interior
+        # is no longer indexed.
+        by_row = {
+            idx.reuse_idx_in_batch: idx for idx in ctx.prefix_last_restore_indices
+        }
+        assert set(by_row) == {1, 2}
 
-        # target_2d_pos = prefix_len-1 = 2 (prefix-last predict position).
-        assert spec.target_2d_pos == 2
-        # The fix: provider_1d_pos must NOT be the -1 sentinel. It must point
-        # into row0's packed region (row0 has 8 tokens, position 2 → packed
-        # index 2 since row0 starts at offset 0 in the packed tensor).
-        assert spec.provider_1d_pos != -1, (
-            "prefix-last in chain-reuse must resolve provider_1d_pos to a "
-            "chain ancestor with a real packed slot, not the -1 sentinel"
-        )
-        assert spec.provider_1d_pos == 2, (
-            f"expected packed index 2 (row0 offset 0 + pos 2), got {spec.provider_1d_pos}"
+        # seq1 prefix-last: position 2 (predicts token 7), direct provider seq0.
+        assert by_row[1].provider_idx_in_batch == 0
+        assert by_row[1].target_2d_pos == 2
+        assert by_row[1].label_value == 7
+        assert by_row[1].provider_1d_pos != -1
+
+        # seq2 prefix-last: position 3 (predicts token 9), direct provider seq1
+        # (NOT the root seq0) — the key chain-reuse property.
+        plast = by_row[2]
+        assert plast.provider_idx_in_batch == 1
+        assert plast.target_2d_pos == 3
+        assert plast.label_value == 9
+        assert plast.provider_1d_pos != -1, (
+            "seq2 prefix-last must resolve to a real packed slot on its direct "
+            "provider seq1, not walk up to the root seq0"
         )

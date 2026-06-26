@@ -126,7 +126,7 @@ def prefix_attention(
                      attention_module.layer_number,
                      attention_module.config.num_layers)
     except Exception as e:
-        prefix_log.warning(f"last-attn dump (ON) failed: {e}")
+        print(f"last-attn dump (ON) failed: {e}")
     ######### prefix-sharing diag: ON attention_output (per-layer) #########
     # ---
 
@@ -216,7 +216,7 @@ def _apply_positioned_rope(
             dump_rope_freqs_on(q_freqs, attention_module.layer_number,
                                attention_module.config.num_layers)
         except Exception as e:
-            prefix_log.warning(f"rope_freqs_on dump failed: {e}")
+            print(f"rope_freqs_on dump failed: {e}")
         ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
         query = apply_rotary_pos_emb(
             query.unsqueeze(1),

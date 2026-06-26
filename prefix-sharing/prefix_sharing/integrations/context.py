@@ -21,12 +21,10 @@ _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
 
 
 @dataclass
-class PackedPrefixRestoreIndex:
+class PackedPrefixLastRestoreIndex:
     reuse_idx_in_batch: int
     provider_idx_in_batch: int
     provider_1d_pos: int
-    reuse_1d_pos: int
-    restore_type: str = "restore_prefix_last"
     target_2d_pos: int = -1
     """Absolute 2D position in output where restored logprob is written."""
     label_value: int = -1
@@ -41,7 +39,7 @@ class PrefixSharingRuntimeContext:
     store: PrefixAttentionStore
     attention_backend: Any | None = None
     kept_position_ids: Any | None = None
-    prefix_restore_indices: list[PackedPrefixRestoreIndex] = field(default_factory=list)
+    prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
     prefix_last_logits_saved: dict[tuple[int, int], Any] = field(default_factory=dict)
     """Saved provider packed logits for prefix-last logprob recompute in 2D space.
 
@@ -49,12 +47,10 @@ class PrefixSharingRuntimeContext:
     cloned from packed logits after temperature scaling, before any
     in-place modification by entropy/logprob computation.
 
-    Only populated for non-interior (prefix-last) restore specs.
-    Interior specs use direct 2D copy instead.
+    Populated for prefix-last restore specs (one per reuser-with-suffix);
+    interior prefix columns are bulk-copied by the 2D restore and need no
+    saved logits.
     """
-    valid_indices: list | None = None
-    """Per-row tensor positions of valid tokens in the original 2D tensors.
-    Used to map planner's valid-space target_2d_pos to tensor-space columns."""
     stats: PrefixSharingStats | None = None
 
     def __init__(self, runtime_state: Any, store: PrefixAttentionStore) -> None:
@@ -64,19 +60,15 @@ class PrefixSharingRuntimeContext:
         self.store = store
         self.attention_backend = runtime_state.attention_backend
         self.kept_position_ids = getattr(runtime_state, "kept_position_ids", None)
-        self.prefix_restore_indices = _build_prefix_restore_indices(
+        self.prefix_last_restore_indices = _build_prefix_last_restore_indices(
             runtime_state.prefix_sharing_plan,
             runtime_state.packed_batch_layout,
         )
         # Provider packed logits saved for prefix-last logprob recompute in 2D
         # space.  Populated lazily by the verl vocab-logprobs patch for each
-        # non-interior (prefix-last) restore spec; read by
+        # prefix-last restore spec (one per reuser-with-suffix); read by
         # restore_reuser_prefix_columns_2d.  Always present (possibly empty).
         self.prefix_last_logits_saved: dict[tuple[int, int], Any] = {}
-        # valid_indices maps planner's valid-space target_2d_pos to tensor
-        # columns; used by the 2D restore path in verl_mcore.  May be absent
-        # on minimal runtime states (e.g. unit-test fixtures).
-        self.valid_indices = getattr(runtime_state, "valid_indices", None)
         # stats drives the per-micro-batch audit log.  Prefer an explicit
         # stats object carried by the runtime state; otherwise derive one
         # from the plan so the audit summary is always available.
@@ -94,75 +86,35 @@ def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
     return _current_context.get()
 
 
-def _resolve_provider_for_position(
-    plan: PrefixSharingPlan,
-    provider_idx: int,
-    target_pos: int,
-) -> int:
-    """Walk up the provider chain to find the nearest ancestor whose
-    packed layout contains ``target_pos`` (absolute original position).
-
-    In chain-reuse scenarios (row 0 → row 1 → row 2), intermediate
-    providers are reusers with truncated packed layouts.  The root
-    provider may also be shorter than the reuser's prefix — in that
-    case intermediate providers contribute the extended range.
-
-    The range is extended left by one position (keep_start - 1) for
-    reusers: that position holds the logprob for the token at
-    keep_start which is still inside the shared prefix.  Its value was
-    computed via prefix-last recompute with the correct shared label
-    and is safe to copy from.
-    """
-    while True:
-        keep_start, keep_end = plan.input_keep_ranges[provider_idx]
-        if keep_start - 1 <= target_pos < keep_end:
-            return provider_idx
-        if plan.is_reuser(provider_idx):
-            provider_idx = plan.provider_index[provider_idx]
-        else:
-            # Can't walk further; return current (should not happen
-            # with valid detection, but guard)
-            return provider_idx
-
-
-def _build_prefix_restore_indices(
+def _build_prefix_last_restore_indices(
     prefix_sharing_plan: PrefixSharingPlan,
     packed_batch_layout: PackedBatchLayout,
-) -> list[PackedPrefixRestoreIndex]:
+) -> list[PackedPrefixLastRestoreIndex]:
+    """Build prefix-last restore indices — one per reuser-with-suffix.
+
+    The planner now emits only prefix-last specs (interior prefix columns are
+    bulk-sliced by the 2D restore off the direct provider's already-restored
+    row, so no per-position index is needed for them). The prefix-last logits
+    always live in the **direct provider's** packed region — chain reuse forces
+    ``prefix_len_reuser > prefix_len_provider`` (a reuser only becomes someone's
+    provider by extending the trie *beyond* its own prefix), so the reuser's
+    prefix-last position ``prefix_len - 1`` is at or beyond the direct
+    provider's ``keep_start`` and thus inside its computed suffix region. No
+    chain walk up to ancestors is needed.
+    """
     indices = []
-    for spec in prefix_sharing_plan.prefix_restore_specs:
-        reuse_idx = spec.reuse_idx_in_batch
-        # Resolve through chain reuse to the nearest provider whose
-        # packed layout contains provider_predict_pos.
-        target_pos = spec.provider_predict_pos
-        resolved_provider = _resolve_provider_for_position(
-            prefix_sharing_plan, spec.provider_idx_in_batch, target_pos
-        )
-
-        # Interior: provider and reuser share the same prefix tokens,
-        # so the logprob at target_pos is identical — just copy.
-        # 2D restore uses provider_idx_in_batch + valid_indices mapping,
-        # no packed-index lookup needed.  1d_pos_in_provider is only used
-        # for prefix-last entries to fetch saved provider logits.
-        provider_offset = (
-            target_pos - prefix_sharing_plan.input_keep_ranges[resolved_provider][0]
-        )
-        if provider_offset >= 0:
-            # target_pos is inside the resolved provider's packed region.
-            pos_1d_in_provider = packed_batch_layout.packed_index(resolved_provider, provider_offset)
-        else:
-            # Interior spec resolved to an intermediate reuser's keep_start-1
-            pos_1d_in_provider = -1
-
-        reuse_1d = -1  # sentinel: no slot in reuser packed region
-
+    for spec in prefix_sharing_plan.prefix_last_restore:
+        provider = spec.provider_idx_in_batch  # direct provider
+        target_pos = spec.target_2d_pos
+        # offset of prefix-last within the direct provider's packed region.
+        # Proven >= 0 (see docstring); guard cheaply to surface regressions.
+        provider_offset = target_pos - prefix_sharing_plan.input_keep_ranges[provider][0]
+        pos_1d_in_provider = packed_batch_layout.packed_index(provider, provider_offset)
         indices.append(
-            PackedPrefixRestoreIndex(
-                reuse_idx_in_batch=reuse_idx,
-                provider_idx_in_batch=resolved_provider,
+            PackedPrefixLastRestoreIndex(
+                reuse_idx_in_batch=spec.reuse_idx_in_batch,
+                provider_idx_in_batch=provider,
                 provider_1d_pos=pos_1d_in_provider,
-                reuse_1d_pos=reuse_1d,
-                restore_type=spec.restore_type,
                 target_2d_pos=spec.target_2d_pos,
                 label_value=spec.label_value,
             )

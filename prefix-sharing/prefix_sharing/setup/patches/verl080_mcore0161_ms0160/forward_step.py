@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from tensordict import TensorDict
-
 
 def _ps_forward_step_probe(event: str, **fields: Any) -> None:
     """Emit a compact rank-aware probe for distributed hang diagnosis."""
@@ -70,7 +68,7 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         # 返回 trimmed_batch（物理裁剪后的 micro-batch）和 ps_state。
         _ps_forward_step_probe("enter")
         _ps_forward_step_probe("before_next_batch")
-        original_batch: TensorDict = next(batch_iter)
+        original_batch = next(batch_iter)
         _ps_forward_step_probe("after_next_batch", batch=_describe_batch(original_batch))
         batch_for_forward = original_batch
 

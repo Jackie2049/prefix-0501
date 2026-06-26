@@ -76,19 +76,18 @@ def test_non_nested_log_probs_returns_unchanged():
     assert torch.equal(result["log_probs"], original)
 
 
-def test_empty_restore_indices_returns_unchanged():
-    """ctx.prefix_restore_indices 为空时 early return（无 restore 需求）。"""
-    state = _make_state([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]])
+def test_no_sharing_returns_output_unchanged():
+    """plan 无 reuser（has_sharing=False）时 early return，输出不变。"""
+    # 两条无公共前缀的序列 → 无 reuse → has_sharing=False
+    state = _make_state([[1, 2, 3, 10, 11], [4, 5, 6, 7, 8]])
     nested = torch.nested.nested_tensor(
         [torch.tensor([1.0, 2.0]), torch.tensor([3.0])], layout=torch.jagged
     )
     output = {"log_probs": nested}
     with prefix_sharing_runtime_context(state) as ctx:
-        saved_indices = ctx.prefix_restore_indices[:]
-        ctx.prefix_restore_indices.clear()
+        assert not ctx.prefix_sharing_plan.has_sharing
         result = restore_via_2d_unfold_verl080(output, _mock_vocab_log_probs_fn)
         assert result is output
-        ctx.prefix_restore_indices.extend(saved_indices)
 
 
 # ═══════════════════════════════════════
@@ -176,11 +175,9 @@ def test_restore_copies_interior_and_recomputes_prefix_last():
     output = {"log_probs": nested_logp}
 
     with prefix_sharing_runtime_context(state) as ctx:
-        assert len(ctx.prefix_restore_indices) == 3
-        prefix_last_idx = [
-            i for i in ctx.prefix_restore_indices
-            if i.restore_type != "restore_prefix_interior"
-        ][0]
+        # 仅 1 条 prefix-last（interior 由 restore 侧 bulk 切片处理，不建索引）
+        assert len(ctx.prefix_last_restore_indices) == 1
+        prefix_last_idx = ctx.prefix_last_restore_indices[0]
         assert prefix_last_idx.target_2d_pos == 2
         assert prefix_last_idx.label_value == 20  # input_ids[1][3]
 
@@ -229,10 +226,7 @@ def test_restore_with_entropy_copies_both_logp_and_entropy():
     output = {"log_probs": nested_logp, "entropy": nested_ent}
 
     with prefix_sharing_runtime_context(state) as ctx:
-        prefix_last_idx = [
-            i for i in ctx.prefix_restore_indices
-            if i.restore_type != "restore_prefix_interior"
-        ][0]
+        prefix_last_idx = ctx.prefix_last_restore_indices[0]
         ctx.prefix_last_logits_saved[
             (prefix_last_idx.reuse_idx_in_batch, prefix_last_idx.target_2d_pos)
         ] = torch.tensor([[0.5, 0.3, 0.1, 0.1]])
@@ -265,10 +259,7 @@ def test_restore_clears_saved_logits_is_callers_responsibility():
     output = {"log_probs": nested_logp}
 
     with prefix_sharing_runtime_context(state) as ctx:
-        prefix_last_idx = [
-            i for i in ctx.prefix_restore_indices
-            if i.restore_type != "restore_prefix_interior"
-        ][0]
+        prefix_last_idx = ctx.prefix_last_restore_indices[0]
         key = (prefix_last_idx.reuse_idx_in_batch, prefix_last_idx.target_2d_pos)
         ctx.prefix_last_logits_saved[key] = torch.tensor([[0.5, 0.3, 0.1, 0.1]])
         restore_via_2d_unfold_verl080(output, _mock_vocab_log_probs_fn)

@@ -28,7 +28,7 @@ class TorchReferenceBackend:
         supports_cuda=True,
         supports_cann=True,
         supports_different_q_kv_lengths=True,
-        supports_prefix_restore=True,
+        supports_prefix_last_restore=True,
         supports_gated_attention=True,
         supports_deltanet_state_reuse=True,
     )
