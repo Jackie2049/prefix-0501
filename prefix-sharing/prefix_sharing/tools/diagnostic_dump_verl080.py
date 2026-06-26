@@ -215,12 +215,14 @@ _ROPE_EMB_BUFFER: dict[int, dict] | None = None
 def dump_rope_emb_verl080(layer_number: int,
                            rotated_query: torch.Tensor,
                            rotated_key: torch.Tensor,
-                           num_layers: int) -> None:
+                           num_layers: int,
+                           positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's post-RoPE Q/K. Auto-flush to ``rope_emb.pt`` on last layer.
 
-    Format: ``{layer_idx: {"query": [T, H, D], "key": [T, H, D]}}``
+    Format: ``{layer_idx: {"query": [T, H, D], "key": [T, H, D], "positions": [T] or None}}``
     ON  packed 只含 suffix（裁剪后），OFF packed 含完整序列。
     cmp 侧用 prefix_lens + cu_seqlens 做 suffix 对齐后对比（同 attn_output 模式）。
+    positions 可选，用于手动排查时的位置回溯。
     """
     global _ROPE_EMB_BUFFER
     dump_dir = _get_dump_dir()
@@ -228,10 +230,13 @@ def dump_rope_emb_verl080(layer_number: int,
         return
     if _ROPE_EMB_BUFFER is None:
         _ROPE_EMB_BUFFER = {}
-    _ROPE_EMB_BUFFER[layer_number] = {
+    entry = {
         "query": rotated_query.detach().cpu().clone(),
         "key": rotated_key.detach().cpu().clone(),
     }
+    if positions is not None:
+        entry["positions"] = positions.detach().cpu().clone()
+    _ROPE_EMB_BUFFER[layer_number] = entry
     if layer_number == num_layers:
         from prefix_sharing.tools.diagnostic_dump import _rank0_only
         if _rank0_only():
