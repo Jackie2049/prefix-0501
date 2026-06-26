@@ -7,7 +7,7 @@
 
   **packed（suffix 对齐）**
     - attention_output per-layer cos   每层 attention 输出余弦相似度
-    - first_token                       packed[0]（attn[0] + logits[0]）
+    - packed_token                      packed[pos]（attn[pos] + logits[pos]，--token 指定 pos，默认 0）
     - logits packed                     全 packed logits suffix 对齐对比
 
   **2D（v080 特有，restore 后 ``[B, L_max]``）**
@@ -32,14 +32,14 @@ dump 文件约定（``diagnostic_dump_verl080``）::
     cu_seqlens_q_logits.pt  [B+1]            logits packed 边界（同上）
 
 Usage:
-    # 完整对比（attn per-layer + first_token + logits + logprobs + entropy）
+    # 完整对比（attn per-layer + packed_token + logits + logprobs + entropy）
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off --tag old
 
     # 只看某一层 attention（1-indexed）
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag old --layer 12
 
-    # top-K 误差最大位置（2D + first_token）
+    # top-K 误差最大位置（2D + packed_token）
     python cmp_diag_verl080.py --dir-on ./dump_on --dir-off ./dump_off \\
         --tag old --topk 20
 
@@ -132,7 +132,7 @@ def _pearson_r(t1: torch.Tensor, t2: torch.Tensor,
     return float("nan") if sx == 0 or sy == 0 else float(cov / (sx * sy))
 
 
-def _first_token_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
+def _vec_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
     err = _error_abs_rel(a_vec, b_vec)
     cos = float(_cosine_sim(a_vec, b_vec, dim=-1))
     pr = _pearson_r(a_vec, b_vec)
@@ -268,12 +268,12 @@ def _align_packed(on_tensor: torch.Tensor, off_tensor: torch.Tensor,
 #  Logits helpers
 # ════════════════════════════════════════════════════════════════
 
-def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
-                        ) -> tuple[torch.Tensor, torch.Tensor]:
-    """取 packed[0] 的 full-vocab 向量（logits 词表恒在最后一维）。"""
+def _logits_at_pos(lo: torch.Tensor, lf: torch.Tensor,
+                   pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """取 packed[pos] 的 full-vocab 向量（logits 词表恒在最后一维）。"""
     lo_2d = lo.reshape(-1, lo.size(-1))
     lf_2d = lf.reshape(-1, lf.size(-1))
-    return lo_2d[0, :].contiguous(), lf_2d[0, :].contiguous()
+    return lo_2d[pos, :].contiguous(), lf_2d[pos, :].contiguous()
 
 
 def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
@@ -284,7 +284,7 @@ def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
 
 
 # ════════════════════════════════════════════════════════════════
-#  Packed compare: attention_output / first_token / logits
+#  Packed compare: attention_output / packed_token / logits
 # ════════════════════════════════════════════════════════════════
 
 def _cos_for_layer(a: torch.Tensor, b: torch.Tensor,
@@ -357,32 +357,36 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
                        metrics={"layers": results})
 
 
-def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
-    """packed[0] 对比：最后一层 attn[0] + logits[0]。
+def cmp_packed_token(dir_on: str, dir_off: str,
+                     pos: int = 0, layer: int | None = None) -> list[CheckResult]:
+    """packed[pos] 对比：attn[pos]（可指定层）+ logits[pos]（仅最后一层）。
 
-    第一个序列（row 0）永远是 provider（完整序列），packed[0] 是完整 suffix token，
-    可直接对比无需对齐。
+    - pos：packed 里的 token 位置（单个 int，默认 0）。不是 2D 位置。
+    - attn：用 *layer*（默认最后一层）。对比第 1 层可区分
+      "结构错（位置/RoPE/mask，第 1 层就偏）" vs "数值累积（第 1 层完美、深层才偏）"。
+    - logits：永远最后一层。logits 只在最后产生，不受 *layer* 影响。
     """
     results: list[CheckResult] = []
-    last = _get_num_layers(dir_on) or _get_num_layers(dir_off)
+    attn_layer = layer if layer is not None else (
+        _get_num_layers(dir_on) or _get_num_layers(dir_off))
 
-    if last:
-        a = _load_attn_output(dir_on, last)
-        b = _load_attn_output(dir_off, last)
+    if attn_layer:
+        a = _load_attn_output(dir_on, attn_layer)
+        b = _load_attn_output(dir_off, attn_layer)
         if a is not None and b is not None:
             a0 = a.squeeze(1) if a.dim() == 3 else a
             b0 = b.squeeze(1) if b.dim() == 3 else b
             results.append(CheckResult(
-                name="first_token_attn",
-                metrics=_first_token_metrics(a0[0], b0[0])))
+                name=f"attn_L{attn_layer}_pos{pos}",
+                metrics=_vec_metrics(a0[pos], b0[pos])))
 
     lo = _load_logits(dir_on)
     lf = _load_logits(dir_off)
     if lo is not None and lf is not None:
-        lo_first, lf_first = _logits_first_token(lo, lf)
+        lo_p, lf_p = _logits_at_pos(lo, lf, pos)
         results.append(CheckResult(
-            name="first_token_logits",
-            metrics=_first_token_metrics(lo_first, lf_first)))
+            name=f"logits_pos{pos}",
+            metrics=_vec_metrics(lo_p, lf_p)))
     return results
 
 
@@ -736,8 +740,8 @@ def _print_per_layer(r: CheckResult):
     print()
 
 
-def _print_first_token(r: CheckResult):
-    print(_SEP_SINGLE + f"\n  [first_token]  {r.name}  (packed position [0])")
+def _print_packed_token(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [packed_token]  {r.name}")
     print(_SEP_SINGLE)
     m = r.metrics
     for k in ["mean_abs", "max_abs", "rel_max", "rel_mean", "cos", "pearson"]:
@@ -778,8 +782,11 @@ def _print_2d_result(r: CheckResult):
 
 
 def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
-                    topk: int, sort_by: str, label: str):
-    """1D 向量 top-K（first_token per-dim）。"""
+                    topk: int, sort_by: str, label: str, show_rel: bool = True):
+    """1D 向量 top-K（packed_token per-dim）。
+
+    show_rel=False 时省略 REL_ERR 列（用于 logits 表，只看 val/abs）。
+    """
     abs_err = (on_vec - off_vec).abs()
     rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
     if sort_by == "abs":
@@ -791,10 +798,16 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
     _, idx = sort_key.topk(min(topk, sort_key.numel()))
     idx = idx.to(torch.long)
     print(f"\n  [{label}]  top-{topk} dims (sort by {sort_by})")
-    print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}  {'REL_ERR':>12s}")
-    for i in idx.tolist():
-        print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
-              f"  {float(abs_err[i]):>12.6e}  {float(rel_err[i]):>12.6e}")
+    if show_rel:
+        print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}  {'REL_ERR':>12s}")
+        for i in idx.tolist():
+            print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
+                  f"  {float(abs_err[i]):>12.6e}  {float(rel_err[i]):>12.6e}")
+    else:
+        print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}")
+        for i in idx.tolist():
+            print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
+                  f"  {float(abs_err[i]):>12.6e}")
 
 
 def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
@@ -875,7 +888,11 @@ def main():
     ap.add_argument("--mask", choices=["label", "attention", "none"],
                     default="label", help="2D mask type (default: label)")
     ap.add_argument("--layer", type=int, default=None,
-                    help="Compare specific attn layer 1-indexed (default: all)")
+                    help="Compare specific attn layer 1-indexed (default: all). "
+                         "Also used by packed_token attn (default: last layer).")
+    ap.add_argument("--token", type=int, default=0,
+                    help="Packed token position for packed_token compare "
+                         "(single int index, default: 0)")
     ap.add_argument("--atol", type=float, default=1e-5,
                     help="Absolute tolerance for 2D (default: 1e-5)")
     ap.add_argument("--topk", type=int, default=0,
@@ -919,27 +936,32 @@ def main():
         all_results.append(r)
         _print_per_layer(r)
 
-    # ── packed: first_token（attn[0] + logits[0]） ──
-    ft_results = cmp_first_token(args.dir_on, args.dir_off)
-    for r in ft_results:
+    # ── packed: packed_token（attn[pos] + logits[pos]） ──
+    # pos 由 --token 指定（默认 0）；attn 用 --layer 指定的层（默认最后一层）；
+    # logits 永远最后一层（logits 只在最后产生）。
+    pos = args.token
+    pt_results = cmp_packed_token(args.dir_on, args.dir_off, pos, args.layer)
+    for r in pt_results:
         all_results.append(r)
-        _print_first_token(r)
-    # first_token top-K（per-dim）
-    if args.topk > 0 and ft_results:
-        last = _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off)
-        if last:
-            a = _load_attn_output(args.dir_on, last)
-            b = _load_attn_output(args.dir_off, last)
+        _print_packed_token(r)
+    # packed_token top-K（per-dim）
+    if args.topk > 0 and pt_results:
+        attn_layer = args.layer if args.layer is not None else (
+            _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off))
+        if attn_layer:
+            a = _load_attn_output(args.dir_on, attn_layer)
+            b = _load_attn_output(args.dir_off, attn_layer)
             if a is not None and b is not None:
-                a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
-                b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
-                _print_topk_vec(a0, b0, args.topk, "val", "first_token_attn")
+                ap = (a.squeeze(1) if a.dim() == 3 else a)[pos].cpu()
+                bp = (b.squeeze(1) if b.dim() == 3 else b)[pos].cpu()
+                _print_topk_vec(ap, bp, args.topk, "val",
+                                f"attn_L{attn_layer}_pos{pos}")
         lo = _load_logits(args.dir_on)
         lf = _load_logits(args.dir_off)
         if lo is not None and lf is not None:
-            lo_f, lf_f = _logits_first_token(lo, lf)
-            _print_topk_vec(lo_f.cpu(), lf_f.cpu(), args.topk,
-                            args.sort_err, "first_token_logits")
+            lo_p, lf_p = _logits_at_pos(lo, lf, pos)
+            _print_topk_vec(lo_p.cpu(), lf_p.cpu(), args.topk,
+                            "val", f"logits_pos{pos}", show_rel=False)
 
     # ── packed: logits（suffix 对齐） ──
     r = cmp_logits_packed(args.dir_on, args.dir_off)
