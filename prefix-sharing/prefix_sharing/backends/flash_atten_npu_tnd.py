@@ -205,7 +205,9 @@ class NpuFlashAttentionTndBackend(FlashAttentionMixin):
         npu_fusion_attention = _import_npu_fusion_attention()
 
         # Step 1: 剥 Q 的 TP padding + 取 cu_seqlens_q/kv（plan 语义长度，带前导 0）。
-        q, k, v, cu_seqlens_q, cu_seqlens_kv, _, _, _, pad_layout = (
+        # _prepare_flash_inputs 返回 8 元组：q, k, v, cu_seqlens_q, cu_seqlens_kv,
+        # max_seqlen_q, max_seqlen_kv, pad_layout（max_seqlen_* 这里不用）。
+        q, k, v, cu_seqlens_q, cu_seqlens_kv, _, _, pad_layout = (
             self._prepare_flash_inputs(
                 query,
                 key,
