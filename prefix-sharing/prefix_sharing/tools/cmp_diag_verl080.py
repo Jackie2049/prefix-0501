@@ -840,8 +840,11 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
         sort_key = abs_err
     elif sort_by == "rel":
         sort_key = rel_err
-    else:  # "val"
-        sort_key = torch.maximum(on_vec.abs(), off_vec.abs())
+    else:  # "val" —— 带符号的实际值，不是绝对值
+        # 对 logits：绝对值大但符号为负的 logit，softmax 后概率极低、不会被选中。
+        # 按 abs 排会把这种"必不选"的 token 顶到表头，掩盖真正的高 logit 候选。
+        # 改用 max(on, off) 带符号值，让真正的高 logit（候选 token）排前面。
+        sort_key = torch.maximum(on_vec, off_vec)
     _, idx = sort_key.topk(min(topk, sort_key.numel()))
     idx = idx.to(torch.long)
     print(f"\n  [{label}]  top-{topk} dims (sort by {sort_by})")
