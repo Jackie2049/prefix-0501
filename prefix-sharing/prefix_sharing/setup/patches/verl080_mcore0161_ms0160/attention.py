@@ -55,8 +55,9 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             import os as _os
             if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 from prefix_sharing.tools.diagnostic_dump import (
-                    dump_attn_off, dump_rope_freqs_off, dump_rope_emb_layer,
+                    dump_attn_off, dump_rope_freqs_off,
                 )
+                from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_emb_verl080
                 from prefix_sharing.integrations.megatron_runtime import _unpack_rotary_pos_emb
                 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
                 _attn_out = _result[0] if isinstance(_result, tuple) else _result
@@ -96,7 +97,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                             _off_k.unsqueeze(1), _off_k_freqs,
                             config=self.config, cu_seqlens=None,
                         ).squeeze(1)
-                        dump_rope_emb_layer(
+                        dump_rope_emb_verl080(
                             self.layer_number, _off_q_rope, _off_k_rope,
                             self.config.num_layers,
                             positions=_off_positions,

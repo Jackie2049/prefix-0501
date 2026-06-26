@@ -203,3 +203,40 @@ def dump_entropy_2d_verl080(ent_2d: torch.Tensor | None, tag: str) -> None:
     if dump_dir is None or ent_2d is None:
         return
     _save_tensor(f"entropy_{tag}.pt", ent_2d, dump_dir)
+
+
+# ════════════════════════════════════════════════════════════════
+#  Post-RoPE Q/K dump (per layer)
+# ════════════════════════════════════════════════════════════════
+
+_ROPE_EMB_BUFFER: dict[int, dict] | None = None
+
+
+def dump_rope_emb_verl080(layer_number: int,
+                           rotated_query: torch.Tensor,
+                           rotated_key: torch.Tensor,
+                           num_layers: int) -> None:
+    """Accumulate one layer's post-RoPE Q/K. Auto-flush to ``rope_emb.pt`` on last layer.
+
+    Format: ``{layer_idx: {"query": [T, H, D], "key": [T, H, D]}}``
+    ON  packed 只含 suffix（裁剪后），OFF packed 含完整序列。
+    cmp 侧用 prefix_lens + cu_seqlens 做 suffix 对齐后对比（同 attn_output 模式）。
+    """
+    global _ROPE_EMB_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _ROPE_EMB_BUFFER is None:
+        _ROPE_EMB_BUFFER = {}
+    _ROPE_EMB_BUFFER[layer_number] = {
+        "query": rotated_query.detach().cpu().clone(),
+        "key": rotated_key.detach().cpu().clone(),
+    }
+    if layer_number == num_layers:
+        from prefix_sharing.tools.diagnostic_dump import _rank0_only
+        if _rank0_only():
+            try:
+                torch.save(_ROPE_EMB_BUFFER, os.path.join(dump_dir, "rope_emb.pt"))
+            except Exception:
+                pass
+        _ROPE_EMB_BUFFER = None

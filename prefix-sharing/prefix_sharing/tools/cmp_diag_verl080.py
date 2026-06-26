@@ -434,6 +434,171 @@ def cmp_packed_token(dir_on: str, dir_off: str,
     return results
 
 
+# ══════════════════════════════════════════════════════════════════
+#  Post-RoPE Q/K compare: per-layer + packed_token
+# ══════════════════════════════════════════════════════════════════
+
+def _load_rope_emb(dir_path: str, layer: int
+                   ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Load post-RoPE Q/K for a single layer from rope_emb.pt.
+
+    Returns ``(query, key)`` or ``(None, None)``.
+    """
+    fp = os.path.join(dir_path, "rope_emb.pt")
+    if not os.path.exists(fp):
+        return None, None
+    d = torch.load(fp, weights_only=True)
+    if not isinstance(d, dict):
+        return None, None
+    entry = d.get(layer)
+    if entry is None:
+        return None, None
+    return entry.get("query"), entry.get("key")
+
+
+def _rope_emb_cos_for_layer(qa: torch.Tensor, ka: torch.Tensor,
+                             qb: torch.Tensor, kb: torch.Tensor,
+                             align_mask: torch.Tensor | None = None) -> dict:
+    """单层 Q/K suffix 对齐 + per-token cosine（Q 和 K 分别算）。"""
+    # Q/K shape: [T, H, D] → 压平 head*dim 维度算 cosine
+    qa_flat = qa.reshape(qa.shape[0], -1)
+    qb_flat = qb.reshape(qb.shape[0], -1)
+    ka_flat = ka.reshape(ka.shape[0], -1)
+    kb_flat = kb.reshape(kb.shape[0], -1)
+
+    if align_mask is not None and qa.shape[0] != qb.shape[0]:
+        qa_flat, qb_flat = _align_packed(qa_flat, qb_flat, align_mask)
+        ka_flat, kb_flat = _align_packed(ka_flat, kb_flat, align_mask)
+
+    q_cos = _cosine_sim(qa_flat, qb_flat, dim=-1)
+    k_cos = _cosine_sim(ka_flat, kb_flat, dim=-1)
+    return {
+        "n_tokens": qa_flat.shape[0],
+        "Q_cos_avg": float(q_cos.mean()), "Q_cos_min": float(q_cos.min()),
+        "K_cos_avg": float(k_cos.mean()), "K_cos_min": float(k_cos.min()),
+    }
+
+
+def cmp_rope_emb_layer(dir_on: str, dir_off: str,
+                        layer: int | None) -> CheckResult | None:
+    """Post-RoPE Q/K per-layer cosine（suffix 对齐）。
+
+    单层模式（layer 给定）：返回该层 Q/K cos。全层模式：返回所有层汇总。
+    """
+    align_mask = _build_attn_align_mask(dir_on, dir_off)
+
+    if layer is not None:
+        q_on, k_on = _load_rope_emb(dir_on, layer)
+        q_off, k_off = _load_rope_emb(dir_off, layer)
+        if q_on is None or q_off is None:
+            return None
+        need = align_mask is not None and q_on.shape[0] != q_off.shape[0]
+        try:
+            d = _rope_emb_cos_for_layer(q_on, k_on, q_off, k_off,
+                                         align_mask if need else None)
+        except ValueError as e:
+            return CheckResult(name=f"rope_emb_L{layer}", passed=False,
+                               metrics={"error": str(e)})
+        d["layer"] = layer
+        ok = (d["Q_cos_avg"] > _COS_AVG_PASS and d["Q_cos_min"] > _COS_MIN_PASS
+              and d["K_cos_avg"] > _COS_AVG_PASS and d["K_cos_min"] > _COS_MIN_PASS)
+        return CheckResult(name=f"rope_emb_L{layer}", passed=ok, metrics=d)
+
+    # All layers
+    fa = os.path.join(dir_on, "rope_emb.pt")
+    fb = os.path.join(dir_off, "rope_emb.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    da = torch.load(fa, weights_only=True)
+    db = torch.load(fb, weights_only=True)
+    if not isinstance(da, dict) or not isinstance(db, dict):
+        return None
+
+    results = {}
+    for lyr in sorted(set(da.keys()) & set(db.keys())):
+        ea, eb = da[lyr], db[lyr]
+        qa, ka = ea.get("query"), ea.get("key")
+        qb, kb = eb.get("query"), eb.get("key")
+        if qa is None or qb is None:
+            continue
+        need = align_mask is not None and qa.shape[0] != qb.shape[0]
+        try:
+            results[lyr] = _rope_emb_cos_for_layer(qa, ka, qb, kb,
+                                                    align_mask if need else None)
+        except ValueError as e:
+            results[lyr] = {"error": str(e)}
+    return CheckResult(name="rope_emb_per_layer", passed=True,
+                       metrics={"layers": results})
+
+
+def _rope_emb_vec_at_pos(q_on: torch.Tensor | None, k_on: torch.Tensor | None,
+                          q_off: torch.Tensor | None, k_off: torch.Tensor | None,
+                          pos: int,
+                          align_mask: torch.Tensor | None
+                          ) -> tuple[torch.Tensor, torch.Tensor,
+                                     torch.Tensor, torch.Tensor] | None:
+    """Q/K suffix 对齐后取 [pos]，返回 (q_on, q_off, k_on, k_off) 四向量。
+
+    每个向量压平 [H*D]，可直接做 vec_metrics 对比。
+    """
+    if q_on is None or q_off is None:
+        return None
+    q_on_f = q_on.reshape(q_on.shape[0], -1)
+    q_off_f = q_off.reshape(q_off.shape[0], -1)
+    k_on_f = k_on.reshape(k_on.shape[0], -1) if k_on is not None else None
+    k_off_f = k_off.reshape(k_off.shape[0], -1) if k_off is not None else None
+
+    if align_mask is not None and q_on.shape[0] != q_off.shape[0]:
+        try:
+            q_on_f, q_off_f = _align_packed(q_on_f, q_off_f, align_mask)
+            if k_on_f is not None:
+                k_on_f, k_off_f = _align_packed(k_on_f, k_off_f, align_mask)
+        except ValueError:
+            return None
+    n = min(q_on_f.shape[0], q_off_f.shape[0])
+    if pos < 0 or pos >= n:
+        return None
+    qo = q_on_f[pos].contiguous()
+    qf = q_off_f[pos].contiguous()
+    ko = k_on_f[pos].contiguous() if k_on_f is not None else None
+    kf = k_off_f[pos].contiguous() if k_off_f is not None else None
+    return qo, qf, ko, kf
+
+
+def cmp_rope_emb_token(dir_on: str, dir_off: str,
+                        pos: int = 0, layer: int | None = None,
+                        align_mask: torch.Tensor | None = None
+                        ) -> list[CheckResult]:
+    """Q/K packed[pos] 对比（**suffix 对齐后**）。
+
+    对 Q 和 K 分别输出 attn_L{lyr}_Q_pos{pos} / attn_L{lyr}_K_pos{pos}。
+    """
+    if align_mask is None:
+        align_mask = _build_attn_align_mask(dir_on, dir_off)
+    results: list[CheckResult] = []
+    rope_layer = layer if layer is not None else (
+        _get_num_layers(dir_on) or _get_num_layers(dir_off))
+
+    if rope_layer:
+        q_on, k_on = _load_rope_emb(dir_on, rope_layer)
+        q_off, k_off = _load_rope_emb(dir_off, rope_layer)
+        vecs = _rope_emb_vec_at_pos(q_on, k_on, q_off, k_off, pos, align_mask)
+        if vecs is None:
+            results.append(CheckResult(
+                name=f"rope_emb_L{rope_layer}_pos{pos}",
+                metrics={"error": f"无法对齐或 pos {pos} 越界"}))
+        else:
+            qo, qf, ko, kf = vecs
+            results.append(CheckResult(
+                name=f"rope_emb_L{rope_layer}_Q_pos{pos}",
+                metrics=_vec_metrics(qo, qf)))
+            if ko is not None and kf is not None:
+                results.append(CheckResult(
+                    name=f"rope_emb_L{rope_layer}_K_pos{pos}",
+                    metrics=_vec_metrics(ko, kf)))
+    return results
+
+
 def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     """全 packed logits suffix 对齐 + per-token cosine。"""
     lo = _load_logits(dir_on)
@@ -784,6 +949,45 @@ def _print_per_layer(r: CheckResult):
     print()
 
 
+def _print_rope_emb_per_layer(r: CheckResult):
+    print(_SEP_SINGLE + "\n  [rope_emb]  Post-RoPE Q/K Per-Layer Cosine Similarity")
+    print(_SEP_SINGLE)
+    layers = r.metrics.get("layers")
+    if isinstance(layers, dict):
+        print(f"  {'LAYER':>6s}  {'Q_COS_AVG':>14s}  {'Q_COS_MIN':>14s}  "
+              f"{'K_COS_AVG':>14s}  {'K_COS_MIN':>14s}  "
+              f"{'TOKENS':>8s}  {'STATUS':>8s}")
+        print(f"  {'─' * 6}  {'─' * 14}  {'─' * 14}  {'─' * 14}  {'─' * 14}  "
+              f"{'─' * 8}  {'─' * 8}")
+        bad = []
+        for lyr in sorted(layers.keys()):
+            d = layers[lyr]
+            if "error" in d:
+                print(f"  {lyr:>6d}  {d['error']}")
+                bad.append(lyr)
+                continue
+            ok = (d["Q_cos_avg"] > _COS_AVG_PASS and d["Q_cos_min"] > _COS_MIN_PASS
+                  and d["K_cos_avg"] > _COS_AVG_PASS and d["K_cos_min"] > _COS_MIN_PASS)
+            print(f"  {lyr:>6d}  {d['Q_cos_avg']:>14.6e}  {d['Q_cos_min']:>14.6e}  "
+                  f"{d['K_cos_avg']:>14.6e}  {d['K_cos_min']:>14.6e}  "
+                  f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
+            if not ok:
+                bad.append(lyr)
+        if bad:
+            print(f"\n  ⚠ First deviating layer: {bad[0]}")
+    elif "Q_cos_avg" in r.metrics:
+        d = r.metrics
+        ok = (d["Q_cos_avg"] > _COS_AVG_PASS and d["Q_cos_min"] > _COS_MIN_PASS
+              and d["K_cos_avg"] > _COS_AVG_PASS and d["K_cos_min"] > _COS_MIN_PASS)
+        print(f"  L{d['layer']}  Q_cos_avg={d['Q_cos_avg']:.6e}  "
+              f"Q_cos_min={d['Q_cos_min']:.6e}  "
+              f"K_cos_avg={d['K_cos_avg']:.6e}  K_cos_min={d['K_cos_min']:.6e}  "
+              f"{'PASS' if ok else 'WARN'}")
+    elif "error" in r.metrics:
+        print(f"  {_CROSS} {r.metrics['error']}")
+    print()
+
+
 def _print_packed_token(r: CheckResult):
     print(_SEP_SINGLE + f"\n  [packed_token]  {r.name}")
     print(_SEP_SINGLE)
@@ -986,6 +1190,12 @@ def main():
         all_results.append(r)
         _print_per_layer(r)
 
+    # ── packed: post-RoPE Q/K per-layer cos ──
+    r = cmp_rope_emb_layer(args.dir_on, args.dir_off, args.layer)
+    if r:
+        all_results.append(r)
+        _print_rope_emb_per_layer(r)
+
     # ── packed: packed_token（attn[pos] + logits[pos]，suffix 对齐后） ──
     # pos 由 --token 指定（默认 0，索引对齐后的 suffix-packed 空间）；
     # attn 用 --layer 指定的层（默认最后一层）；logits 永远最后一层。
@@ -1019,6 +1229,28 @@ def main():
     if r:
         all_results.append(r)
         _print_logits_packed(r)
+
+    # ── packed: post-RoPE Q/K packed_token ──
+    rope_pt_results = cmp_rope_emb_token(args.dir_on, args.dir_off, pos, args.layer,
+                                          align_mask=align_mask)
+    for r in rope_pt_results:
+        all_results.append(r)
+        _print_packed_token(r)
+    # rope_emb packed_token top-K
+    if args.topk > 0 and rope_pt_results:
+        rope_layer = args.layer if args.layer is not None else (
+            _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off))
+        if rope_layer:
+            q_on, k_on = _load_rope_emb(args.dir_on, rope_layer)
+            q_off, k_off = _load_rope_emb(args.dir_off, rope_layer)
+            vecs = _rope_emb_vec_at_pos(q_on, k_on, q_off, k_off, pos, align_mask)
+            if vecs is not None:
+                qo, qf, ko, kf = vecs
+                _print_topk_vec(qo.cpu(), qf.cpu(), args.topk, "val",
+                                f"rope_emb_L{rope_layer}_Q_pos{pos}")
+                if ko is not None and kf is not None:
+                    _print_topk_vec(ko.cpu(), kf.cpu(), args.topk, "val",
+                                    f"rope_emb_L{rope_layer}_K_pos{pos}")
 
     # ── 2D: logprobs + entropy ──
     for fname, cname in [("logprobs", "logp"), ("entropy", "entropy")]:
