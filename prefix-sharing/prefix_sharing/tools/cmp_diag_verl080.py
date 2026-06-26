@@ -268,12 +268,41 @@ def _align_packed(on_tensor: torch.Tensor, off_tensor: torch.Tensor,
 #  Logits helpers
 # ════════════════════════════════════════════════════════════════
 
-def _logits_at_pos(lo: torch.Tensor, lf: torch.Tensor,
-                   pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-    """取 packed[pos] 的 full-vocab 向量（logits 词表恒在最后一维）。"""
-    lo_2d = lo.reshape(-1, lo.size(-1))
-    lf_2d = lf.reshape(-1, lf.size(-1))
-    return lo_2d[pos, :].contiguous(), lf_2d[pos, :].contiguous()
+def _aligned_vec_at_pos(
+    on_tensor: torch.Tensor | None,
+    off_tensor: torch.Tensor | None,
+    is_attn: bool,
+    pos: int,
+    align_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """ON(suffix-only)/OFF(full-packed) 的 packed 张量 **suffix 对齐后** 取 [pos]。
+
+    ON 物理裁剪后只含 suffix，OFF 含完整序列，两者 token 不直接对应——必须先用
+    align_mask 把 OFF 的 suffix 段抽出来与 ON 对齐，再取 [pos]。pos 索引的是
+    对齐后的 suffix-packed 空间（ON/OFF 一致，指向同一个 token）。
+
+    - is_attn=True：attn_output ``[T,1,hidden]`` → ``[T,hidden]``。
+    - is_attn=False：logits → ``[N, V]``（vocab 恒在最后一维）。
+    返回 (on_vec, off_vec)（同 token、同向量长度），或 None（数据缺失 / pos 越界 /
+    对齐失败）。
+    """
+    if on_tensor is None or off_tensor is None:
+        return None
+    if is_attn:
+        on = on_tensor.squeeze(1) if on_tensor.dim() == 3 else on_tensor
+        off = off_tensor.squeeze(1) if off_tensor.dim() == 3 else off_tensor
+    else:
+        on = on_tensor.reshape(-1, on_tensor.size(-1))
+        off = off_tensor.reshape(-1, off_tensor.size(-1))
+    if align_mask is not None and on.shape[0] != off.shape[0]:
+        try:
+            on, off = _align_packed(on, off, align_mask)
+        except ValueError:
+            return None
+    n = min(on.shape[0], off.shape[0])
+    if pos < 0 or pos >= n:
+        return None
+    return on[pos].contiguous(), off[pos].contiguous()
 
 
 def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
@@ -358,14 +387,22 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
 
 
 def cmp_packed_token(dir_on: str, dir_off: str,
-                     pos: int = 0, layer: int | None = None) -> list[CheckResult]:
-    """packed[pos] 对比：attn[pos]（可指定层）+ logits[pos]（仅最后一层）。
+                     pos: int = 0, layer: int | None = None,
+                     align_mask: torch.Tensor | None = None) -> list[CheckResult]:
+    """packed[pos] 对比（**suffix 对齐后**）：attn[pos]（可指定层）+ logits[pos]（仅最后一层）。
 
-    - pos：packed 里的 token 位置（单个 int，默认 0）。不是 2D 位置。
+    ON 是裁剪后的 suffix-only packed，OFF 是完整 packed，两者 token **不直接对应**——
+    必须先用 align_mask（OFF cu_seqlens + ON prefix_lens）把 OFF 的 suffix 段抽出来
+    与 ON 对齐，再取 [pos]。pos 索引的是对齐后的 suffix-packed 空间（ON/OFF 一致）。
+
+    - pos：对齐后 suffix-packed 里的位置（单个 int，默认 0）。
     - attn：用 *layer*（默认最后一层）。对比第 1 层可区分
-      "结构错（位置/RoPE/mask，第 1 层就偏）" vs "数值累积（第 1 层完美、深层才偏）"。
-    - logits：永远最后一层。logits 只在最后产生，不受 *layer* 影响。
+      "结构错（第 1 层就偏）" vs "数值累积（第 1 层完美、深层才偏）"。
+    - logits：永远最后一层。
+    - align_mask：可选，复用调用方已构建的；None 则内部构建。
     """
+    if align_mask is None:
+        align_mask = _build_attn_align_mask(dir_on, dir_off)
     results: list[CheckResult] = []
     attn_layer = layer if layer is not None else (
         _get_num_layers(dir_on) or _get_num_layers(dir_off))
@@ -373,20 +410,27 @@ def cmp_packed_token(dir_on: str, dir_off: str,
     if attn_layer:
         a = _load_attn_output(dir_on, attn_layer)
         b = _load_attn_output(dir_off, attn_layer)
-        if a is not None and b is not None:
-            a0 = a.squeeze(1) if a.dim() == 3 else a
-            b0 = b.squeeze(1) if b.dim() == 3 else b
+        vecs = _aligned_vec_at_pos(a, b, True, pos, align_mask)
+        if vecs is None:
             results.append(CheckResult(
                 name=f"attn_L{attn_layer}_pos{pos}",
-                metrics=_vec_metrics(a0[pos], b0[pos])))
+                metrics={"error": f"无法对齐或 pos {pos} 越界"}))
+        else:
+            results.append(CheckResult(
+                name=f"attn_L{attn_layer}_pos{pos}",
+                metrics=_vec_metrics(vecs[0], vecs[1])))
 
     lo = _load_logits(dir_on)
     lf = _load_logits(dir_off)
-    if lo is not None and lf is not None:
-        lo_p, lf_p = _logits_at_pos(lo, lf, pos)
+    vecs = _aligned_vec_at_pos(lo, lf, False, pos, align_mask)
+    if vecs is None:
         results.append(CheckResult(
             name=f"logits_pos{pos}",
-            metrics=_vec_metrics(lo_p, lf_p)))
+            metrics={"error": f"无法对齐或 pos {pos} 越界"}))
+    else:
+        results.append(CheckResult(
+            name=f"logits_pos{pos}",
+            metrics=_vec_metrics(vecs[0], vecs[1])))
     return results
 
 
@@ -744,6 +788,9 @@ def _print_packed_token(r: CheckResult):
     print(_SEP_SINGLE + f"\n  [packed_token]  {r.name}")
     print(_SEP_SINGLE)
     m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}\n")
+        return
     for k in ["mean_abs", "max_abs", "rel_max", "rel_mean", "cos", "pearson"]:
         v = m.get(k)
         if v is not None:
@@ -936,31 +983,32 @@ def main():
         all_results.append(r)
         _print_per_layer(r)
 
-    # ── packed: packed_token（attn[pos] + logits[pos]） ──
-    # pos 由 --token 指定（默认 0）；attn 用 --layer 指定的层（默认最后一层）；
-    # logits 永远最后一层（logits 只在最后产生）。
+    # ── packed: packed_token（attn[pos] + logits[pos]，suffix 对齐后） ──
+    # pos 由 --token 指定（默认 0，索引对齐后的 suffix-packed 空间）；
+    # attn 用 --layer 指定的层（默认最后一层）；logits 永远最后一层。
     pos = args.token
-    pt_results = cmp_packed_token(args.dir_on, args.dir_off, pos, args.layer)
+    align_mask = _build_attn_align_mask(args.dir_on, args.dir_off)
+    pt_results = cmp_packed_token(args.dir_on, args.dir_off, pos, args.layer,
+                                  align_mask=align_mask)
     for r in pt_results:
         all_results.append(r)
         _print_packed_token(r)
-    # packed_token top-K（per-dim）
+    # packed_token top-K（per-dim，同样先对齐再取 [pos]）
     if args.topk > 0 and pt_results:
         attn_layer = args.layer if args.layer is not None else (
             _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off))
         if attn_layer:
             a = _load_attn_output(args.dir_on, attn_layer)
             b = _load_attn_output(args.dir_off, attn_layer)
-            if a is not None and b is not None:
-                ap = (a.squeeze(1) if a.dim() == 3 else a)[pos].cpu()
-                bp = (b.squeeze(1) if b.dim() == 3 else b)[pos].cpu()
-                _print_topk_vec(ap, bp, args.topk, "val",
+            vecs = _aligned_vec_at_pos(a, b, True, pos, align_mask)
+            if vecs is not None:
+                _print_topk_vec(vecs[0].cpu(), vecs[1].cpu(), args.topk, "val",
                                 f"attn_L{attn_layer}_pos{pos}")
         lo = _load_logits(args.dir_on)
         lf = _load_logits(args.dir_off)
-        if lo is not None and lf is not None:
-            lo_p, lf_p = _logits_at_pos(lo, lf, pos)
-            _print_topk_vec(lo_p.cpu(), lf_p.cpu(), args.topk,
+        vecs = _aligned_vec_at_pos(lo, lf, False, pos, align_mask)
+        if vecs is not None:
+            _print_topk_vec(vecs[0].cpu(), vecs[1].cpu(), args.topk,
                             "val", f"logits_pos{pos}", show_rel=False)
 
     # ── packed: logits（suffix 对齐） ──
