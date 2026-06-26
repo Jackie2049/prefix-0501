@@ -641,7 +641,18 @@ def build_prefix_sharing_micro_batch_verl080(
 
     # ── 阶段 4: 前缀共享规划 ──
     plan = PrefixSharingPlanner(ps_config).plan(sequences)
-    if not plan.has_sharing:
+
+    # 诊断开关 PREFIX_SHARING_FORCE_ZERO_PREFIX：detect() 被旁路返回 0-prefix，此处
+    # plan.has_sharing=False。仍要让 ON pipeline 跑（prefix_attention 用 mode-3 跑全
+    # 序列、无裁剪/注入），故旁路 has_sharing 早返回。用于隔离 "kernel-mode 差异"：
+    #   ON(0-prefix, mode 3, 全序列) vs OFF(mode 2, 全序列)
+    #   ≈ → kernel mode 不是根因，偏差来自裁剪/注入；偏差大 → kernel mode 是根因。
+    import os as _os_force_zero
+    _force_zero_prefix = bool(_os_force_zero.environ.get("PREFIX_SHARING_FORCE_ZERO_PREFIX"))
+    if _force_zero_prefix:
+        print("[PS][prepare] FORCE_ZERO_PREFIX: 跳过 has_sharing 早返回，"
+              "ON pipeline 用 mode-3 跑全序列（无裁剪/注入）")
+    elif not plan.has_sharing:
         print("[PS][prepare] no prefix sharing detected")
         return batch, None
 
