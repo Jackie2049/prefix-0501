@@ -174,16 +174,24 @@ def _apply_positioned_rope(
         dim_half = q_pos_emb.shape[-1] // 2
         step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
 
-        # ── [PS-diag] RoPE extrapolation diagnostic log ──
+        # ── [PS-diag] RoPE extrapolation: 验证相邻位置 step 是否恒定 ──
         _layer = getattr(attention_module, 'layer_number', -1)
         _num_extra = int(max_needed - q_pos_emb.shape[0])
         _step_vals = step.detach().flatten()
+        # 关键诊断: step01 == step12 ? (pos_emb[p] 对 p 是否线性)
+        _step01_vs_step12_diff = None
+        if q_pos_emb.shape[0] >= 3:
+            _step12 = q_pos_emb[2:3, :, :, :dim_half] - q_pos_emb[1:2, :, :, :dim_half]
+            _step12_vals = _step12.detach().flatten()
+            _diff = (_step_vals - _step12_vals).abs()
+            _step01_vs_step12_diff = _diff.max().item()
+        _is_linear = (_step01_vs_step12_diff is not None and _step01_vs_step12_diff < 1e-8)
         print(
             f"[PS][RoPE-extrapolate-Q] layer={_layer} "
             f"max_needed={max_needed} precomputed={q_pos_emb.shape[0]} extra={_num_extra} "
             f"step_min={_step_vals.min().item():.8f} step_max={_step_vals.max().item():.8f} "
             f"step_mean={_step_vals.mean().item():.8f} step_std={_step_vals.std().item():.8f} "
-            f"step_is_uniform={bool((_step_vals.max() - _step_vals.min()).abs() < 1e-8)}",
+            f"step01_vs_step12_maxdiff={_step01_vs_step12_diff} is_linear={_is_linear}",
             flush=True,
         )
         # ── [PS-diag] end ──
@@ -191,9 +199,6 @@ def _apply_positioned_rope(
         # RoPE 具有线性性质：freqs[p] = p * inv_freq。
         # 因此可以通过 pos_emb[1] - pos_emb[0] 恢复出 step（即 inv_freq），
         # 从而生成缺失的高位置频率向量。
-        # 注意：这对标准 sin/cos RoPE 成立，但对 NTK-aware/YaRN 等非线性
-        # 频率调度不成立。如果 step_std > 0 且 step_is_uniform=False，
-        # 说明使用了非线性 RoPE 调度，线性外推会引入数值误差。
         extra_positions = torch.arange(
             q_pos_emb.shape[0], max_needed,
             device=q_pos_emb.device, dtype=q_pos_emb.dtype,
@@ -205,16 +210,23 @@ def _apply_positioned_rope(
         dim_half = k_pos_emb.shape[-1] // 2
         step = k_pos_emb[1:2, :, :, :dim_half] - k_pos_emb[0:1, :, :, :dim_half]
 
-        # ── [PS-diag] RoPE extrapolation diagnostic log ──
+        # ── [PS-diag] RoPE extrapolation: 验证相邻位置 step 是否恒定 ──
         _layer = getattr(attention_module, 'layer_number', -1)
         _num_extra = int(max_needed - k_pos_emb.shape[0])
         _step_vals = step.detach().flatten()
+        _step01_vs_step12_diff = None
+        if k_pos_emb.shape[0] >= 3:
+            _step12 = k_pos_emb[2:3, :, :, :dim_half] - k_pos_emb[1:2, :, :, :dim_half]
+            _step12_vals = _step12.detach().flatten()
+            _diff = (_step_vals - _step12_vals).abs()
+            _step01_vs_step12_diff = _diff.max().item()
+        _is_linear = (_step01_vs_step12_diff is not None and _step01_vs_step12_diff < 1e-8)
         print(
             f"[PS][RoPE-extrapolate-K] layer={_layer} "
             f"max_needed={max_needed} precomputed={k_pos_emb.shape[0]} extra={_num_extra} "
             f"step_min={_step_vals.min().item():.8f} step_max={_step_vals.max().item():.8f} "
             f"step_mean={_step_vals.mean().item():.8f} step_std={_step_vals.std().item():.8f} "
-            f"step_is_uniform={bool((_step_vals.max() - _step_vals.min()).abs() < 1e-8)}",
+            f"step01_vs_step12_maxdiff={_step01_vs_step12_diff} is_linear={_is_linear}",
             flush=True,
         )
         # ── [PS-diag] end ──
