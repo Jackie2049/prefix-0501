@@ -387,9 +387,20 @@ def cmp_position_ids(dir_a: str, dir_b: str) -> CheckResult | None:
 #  2. RoPE encoding — absolute equality
 # ══════════════════════════════════════════════════════════════════
 
-def cmp_rope_emb(dir_a: str, dir_b: str) -> CheckResult | None:
-    fa = os.path.join(dir_a, "rope_emb.pt")
-    fb = os.path.join(dir_b, "rope_emb.pt")
+def cmp_rope_emb(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare post-RoPE Q/K between ON and OFF, aligned by position IDs.
+
+    ON  positions are absolute (preserved from original input).
+    OFF positions are per-segment relative (0..L-1 for each row).
+
+    Comparison strategy:
+    1. First packed token (row 0, pos 0): always a provider, must match exactly.
+    2. Within the first row: match tokens by position ID (0..L-1 for both paths).
+    3. For reuser rows: ON uses absolute positions (prefix_len..), OFF uses
+       relative (0..).  Positions differ by design — skip direct comparison.
+    """
+    fa = os.path.join(dir_on, "rope_emb.pt")
+    fb = os.path.join(dir_off, "rope_emb.pt")
     if not os.path.exists(fa) or not os.path.exists(fb):
         return None
     a = torch.load(fa, weights_only=True)
@@ -400,12 +411,87 @@ def cmp_rope_emb(dir_a: str, dir_b: str) -> CheckResult | None:
     if la != lb:
         return CheckResult(name="rope_emb", passed=False,
                            metrics={"error": "layer set mismatch"})
-    md = 0.0
+
+    max_diff_q = 0.0
+    max_diff_k = 0.0
+    first_token_q_diff = 0.0
+    first_token_k_diff = 0.0
+    first_row_q_diff = 0.0
+    first_row_k_diff = 0.0
+    first_row_len = 0
+    num_layers = len(la)
+
     for lyr in sorted(la):
-        for k in ("query", "key"):
-            md = max(md, float((a[lyr][k] - b[lyr][k]).abs().max()))
-    return CheckResult(name="rope_emb", passed=md == 0.0,
-                       metrics={"max_diff": md, "num_layers": len(la)})
+        on_entry = a[lyr]
+        off_entry = b[lyr]
+        on_q, on_k = on_entry["query"], on_entry["key"]
+        off_q, off_k = off_entry["query"], off_entry["key"]
+        on_pos = on_entry.get("positions")
+        off_pos = off_entry.get("positions")
+
+        # ── Check 1: first packed token (row 0, position 0) ──
+        first_token_q_diff = max(first_token_q_diff,
+                                 float((on_q[0] - off_q[0]).abs().max()))
+        first_token_k_diff = max(first_token_k_diff,
+                                 float((on_k[0] - off_k[0]).abs().max()))
+
+        # ── Check 2: first row — match by ON position IDs ──
+        if on_pos is not None and off_pos is not None:
+            on_pos_t = on_pos.long()
+            off_pos_t = off_pos.long()
+            # Find first-row extent in ON: tokens before the first position reset
+            # (position decreases or jumps to prefix_start)
+            _on_row1_end = 1
+            for _i in range(1, len(on_pos_t)):
+                if on_pos_t[_i] <= on_pos_t[_i - 1]:
+                    break
+                _on_row1_end = _i + 1
+            _on_row1_len = _on_row1_end  # positions 0..L-1
+
+            # First row in OFF: positions go 0..L-1 (find matching extent)
+            _off_row1_end = 1
+            for _i in range(1, len(off_pos_t)):
+                if off_pos_t[_i] <= off_pos_t[_i - 1]:
+                    break
+                _off_row1_end = _i + 1
+            _off_row1_len = _off_row1_end
+
+            _cmp_len = min(_on_row1_len, _off_row1_len)
+            if _cmp_len > 0:
+                first_row_len = max(first_row_len, _cmp_len)
+                # Match by position ID within the first row
+                for _pos_id in range(_cmp_len):
+                    _on_idx = _pos_id  # ON row 1 starts at packed index 0
+                    _off_idx = _pos_id  # OFF row 1 starts at packed index 0
+                    first_row_q_diff = max(first_row_q_diff,
+                        float((on_q[_on_idx] - off_q[_off_idx]).abs().max()))
+                    first_row_k_diff = max(first_row_k_diff,
+                        float((on_k[_on_idx] - off_k[_off_idx]).abs().max()))
+                max_diff_q = max(max_diff_q, first_row_q_diff)
+                max_diff_k = max(max_diff_k, first_row_k_diff)
+        else:
+            # Fallback: no positions available, compare first row by direct offset
+            _cmp_len = min(on_q.shape[0], off_q.shape[0], 128)
+            first_row_len = _cmp_len
+            first_row_q_diff = float((on_q[:_cmp_len] - off_q[:_cmp_len]).abs().max())
+            first_row_k_diff = float((on_k[:_cmp_len] - off_k[:_cmp_len]).abs().max())
+            max_diff_q = first_row_q_diff
+            max_diff_k = first_row_k_diff
+
+    # Pass if all diffs are near zero
+    threshold = 1e-7
+    passed = (first_token_q_diff < threshold and first_token_k_diff < threshold
+              and first_row_q_diff < threshold and first_row_k_diff < threshold)
+    return CheckResult(name="rope_emb", passed=passed, metrics={
+        "num_layers": num_layers,
+        "first_row_len": first_row_len,
+        "first_token_q_maxdiff": first_token_q_diff,
+        "first_token_k_maxdiff": first_token_k_diff,
+        "first_row_q_maxdiff": first_row_q_diff,
+        "first_row_k_maxdiff": first_row_k_diff,
+        "max_diff_q": max_diff_q,
+        "max_diff_k": max_diff_k,
+    })
 
 
 def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:

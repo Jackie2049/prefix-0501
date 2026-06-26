@@ -334,6 +334,7 @@ def _apply_positioned_rope(
             attention_module.layer_number,
             query, key,
             attention_module.config.num_layers,
+            positions=packed_position_ids,
         )
     except Exception as e:
         print(f"rope_emb_layer dump failed: {e}")

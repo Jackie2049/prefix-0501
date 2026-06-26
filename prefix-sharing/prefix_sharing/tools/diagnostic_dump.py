@@ -250,7 +250,8 @@ def _flush_attn_buffer(dump_dir: str) -> None:
 
 
 def _add_to_rope_buffer(layer_number: int, rotated_query: torch.Tensor,
-                        rotated_key: torch.Tensor) -> None:
+                        rotated_key: torch.Tensor,
+                        positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's RoPE encoding into the global buffer."""
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
@@ -258,6 +259,7 @@ def _add_to_rope_buffer(layer_number: int, rotated_query: torch.Tensor,
     _ROPE_BUFFER[layer_number] = {
         "query": rotated_query.detach().cpu().clone(),
         "key": rotated_key.detach().cpu().clone(),
+        "positions": positions.detach().cpu().clone() if positions is not None else None,
     }
 
 
@@ -350,7 +352,8 @@ def dump_position_ids(position_ids: torch.Tensor) -> None:
 # ── RoPE encoding dump (per layer) ──────────────────────────────
 
 def dump_rope_emb_layer(layer_number: int, rotated_query: torch.Tensor,
-                        rotated_key: torch.Tensor, num_layers: int) -> None:
+                        rotated_key: torch.Tensor, num_layers: int,
+                        positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's post-RoPE query/key. Auto-flush on last layer.
 
     Call after RoPE is applied in each attention layer, for both ON and OFF modes.
@@ -358,7 +361,7 @@ def dump_rope_emb_layer(layer_number: int, rotated_query: torch.Tensor,
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _add_to_rope_buffer(layer_number, rotated_query, rotated_key)
+    _add_to_rope_buffer(layer_number, rotated_query, rotated_key, positions)
     if layer_number == num_layers:
         _flush_rope_buffer(dump_dir)
 

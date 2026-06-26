@@ -99,6 +99,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                         dump_rope_emb_layer(
                             self.layer_number, _off_q_rope, _off_k_rope,
                             self.config.num_layers,
+                            positions=_off_positions,
                         )
             # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump end #####
             return _result
