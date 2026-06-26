@@ -393,6 +393,16 @@ def restore_via_2d_unfold_verl080(
     if ctx is None:
         return output
     plan = ctx.prefix_sharing_plan
+    # ── [PS-diag] skip-restore probe ──
+    # PREFIX_SHARING_DIAG_SKIP_RESTORE=1 时跳过 restore，直接返回 forward 原始输出。
+    # 用于隔离：如果 skip restore 后 suffix logprobs 与 OFF 一致，偏差在 restore；
+    # 如果 suffix logprobs 仍不一致，偏差在 forward（attention/build_kv）。
+    import os as _os_skip
+    if _os_skip.environ.get("PREFIX_SHARING_DIAG_SKIP_RESTORE"):
+        print("[PS][diag] SKIP_RESTORE: 跳过 restore，直接返回 forward 原始输出")
+        return output
+    # ── [PS-diag] end ──
+
     # Guard on reuser presence, not on prefix_last_restore_indices: a batch
     # whose reusers all have suffix_len == 0 has no prefix-last spec but still
     # needs interior prefix columns restored.

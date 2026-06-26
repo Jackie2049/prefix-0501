@@ -173,6 +173,27 @@ def _apply_positioned_rope(
     if q_pos_emb is not None and max_needed > q_pos_emb.shape[0]:
         dim_half = q_pos_emb.shape[-1] // 2
         step = q_pos_emb[1:2, :, :, :dim_half] - q_pos_emb[0:1, :, :, :dim_half]
+
+        # ── [PS-diag] RoPE extrapolation diagnostic log ──
+        _layer = getattr(attention_module, 'layer_number', -1)
+        _num_extra = int(max_needed - q_pos_emb.shape[0])
+        _step_vals = step.detach().flatten()
+        print(
+            f"[PS][RoPE-extrapolate-Q] layer={_layer} "
+            f"max_needed={max_needed} precomputed={q_pos_emb.shape[0]} extra={_num_extra} "
+            f"step_min={_step_vals.min().item():.8f} step_max={_step_vals.max().item():.8f} "
+            f"step_mean={_step_vals.mean().item():.8f} step_std={_step_vals.std().item():.8f} "
+            f"step_is_uniform={bool((_step_vals.max() - _step_vals.min()).abs() < 1e-8)}",
+            flush=True,
+        )
+        # ── [PS-diag] end ──
+
+        # RoPE 具有线性性质：freqs[p] = p * inv_freq。
+        # 因此可以通过 pos_emb[1] - pos_emb[0] 恢复出 step（即 inv_freq），
+        # 从而生成缺失的高位置频率向量。
+        # 注意：这对标准 sin/cos RoPE 成立，但对 NTK-aware/YaRN 等非线性
+        # 频率调度不成立。如果 step_std > 0 且 step_is_uniform=False，
+        # 说明使用了非线性 RoPE 调度，线性外推会引入数值误差。
         extra_positions = torch.arange(
             q_pos_emb.shape[0], max_needed,
             device=q_pos_emb.device, dtype=q_pos_emb.dtype,
@@ -183,6 +204,21 @@ def _apply_positioned_rope(
     if k_pos_emb is not None and max_needed > k_pos_emb.shape[0]:
         dim_half = k_pos_emb.shape[-1] // 2
         step = k_pos_emb[1:2, :, :, :dim_half] - k_pos_emb[0:1, :, :, :dim_half]
+
+        # ── [PS-diag] RoPE extrapolation diagnostic log ──
+        _layer = getattr(attention_module, 'layer_number', -1)
+        _num_extra = int(max_needed - k_pos_emb.shape[0])
+        _step_vals = step.detach().flatten()
+        print(
+            f"[PS][RoPE-extrapolate-K] layer={_layer} "
+            f"max_needed={max_needed} precomputed={k_pos_emb.shape[0]} extra={_num_extra} "
+            f"step_min={_step_vals.min().item():.8f} step_max={_step_vals.max().item():.8f} "
+            f"step_mean={_step_vals.mean().item():.8f} step_std={_step_vals.std().item():.8f} "
+            f"step_is_uniform={bool((_step_vals.max() - _step_vals.min()).abs() < 1e-8)}",
+            flush=True,
+        )
+        # ── [PS-diag] end ──
+
         extra_positions = torch.arange(
             k_pos_emb.shape[0], max_needed,
             device=k_pos_emb.device, dtype=k_pos_emb.dtype,
@@ -190,6 +226,54 @@ def _apply_positioned_rope(
         extra_angles = extra_positions[:, None, None, None] * step
         extra_emb = torch.cat([extra_angles, extra_angles], dim=-1)
         k_pos_emb = torch.cat([k_pos_emb, extra_emb], dim=0)
+
+    # ── [PS-diag] RoPE ground-truth probe ──
+    # 当 PREFIX_SHARING_DIAG_ROPE_GROUND_TRUTH=1 时，从 inv_freq 直接计算完整
+    # 频率表（跳过线性外推），用于验证外推是否引入数值偏差。
+    # 如果启用此开关后 ON vs OFF 结果一致，RoPE 外推就是根因。
+    import os as _os_gt
+    if _os_gt.environ.get("PREFIX_SHARING_DIAG_ROPE_GROUND_TRUTH"):
+        _layer_gt = getattr(attention_module, 'layer_number', -1)
+        # 尝试从 attention_module 获取 inv_freq
+        _inv_freq = None
+        _rotary_emb = getattr(attention_module, 'rotary_pos_emb', None)
+        if _rotary_emb is not None:
+            _inv_freq = getattr(_rotary_emb, 'inv_freq', None)
+        if _inv_freq is None:
+            # fallback: 从 config 读取 RoPE 参数
+            _cfg = attention_module.config
+            _dim = getattr(_cfg, 'hidden_size', 4096) // getattr(_cfg, 'num_attention_heads', 32)
+            _base = getattr(_cfg, 'rope_theta', 10000.0)
+            _inv_freq = 1.0 / (_base ** (torch.arange(
+                0, _dim, 2, device=q_pos_emb.device if q_pos_emb is not None
+                else k_pos_emb.device).float() / _dim))
+
+        _device = q_pos_emb.device if q_pos_emb is not None else k_pos_emb.device
+        _dtype = q_pos_emb.dtype if q_pos_emb is not None else k_pos_emb.dtype
+        _all_positions = torch.arange(0, max_needed, device=_device, dtype=torch.float)
+        _freqs = torch.outer(_all_positions, _inv_freq.to(_device).float())  # [max_needed, dim/2]
+        _emb_gt = torch.cat([_freqs, _freqs], dim=-1)  # [max_needed, dim]
+        # reshape 匹配 pos_emb 维度 [max_needed, 1, 1, dim]
+        _emb_gt = _emb_gt.unsqueeze(1).unsqueeze(1).to(_dtype)
+
+        _extra_old = max(0, int(max_needed - (
+            q_pos_emb.shape[0] if q_pos_emb is not None else max_needed)))
+        _is_q_truncated = q_pos_emb is not None and q_pos_emb.shape[0] < max_needed
+        _is_k_truncated = k_pos_emb is not None and k_pos_emb.shape[0] < max_needed
+
+        if q_pos_emb is not None:
+            q_pos_emb = _emb_gt
+        if k_pos_emb is not None:
+            k_pos_emb = _emb_gt
+
+        print(
+            f"[PS][RoPE-ground-truth] layer={_layer_gt} "
+            f"max_needed={max_needed} emb_shape={_emb_gt.shape} "
+            f"was_extrapolated_q={_is_q_truncated} was_extrapolated_k={_is_k_truncated} "
+            f"old_extra_count={_extra_old}",
+            flush=True,
+        )
+    # ── [PS-diag] end ──
 
     # Build kwargs for apply_rotary_pos_emb.
     # Only include version-specific params when they're provided,
