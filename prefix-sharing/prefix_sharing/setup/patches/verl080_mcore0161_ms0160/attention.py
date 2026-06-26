@@ -51,20 +51,14 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                 sequence_len_offset=sequence_len_offset,
                 inference_params=inference_params,
             )
-            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off dump #####
-            # OFF 走原始 forward，不经 prefix_attention/_apply_positioned_rope，
-            # 所以 ON 路径里的 dump_attn_on/dump_rope_freqs_on 不会触发。
-            # 这里在 OFF 分支补 dump，让 cmp_diag 的 attn/RoPE 对比有 OFF ground truth。
-            # v070 是直接改 megatron attention 源码在 forward 内部 dump；v080 用 patch
-            # wrapper 在 forward 返回后 dump output + 入参 rotary_pos_emb 解包出 angle table，
-            # 语义等价（唯一拿不到的是 rope_emb rotated q/k，在 forward 内部，但 rope_freqs
-            # angle table 已够验证 RoPE）。
+            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump #####
             import os as _os
             if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
                 from prefix_sharing.tools.diagnostic_dump import (
-                    dump_attn_off, dump_rope_freqs_off,
+                    dump_attn_off, dump_rope_freqs_off, dump_rope_emb_layer,
                 )
                 from prefix_sharing.integrations.megatron_runtime import _unpack_rotary_pos_emb
+                from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
                 _attn_out = _result[0] if isinstance(_result, tuple) else _result
                 _bs = (
                     len(packed_seq_params.cu_seqlens_q_padded) - 1
@@ -75,9 +69,38 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                 dump_attn_off(_attn_out, packed_seq_params,
                               self.layer_number, _bs, self.config.num_layers)
                 if rotary_pos_emb is not None:
-                    _q_pos_emb, _ = _unpack_rotary_pos_emb(rotary_pos_emb)
+                    _q_pos_emb, _k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
                     dump_rope_freqs_off(_q_pos_emb, self.layer_number, self.config.num_layers)
-            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off dump end #####
+                    # OFF post-RoPE Q/K dump: 提取 QKV + 手动 apply RoPE 后 dump，供与 ON 对比
+                    # OFF 路径 position IDs 是标准的 0..seg_len-1（每 segment 内连续）
+                    if (packed_seq_params is not None
+                            and packed_seq_params.qkv_format == "thd"
+                            and hasattr(packed_seq_params, "cu_seqlens_q_padded")):
+                        _off_q, _off_k, _off_v = self.get_query_key_value_tensors(
+                            hidden_states, key_value_states,
+                            split_qkv=True, output_gate=False,
+                        )
+                        _off_q = _off_q.squeeze(1)
+                        _off_k = _off_k.squeeze(1)
+                        _cu = packed_seq_params.cu_seqlens_q_padded
+                        _pos_list = [torch.arange(_cu[i+1] - _cu[i], device=_off_q.device)
+                                     for i in range(len(_cu) - 1)]
+                        _off_positions = torch.cat(_pos_list, dim=0).long()
+                        _off_q_freqs = _q_pos_emb.index_select(0, _off_positions)
+                        _off_k_freqs = (_k_pos_emb or _q_pos_emb).index_select(0, _off_positions)
+                        _off_q_rope = apply_rotary_pos_emb(
+                            _off_q.unsqueeze(1), _off_q_freqs,
+                            config=self.config, cu_seqlens=None,
+                        ).squeeze(1)
+                        _off_k_rope = apply_rotary_pos_emb(
+                            _off_k.unsqueeze(1), _off_k_freqs,
+                            config=self.config, cu_seqlens=None,
+                        ).squeeze(1)
+                        dump_rope_emb_layer(
+                            self.layer_number, _off_q_rope, _off_k_rope,
+                            self.config.num_layers,
+                        )
+            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump end #####
             return _result
 
         # ── prefix-sharing path ──

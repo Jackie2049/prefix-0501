@@ -326,6 +326,19 @@ def _apply_positioned_rope(
             k_freqs,
             **_rope_kwargs(cu_seqlens_kv),
         ).squeeze(1)
+
+    ######### prefix-sharing diag: ON post-RoPE Q/K dump (per-layer) #########
+    try:
+        from prefix_sharing.tools.diagnostic_dump import dump_rope_emb_layer
+        dump_rope_emb_layer(
+            attention_module.layer_number,
+            query, key,
+            attention_module.config.num_layers,
+        )
+    except Exception as e:
+        print(f"rope_emb_layer dump failed: {e}")
+    ######### prefix-sharing diag: ON post-RoPE Q/K dump end #########
+
     return query, key
 
 
