@@ -44,7 +44,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             _diag_on = _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
             if _diag_on and rotary_pos_emb is not None:
                 from prefix_sharing.tools.diagnostic_dump_verl080 import capture_rope_qk
-                _rope_cm = capture_rope_qk()
+                _rope_cm = capture_rope_qk(self)
             else:
                 _rope_cm = nullcontext()
             with _rope_cm as _rope_caps:
@@ -104,9 +104,14 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                     # OFF post-RoPE Q/K：直接用 hook 截获的真实张量
                     # （original_forward 内部 apply_rotary_pos_emb 的返回值），
                     # captures[0]=Q, captures[1]=K。不再 get_query_key_value_tensors + 重算 RoPE。
-                    if _rope_caps is not None and len(_rope_caps) >= 2:
+                    # _rope_caps = (qk_captures, v_captures)，均 in-context 截获
+                    if _rope_caps is not None:
+                        _qk_caps, _v_caps = _rope_caps
+                    else:
+                        _qk_caps, _v_caps = None, None
+                    if _qk_caps is not None and len(_qk_caps) >= 2:
                         # 每个捕获是 {"pre": 旋转前, "post": 旋转后}
-                        _q_cap, _k_cap = _rope_caps[0], _rope_caps[1]
+                        _q_cap, _k_cap = _qk_caps[0], _qk_caps[1]
                         # post-RoPE（旋转后）
                         dump_rope_postqk_verl080(
                             self.layer_number, _q_cap["post"], _k_cap["post"],
@@ -117,22 +122,23 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                             self.layer_number, _q_cap["pre"], _k_cap["pre"],
                             self.config.num_layers,
                         )
-                        # full KV（post-RoPE K from hook + V from get_qkv），供与 ON expanded_kv 对比
-                        _off_v = self.get_query_key_value_tensors(
-                            hidden_states, key_value_states,
-                            split_qkv=True, output_gate=False,
-                        )[2]
-                        if _off_v.dim() > 2:
+                        # full KV（post-RoPE K + V，均 in-context 截获，不再事后 re-call）
+                        _off_v = _v_caps[-1] if _v_caps else None
+                        if _off_v is not None and _off_v.dim() > 2:
                             _off_v = _off_v.squeeze(1)
-                        dump_full_kv_off(
-                            self.layer_number, _k_cap["post"], _off_v,
-                            self.config.num_layers,
-                        )
+                        if _off_v is not None:
+                            dump_full_kv_off(
+                                self.layer_number, _k_cap["post"], _off_v,
+                                self.config.num_layers,
+                            )
+                        else:
+                            print(f"[PS-diag] OFF full_kv L{self.layer_number}: V 未截获; skip",
+                                  flush=True)
                     else:
                         print(
                             f"[PS-diag] OFF rope_postqk L{self.layer_number}: "
                             f"expected 2 captures (Q,K), got "
-                            f"{len(_rope_caps) if _rope_caps is not None else 'None'}; skip",
+                            f"{len(_qk_caps) if _qk_caps is not None else 'None'}; skip",
                             flush=True,
                         )
             # ##### [PS-diag] OFF attn_outputs + rope_freqs + rope_postqk/preqk dump end #####

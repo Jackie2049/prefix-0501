@@ -340,36 +340,51 @@ def dump_full_kv_off(layer_number: int, key: torch.Tensor, value: torch.Tensor,
 
 
 @contextlib.contextmanager
-def capture_rope_qk():
-    """Hook mcore 的 ``apply_rotary_pos_emb``，同时截获旋转前(pre)与旋转后(post)的 Q/K。
+def capture_rope_qk(attention_module):
+    """Hook apply_rotary_pos_emb（Q/K pre+post）+ get_query_key_value_tensors（V），全 in-context。
 
-    mcore ``Attention.forward`` 的 THD prefill 路径每层恰好调用模块级
-    ``apply_rotary_pos_emb`` 两次——先 Q 后 K（见 megatron/core/transformer/
-    attention.py:1097,1110）。monkey-patch 该模块全局函数，把每次调用的输入 t
-    (pre-RoPE) 与返回值 out (post-RoPE) 存为 ``{"pre": t, "post": out}`` 追加到
-    yield 的 list；``finally`` 还原原函数。
+    mcore ``Attention.forward`` THD prefill 每层调模块级 ``apply_rotary_pos_emb`` 两次（先 Q 后
+    K），把每次输入/返回存为 ``{"pre": t, "post": out}``。V 不走 rotary，所以单独 hook
+    ``attention_module.get_query_key_value_tensors``（实例级），截其返回的 V（第 3 个元素）。
 
-    ON 路径不受影响：它在 megatron_runtime.py 里把 ``apply_rotary_pos_emb``
-    import 进了自有命名空间，不经 attention 模块全局解析，patch 不到它。
+    全部 in-context 截获（在 original_forward 内部），避免事后 re-call get_query_key_value_tensors
+    因 hidden_states 被 in-place 改写而失真——K 走 rotary hook 一向准确，V 之前用 re-call 才显得偏。
 
-    用法（OFF 分支，包住 original_forward 调用）::
+    用法::
 
-        with capture_rope_qk() as caps:
+        with capture_rope_qk(self) as (qk_caps, v_caps):
             result = original_forward(...)
-        # caps[0]={"pre":Q_pre,"post":Q_post}, caps[1]={"pre":K_pre,"post":K_post}
+        # qk_caps[0]={"pre":Q_pre,"post":Q_post}, qk_caps[1]={...K...}; v_caps[-1]=V
     """
     import megatron.core.transformer.attention as _attn_mod
+    import types as _types
 
-    _orig = _attn_mod.apply_rotary_pos_emb
-    captures: list = []  # 每元素 {"pre": 旋转前 t, "post": 旋转后 out}
+    _orig_arpe = _attn_mod.apply_rotary_pos_emb
+    _orig_get_qkv = attention_module.get_query_key_value_tensors  # 已绑定方法
+    qk_captures: list = []
+    v_captures: list = []
 
-    def _capturing(t, *args, **kwargs):
-        out = _orig(t, *args, **kwargs)
-        captures.append({"pre": t, "post": out})
+    def _capturing_arpe(t, *args, **kwargs):
+        out = _orig_arpe(t, *args, **kwargs)
+        qk_captures.append({"pre": t, "post": out})
         return out
 
-    _attn_mod.apply_rotary_pos_emb = _capturing
+    def _capturing_get_qkv(*args, **kwargs):
+        out = _orig_get_qkv(*args, **kwargs)
+        try:
+            v_captures.append(out[2])  # (Q, K, V[, gate]) → V
+        except Exception:
+            pass
+        return out
+
+    _attn_mod.apply_rotary_pos_emb = _capturing_arpe
+    attention_module.get_query_key_value_tensors = _types.MethodType(
+        _capturing_get_qkv, attention_module)
     try:
-        yield captures
+        yield qk_captures, v_captures
     finally:
-        _attn_mod.apply_rotary_pos_emb = _orig
+        _attn_mod.apply_rotary_pos_emb = _orig_arpe
+        try:
+            del attention_module.get_query_key_value_tensors  # 还原：删实例属性，回落到类方法
+        except AttributeError:
+            pass
