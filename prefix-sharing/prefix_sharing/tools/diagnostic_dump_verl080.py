@@ -288,6 +288,57 @@ def dump_rope_preqk_verl080(layer_number: int,
         _ROPE_PREQK_BUFFER = None
 
 
+_EXPANDED_KV_BUFFER: dict[int, dict] | None = None
+
+
+def dump_expanded_kv_on(layer_number: int, expanded_key: torch.Tensor,
+                        expanded_value: torch.Tensor, num_layers: int) -> None:
+    """ON: 累加 build_kv 输出（expanded K/V = prefix 复用 + suffix，全量），满层 flush ``expanded_kv.pt``。
+
+    Format: ``{layer_idx: {"key": [T,H,D], "value": [T,H,D]}}``。这是 ON attention 实际用的
+    完整 K/V，应与 OFF ``full_kv.pt`` 逐元素相同——验证 prefix-sharing 的 KV 展开/复用
+    是否正确还原了完整 KV。
+    """
+    global _EXPANDED_KV_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _EXPANDED_KV_BUFFER is None:
+        _EXPANDED_KV_BUFFER = {}
+    _EXPANDED_KV_BUFFER[layer_number] = {
+        "key": expanded_key.detach().cpu().clone(),
+        "value": expanded_value.detach().cpu().clone(),
+    }
+    if layer_number == num_layers:
+        _flush_dict_buffer("expanded_kv.pt", _EXPANDED_KV_BUFFER, dump_dir)
+        _EXPANDED_KV_BUFFER = None
+
+
+_FULL_KV_BUFFER: dict[int, dict] | None = None
+
+
+def dump_full_kv_off(layer_number: int, key: torch.Tensor, value: torch.Tensor,
+                     num_layers: int) -> None:
+    """OFF: 累加完整 K（post-RoPE）/ V，满层 flush ``full_kv.pt``。
+
+    Format: ``{layer_idx: {"key": [T,H,D], "value": [T,H,D]}}``。key 应为 post-RoPE 完整 K
+    （与 ON expanded_key 同语义），value 为完整 V。供与 ON expanded_kv 逐元素对比。
+    """
+    global _FULL_KV_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _FULL_KV_BUFFER is None:
+        _FULL_KV_BUFFER = {}
+    _FULL_KV_BUFFER[layer_number] = {
+        "key": key.detach().cpu().clone(),
+        "value": value.detach().cpu().clone(),
+    }
+    if layer_number == num_layers:
+        _flush_dict_buffer("full_kv.pt", _FULL_KV_BUFFER, dump_dir)
+        _FULL_KV_BUFFER = None
+
+
 @contextlib.contextmanager
 def capture_rope_qk():
     """Hook mcore 的 ``apply_rotary_pos_emb``，同时截获旋转前(pre)与旋转后(post)的 Q/K。

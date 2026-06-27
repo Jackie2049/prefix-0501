@@ -823,6 +823,112 @@ def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
 
 
 # ════════════════════════════════════════════════════════════════
+#  Attention KV: ON expanded_kv vs OFF full_kv（prefix 复用校验）
+# ════════════════════════════════════════════════════════════════
+
+def _load_attn_kv(dir_path: str, layer: int,
+                  fname: str) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """load {key, value} for a layer from fname. Returns (key, value) or (None, None)."""
+    fp = os.path.join(dir_path, fname)
+    if not os.path.exists(fp):
+        return None, None
+    d = torch.load(fp, weights_only=True)
+    if not isinstance(d, dict):
+        return None, None
+    entry = d.get(layer)
+    if entry is None:
+        return None, None
+    return entry.get("key"), entry.get("value")
+
+
+def cmp_attn_kv(dir_on: str, dir_off: str,
+                layer: int | None = None) -> CheckResult | None:
+    """对比 ON expanded_kv vs OFF full_kv（K/V 分别），逐元素 max_diff + cos。
+
+    两者都应是 full（prefix+suffix）且**逐元素相同**（prefix-sharing 的 KV 展开应精确还原
+    完整 KV）。相同 → attention 输入一致，attention_output 差异必来自 attention 计算/mask；
+    不同 → bug 在 build_kv 的 prefix 复用（store/expand）。
+    """
+    fa = os.path.join(dir_on, "expanded_kv.pt")
+    fb = os.path.join(dir_off, "full_kv.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    on_dict = torch.load(fa, weights_only=True)
+    off_dict = torch.load(fb, weights_only=True)
+    if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
+        return None
+    layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
+    if layer is not None:
+        layers = [l for l in layers if l == layer]
+    _name = f"attn_kv_L{layer}" if layer is not None else "attn_kv"
+    if not layers:
+        return CheckResult(name=_name, passed=False,
+                           metrics={"error": f"layer {layer} 不在双方 attn_kv 中"})
+
+    per_layer: dict = {}
+    worst = {"max_diff": 0.0, "cos_min": 1.0}
+    for lyr in layers:
+        ek, ev = on_dict[lyr].get("key"), on_dict[lyr].get("value")
+        fk, fv = off_dict[lyr].get("key"), off_dict[lyr].get("value")
+        d: dict = {}
+        for _tag, (_a, _b) in [("K", (ek, fk)), ("V", (ev, fv))]:
+            if _a is None or _b is None:
+                d[_tag] = {"error": "缺失"}
+                continue
+            if _a.shape != _b.shape:
+                d[_tag] = {"error": f"shape mismatch ON{tuple(_a.shape)} vs OFF{tuple(_b.shape)}"}
+                continue
+            _af = _a.reshape(_a.shape[0], -1).float()
+            _bf = _b.reshape(_b.shape[0], -1).float()
+            _diff = (_af - _bf).abs()
+            _cos = _cosine_sim(_af, _bf, dim=-1)
+            _md = float(_diff.max())
+            d[_tag] = {"max_diff": _md,
+                       "cos_avg": float(_cos.mean()), "cos_min": float(_cos.min()),
+                       "n_tokens": _af.shape[0]}
+            worst["max_diff"] = max(worst["max_diff"], _md)
+            worst["cos_min"] = min(worst["cos_min"], float(_cos.min()))
+        per_layer[lyr] = d
+    # expanded 应精确等于 full → 阈值极严
+    passed = worst["max_diff"] < 1e-5 and worst["cos_min"] > 0.9999
+    return CheckResult(name=_name, passed=passed,
+                       metrics={"layers": per_layer, "max_diff": worst["max_diff"],
+                                "cos_min": worst["cos_min"], "num_layers": len(layers)})
+
+
+def _print_attn_kv(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [{r.name}]  ON expanded_kv vs OFF full_kv（K/V 逐元素）")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}\n"); return
+    layers = m.get("layers", {})
+    print(f"  {'LAYER':>6s}  {'K_MAXDIFF':>12s} {'K_COS':>10s}  "
+          f"{'V_MAXDIFF':>12s} {'V_COS':>10s}  {'STATUS':>8s}")
+    print(f"  {'─' * 6}  {'─' * 12} {'─' * 10}  {'─' * 12} {'─' * 10}  {'─' * 8}")
+    bad = []
+    for lyr in sorted(layers):
+        d = layers[lyr]
+        kd, vd = d.get("K", {}), d.get("V", {})
+        if "error" in kd or "error" in vd:
+            print(f"  {lyr:>6d}  K:{kd.get('error','')}  V:{vd.get('error','')}")
+            bad.append(lyr); continue
+        kmd, kcos = kd["max_diff"], kd["cos_avg"]
+        vmd, vcos = vd["max_diff"], vd["cos_avg"]
+        ok = kmd < 1e-5 and vmd < 1e-5
+        if not ok:
+            bad.append(lyr)
+        print(f"  {lyr:>6d}  {kmd:>12.3e} {kcos:>10.6f}  "
+              f"{vmd:>12.3e} {vcos:>10.6f}  {'OK' if ok else 'DIFF':>8s}")
+    print(f"\n  max_diff={m.get('max_diff')}  cos_min={m.get('cos_min')}  "
+          f"{_CHECK if r.passed else _CROSS} "
+          f"{'PASS（KV 一致）' if r.passed else 'FAIL（KV 不一致 → build_kv prefix 复用）'}")
+    if bad:
+        print(f"  ⚠ 首个 KV 不一致层: {bad[0]}")
+    print()
+
+
+# ════════════════════════════════════════════════════════════════
 #  2D mask loading
 # ════════════════════════════════════════════════════════════════
 
@@ -972,6 +1078,8 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str,
         "rope_postqk.pt",
         "rope_preqk.pt",
         "rope_freqs.pt",
+        "expanded_kv.pt",
+        "full_kv.pt",
         "prefix_lens.pt",
         "cu_seqlens_q.pt",
     ]
@@ -1339,6 +1447,12 @@ def main():
     if r:
         all_results.append(r)
         _print_rope_postqk_per_layer(r)
+
+    # ── packed: attention KV（ON expanded vs OFF full，prefix 复用校验）──
+    r = cmp_attn_kv(args.dir_on, args.dir_off, args.layer)
+    if r:
+        all_results.append(r)
+        _print_attn_kv(r)
 
     # ── packed: attention_output per-layer cos（RoPE 下游）──
     r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)

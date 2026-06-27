@@ -106,6 +106,15 @@ def prefix_attention(
         f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"
     )
 
+    ######### prefix-sharing diag: ON expanded K/V dump（build_kv 输出，attention 实际用的完整 KV）#########
+    try:
+        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_expanded_kv_on
+        dump_expanded_kv_on(layer_id, expanded_key, expanded_value,
+                            attention_module.config.num_layers)
+    except Exception as _e:
+        print(f"expanded_kv dump failed: {_e}", flush=True)
+    ######### prefix-sharing diag: ON expanded K/V dump end #########
+
     # 注意力计算
     core_attn_out = attention_backend.attention(
         query,

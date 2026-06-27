@@ -70,7 +70,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                     dump_attn_off, dump_rope_freqs,
                 )
                 from prefix_sharing.tools.diagnostic_dump_verl080 import (
-                    dump_rope_postqk_verl080, dump_rope_preqk_verl080,
+                    dump_rope_postqk_verl080, dump_rope_preqk_verl080, dump_full_kv_off,
                 )
                 from prefix_sharing.integrations.megatron_runtime import _unpack_rotary_pos_emb
                 _attn_out = _result[0] if isinstance(_result, tuple) else _result
@@ -115,6 +115,17 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                         # pre-RoPE（旋转前，纯 QKV 投影）
                         dump_rope_preqk_verl080(
                             self.layer_number, _q_cap["pre"], _k_cap["pre"],
+                            self.config.num_layers,
+                        )
+                        # full KV（post-RoPE K from hook + V from get_qkv），供与 ON expanded_kv 对比
+                        _off_v = self.get_query_key_value_tensors(
+                            hidden_states, key_value_states,
+                            split_qkv=True, output_gate=False,
+                        )[2]
+                        if _off_v.dim() > 2:
+                            _off_v = _off_v.squeeze(1)
+                        dump_full_kv_off(
+                            self.layer_number, _k_cap["post"], _off_v,
                             self.config.num_layers,
                         )
                     else:
