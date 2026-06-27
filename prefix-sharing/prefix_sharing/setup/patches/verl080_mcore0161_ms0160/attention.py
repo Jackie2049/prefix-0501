@@ -36,31 +36,41 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         ctx = current_prefix_sharing_context()
         if ctx is None:
             # ── normal path: 调用原始 forward ──
-            _result = original_forward(
-                self,
-                hidden_states,
-                attention_mask,
-                key_value_states=key_value_states,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                rotary_pos_cos_sin=rotary_pos_cos_sin,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                inference_params=inference_params,
-            )
-            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump #####
+            # diag: hook 截获 original_forward 内部 apply_rotary_pos_emb 的真实 post-RoPE
+            # Q/K（mcore Attention.forward THD prefill 每层调两次：先 Q 后 K）。post-RoPE Q/K
+            # 是 forward 内部中间变量，唯一能拿到真实张量的办法就是 hook 那个模块级 rotary 函数。
             import os as _os
-            if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
-                import torch  # OFF diag block 用 torch.arange/torch.cat（顶部未导入 torch，与 forward_step.py 惯例一致，按需局部导入）
+            from contextlib import nullcontext
+            _diag_on = _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
+            if _diag_on and rotary_pos_emb is not None:
+                from prefix_sharing.tools.diagnostic_dump_verl080 import capture_post_rope_qk
+                _rope_cm = capture_post_rope_qk()
+            else:
+                _rope_cm = nullcontext()
+            with _rope_cm as _rope_caps:
+                _result = original_forward(
+                    self,
+                    hidden_states,
+                    attention_mask,
+                    key_value_states=key_value_states,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    inference_params=inference_params,
+                )
+            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump #####
+            if _diag_on:
+                import torch  # 仅用于构造 debug 用的 positions（cmp 不依赖）
                 from prefix_sharing.tools.diagnostic_dump import (
                     dump_attn_off, dump_rope_freqs_off,
                 )
                 from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_emb_verl080
                 from prefix_sharing.integrations.megatron_runtime import _unpack_rotary_pos_emb
-                from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
                 _attn_out = _result[0] if isinstance(_result, tuple) else _result
                 _bs = (
                     len(packed_seq_params.cu_seqlens_q_padded) - 1
@@ -73,35 +83,30 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                 if rotary_pos_emb is not None:
                     _q_pos_emb, _k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
                     dump_rope_freqs_off(_q_pos_emb, self.layer_number, self.config.num_layers)
-                    # OFF post-RoPE Q/K dump: 提取 QKV + 手动 apply RoPE 后 dump，供与 ON 对比
-                    # OFF 路径 position IDs 是标准的 0..seg_len-1（每 segment 内连续）
-                    if (packed_seq_params is not None
-                            and packed_seq_params.qkv_format == "thd"
-                            and hasattr(packed_seq_params, "cu_seqlens_q_padded")):
-                        _off_q, _off_k, _off_v = self.get_query_key_value_tensors(
-                            hidden_states, key_value_states,
-                            split_qkv=True, output_gate=False,
-                        )
-                        _off_q = _off_q.squeeze(1)
-                        _off_k = _off_k.squeeze(1)
-                        _cu = packed_seq_params.cu_seqlens_q_padded
-                        _pos_list = [torch.arange(_cu[i+1] - _cu[i], device=_off_q.device)
-                                     for i in range(len(_cu) - 1)]
-                        _off_positions = torch.cat(_pos_list, dim=0).long()
-                        _off_q_freqs = _q_pos_emb.index_select(0, _off_positions)
-                        _off_k_freqs = (_k_pos_emb or _q_pos_emb).index_select(0, _off_positions)
-                        _off_q_rope = apply_rotary_pos_emb(
-                            _off_q.unsqueeze(1), _off_q_freqs,
-                            config=self.config, cu_seqlens=None,
-                        ).squeeze(1)
-                        _off_k_rope = apply_rotary_pos_emb(
-                            _off_k.unsqueeze(1), _off_k_freqs,
-                            config=self.config, cu_seqlens=None,
-                        ).squeeze(1)
+                    # OFF post-RoPE Q/K：直接用 hook 截获的真实张量
+                    # （original_forward 内部 apply_rotary_pos_emb 的返回值），
+                    # captures[0]=Q, captures[1]=K。不再 get_query_key_value_tensors + 重算 RoPE。
+                    if _rope_caps is not None and len(_rope_caps) >= 2:
+                        _off_q_rope, _off_k_rope = _rope_caps[0], _rope_caps[1]
+                        # positions 仅作 debug 记录；cmp 按 cu_seqlens+prefix_lens 对齐，不用它
+                        _off_positions = None
+                        if (packed_seq_params is not None
+                                and hasattr(packed_seq_params, "cu_seqlens_q_padded")):
+                            _cu = packed_seq_params.cu_seqlens_q_padded
+                            _off_positions = torch.cat([
+                                torch.arange(_cu[i + 1] - _cu[i])
+                                for i in range(len(_cu) - 1)
+                            ]).long()
                         dump_rope_emb_verl080(
                             self.layer_number, _off_q_rope, _off_k_rope,
-                            self.config.num_layers,
-                            positions=_off_positions,
+                            self.config.num_layers, positions=_off_positions,
+                        )
+                    else:
+                        print(
+                            f"[PS-diag] OFF rope_emb L{self.layer_number}: "
+                            f"expected 2 captures (Q,K), got "
+                            f"{len(_rope_caps) if _rope_caps is not None else 'None'}; skip",
+                            flush=True,
                         )
             # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump end #####
             return _result

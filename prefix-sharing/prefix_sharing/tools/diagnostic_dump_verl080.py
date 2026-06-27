@@ -22,6 +22,7 @@ dump 内容（第一版，聚焦 loss 相关量）：
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import torch
@@ -238,10 +239,42 @@ def dump_rope_emb_verl080(layer_number: int,
         entry["positions"] = positions.detach().cpu().clone()
     _ROPE_EMB_BUFFER[layer_number] = entry
     if layer_number == num_layers:
-        from prefix_sharing.tools.diagnostic_dump import _rank0_only
-        if _rank0_only():
-            try:
-                torch.save(_ROPE_EMB_BUFFER, os.path.join(dump_dir, "rope_emb.pt"))
-            except Exception:
-                pass
+        # 用 _save_tensor 写盘（修潜伏 bug：原手写 os.path.join 但本文件未 import os，
+        # NameError 被外层 except 静默吞掉 → rope_emb.pt 从未真正写盘）。
+        _save_tensor("rope_emb.pt", _ROPE_EMB_BUFFER, dump_dir)
         _ROPE_EMB_BUFFER = None
+
+
+@contextlib.contextmanager
+def capture_post_rope_qk():
+    """Hook mcore 的 ``apply_rotary_pos_emb``，截获 original_forward 内部真实算出的 post-RoPE Q/K。
+
+    mcore ``Attention.forward`` 的 THD prefill 路径每层恰好调用模块级
+    ``apply_rotary_pos_emb`` 两次——先 Q 后 K（见 megatron/core/transformer/
+    attention.py:1097,1110）。这里 monkey-patch 该模块全局函数，把每次调用的
+    返回值（旋转后的张量）追加到 yield 的 list；``finally`` 还原原函数。
+
+    ON 路径不受影响：它在 megatron_runtime.py 里把 ``apply_rotary_pos_emb``
+    import 进了自有命名空间，不经 attention 模块全局解析，patch 不到它。
+
+    用法（OFF 分支，包住 original_forward 调用）::
+
+        with capture_post_rope_qk() as caps:
+            result = original_forward(...)
+        # caps[0]=rotated_query, caps[1]=rotated_key（单层 Attention.forward 内的调用顺序）
+    """
+    import megatron.core.transformer.attention as _attn_mod
+
+    _orig = _attn_mod.apply_rotary_pos_emb
+    captures: list = []
+
+    def _capturing(t, *args, **kwargs):
+        out = _orig(t, *args, **kwargs)
+        captures.append(out)
+        return out
+
+    _attn_mod.apply_rotary_pos_emb = _capturing
+    try:
+        yield captures
+    finally:
+        _attn_mod.apply_rotary_pos_emb = _orig
