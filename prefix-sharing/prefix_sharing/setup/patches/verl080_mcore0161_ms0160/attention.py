@@ -54,6 +54,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump #####
             import os as _os
             if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+                import torch  # OFF diag block 用 torch.arange/torch.cat（顶部未导入 torch，与 forward_step.py 惯例一致，按需局部导入）
                 from prefix_sharing.tools.diagnostic_dump import (
                     dump_attn_off, dump_rope_freqs_off,
                 )
