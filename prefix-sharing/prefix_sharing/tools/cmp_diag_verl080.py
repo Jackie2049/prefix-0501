@@ -565,6 +565,21 @@ def _rope_emb_vec_at_pos(q_on: torch.Tensor | None, k_on: torch.Tensor | None,
     return qo, qf, ko, kf
 
 
+def _diag_rope_pos_fail(q_on: torch.Tensor | None, q_off: torch.Tensor | None,
+                        pos: int, align_mask: torch.Tensor | None) -> str:
+    """rope_emb packed_token 取 [pos] 失败时的诊断串：区分 缺失 / 对齐失败 / pos 越界。"""
+    if q_on is None or q_off is None:
+        return f"rope_emb 该层在 {'ON' if q_on is None else 'OFF'} 侧缺失"
+    n_on, n_off = q_on.shape[0], q_off.shape[0]
+    if align_mask is not None and n_on != n_off:
+        msum = int(align_mask.sum())
+        return (f"对齐失败: n_on={n_on} n_off={n_off} "
+                f"align_mask(len={align_mask.shape[0]}, sum={msum}); "
+                f"需 ON tokens==sum({msum}) 且 mask_len==n_off({n_off})")
+    post = min(n_on, n_off)
+    return f"pos {pos} 越界: 对齐后 token 数={post} (n_on={n_on}, n_off={n_off})"
+
+
 def cmp_rope_emb_token(dir_on: str, dir_off: str,
                         pos: int = 0, layer: int | None = None,
                         align_mask: torch.Tensor | None = None
@@ -586,7 +601,7 @@ def cmp_rope_emb_token(dir_on: str, dir_off: str,
         if vecs is None:
             results.append(CheckResult(
                 name=f"rope_emb_L{rope_layer}_pos{pos}",
-                metrics={"error": f"无法对齐或 pos {pos} 越界"}))
+                metrics={"error": _diag_rope_pos_fail(q_on, q_off, pos, align_mask)}))
         else:
             qo, qf, ko, kf = vecs
             results.append(CheckResult(
@@ -799,7 +814,14 @@ def _shape_of(dir_path: str, filename: str) -> str:
         if isinstance(obj, dict):
             # per-layer dict（attn_outputs / rope_freqs_*）：显示层数 + 首层 shape
             sample = next(iter(obj.values())) if obj else None
-            sample_shape = f",{tuple(sample.shape)}" if sample is not None else ""
+            # rope_emb.pt：每层值是 {"query","key"[,"positions"]} dict，取 query 的 shape 代表
+            if isinstance(sample, dict):
+                _q = sample.get("query")
+                sample_shape = f",Q{tuple(_q.shape)}" if _q is not None else ""
+            elif sample is not None:
+                sample_shape = f",{tuple(sample.shape)}"
+            else:
+                sample_shape = ""
             return f"(dict,{len(obj)}L{sample_shape})"
         return str(tuple(obj.shape))
     except Exception:
@@ -853,6 +875,7 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str,
         f"attention_mask_{tag}.pt",
         "logits.pt",
         "attn_outputs.pt",
+        "rope_emb.pt",
         "prefix_lens.pt",
         "cu_seqlens_q.pt",
     ]
