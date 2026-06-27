@@ -317,11 +317,11 @@ def _apply_positioned_rope(
         q_freqs = q_pos_emb.index_select(0, positions)
         ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
         try:
-            from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs_on
-            dump_rope_freqs_on(q_freqs, attention_module.layer_number,
+            from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs
+            dump_rope_freqs(q_freqs, attention_module.layer_number,
                                attention_module.config.num_layers)
         except Exception as e:
-            print(f"rope_freqs_on dump failed: {e}")
+            print(f"rope_freqs dump failed: {e}")
         ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
         query = apply_rotary_pos_emb(
             query.unsqueeze(1),
@@ -338,15 +338,15 @@ def _apply_positioned_rope(
 
     ######### prefix-sharing diag: ON post-RoPE Q/K dump (per-layer) #########
     try:
-        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_emb_verl080
-        dump_rope_emb_verl080(
+        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_postqk_verl080
+        dump_rope_postqk_verl080(
             attention_module.layer_number,
             query, key,
             attention_module.config.num_layers,
             positions=packed_position_ids,
         )
     except Exception as e:
-        print(f"rope_emb_layer dump failed: {e}")
+        print(f"rope_postqk_layer dump failed: {e}")
     ######### prefix-sharing diag: ON post-RoPE Q/K dump end #########
 
     return query, key

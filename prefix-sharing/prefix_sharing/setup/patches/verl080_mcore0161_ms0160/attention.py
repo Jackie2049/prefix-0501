@@ -63,14 +63,14 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                     sequence_len_offset=sequence_len_offset,
                     inference_params=inference_params,
                 )
-            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump #####
+            # ##### [PS-diag] OFF attn_outputs + rope_freqs + rope_postqk/preqk dump #####
             if _diag_on:
-                import torch  # 仅用于构造 debug 用的 positions（cmp 不依赖）
+                import torch  # 仅用于构造 positions（freqs 切 per-token + Q/K debug）
                 from prefix_sharing.tools.diagnostic_dump import (
-                    dump_attn_off, dump_rope_freqs_off,
+                    dump_attn_off, dump_rope_freqs,
                 )
                 from prefix_sharing.tools.diagnostic_dump_verl080 import (
-                    dump_rope_emb_verl080, dump_rope_preqk_verl080,
+                    dump_rope_postqk_verl080, dump_rope_preqk_verl080,
                 )
                 from prefix_sharing.integrations.megatron_runtime import _unpack_rotary_pos_emb
                 _attn_out = _result[0] if isinstance(_result, tuple) else _result
@@ -84,24 +84,29 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                               self.layer_number, _bs, self.config.num_layers)
                 if rotary_pos_emb is not None:
                     _q_pos_emb, _k_pos_emb = _unpack_rotary_pos_emb(rotary_pos_emb)
-                    dump_rope_freqs_off(_q_pos_emb, self.layer_number, self.config.num_layers)
+                    # OFF 标准 positions（每 segment 内 0..seg-1）：切 per-token freqs + Q/K debug
+                    _off_positions = None
+                    if (packed_seq_params is not None
+                            and hasattr(packed_seq_params, "cu_seqlens_q_padded")):
+                        _cu = packed_seq_params.cu_seqlens_q_padded
+                        _off_positions = torch.cat([
+                            torch.arange(_cu[i + 1] - _cu[i])
+                            for i in range(len(_cu) - 1)
+                        ]).long()
+                    # rope_freqs：存 per-token 角度（与 ON 同款），统一 rope_freqs.pt
+                    if _off_positions is not None:
+                        dump_rope_freqs(
+                            _q_pos_emb.index_select(0, _off_positions),
+                            self.layer_number, self.config.num_layers,
+                        )
                     # OFF post-RoPE Q/K：直接用 hook 截获的真实张量
                     # （original_forward 内部 apply_rotary_pos_emb 的返回值），
                     # captures[0]=Q, captures[1]=K。不再 get_query_key_value_tensors + 重算 RoPE。
                     if _rope_caps is not None and len(_rope_caps) >= 2:
                         # 每个捕获是 {"pre": 旋转前, "post": 旋转后}
                         _q_cap, _k_cap = _rope_caps[0], _rope_caps[1]
-                        # positions 仅作 debug 记录；cmp 按 cu_seqlens+prefix_lens 对齐，不用它
-                        _off_positions = None
-                        if (packed_seq_params is not None
-                                and hasattr(packed_seq_params, "cu_seqlens_q_padded")):
-                            _cu = packed_seq_params.cu_seqlens_q_padded
-                            _off_positions = torch.cat([
-                                torch.arange(_cu[i + 1] - _cu[i])
-                                for i in range(len(_cu) - 1)
-                            ]).long()
                         # post-RoPE（旋转后）
-                        dump_rope_emb_verl080(
+                        dump_rope_postqk_verl080(
                             self.layer_number, _q_cap["post"], _k_cap["post"],
                             self.config.num_layers, positions=_off_positions,
                         )
@@ -112,12 +117,12 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                         )
                     else:
                         print(
-                            f"[PS-diag] OFF rope_emb L{self.layer_number}: "
+                            f"[PS-diag] OFF rope_postqk L{self.layer_number}: "
                             f"expected 2 captures (Q,K), got "
                             f"{len(_rope_caps) if _rope_caps is not None else 'None'}; skip",
                             flush=True,
                         )
-            # ##### [PS-diag] OFF attn_outputs + rope_freqs_off + rope_emb dump end #####
+            # ##### [PS-diag] OFF attn_outputs + rope_freqs + rope_postqk/preqk dump end #####
             return _result
 
         # ── prefix-sharing path ──

@@ -210,44 +210,44 @@ def dump_entropy_2d_verl080(ent_2d: torch.Tensor | None, tag: str) -> None:
 #  Post-RoPE Q/K dump (per layer)
 # ════════════════════════════════════════════════════════════════
 
-_ROPE_EMB_BUFFER: dict[int, dict] | None = None
+_ROPE_POSTQK_BUFFER: dict[int, dict] | None = None
 
 
-def dump_rope_emb_verl080(layer_number: int,
+def dump_rope_postqk_verl080(layer_number: int,
                            rotated_query: torch.Tensor,
                            rotated_key: torch.Tensor,
                            num_layers: int,
                            positions: torch.Tensor | None = None) -> None:
-    """Accumulate one layer's post-RoPE Q/K. Auto-flush to ``rope_emb.pt`` on last layer.
+    """Accumulate one layer's post-RoPE Q/K. Auto-flush to ``rope_postqk.pt`` on last layer.
 
     Format: ``{layer_idx: {"query": [T, H, D], "key": [T, H, D], "positions": [T] or None}}``
     ON  packed 只含 suffix（裁剪后），OFF packed 含完整序列。
     cmp 侧用 prefix_lens + cu_seqlens 做 suffix 对齐后对比（同 attn_output 模式）。
     positions 可选，用于手动排查时的位置回溯。
     """
-    global _ROPE_EMB_BUFFER
+    global _ROPE_POSTQK_BUFFER
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    if _ROPE_EMB_BUFFER is None:
-        _ROPE_EMB_BUFFER = {}
+    if _ROPE_POSTQK_BUFFER is None:
+        _ROPE_POSTQK_BUFFER = {}
     entry = {
         "query": rotated_query.detach().cpu().clone(),
         "key": rotated_key.detach().cpu().clone(),
     }
     if positions is not None:
         entry["positions"] = positions.detach().cpu().clone()
-    _ROPE_EMB_BUFFER[layer_number] = entry
+    _ROPE_POSTQK_BUFFER[layer_number] = entry
     if layer_number == num_layers:
-        _flush_dict_buffer("rope_emb.pt", _ROPE_EMB_BUFFER, dump_dir)
-        _ROPE_EMB_BUFFER = None
+        _flush_dict_buffer("rope_postqk.pt", _ROPE_POSTQK_BUFFER, dump_dir)
+        _ROPE_POSTQK_BUFFER = None
 
 
 def _flush_dict_buffer(fname: str, buffer: dict, dump_dir: str) -> None:
     """rank0 直接 torch.save 一个 dict buffer。
 
     不能用 _save_tensor：它对入参做 .detach().cpu().clone()，dict 没 .detach() →
-    AttributeError 被其 except 吞掉，文件永不写盘（rope_emb.pt 曾因此丢失）。
+    AttributeError 被其 except 吞掉，文件永不写盘（rope_postqk.pt 曾因此丢失）。
     entries 应在插入时已 detach().cpu().clone()。仿 _flush_attn_buffer。
     """
     import os as _os

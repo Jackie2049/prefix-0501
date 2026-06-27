@@ -387,7 +387,7 @@ def cmp_position_ids(dir_a: str, dir_b: str) -> CheckResult | None:
 #  2. RoPE encoding — absolute equality
 # ══════════════════════════════════════════════════════════════════
 
-def cmp_rope_emb(dir_on: str, dir_off: str) -> CheckResult | None:
+def cmp_rope_postqk(dir_on: str, dir_off: str) -> CheckResult | None:
     """Compare post-RoPE Q/K between ON and OFF, aligned by position IDs.
 
     ON  positions are absolute (preserved from original input).
@@ -399,8 +399,8 @@ def cmp_rope_emb(dir_on: str, dir_off: str) -> CheckResult | None:
     3. For reuser rows: ON uses absolute positions (prefix_len..), OFF uses
        relative (0..).  Positions differ by design — skip direct comparison.
     """
-    fa = os.path.join(dir_on, "rope_emb.pt")
-    fb = os.path.join(dir_off, "rope_emb.pt")
+    fa = os.path.join(dir_on, "rope_postqk.pt")
+    fb = os.path.join(dir_off, "rope_postqk.pt")
     if not os.path.exists(fa) or not os.path.exists(fb):
         return None
     a = torch.load(fa, weights_only=True)
@@ -409,7 +409,7 @@ def cmp_rope_emb(dir_on: str, dir_off: str) -> CheckResult | None:
         return None
     la, lb = set(a.keys()), set(b.keys())
     if la != lb:
-        return CheckResult(name="rope_emb", passed=False,
+        return CheckResult(name="rope_postqk", passed=False,
                            metrics={"error": "layer set mismatch"})
 
     max_diff_q = 0.0
@@ -482,7 +482,7 @@ def cmp_rope_emb(dir_on: str, dir_off: str) -> CheckResult | None:
     threshold = 1e-7
     passed = (first_token_q_diff < threshold and first_token_k_diff < threshold
               and first_row_q_diff < threshold and first_row_k_diff < threshold)
-    return CheckResult(name="rope_emb", passed=passed, metrics={
+    return CheckResult(name="rope_postqk", passed=passed, metrics={
         "num_layers": num_layers,
         "first_row_len": first_row_len,
         "first_token_q_maxdiff": first_token_q_diff,
@@ -862,7 +862,7 @@ def _print_pos_ids(r: CheckResult):
 
 
 def _print_rope(r: CheckResult):
-    print(_SEP_SINGLE + f"\n  [rope_emb]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
+    print(_SEP_SINGLE + f"\n  [rope_postqk]  {_CHECK if r.passed else _CROSS} {'PASS' if r.passed else 'FAIL'}")
     print(_SEP_SINGLE)
     m = r.metrics
     if "error" in m:
@@ -1111,7 +1111,7 @@ def main():
 
     # ── ②b RoPE encoding (post-apply rotated Q/K) ──
     if not stop:
-        r = cmp_rope_emb(args.dir_on, args.dir_off)
+        r = cmp_rope_postqk(args.dir_on, args.dir_off)
         if r:
             all_results.append(r)
             _print_rope(r)

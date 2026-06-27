@@ -10,7 +10,7 @@ Supports two dump modes:
 
 2. Positional encoding:
    - ``position_ids.pt``    — packed position ids [N]
-   - ``rope_emb.pt``        — per-layer RoPE encoding dict
+   - ``rope_postqk.pt``        — per-layer RoPE encoding dict
                               {layer_idx: {"query": rotated_q, "key": rotated_k}}
 
 3. 2D format:
@@ -39,8 +39,7 @@ _DUMP_DIR: str | None = None
 _META_SAVED: set[str] = set()       # saved metadata keys (dedup per key)
 _ATTN_BUFFER: dict[int, torch.Tensor] | None = None  # {layer_idx: tensor}
 _ROPE_BUFFER: dict[int, dict] | None = None           # {layer_idx: {"query": q, "key": k}}
-_ROPE_FREQS_ON_BUFFER: dict[int, torch.Tensor] | None = None   # {layer_idx: q_freqs per-token}
-_ROPE_FREQS_OFF_BUFFER: dict[int, torch.Tensor] | None = None  # {layer_idx: q_pos_emb table}
+_ROPE_FREQS_BUFFER: dict[int, torch.Tensor] | None = None      # {layer_idx: per-token RoPE 角度}
 
 
 def _get_dump_dir() -> str | None:
@@ -264,7 +263,7 @@ def _add_to_rope_buffer(layer_number: int, rotated_query: torch.Tensor,
 
 
 def _flush_rope_buffer(dump_dir: str) -> None:
-    """Write accumulated rope_emb dict to disk and clear buffer."""
+    """Write accumulated rope_postqk dict to disk and clear buffer."""
     global _ROPE_BUFFER
     if _ROPE_BUFFER is None:
         return
@@ -272,67 +271,41 @@ def _flush_rope_buffer(dump_dir: str) -> None:
         _ROPE_BUFFER = None
         return
     try:
-        torch.save(_ROPE_BUFFER, os.path.join(dump_dir, "rope_emb.pt"))
-        _log.warning("rope_emb.pt saved (%d layers)", len(_ROPE_BUFFER))
+        torch.save(_ROPE_BUFFER, os.path.join(dump_dir, "rope_postqk.pt"))
+        _log.warning("rope_postqk.pt saved (%d layers)", len(_ROPE_BUFFER))
         _ROPE_BUFFER = None
     except Exception as e:
-        _log.warning("rope_emb.pt save failed: %s", e)
+        _log.warning("rope_postqk.pt save failed: %s", e)
 
 
 # ── RoPE angle dump (pre-apply, per-layer) ──────────────────────
 
-def dump_rope_freqs_on(q_freqs: torch.Tensor, layer_number: int,
-                       num_layers: int) -> None:
-    """Accumulate ON-mode per-token RoPE angles. Auto-flush on last layer.
+def dump_rope_freqs(q_freqs: torch.Tensor, layer_number: int,
+                    num_layers: int) -> None:
+    """Accumulate per-token RoPE angles (ON/OFF 共用). Auto-flush on last layer.
 
-    ``q_freqs`` is the result of ``q_pos_emb.index_select(0, packed_position_ids)``
-    — shape [T_on, 1, 1, D], each token's actual rotation angles **before
-    cos/sin**.  Stored as ``rope_freqs_on.pt`` (dict {layer_idx: tensor}).
+    ``q_freqs`` = 每 token 实际旋转角度（cos/sin 之前），shape [T, 1, 1, D]。
+    ON 由 ``q_pos_emb.index_select(0, packed_position_ids)`` 得到；OFF 由 raw 表
+    按 cu_seqlens 切 per-token（每段 0..seg-1）得到。两边语义统一，写到各自 dump
+    目录的 ``rope_freqs.pt``，cmp 侧 suffix 对齐后比 max_diff（角度应精确相等）。
     """
-    global _ROPE_FREQS_ON_BUFFER
+    global _ROPE_FREQS_BUFFER
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    if _ROPE_FREQS_ON_BUFFER is None:
-        _ROPE_FREQS_ON_BUFFER = {}
-    _ROPE_FREQS_ON_BUFFER[layer_number] = q_freqs.detach().cpu().clone()
+    if _ROPE_FREQS_BUFFER is None:
+        _ROPE_FREQS_BUFFER = {}
+    _ROPE_FREQS_BUFFER[layer_number] = q_freqs.detach().cpu().clone()
     if layer_number == num_layers:
         if _rank0_only():
             try:
-                torch.save(_ROPE_FREQS_ON_BUFFER,
-                           os.path.join(dump_dir, "rope_freqs_on.pt"))
-                _log.warning("rope_freqs_on.pt saved (%d layers)",
-                             len(_ROPE_FREQS_ON_BUFFER))
+                torch.save(_ROPE_FREQS_BUFFER,
+                           os.path.join(dump_dir, "rope_freqs.pt"))
+                _log.warning("rope_freqs.pt saved (%d layers)",
+                             len(_ROPE_FREQS_BUFFER))
             except Exception as e:
-                _log.warning("rope_freqs_on.pt save failed: %s", e)
-        _ROPE_FREQS_ON_BUFFER = None
-
-
-def dump_rope_freqs_off(q_pos_emb: torch.Tensor, layer_number: int,
-                        num_layers: int) -> None:
-    """Accumulate OFF-mode raw RoPE angle table. Auto-flush on last layer.
-
-    ``q_pos_emb`` is the raw angle table (before per-token slicing) —
-    shape [L0, 1, 1, D], where ``freqs[p] = p * inv_freq``.
-    Stored as ``rope_freqs_off.pt`` (dict {layer_idx: tensor}).
-    """
-    global _ROPE_FREQS_OFF_BUFFER
-    dump_dir = _get_dump_dir()
-    if dump_dir is None:
-        return
-    if _ROPE_FREQS_OFF_BUFFER is None:
-        _ROPE_FREQS_OFF_BUFFER = {}
-    _ROPE_FREQS_OFF_BUFFER[layer_number] = q_pos_emb.detach().cpu().clone()
-    if layer_number == num_layers:
-        if _rank0_only():
-            try:
-                torch.save(_ROPE_FREQS_OFF_BUFFER,
-                           os.path.join(dump_dir, "rope_freqs_off.pt"))
-                _log.warning("rope_freqs_off.pt saved (%d layers)",
-                             len(_ROPE_FREQS_OFF_BUFFER))
-            except Exception as e:
-                _log.warning("rope_freqs_off.pt save failed: %s", e)
-        _ROPE_FREQS_OFF_BUFFER = None
+                _log.warning("rope_freqs.pt save failed: %s", e)
+        _ROPE_FREQS_BUFFER = None
 
 
 # ── Position IDs dump ───────────────────────────────────────────
@@ -351,7 +324,7 @@ def dump_position_ids(position_ids: torch.Tensor) -> None:
 
 # ── RoPE encoding dump (per layer) ──────────────────────────────
 
-def dump_rope_emb_layer(layer_number: int, rotated_query: torch.Tensor,
+def dump_rope_postqk_layer(layer_number: int, rotated_query: torch.Tensor,
                         rotated_key: torch.Tensor, num_layers: int,
                         positions: torch.Tensor | None = None) -> None:
     """Accumulate one layer's post-RoPE query/key. Auto-flush on last layer.
