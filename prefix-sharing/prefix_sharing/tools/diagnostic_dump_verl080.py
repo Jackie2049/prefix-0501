@@ -239,9 +239,17 @@ def dump_rope_emb_verl080(layer_number: int,
         entry["positions"] = positions.detach().cpu().clone()
     _ROPE_EMB_BUFFER[layer_number] = entry
     if layer_number == num_layers:
-        # 用 _save_tensor 写盘（修潜伏 bug：原手写 os.path.join 但本文件未 import os，
-        # NameError 被外层 except 静默吞掉 → rope_emb.pt 从未真正写盘）。
-        _save_tensor("rope_emb.pt", _ROPE_EMB_BUFFER, dump_dir)
+        # 不能用 _save_tensor：它对入参做 .detach().cpu().clone()，dict 没 .detach() →
+        # AttributeError 被其 except 吞掉，rope_emb.pt 永不写盘（这是 da396612 引入的回归）。
+        # entries 在插入时已 detach().cpu().clone()，这里 rank0 直接 torch.save（仿
+        # _flush_attn_buffer 写 attn_outputs.pt 的方式）。
+        import os as _os
+        from prefix_sharing.tools.diagnostic_dump import _rank0_only
+        if _rank0_only():
+            try:
+                torch.save(_ROPE_EMB_BUFFER, _os.path.join(dump_dir, "rope_emb.pt"))
+            except Exception as _e:
+                print(f"[PS-diag] rope_emb.pt save failed: {_e}", flush=True)
         _ROPE_EMB_BUFFER = None
 
 
