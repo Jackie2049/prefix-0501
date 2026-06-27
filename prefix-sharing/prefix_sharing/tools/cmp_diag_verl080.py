@@ -691,6 +691,36 @@ def _align_rope_freqs_layer(on_freqs: torch.Tensor, off_freqs: torch.Tensor,
         return None
 
 
+def _load_rope_freqs_vec_at_pos(dir_on: str, dir_off: str, layer: int, pos: int,
+                                align_mask: torch.Tensor | None = None
+                                ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """加载 rope_freqs 对齐后 [pos] 的角度向量 [D]，返回 (on_vec, off_vec) 或 (None, None)。
+
+    供 top-K 跨 stage 对齐用（freqs dim = Q/K dim % D，角度按 head_dim 共享）。
+    """
+    fa = os.path.join(dir_on, "rope_freqs.pt")
+    fb = os.path.join(dir_off, "rope_freqs.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None, None
+    on_dict = torch.load(fa, weights_only=True)
+    off_dict = torch.load(fb, weights_only=True)
+    if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
+        return None, None
+    if layer not in on_dict or layer not in off_dict:
+        return None, None
+    if align_mask is None:
+        align_mask = _build_attn_align_mask(dir_on, dir_off)
+    if align_mask is None:
+        return None, None
+    _aligned = _align_rope_freqs_layer(on_dict[layer], off_dict[layer], align_mask)
+    if _aligned is None:
+        return None, None
+    on_a, off_a = _aligned
+    if pos < 0 or pos >= on_a.shape[0]:
+        return None, None
+    return on_a[pos].reshape(-1), off_a[pos].reshape(-1)
+
+
 def cmp_rope_freqs(dir_on: str, dir_off: str,
                     layer: int | None = None) -> CheckResult | None:
     """对比 per-token RoPE 角度 — suffix 对齐，应精确相等 max_diff==0。
@@ -1153,6 +1183,29 @@ def _print_topk_vec(on_vec: torch.Tensor, off_vec: torch.Tensor,
         for i in idx.tolist():
             print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
                   f"  {float(abs_err[i]):>12.6e}")
+    return idx.tolist()
+
+
+def _print_vec_at_dims(on_vec: torch.Tensor, off_vec: torch.Tensor,
+                       dims, label: str, show_rel: bool = True):
+    """在指定 dims 上打印 ON/OFF/ABS_ERR（不排序），跨 stage 对齐同一批 dim。
+
+    供 rope 流水线 top-K 对齐：dims 取自 rope_postqk 的 sort-err top-K，
+    在 rope_preqk / rope_freqs 上显示同样的 dim，逐 dim 追溯误差来源。
+    """
+    abs_err = (on_vec - off_vec).abs()
+    rel_err = abs_err / torch.maximum(on_vec.abs(), off_vec.abs()).clamp(min=1e-8)
+    print(f"\n  [{label}]  at {len(dims)} dims")
+    if show_rel:
+        print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}  {'REL_ERR':>12s}")
+        for i in dims:
+            print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
+                  f"  {float(abs_err[i]):>12.6e}  {float(rel_err[i]):>12.6e}")
+    else:
+        print(f"  {'DIM':>6s}  {'ON':>14s}  {'OFF':>14s}  {'ABS_ERR':>12s}")
+        for i in dims:
+            print(f"  {i:>6d}  {float(on_vec[i]):>14.6e}  {float(off_vec[i]):>14.6e}"
+                  f"  {float(abs_err[i]):>12.6e}")
 
 
 def _print_topk_2d(on_t: torch.Tensor, off_t: torch.Tensor,
@@ -1339,22 +1392,44 @@ def main():
     for r in cmp_rope_postqk_token(args.dir_on, args.dir_off, pos, args.layer,
                                 align_mask=align_mask, stage="post"):
         all_results.append(r); rope_pt_results.append(r); _print_packed_token(r)
-    # rope packed_token top-K（pre Q/K + post Q/K；freqs 角度应精确相等，vec_metrics 已含 max_abs）
+    # rope packed_token top-K —— dim 跨 stage 对齐：以 rope_postqk 的 sort-err top-K dim 为基准，
+    # rope_preqk 显示同样 dim，rope_freqs 显示 dim%D（角度按 head_dim 共享），逐 dim 追溯误差。
     if args.topk > 0 and rope_pt_results:
         rope_layer = args.layer if args.layer is not None else (
             _get_num_layers(args.dir_on) or _get_num_layers(args.dir_off))
         if rope_layer:
-            for _stage, _fname, _label in _ROPE_STAGES:
-                q_on, k_on = _load_rope_postqk(args.dir_on, rope_layer, _fname)
-                q_off, k_off = _load_rope_postqk(args.dir_off, rope_layer, _fname)
-                vecs = _rope_postqk_vec_at_pos(q_on, k_on, q_off, k_off, pos, align_mask)
-                if vecs is not None:
-                    qo, qf, ko, kf = vecs
-                    _print_topk_vec(qo.cpu(), qf.cpu(), args.topk, "val",
-                                    f"{_label}_L{rope_layer}_Q_pos{pos}")
-                    if ko is not None and kf is not None:
-                        _print_topk_vec(ko.cpu(), kf.cpu(), args.topk, "val",
-                                        f"{_label}_L{rope_layer}_K_pos{pos}")
+            pre_q_on, pre_k_on = _load_rope_postqk(args.dir_on, rope_layer, "rope_preqk.pt")
+            pre_q_off, pre_k_off = _load_rope_postqk(args.dir_off, rope_layer, "rope_preqk.pt")
+            post_q_on, post_k_on = _load_rope_postqk(args.dir_on, rope_layer, "rope_postqk.pt")
+            post_q_off, post_k_off = _load_rope_postqk(args.dir_off, rope_layer, "rope_postqk.pt")
+            pre_vecs = _rope_postqk_vec_at_pos(pre_q_on, pre_k_on, pre_q_off, pre_k_off, pos, align_mask)
+            post_vecs = _rope_postqk_vec_at_pos(post_q_on, post_k_on, post_q_off, post_k_off, pos, align_mask)
+            freq_on, freq_off = _load_rope_freqs_vec_at_pos(
+                args.dir_on, args.dir_off, rope_layer, pos, align_mask)
+            if post_vecs is not None:
+                pqo, pqf, pko, pkf = post_vecs
+                # Q: postqk sort-err top-K → preqk / freqs 同 dim
+                q_dims = _print_topk_vec(pqo.cpu(), pqf.cpu(), args.topk, args.sort_err,
+                                         f"rope_postqk_L{rope_layer}_Q_pos{pos}")
+                if pre_vecs is not None:
+                    _print_vec_at_dims(pre_vecs[0].cpu(), pre_vecs[1].cpu(), q_dims,
+                                       f"rope_preqk_L{rope_layer}_Q_pos{pos} (same dims)")
+                if freq_on is not None and freq_off is not None:
+                    _D = freq_on.numel()
+                    _print_vec_at_dims(freq_on.cpu(), freq_off.cpu(),
+                                       [d % _D for d in q_dims],
+                                       f"rope_freqs_L{rope_layer}_Q_pos{pos} (dim%D)")
+                # K: 同样
+                if pko is not None and pkf is not None:
+                    k_dims = _print_topk_vec(pko.cpu(), pkf.cpu(), args.topk, args.sort_err,
+                                             f"rope_postqk_L{rope_layer}_K_pos{pos}")
+                    if pre_vecs is not None and pre_vecs[2] is not None and pre_vecs[3] is not None:
+                        _print_vec_at_dims(pre_vecs[2].cpu(), pre_vecs[3].cpu(), k_dims,
+                                           f"rope_preqk_L{rope_layer}_K_pos{pos} (same dims)")
+                    if freq_on is not None and freq_off is not None:
+                        _print_vec_at_dims(freq_on.cpu(), freq_off.cpu(),
+                                           [d % _D for d in k_dims],
+                                           f"rope_freqs_L{rope_layer}_K_pos{pos} (dim%D)")
 
     # ── 2D: logprobs + entropy ──
     for fname, cname in [("logprobs", "logp"), ("entropy", "entropy")]:
