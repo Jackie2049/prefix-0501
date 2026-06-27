@@ -89,8 +89,10 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                     if (packed_seq_params is not None
                             and hasattr(packed_seq_params, "cu_seqlens_q_padded")):
                         _cu = packed_seq_params.cu_seqlens_q_padded
+                        # device 必须显式到 _cu.device(GPU)：arange 默认 CPU，否则后面
+                        # _q_pos_emb.index_select(0, _off_positions) 会 device 不匹配崩 forward。
                         _off_positions = torch.cat([
-                            torch.arange(_cu[i + 1] - _cu[i])
+                            torch.arange(int(_cu[i + 1] - _cu[i]), device=_cu.device)
                             for i in range(len(_cu) - 1)
                         ]).long()
                     # rope_freqs：存 per-token 角度（与 ON 同款），统一 rope_freqs.pt
