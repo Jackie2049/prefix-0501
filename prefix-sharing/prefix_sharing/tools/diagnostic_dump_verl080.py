@@ -239,46 +239,82 @@ def dump_rope_emb_verl080(layer_number: int,
         entry["positions"] = positions.detach().cpu().clone()
     _ROPE_EMB_BUFFER[layer_number] = entry
     if layer_number == num_layers:
-        # 不能用 _save_tensor：它对入参做 .detach().cpu().clone()，dict 没 .detach() →
-        # AttributeError 被其 except 吞掉，rope_emb.pt 永不写盘（这是 da396612 引入的回归）。
-        # entries 在插入时已 detach().cpu().clone()，这里 rank0 直接 torch.save（仿
-        # _flush_attn_buffer 写 attn_outputs.pt 的方式）。
-        import os as _os
-        from prefix_sharing.tools.diagnostic_dump import _rank0_only
-        if _rank0_only():
-            try:
-                torch.save(_ROPE_EMB_BUFFER, _os.path.join(dump_dir, "rope_emb.pt"))
-            except Exception as _e:
-                print(f"[PS-diag] rope_emb.pt save failed: {_e}", flush=True)
+        _flush_dict_buffer("rope_emb.pt", _ROPE_EMB_BUFFER, dump_dir)
         _ROPE_EMB_BUFFER = None
 
 
+def _flush_dict_buffer(fname: str, buffer: dict, dump_dir: str) -> None:
+    """rank0 直接 torch.save 一个 dict buffer。
+
+    不能用 _save_tensor：它对入参做 .detach().cpu().clone()，dict 没 .detach() →
+    AttributeError 被其 except 吞掉，文件永不写盘（rope_emb.pt 曾因此丢失）。
+    entries 应在插入时已 detach().cpu().clone()。仿 _flush_attn_buffer。
+    """
+    import os as _os
+    from prefix_sharing.tools.diagnostic_dump import _rank0_only
+    if _rank0_only():
+        try:
+            torch.save(buffer, _os.path.join(dump_dir, fname))
+        except Exception as _e:
+            print(f"[PS-diag] {fname} save failed: {_e}", flush=True)
+
+
+_ROPE_PREQK_BUFFER: dict[int, dict] | None = None
+
+
+def dump_rope_preqk_verl080(layer_number: int,
+                             query: torch.Tensor,
+                             key: torch.Tensor,
+                             num_layers: int) -> None:
+    """Accumulate one layer's pre-RoPE Q/K. Auto-flush to ``rope_preqk.pt`` on last layer.
+
+    Format: ``{layer_idx: {"query": [T, H, D], "key": [T, H, D]}}``。
+    旋转前的 Q/K（纯 QKV 投影输出，未加位置编码）。ON/OFF 应逐元素相同——
+    同 hidden_states、同 QKV 权重。用来隔离：pre-RoPE 相同但 post-RoPE 不同 →
+    问题在 RoPE；pre 就不同 → 问题在上游（hidden_states / 投影）。
+    """
+    global _ROPE_PREQK_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _ROPE_PREQK_BUFFER is None:
+        _ROPE_PREQK_BUFFER = {}
+    _ROPE_PREQK_BUFFER[layer_number] = {
+        "query": query.detach().cpu().clone(),
+        "key": key.detach().cpu().clone(),
+    }
+    if layer_number == num_layers:
+        _flush_dict_buffer("rope_preqk.pt", _ROPE_PREQK_BUFFER, dump_dir)
+        _ROPE_PREQK_BUFFER = None
+
+
 @contextlib.contextmanager
-def capture_post_rope_qk():
-    """Hook mcore 的 ``apply_rotary_pos_emb``，截获 original_forward 内部真实算出的 post-RoPE Q/K。
+def capture_rope_qk():
+    """Hook mcore 的 ``apply_rotary_pos_emb``，同时截获旋转前(pre)与旋转后(post)的 Q/K。
 
     mcore ``Attention.forward`` 的 THD prefill 路径每层恰好调用模块级
     ``apply_rotary_pos_emb`` 两次——先 Q 后 K（见 megatron/core/transformer/
-    attention.py:1097,1110）。这里 monkey-patch 该模块全局函数，把每次调用的
-    返回值（旋转后的张量）追加到 yield 的 list；``finally`` 还原原函数。
+    attention.py:1097,1110）。monkey-patch 该模块全局函数，把每次调用的输入 t
+    (pre-RoPE) 与返回值 out (post-RoPE) 存为 ``{"pre": t, "post": out}`` 追加到
+    yield 的 list；``finally`` 还原原函数。
 
     ON 路径不受影响：它在 megatron_runtime.py 里把 ``apply_rotary_pos_emb``
     import 进了自有命名空间，不经 attention 模块全局解析，patch 不到它。
 
     用法（OFF 分支，包住 original_forward 调用）::
 
-        with capture_post_rope_qk() as caps:
+        with capture_rope_qk() as caps:
             result = original_forward(...)
-        # caps[0]=rotated_query, caps[1]=rotated_key（单层 Attention.forward 内的调用顺序）
+        # caps[0]={"pre":Q_pre,"post":Q_post}, caps[1]={"pre":K_pre,"post":K_post}
     """
     import megatron.core.transformer.attention as _attn_mod
 
     _orig = _attn_mod.apply_rotary_pos_emb
-    captures: list = []
+    captures: list = []  # 每元素 {"pre": 旋转前 t, "post": 旋转后 out}
 
     def _capturing(t, *args, **kwargs):
         out = _orig(t, *args, **kwargs)
-        captures.append(out)
+        captures.append({"pre": t, "post": out})
         return out
 
     _attn_mod.apply_rotary_pos_emb = _capturing

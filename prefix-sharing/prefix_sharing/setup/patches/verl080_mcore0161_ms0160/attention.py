@@ -43,8 +43,8 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             from contextlib import nullcontext
             _diag_on = _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
             if _diag_on and rotary_pos_emb is not None:
-                from prefix_sharing.tools.diagnostic_dump_verl080 import capture_post_rope_qk
-                _rope_cm = capture_post_rope_qk()
+                from prefix_sharing.tools.diagnostic_dump_verl080 import capture_rope_qk
+                _rope_cm = capture_rope_qk()
             else:
                 _rope_cm = nullcontext()
             with _rope_cm as _rope_caps:
@@ -69,7 +69,9 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                 from prefix_sharing.tools.diagnostic_dump import (
                     dump_attn_off, dump_rope_freqs_off,
                 )
-                from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_emb_verl080
+                from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                    dump_rope_emb_verl080, dump_rope_preqk_verl080,
+                )
                 from prefix_sharing.integrations.megatron_runtime import _unpack_rotary_pos_emb
                 _attn_out = _result[0] if isinstance(_result, tuple) else _result
                 _bs = (
@@ -87,7 +89,8 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                     # （original_forward 内部 apply_rotary_pos_emb 的返回值），
                     # captures[0]=Q, captures[1]=K。不再 get_query_key_value_tensors + 重算 RoPE。
                     if _rope_caps is not None and len(_rope_caps) >= 2:
-                        _off_q_rope, _off_k_rope = _rope_caps[0], _rope_caps[1]
+                        # 每个捕获是 {"pre": 旋转前, "post": 旋转后}
+                        _q_cap, _k_cap = _rope_caps[0], _rope_caps[1]
                         # positions 仅作 debug 记录；cmp 按 cu_seqlens+prefix_lens 对齐，不用它
                         _off_positions = None
                         if (packed_seq_params is not None
@@ -97,9 +100,15 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                                 torch.arange(_cu[i + 1] - _cu[i])
                                 for i in range(len(_cu) - 1)
                             ]).long()
+                        # post-RoPE（旋转后）
                         dump_rope_emb_verl080(
-                            self.layer_number, _off_q_rope, _off_k_rope,
+                            self.layer_number, _q_cap["post"], _k_cap["post"],
                             self.config.num_layers, positions=_off_positions,
+                        )
+                        # pre-RoPE（旋转前，纯 QKV 投影）
+                        dump_rope_preqk_verl080(
+                            self.layer_number, _q_cap["pre"], _k_cap["pre"],
+                            self.config.num_layers,
                         )
                     else:
                         print(

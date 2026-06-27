@@ -161,6 +161,15 @@ def _apply_positioned_rope(
     positions = packed_position_ids.to(device=query.device, dtype=torch.long)
     max_needed = positions.max().item() + 1
 
+    ######### prefix-sharing diag: pre-RoPE Q/K dump（旋转前，尚未加位置编码）#########
+    try:
+        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_preqk_verl080
+        dump_rope_preqk_verl080(attention_module.layer_number, query, key,
+                                attention_module.config.num_layers)
+    except Exception as _e:
+        print(f"rope_preqk (pre-RoPE) dump failed: {_e}", flush=True)
+    ######### prefix-sharing diag: pre-RoPE Q/K dump end #########
+
     # 当 packed_position_ids 所需要的最大 position id 超过了 q_pos_emb / k_pos_emb 的当前长度时，
     # 就需要对 q_pos_emb / k_pos_emb 进行扩展。
     # THD 模式下生成的 pos_emb 仅覆盖 positions 0 .. max_seqlen_q-1 这段范围，
