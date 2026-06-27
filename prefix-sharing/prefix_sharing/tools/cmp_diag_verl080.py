@@ -485,6 +485,8 @@ def _rope_postqk_cos_for_layer(qa: torch.Tensor, ka: torch.Tensor,
         "n_tokens": qa_flat.shape[0],
         "Q_cos_avg": float(q_cos.mean()), "Q_cos_min": float(q_cos.min()),
         "K_cos_avg": float(k_cos.mean()), "K_cos_min": float(k_cos.min()),
+        "Q_max_diff": float((qa_flat - qb_flat).abs().max()),
+        "K_max_diff": float((ka_flat - kb_flat).abs().max()),
     }
 
 
@@ -1265,10 +1267,10 @@ def _print_rope_postqk_per_layer(r: CheckResult):
     print(_SEP_SINGLE)
     layers = r.metrics.get("layers")
     if isinstance(layers, dict):
-        print(f"  {'LAYER':>6s}  {'Q_COS_AVG':>14s}  {'Q_COS_MIN':>14s}  "
-              f"{'K_COS_AVG':>14s}  {'K_COS_MIN':>14s}  "
+        print(f"  {'LAYER':>6s}  {'Q_MAXDIFF':>12s}  {'Q_COS_AVG':>12s}  "
+              f"{'K_MAXDIFF':>12s}  {'K_COS_AVG':>12s}  "
               f"{'TOKENS':>8s}  {'STATUS':>8s}")
-        print(f"  {'─' * 6}  {'─' * 14}  {'─' * 14}  {'─' * 14}  {'─' * 14}  "
+        print(f"  {'─' * 6}  {'─' * 12}  {'─' * 12}  {'─' * 12}  {'─' * 12}  "
               f"{'─' * 8}  {'─' * 8}")
         bad = []
         for lyr in sorted(layers.keys()):
@@ -1279,21 +1281,23 @@ def _print_rope_postqk_per_layer(r: CheckResult):
                 continue
             ok = (d["Q_cos_avg"] > _COS_AVG_PASS and d["Q_cos_min"] > _COS_MIN_PASS
                   and d["K_cos_avg"] > _COS_AVG_PASS and d["K_cos_min"] > _COS_MIN_PASS)
-            print(f"  {lyr:>6d}  {d['Q_cos_avg']:>14.6e}  {d['Q_cos_min']:>14.6e}  "
-                  f"{d['K_cos_avg']:>14.6e}  {d['K_cos_min']:>14.6e}  "
+            print(f"  {lyr:>6d}  {d.get('Q_max_diff', 0.0):>12.3e}  "
+                  f"{d['Q_cos_avg']:>12.6e}  "
+                  f"{d.get('K_max_diff', 0.0):>12.3e}  {d['K_cos_avg']:>12.6e}  "
                   f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
             if not ok:
                 bad.append(lyr)
         if bad:
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
+        print(f"  （Q/K max_diff 与 build_kv_input_v 的 V max_diff 同口径，可直接对比）")
     elif "Q_cos_avg" in r.metrics:
         d = r.metrics
         ok = (d["Q_cos_avg"] > _COS_AVG_PASS and d["Q_cos_min"] > _COS_MIN_PASS
               and d["K_cos_avg"] > _COS_AVG_PASS and d["K_cos_min"] > _COS_MIN_PASS)
-        print(f"  L{d['layer']}  Q_cos_avg={d['Q_cos_avg']:.6e}  "
-              f"Q_cos_min={d['Q_cos_min']:.6e}  "
-              f"K_cos_avg={d['K_cos_avg']:.6e}  K_cos_min={d['K_cos_min']:.6e}  "
-              f"{'PASS' if ok else 'WARN'}")
+        print(f"  L{d['layer']}  Q_maxdiff={d.get('Q_max_diff', 0.0):.3e}  "
+              f"Q_cos_avg={d['Q_cos_avg']:.6e}  "
+              f"K_maxdiff={d.get('K_max_diff', 0.0):.3e}  "
+              f"K_cos_avg={d['K_cos_avg']:.6e}  {'PASS' if ok else 'WARN'}")
     elif "error" in r.metrics:
         print(f"  {_CROSS} {r.metrics['error']}")
     print()
