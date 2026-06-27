@@ -90,6 +90,13 @@ def prefix_attention(
 
     # 前缀共享：provider 存储激活值，reuser 拼接激活值
     attention_backend = prefix_sharing_context.attention_backend or TorchReferenceBackend()
+    ######### prefix-sharing diag: ON build_kv 输入 V dump（build_kv 之前）#########
+    try:
+        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_build_kv_input_v_on
+        dump_build_kv_input_v_on(layer_id, value, attention_module.config.num_layers)
+    except Exception as _e:
+        print(f"build_kv_input_v dump failed: {_e}", flush=True)
+    ######### prefix-sharing diag: ON build_kv 输入 V dump end #########
     expanded_key, expanded_value = attention_backend.build_kv(
         key,
         value,

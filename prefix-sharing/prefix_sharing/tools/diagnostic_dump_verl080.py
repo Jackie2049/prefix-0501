@@ -339,6 +339,29 @@ def dump_full_kv_off(layer_number: int, key: torch.Tensor, value: torch.Tensor,
         _FULL_KV_BUFFER = None
 
 
+_BUILD_KV_INPUT_V_BUFFER: dict[int, torch.Tensor] | None = None
+
+
+def dump_build_kv_input_v_on(layer_number: int, value: torch.Tensor,
+                             num_layers: int) -> None:
+    """ON: build_kv 输入的 V（get_qkv 出来、build_kv 之前的 raw V）。满层 flush ``build_kv_input_v.pt``。
+
+    Format: ``{layer_idx: [T_on, ...]}``。供与 OFF ``full_kv.pt`` 的 V 做 suffix 对比——
+    定位 V 是在 build_kv 之前（get_qkv/hidden_states）就偏，还是 build_kv 引入。
+    T_on vs T_off 还能看出 ON 有没有把 hidden_states 裁剪成 suffix-only。
+    """
+    global _BUILD_KV_INPUT_V_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _BUILD_KV_INPUT_V_BUFFER is None:
+        _BUILD_KV_INPUT_V_BUFFER = {}
+    _BUILD_KV_INPUT_V_BUFFER[layer_number] = value.detach().cpu().clone()
+    if layer_number == num_layers:
+        _flush_dict_buffer("build_kv_input_v.pt", _BUILD_KV_INPUT_V_BUFFER, dump_dir)
+        _BUILD_KV_INPUT_V_BUFFER = None
+
+
 @contextlib.contextmanager
 def capture_rope_qk(attention_module):
     """Hook apply_rotary_pos_emb（Q/K pre+post）+ get_query_key_value_tensors（V），全 in-context。
