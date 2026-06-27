@@ -360,7 +360,7 @@ def capture_rope_qk(attention_module):
     import types as _types
 
     _orig_arpe = _attn_mod.apply_rotary_pos_emb
-    _orig_get_qkv = attention_module.get_query_key_value_tensors  # 已绑定方法
+    _orig_get_qkv = type(attention_module).get_query_key_value_tensors  # 未绑定的类方法函数
     qk_captures: list = []
     v_captures: list = []
 
@@ -369,8 +369,9 @@ def capture_rope_qk(attention_module):
         qk_captures.append({"pre": t, "post": out})
         return out
 
-    def _capturing_get_qkv(*args, **kwargs):
-        out = _orig_get_qkv(*args, **kwargs)
+    def _capturing_get_qkv(self_, *args, **kwargs):
+        # MethodType 绑定后 self_=attention_module；_orig_get_qkv 是未绑定函数，需显式传 self_
+        out = _orig_get_qkv(self_, *args, **kwargs)
         try:
             v_captures.append(out[2])  # (Q, K, V[, gate]) → V
         except Exception:
