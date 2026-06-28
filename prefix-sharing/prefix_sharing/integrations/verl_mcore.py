@@ -13,7 +13,7 @@ Both paths share the same core logic (plan -> trim -> layout -> state).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
@@ -23,8 +23,6 @@ from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
-from prefix_sharing.utils import ensure_global_packed_token_lengths
-from prefix_sharing.integrations.patch_manager import PatchHandle
 
 
 @dataclass(frozen=True)
