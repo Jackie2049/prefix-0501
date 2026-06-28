@@ -106,3 +106,23 @@ def test_enabled_config_rejects_non_phase_one_modes():
         PrefixSharingConfig(enable_prefix_sharing=True, boundary_strategy="restore_last_prefix_token").validate(ModelConfig())
     with pytest.raises(PrefixSharingConfigError, match="integrate_mode"):
         PrefixSharingConfig(enable_prefix_sharing=True).validate(ModelConfig(), integrate_mode="verl_fsdp")
+
+
+def test_prefix_sharing_config_from_raw_accepts_nested_config():
+    config = PrefixSharingConfig.from_raw(
+        {
+            "enable_prefix_sharing": True,
+            "min_prefix_len": 4,
+            "min_group_size": 3,
+            "boundary_strategy": "prefix_last_restore",
+        }
+    )
+
+    assert config.enable_prefix_sharing is True
+    assert config.min_prefix_len == 4
+    assert config.min_group_size == 3
+
+
+def test_prefix_sharing_config_from_raw_rejects_legacy_enabled_key():
+    with pytest.raises(TypeError, match="enabled"):
+        PrefixSharingConfig.from_raw({"enabled": True})

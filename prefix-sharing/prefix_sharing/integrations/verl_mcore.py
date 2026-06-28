@@ -8,21 +8,12 @@ This module covers both v070 and v080 (verl 0.8.0 engine) paths:
   handle the monkey-patch integration via ``setup/patches/``.
 
 Both paths share the same core logic (plan -> trim -> layout -> state).
-
-``VerlMCoreBatchAdapter`` is framework-light and testable locally. It turns a
-verl-style micro-batch payload into prefix-sharing metadata plus trimmed
-inputs/labels/masks, and it assembles restored logprobs after forward.
-``VerlMCoreIntegration`` installs the Megatron attention patch. The real
-Megatron QKV rewiring still requires the framework runtime and remains guarded
-by optional integration tests.
 """
 
 from __future__ import annotations
 
-import importlib
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
@@ -30,10 +21,8 @@ from prefix_sharing.core.config import PrefixSharingConfig
 from prefix_sharing.core.planner import PrefixSharingPlan
 from prefix_sharing.core.planner import PrefixSharingPlanner
 from prefix_sharing.integrations.context import current_prefix_sharing_context
-from prefix_sharing.integrations.megatron_attention import IntegrationUnavailable, MegatronAttentionIntegration
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
-from prefix_sharing.integrations.patch_manager import PatchHandle
 
 
 @dataclass(frozen=True)
@@ -43,54 +32,6 @@ class PrefixSharingRuntimeState:
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
     kept_position_ids: Any | None = None
-
-
-@dataclass
-class VerlMCoreIntegration:
-    config: PrefixSharingConfig
-    backend: Any | None = None
-
-    def install(self, model_config: Any | None = None) -> PatchHandle:
-        self.config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
-        self._ensure_verl_importable()
-        backend = get_backend_instance(self.config, self.backend)
-        return MegatronAttentionIntegration(config=self.config, backend=backend).install(
-            model_config=model_config
-        )
-
-    @staticmethod
-    def _ensure_verl_importable() -> None:
-        try:
-            importlib.import_module("verl")
-        except ModuleNotFoundError as exc:
-            raise IntegrationUnavailable("verl is not importable in this environment") from exc
-
-
-def enable_prefix_sharing(
-    config: PrefixSharingConfig,
-    *,
-    model_config: Any | None = None,
-    backend: Any | None = None,
-) -> PatchHandle:
-    """Install Phase 1 prefix-sharing patches for the verl + Megatron path."""
-
-    return VerlMCoreIntegration(config=config, backend=backend).install(model_config=model_config)
-
-
-@contextmanager
-def prefix_sharing_enabled(
-    config: PrefixSharingConfig,
-    *,
-    model_config: Any | None = None,
-    backend: Any | None = None,
-) -> Iterator[PatchHandle]:
-    """Context manager wrapper around :func:`enable_prefix_sharing`."""
-
-    handle = enable_prefix_sharing(config, model_config=model_config, backend=backend)
-    try:
-        yield handle
-    finally:
-        handle.disable()
 
 
 def build_prefix_sharing_micro_batch_verl070(

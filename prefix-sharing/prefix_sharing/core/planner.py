@@ -206,42 +206,42 @@ class PrefixSharingPlanner:
 
     def plan(
         self,
-        input_ids: Sequence[Sequence[int]],
+        sequences: Sequence[Sequence[int]],
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> PrefixSharingPlan:
-        detection = self.detector.detect(input_ids)
+        detect_result = self.detector.detect(sequences)
         return self.plan_from_detection(
-            input_ids,
-            detection,
+            sequences,
+            detect_result,
             forward_id=forward_id,
             micro_batch_id=micro_batch_id,
         )
 
     def plan_from_detection(
         self,
-        input_ids: Sequence[Sequence[int]],
-        detection: PrefixDetectionResult,
+        sequences: Sequence[Sequence[int]],
+        detect_result: PrefixDetectionResult,
         *,
         forward_id: int | None = None,
         micro_batch_id: int | None = None,
     ) -> PrefixSharingPlan:
-        if len(input_ids) != detection.batch_size:
-            raise ValueError("input_ids batch size does not match detection result")
+        if len(sequences) != detect_result.batch_size:
+            raise ValueError("sequences batch size does not match detection result")
         if forward_id is None:
             forward_id = next(_forward_ids)
         if micro_batch_id is None:
             self._micro_batch_counter += 1
             micro_batch_id = self._micro_batch_counter
 
-        batch_size = len(input_ids)
-        original_lengths = [len(seq) for seq in input_ids]
-        group_ids = list(detection.group_ids)
-        is_provider = list(detection.is_provider)
-        provider_index = list(detection.provider_index)
-        prefix_lens = list(detection.prefix_lens)
-        reuse_specs = list(detection.reuse_specs)
+        batch_size = len(sequences)
+        original_lengths = [len(seq) for seq in sequences]
+        group_ids = list(detect_result.group_ids)
+        is_provider = list(detect_result.is_provider)
+        provider_index = list(detect_result.provider_index)
+        prefix_lens = list(detect_result.prefix_lens)
+        reuse_specs = list(detect_result.reuse_specs)
 
         suffix_lens: list[int] = []
         kept_lengths_q: list[int] = []
@@ -253,18 +253,22 @@ class PrefixSharingPlanner:
         loss_mask_keep_ranges: list[tuple[int, int]] = []
         restore_specs: list[PrefixLastRestoreSpec] = []
 
-        for index, original_len in enumerate(original_lengths):
-            prefix_len = prefix_lens[index]
+        for seq_idx, original_len in enumerate(original_lengths):
+            prefix_len = prefix_lens[seq_idx]
             if prefix_len > original_len:
-                raise ValueError(f"prefix_len exceeds sequence length for batch index {index}")
-            is_reuser = provider_index[index] != index and prefix_len > 0
+                raise ValueError(f"prefix_len exceeds sequence length for batch index {seq_idx}")
+            is_reuser = provider_index[seq_idx] != seq_idx and prefix_len > 0
             suffix_len = original_len - prefix_len if is_reuser else original_len
             suffix_lens.append(suffix_len)
             expanded_lengths_kv.append(original_len)
 
             if is_reuser:
-                keep_start = prefix_len
-                keep_end = original_len
+                # 1 - 为输入数据的预处理做准备：输入阶段要对 reuser 进行序列裁剪
+                #   - 只需保留suffix部分
+                #   - prefix 部分
+                #       - KV 激活值：在 attention 时候读取缓存并进行拼接即可
+                #       - logp：可以在后处理阶段直接从provider复制得到
+                keep_start, keep_end = prefix_len, original_len
                 kept_len = suffix_len
                 q_offset = prefix_len
 
@@ -274,22 +278,21 @@ class PrefixSharingPlanner:
                 # provider's already-restored row (identical across the shared
                 # prefix), so the planner only emits the prefix-last token.
                 # The logits at position prefix_len-1 predict the first suffix
-                # token whose label is input_ids[prefix_len] (differs per
+                # token whose label is sequences[prefix_len] (differs per
                 # reuser); the restored logprob is written to 2D position
                 # prefix_len - 1 (the label slot for first-suffix prediction).
                 if prefix_len > 0 and suffix_len > 0:
                     restore_specs.append(
                         PrefixLastRestoreSpec(
-                            reuse_idx_in_batch=index,
-                            provider_idx_in_batch=provider_index[index],
-                            group_id=group_ids[index],
+                            reuse_idx_in_batch=seq_idx,
+                            provider_idx_in_batch=provider_index[seq_idx],
+                            group_id=group_ids[seq_idx],
                             target_2d_pos=prefix_len - 1,
-                            label_value=input_ids[index][prefix_len],
+                            label_value=sequences[seq_idx][prefix_len],
                         )
                     )
             else:
-                keep_start = 0
-                keep_end = original_len
+                keep_start, keep_end = 0, original_len
                 kept_len = original_len
                 q_offset = 0
 
