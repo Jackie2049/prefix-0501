@@ -13,7 +13,7 @@ Both paths share the same core logic (plan -> trim -> layout -> state).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from prefix_sharing.backends.factory import get_backend_instance
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
@@ -24,6 +24,7 @@ from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
 from prefix_sharing.utils import ensure_global_packed_token_lengths
+from prefix_sharing.integrations.patch_manager import PatchHandle
 
 
 @dataclass(frozen=True)
@@ -59,26 +60,25 @@ def build_prefix_sharing_micro_batch_verl070(
 
     # --- Path 1: prefix sharing disabled by config ---
     if not config.enable_prefix_sharing:
-        print(f"[PS][prepare] PATH 1: prefix sharing disabled (config.enable_prefix_sharing=False), returning (batch, None)")
+        print("[PS][prepare] PATH 1: prefix sharing disabled (config.enable_prefix_sharing=False), returning (batch, None)")
         return batch, None
 
-    print(f"[PS][prepare] config.enable_prefix_sharing=True, validating config...")
+    print("[PS][prepare] config.enable_prefix_sharing=True, validating config...")
 
     config.validate(model_config=model_config, integrate_mode="verl_megatron_actor")
-    print(f"[PS][prepare] config.validate() returned OK")
+    print("[PS][prepare] config.validate() returned OK")
 
     # --- Path 2: missing use_remove_padding ---
-    print(f"[PS][prepare] checking megatron.use_remove_padding...")
+    print("[PS][prepare] checking megatron.use_remove_padding...")
     if not _read_actor_bool(actor_config, "megatron.use_remove_padding", False):
-        print(f"[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
+        print("[PS][prepare] PATH 2: megatron.use_remove_padding=False, raising RuntimeError")
         raise RuntimeError("prefix sharing phase 1 requires verl megatron.use_remove_padding=True")
 
     # --- Path 3: multi_modal check ---
-    print(f"[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
+    print("[PS][prepare] use_remove_padding=True, about to batch.get(multi_modal_inputs)...")
     multi_modal_inputs = batch.get("multi_modal_inputs")
     if multi_modal_inputs is not None:
         # tensorclass 无法遍历（触发 CUDA 同步），改用底层 td 检查字段数
-        import inspect
         is_tensorclass = hasattr(multi_modal_inputs, 'batch_size')
         print(f"[PS][prepare] multi_modal_inputs type: tensorclass={is_tensorclass}, type={type(multi_modal_inputs).__name__}")
         if is_tensorclass:
@@ -89,9 +89,9 @@ def build_prefix_sharing_micro_batch_verl070(
         else:
             has_mm = any(mmi is not None and len(mmi.keys()) > 0 for mmi in multi_modal_inputs)
         if has_mm:
-            print(f"[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
+            print("[PS][prepare] PATH 3: multi_modal_inputs has content, raising RuntimeError")
             raise RuntimeError("prefix sharing phase 1 supports only text-only actor micro-batches")
-        print(f"[PS][prepare] multi_modal check PASSED (no real multi-modal content)")
+        print("[PS][prepare] multi_modal check PASSED (no real multi-modal content)")
 
     # --- Read tensors ---
     attention_mask = batch["attention_mask"].to(bool)
@@ -101,7 +101,7 @@ def build_prefix_sharing_micro_batch_verl070(
 
     # --- Path 4: wrong tensor dims ---
     if attention_mask.dim() != 2 or input_ids.dim() != 2 or position_ids.dim() != 2:
-        print(f"[PS][prepare] PATH 4: non-2D tensors detected, raising RuntimeError")
+        print("[PS][prepare] PATH 4: non-2D tensors detected, raising RuntimeError")
         raise RuntimeError("prefix sharing phase 1 expects 2D input_ids/attention_mask/position_ids")
 
     # --- Planning ---
@@ -119,11 +119,11 @@ def build_prefix_sharing_micro_batch_verl070(
 
     # --- Path 5: no sharing found ---
     if not prefix_sharing_plan.has_sharing:
-        print(f"[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
+        print("[PS][prepare] PATH 5: no sharing detected, returning (batch, None)")
         return batch, None
 
     # --- Path 6: sharing found, trim the original micro-batch ---
-    print(f"[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
+    print("[PS][prepare] PATH 6: sharing detected, preparing trimmed batch...")
     trimmed_micro_batch = _clone_batch(batch)
     new_attention_mask = attention_mask.clone()
     new_attention_mask[:] = False
@@ -328,7 +328,6 @@ def restore_via_2d_unfold_verl080(
     Returns:
         ``output``（``log_probs``/``entropy`` 被替换为重组后的 NestedTensor）。
     """
-    import torch
 
     ctx = current_prefix_sharing_context()
     if ctx is None:
@@ -352,8 +351,6 @@ def restore_via_2d_unfold_verl080(
     if B == 0:
         return output
     L_max = max(original_lengths)
-
-    device = log_probs_nested.values().device
 
     # --- Step 1: 展开裁剪后 NestedTensor → 完整 2D [B, L_max] ---
     log_probs_2d, entropy_2d = _unfold_trimmed_nested_to_2d(
