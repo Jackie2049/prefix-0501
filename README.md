@@ -7,12 +7,6 @@
 在已有前置环境（Python、PyTorch、CUDA/Ascend 等）的基础上，进入各依赖目录执行安装：
 
 ```bash
-# Qwen2.5 旧配套（v0.12.1 系列）
-cd dependency/mbridge-main && pip install --no-deps -v -e . && cd ../..
-cd dependency/Megatron-LM-core_v0.12.1 && pip install --no-deps -v -e . && cd ../..
-cd dependency/MindSpeed-v2.2.0_core_r0.12.1 && pip install --no-deps -v -e . && cd ../..
-cd dependency/verl_v070 && pip install --no-deps -v -e . && cd ../..
-
 # Qwen3.5 新配套（v0.16.1 系列）
 cd dependency/Megatron-Bridge_de93536e && pip install --no-deps -v -e . && cd ../..
 cd dependency/Megatron-LM-core_v0.16.1 && pip install --no-deps -v -e . && cd ../..
@@ -24,7 +18,6 @@ cd dependency/verl_cdd9014f && pip install --no-deps -v -e . && cd ../..
 
 > **版本配套说明**
 >
-> - **Qwen2.5 系列**：verl_v070 + Megatron-LM core_v0.12.1 + MindSpeed core_r0.12.1 + mbridge-main
 > - **Qwen3.5 系列**：verl_cdd9014f + Megatron-LM core_v0.16.1 + MindSpeed core_r0.16.0 + Megatron-Bridge de93536e
 >   - verl、mindspeed、megatron、megatron-bridge四大依赖的配套版本选用参考自 [verl Qwen3.5 NPU 教程](https://verl.readthedocs.io/en/latest/ascend_tutorial/model_support/examples/qwen3_5_122b_npu.html) 
 >   - 其他运行时依赖推荐使用以下版本（出自 [官方 Dockerfile](dependency/verl_cdd9014f/docker/ascend/Dockerfile.ascend_8.5.2_a2_qwen3-5) ），或直接使用云道上的zzf-verl080-qwen35镜像：
@@ -373,17 +366,6 @@ cd vllm-ascend && git checkout 54879467c41784a446aa5b486a391d9bfbf488fa
 pip install -r requirements.txt
 export COMPILE_CUSTOM_KERNELS=1 && pip install -v -e . --no-build-isolation
 ```
-
-### Qwen2.5 配套（旧版）
-
-参照 [verl 官方安装文档](https://verl.org.cn/en/latest/start/install.html#install-from-custom-environment)，使用 verl 提供的脚本安装推理框架和基础依赖：
-
-```bash
-cd dependency/verl_v070
-bash scripts/install_vllm_sglang_mcore.sh
-```
-
-该脚本会安装 vLLM、SGLang、FlashAttention、TransformerEngine 等依赖。注意脚本中默认安装的 Megatron-LM 版本与本项目不同，本项目使用 `dependency/Megatron-LM-core_v0.12.1` 的快照版本，需在第 1 节单独安装覆盖。
 
 ### MindSpeed（NPU）
 
