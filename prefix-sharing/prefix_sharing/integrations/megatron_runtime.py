@@ -90,13 +90,6 @@ def prefix_attention(
 
     # 前缀共享：provider 存储激活值，reuser 拼接激活值
     attention_backend = prefix_sharing_context.attention_backend or TorchReferenceBackend()
-    ######### prefix-sharing diag: ON build_kv 输入 V dump（build_kv 之前）#########
-    try:
-        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_build_kv_input_v_on
-        dump_build_kv_input_v_on(layer_id, value, attention_module.config.num_layers)
-    except Exception as _e:
-        print(f"build_kv_input_v dump failed: {_e}", flush=True)
-    ######### prefix-sharing diag: ON build_kv 输入 V dump end #########
     expanded_key, expanded_value = attention_backend.build_kv(
         key,
         value,
@@ -176,15 +169,6 @@ def _apply_positioned_rope(
 
     positions = packed_position_ids.to(device=query.device, dtype=torch.long)
     max_needed = positions.max().item() + 1
-
-    ######### prefix-sharing diag: pre-RoPE Q/K dump（旋转前，尚未加位置编码）#########
-    try:
-        from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_preqk_verl080
-        dump_rope_preqk_verl080(attention_module.layer_number, query, key,
-                                attention_module.config.num_layers)
-    except Exception as _e:
-        print(f"rope_preqk (pre-RoPE) dump failed: {_e}", flush=True)
-    ######### prefix-sharing diag: pre-RoPE Q/K dump end #########
 
     # 当 packed_position_ids 所需要的最大 position id 超过了 q_pos_emb / k_pos_emb 的当前长度时，
     # 就需要对 q_pos_emb / k_pos_emb 进行扩展。

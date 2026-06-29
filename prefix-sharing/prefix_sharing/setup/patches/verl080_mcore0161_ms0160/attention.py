@@ -159,6 +159,25 @@ def patch_megatron_attention(original_forward: Any) -> Any:
             key = key.squeeze(1)
             value = value.squeeze(1)
 
+        # ##### [PS-diag] ON pre-RoPE Q/K/V 统一 dump（get_qkv 之后、RoPE 之前）#####
+        # 全部在此点 dump（squeeze 后、_apply_positioned_rope / build_kv 之前），
+        # 与 OFF baseline（hook 在 get_qkv 输出处截）同口径，集中对比，避免分散。
+        import os as _os
+        if _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                dump_rope_preqk_verl080, dump_build_kv_input_v_on,
+            )
+            try:
+                dump_rope_preqk_verl080(self.layer_number, query, key,
+                                        self.config.num_layers)
+            except Exception as _e:
+                print(f"rope_preqk (pre-RoPE Q/K) dump failed: {_e}", flush=True)
+            try:
+                dump_build_kv_input_v_on(self.layer_number, value,
+                                         self.config.num_layers)
+            except Exception as _e:
+                print(f"build_kv_input_v (pre-RoPE V) dump failed: {_e}", flush=True)
+
         # delegate to verified integrations code
         from prefix_sharing.integrations.megatron_runtime import (
             prefix_attention,
