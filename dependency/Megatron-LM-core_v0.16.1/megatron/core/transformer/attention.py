@@ -1141,6 +1141,21 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        # [PS-diag] OFF post-RoPE Q/K + full_kv dump — 侵入式，rotary block 之后、core attention 之前，
+        # 与 ON 侧（_apply_positioned_rope 返回后 dump rope_postqk；build_kv 后 dump expanded_kv）对称。
+        # 此处 query/key 是 post-RoPE，value 是 raw（未旋转），都在 scope。
+        if _ps_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            try:
+                from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                    dump_rope_postqk_verl080, dump_full_kv_off,
+                )
+                dump_rope_postqk_verl080(self.layer_number, query, key,
+                                         self.config.num_layers)
+                dump_full_kv_off(self.layer_number, key, value,
+                                 self.config.num_layers)
+            except Exception as _ps_e2:
+                print(f"[PS-diag] OFF postqk/full_kv dump failed: {_ps_e2}", flush=True)
+
         # ==================================
         # core attention computation
         # ==================================
