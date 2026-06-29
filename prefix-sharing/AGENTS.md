@@ -10,7 +10,7 @@ RL 训练中前缀复用（prefix sharing），目标是插件化集成到 verl+
 ## 工作区结构
 
 ```
-PrefixAttention/
+PrefixSharing/
 ├── dependency/       # verl, megatron, mindspeed 依赖快照
 └── prefix-sharing/   # prefix sharing 核心代码与测试
 ```
