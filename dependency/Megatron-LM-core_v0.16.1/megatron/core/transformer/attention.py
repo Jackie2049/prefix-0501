@@ -1075,12 +1075,14 @@ class Attention(MegatronModule, ABC):
         if _ps_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             try:
                 from prefix_sharing.tools.diagnostic_dump_verl080 import (
-                    dump_rope_preqk_verl080, dump_build_kv_input_v_on,
+                    dump_rope_preqk_verl080, dump_build_kv_input_v_on, dump_hidden_states_on,
                 )
                 dump_rope_preqk_verl080(self.layer_number, query, key,
                                         self.config.num_layers)
                 dump_build_kv_input_v_on(self.layer_number, value,
                                          self.config.num_layers)
+                dump_hidden_states_on(self.layer_number, hidden_states,
+                                      self.config.num_layers)
             except Exception as _ps_e:
                 print(f"[PS-diag] OFF preqkv dump failed: {_ps_e}", flush=True)
 

@@ -1011,6 +1011,85 @@ def _print_build_kv_input_v(r: CheckResult):
     print()
 
 
+def cmp_hidden_states(dir_on: str, dir_off: str,
+                      layer: int | None = None) -> CheckResult | None:
+    """对比 ON vs OFF hidden_states（suffix 对齐，注意力层入口）。
+
+    这是 QKV 投影的 INPUT。如果 hidden_states 一致但 V 不一致 → GEMM 精度差异；
+    如果 hidden_states 就不一致 → 根因在上游（embedding / input_layernorm）。
+    """
+    fa = os.path.join(dir_on, "hidden_states.pt")
+    fb = os.path.join(dir_off, "hidden_states.pt")
+    if not os.path.exists(fa) or not os.path.exists(fb):
+        return None
+    on_dict = torch.load(fa, weights_only=True)
+    off_dict = torch.load(fb, weights_only=True)
+    if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
+        return None
+    layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
+    if layer is not None:
+        layers = [l for l in layers if l == layer]
+    _name = f"hidden_states_L{layer}" if layer is not None else "hidden_states"
+    if not layers:
+        return CheckResult(name=_name, passed=False, metrics={"error": "no layers"})
+
+    align_mask = _build_attn_align_mask(dir_on, dir_off)
+    per_layer: dict = {}
+    worst_md = 0.0
+    worst_cos = 1.0
+    for lyr in layers:
+        on_hs = on_dict[lyr]
+        off_hs = off_dict[lyr]
+        if on_hs is None or off_hs is None:
+            per_layer[lyr] = {"error": "缺失"}; continue
+        on_f = on_hs.reshape(on_hs.shape[0], -1).float()
+        off_f = off_hs.reshape(off_hs.shape[0], -1).float()
+        on_T, off_T = int(on_hs.shape[0]), int(off_hs.shape[0])
+        if align_mask is not None and on_f.shape[0] != off_f.shape[0]:
+            try:
+                on_f, off_f = _align_packed(on_f, off_f, align_mask)
+            except ValueError as e:
+                per_layer[lyr] = {"error": str(e), "on_T": on_T, "off_T": off_T}
+                continue
+        diff = (on_f - off_f).abs()
+        cos = _cosine_sim(on_f, off_f, dim=-1)
+        md = float(diff.max())
+        per_layer[lyr] = {"max_diff": md, "cos_avg": float(cos.mean()),
+                          "cos_min": float(cos.min()), "n_tokens": on_f.shape[0],
+                          "on_T": on_T, "off_T": off_T}
+        worst_md = max(worst_md, md)
+        worst_cos = min(worst_cos, float(cos.min()))
+    passed = worst_md < 1e-5
+    return CheckResult(name=_name, passed=passed,
+                       metrics={"layers": per_layer, "max_diff": worst_md, "cos_min": worst_cos})
+
+
+def _print_hidden_states(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [{r.name}]  ON vs OFF hidden_states（suffix 对齐，注意力入口）")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}\n"); return
+    layers = m.get("layers", {})
+    print(f"  {'LAYER':>6s}  {'MAXDIFF':>12s} {'COS':>10s}  "
+          f"{'ON_T':>8s} {'OFF_T':>8s}  {'STATUS':>8s}")
+    print(f"  {'─' * 6}  {'─' * 12} {'─' * 10}  {'─' * 8} {'─' * 8}  {'─' * 8}")
+    for lyr in sorted(layers):
+        d = layers[lyr]
+        if "max_diff" not in d:
+            print(f"  {lyr:>6d}  {d.get('error', '')}  ON_T={d.get('on_T')} OFF_T={d.get('off_T')}")
+            continue
+        md, cos = d["max_diff"], d["cos_avg"]
+        ok = md < 1e-5
+        print(f"  {lyr:>6d}  {md:>12.3e} {cos:>10.6f}  "
+              f"{d.get('on_T', '—'):>8} {d.get('off_T', '—'):>8}  "
+              f"{'OK' if ok else 'DIFF':>8s}")
+    print(f"\n  max_diff={m.get('max_diff')}  cos_min={m.get('cos_min')}  "
+          f"{_CHECK if r.passed else _CROSS} "
+          f"{'PASS（hidden_states 一致 → V 差异在 GEMM）' if r.passed else 'FAIL（hidden_states 不一致 → 根因上游）'}")
+    print()
+
+
 # ════════════════════════════════════════════════════════════════
 #  2D mask loading
 # ════════════════════════════════════════════════════════════════
@@ -1164,6 +1243,7 @@ def _print_shapes(dir_on: str, dir_off: str, tag: str,
         "expanded_kv.pt",
         "full_kv.pt",
         "build_kv_input_v.pt",
+        "hidden_states.pt",
         "prefix_lens.pt",
         "cu_seqlens_q.pt",
     ]
@@ -1540,11 +1620,17 @@ def main():
         all_results.append(r)
         _print_attn_kv(r)
 
-    # ── packed: build_kv 输入 V（build_kv 前）vs OFF full_kv V —— 定位 V 偏在 build_kv 之前还是之后 ──
+    # ── packed: build_kv 输入 V — ON vs OFF 同源对比 ──
     r = cmp_build_kv_input_v(args.dir_on, args.dir_off, args.layer)
     if r:
         all_results.append(r)
         _print_build_kv_input_v(r)
+
+    # ── packed: hidden_states（注意力入口）— 隔离 QKV 投影 vs 上游 ──
+    r = cmp_hidden_states(args.dir_on, args.dir_off, args.layer)
+    if r:
+        all_results.append(r)
+        _print_hidden_states(r)
 
     # ── packed: attention_output per-layer cos（RoPE 下游）──
     r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)

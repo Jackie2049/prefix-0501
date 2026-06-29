@@ -362,6 +362,28 @@ def dump_build_kv_input_v_on(layer_number: int, value: torch.Tensor,
         _BUILD_KV_INPUT_V_BUFFER = None
 
 
+_HIDDEN_STATES_BUFFER: dict[int, torch.Tensor] | None = None
+
+
+def dump_hidden_states_on(layer_number: int, hidden_states: torch.Tensor,
+                          num_layers: int) -> None:
+    """Accumulate hidden_states at attention entrance. Auto-flush ``hidden_states.pt`` on last layer.
+
+    Used to verify whether ON/OFF hidden_states are bit-identical for suffix tokens.
+    Format: ``{layer_idx: [T, H]}``.
+    """
+    global _HIDDEN_STATES_BUFFER
+    dump_dir = _get_dump_dir()
+    if dump_dir is None:
+        return
+    if _HIDDEN_STATES_BUFFER is None:
+        _HIDDEN_STATES_BUFFER = {}
+    _HIDDEN_STATES_BUFFER[layer_number] = hidden_states.detach().cpu().clone()
+    if layer_number == num_layers:
+        _flush_dict_buffer("hidden_states.pt", _HIDDEN_STATES_BUFFER, dump_dir)
+        _HIDDEN_STATES_BUFFER = None
+
+
 @contextlib.contextmanager
 def capture_rope_qk(attention_module):
     """Hook apply_rotary_pos_emb（post-RoPE Q/K）+ get_query_key_value_tensors（pre-RoPE Q/K/V）。
