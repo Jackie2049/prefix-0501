@@ -932,13 +932,14 @@ def _print_attn_kv(r: CheckResult):
 
 def cmp_build_kv_input_v(dir_on: str, dir_off: str,
                          layer: int | None = None) -> CheckResult | None:
-    """对比 ON build_kv 输入 V（build_kv 之前）vs OFF full_kv V（suffix 对齐）。
+    """对比 ON build_kv_input_v vs OFF build_kv_input_v（suffix 对齐）。
 
-    定位 V 偏是在 build_kv 之前（get_qkv/hidden_states）还是 build_kv 引入。
+    两边都存 get_qkv 后、build_kv/RoPE 前的 raw V（``{layer: tensor}``）。同源对比，
+    应逐元素相同——若不同则问题在 QKV 投影阶段（hidden_states / QKV 权重）。
     ON_T vs OFF_T 还能看出 ON 有没有把 hidden_states 裁成 suffix-only。
     """
     fa = os.path.join(dir_on, "build_kv_input_v.pt")
-    fb = os.path.join(dir_off, "full_kv.pt")
+    fb = os.path.join(dir_off, "build_kv_input_v.pt")
     if not os.path.exists(fa) or not os.path.exists(fb):
         return None
     on_dict = torch.load(fa, weights_only=True)
@@ -958,8 +959,7 @@ def cmp_build_kv_input_v(dir_on: str, dir_off: str,
     worst_cos = 1.0
     for lyr in layers:
         on_v = on_dict[lyr]
-        off_entry = off_dict[lyr]
-        off_v = off_entry.get("value") if isinstance(off_entry, dict) else None
+        off_v = off_dict[lyr]
         if on_v is None or off_v is None:
             per_layer[lyr] = {"error": "缺失"}; continue
         on_f = on_v.reshape(on_v.shape[0], -1).float()
@@ -985,7 +985,7 @@ def cmp_build_kv_input_v(dir_on: str, dir_off: str,
 
 
 def _print_build_kv_input_v(r: CheckResult):
-    print(_SEP_SINGLE + f"\n  [{r.name}]  ON build_kv 输入 V vs OFF full_kv V（suffix 对齐）")
+    print(_SEP_SINGLE + f"\n  [{r.name}]  ON build_kv_input_v vs OFF build_kv_input_v（suffix 对齐）")
     print(_SEP_SINGLE)
     m = r.metrics
     if "error" in m:

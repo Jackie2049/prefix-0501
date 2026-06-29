@@ -36,42 +36,32 @@ def patch_megatron_attention(original_forward: Any) -> Any:
         ctx = current_prefix_sharing_context()
         if ctx is None:
             # ── normal path: 调用原始 forward ──
-            # diag: hook 截获 original_forward 内部 apply_rotary_pos_emb 的真实 post-RoPE
-            # Q/K（mcore Attention.forward THD prefill 每层调两次：先 Q 后 K）。post-RoPE Q/K
-            # 是 forward 内部中间变量，唯一能拿到真实张量的办法就是 hook 那个模块级 rotary 函数。
+            # post-RoPE Q/K / full_kv / preqk 由 Megatron attention.py 侵入式 dump 写入；
+            # patch 层只负责 attn_outputs + rope_freqs（侵入式未覆盖的）。
             import os as _os
-            from contextlib import nullcontext
             _diag_on = _os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None
-            if _diag_on and rotary_pos_emb is not None:
-                from prefix_sharing.tools.diagnostic_dump_verl080 import capture_rope_qk
-                _rope_cm = capture_rope_qk(self)
-            else:
-                _rope_cm = nullcontext()
-            with _rope_cm as _rope_caps:
-                _result = original_forward(
-                    self,
-                    hidden_states,
-                    attention_mask,
-                    key_value_states=key_value_states,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    rotary_pos_cos=rotary_pos_cos,
-                    rotary_pos_sin=rotary_pos_sin,
-                    rotary_pos_cos_sin=rotary_pos_cos_sin,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                    sequence_len_offset=sequence_len_offset,
-                    inference_params=inference_params,
-                )
-            # ##### [PS-diag] OFF attn_outputs + rope_freqs + rope_postqk/preqk dump #####
+            _result = original_forward(
+                self,
+                hidden_states,
+                attention_mask,
+                key_value_states=key_value_states,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                inference_params=inference_params,
+            )
+            # ##### [PS-diag] OFF attn_outputs + rope_freqs dump #####
             if _diag_on:
                 import torch  # 仅用于构造 positions（freqs 切 per-token + Q/K debug）
                 from prefix_sharing.tools.diagnostic_dump import (
                     dump_attn_off, dump_rope_freqs,
                 )
-                from prefix_sharing.tools.diagnostic_dump_verl080 import (
-                    dump_rope_postqk_verl080, dump_rope_preqk_verl080, dump_full_kv_off,
-                )
+                # rope_postqk / preqk / full_kv 已由 Megatron 侵入式 dump 覆盖
                 from prefix_sharing.integrations.megatron_runtime import _unpack_rotary_pos_emb
                 _attn_out = _result[0] if isinstance(_result, tuple) else _result
                 _bs = (
@@ -101,38 +91,10 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                             _q_pos_emb.index_select(0, _off_positions),
                             self.layer_number, self.config.num_layers,
                         )
-                    # _rope_caps = (qk_caps[post-RoPE], qkv_caps[pre-RoPE Q/K/V])
-                    # pre-RoPE Q/K/V 已由 megatron attention.py 侵入式 dump（line 1070 之后），
-                    # 这里只处理 post-RoPE Q/K（apply_rotary 返回）+ full_kv。
-                    if _rope_caps is not None:
-                        _qk_caps, _qkv_caps = _rope_caps
-                    else:
-                        _qk_caps, _qkv_caps = None, None
-                    # post-RoPE Q/K（apply_rotary 返回）
-                    if _qk_caps is not None and len(_qk_caps) >= 2:
-                        _q_post, _k_post = _qk_caps[0]["post"], _qk_caps[1]["post"]
-                        dump_rope_postqk_verl080(
-                            self.layer_number, _q_post, _k_post,
-                            self.config.num_layers, positions=_off_positions,
-                        )
-                        # full KV（post-RoPE K + V）：V 从 get_qkv 截（侵入式已在 megatron dump build_kv_input_v，
-                        # 这里 full_kv 另存一份 post-K + V 供 attn_kv 对比）
-                        if _qkv_caps:
-                            _pre_v = _qkv_caps[-1][2]
-                            if _pre_v.dim() > 2:
-                                _pre_v = _pre_v.squeeze(1)
-                            dump_full_kv_off(
-                                self.layer_number, _k_post, _pre_v,
-                                self.config.num_layers,
-                            )
-                    else:
-                        print(
-                            f"[PS-diag] OFF rope_postqk L{self.layer_number}: "
-                            f"expected 2 captures (Q,K), got "
-                            f"{len(_qk_caps) if _qk_caps is not None else 'None'}; skip",
-                            flush=True,
-                        )
-            # ##### [PS-diag] OFF attn_outputs + rope_freqs + rope_postqk/preqk dump end #####
+                    # rope_postqk + full_kv 已由 megatron attention.py 侵入式 dump
+                    # （rotary block 之后），不在 patch 层重复——避免 hook 二次 flush
+                    # 覆盖侵入式已写好的完整 24 层文件。
+            # ##### [PS-diag] OFF attn_outputs + rope_freqs dump end #####
             return _result
 
         # ── prefix-sharing path ──
