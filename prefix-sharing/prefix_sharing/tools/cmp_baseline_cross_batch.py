@@ -142,13 +142,13 @@ def _compare_plain_file(dir_single: str, dir_stacked: str, filename: str,
 def _compare_rope_preqk(dir_single: str, dir_stacked: str,
                         cu_single: torch.Tensor, cu_stacked: torch.Tensor,
                         n_copies: int, layer: int | None,
-                        label: str) -> CheckResult:
-    """Compare ``rope_preqk.pt`` (``{layer: {"query", "key"}}``) across copies."""
-    sd = _load_per_layer_dict(dir_single, "rope_preqk.pt")
-    md = _load_per_layer_dict(dir_stacked, "rope_preqk.pt")
+                        label: str, fname: str = "rope_preqk.pt") -> CheckResult:
+    """Compare ``{layer: {"query", "key"}}`` dict file across copies."""
+    sd = _load_per_layer_dict(dir_single, fname)
+    md = _load_per_layer_dict(dir_stacked, fname)
     if sd is None or md is None:
         return CheckResult(name=label, passed=False,
-                           metrics={"error": "rope_preqk.pt missing"})
+                           metrics={"error": f"{fname} missing"})
 
     layers = _get_layers(sd)
     if layer is not None:
@@ -334,6 +334,29 @@ def main():
     all_results.append(r)
     _print_rope_preqk_table(r, "Q")
     _print_rope_preqk_table(r, "K")
+
+    # ── rope_freqs ──
+    r = _compare_plain_file(args.dir_single, args.dir_stacked,
+                            "rope_freqs.pt", cu_single, cu_stacked,
+                            args.num_copies, args.layer, "rope_freqs")
+    all_results.append(r)
+    _print_plain_table(r)
+
+    # ── rope_postqk ──
+    r = _compare_rope_preqk(args.dir_single, args.dir_stacked,
+                            cu_single, cu_stacked,
+                            args.num_copies, args.layer, "rope_postqk",
+                            fname="rope_postqk.pt")
+    all_results.append(r)
+    _print_rope_preqk_table(r, "Q")
+    _print_rope_preqk_table(r, "K")
+
+    # ── attn_outputs ──
+    r = _compare_plain_file(args.dir_single, args.dir_stacked,
+                            "attn_outputs.pt", cu_single, cu_stacked,
+                            args.num_copies, args.layer, "attn_outputs")
+    all_results.append(r)
+    _print_plain_table(r)
 
     _print_summary(all_results)
 

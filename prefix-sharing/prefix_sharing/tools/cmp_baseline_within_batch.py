@@ -146,12 +146,12 @@ def _compare_plain_file_within(dir_multi: str, filename: str,
 
 def _compare_rope_preqk_within(dir_multi: str, cu: torch.Tensor,
                                n_copies: int, layer: int | None,
-                               label: str) -> CheckResult:
-    """Pairwise comparison of rope_preqk Q and K within a single dump."""
-    d = _load_per_layer_dict(dir_multi, "rope_preqk.pt")
+                               label: str, fname: str = "rope_preqk.pt") -> CheckResult:
+    """Pairwise comparison of ``{layer: {"query","key"}}`` dict within a single dump."""
+    d = _load_per_layer_dict(dir_multi, fname)
     if d is None:
         return CheckResult(name=label, passed=False,
-                           metrics={"error": "rope_preqk.pt missing"})
+                           metrics={"error": f"{fname} missing"})
 
     layers = _get_layers(d)
     if layer is not None:
@@ -309,6 +309,27 @@ def main():
     # ── rope_preqk ──
     r = _compare_rope_preqk_within(args.dir_multi, cu, args.num_copies,
                                    args.layer, "rope_preqk")
+    all_results.append(r)
+    _print_within_plain_table(r)
+
+    # ── rope_freqs ──
+    r = _compare_plain_file_within(args.dir_multi, "rope_freqs.pt",
+                                   cu, args.num_copies, args.layer,
+                                   "rope_freqs")
+    all_results.append(r)
+    _print_within_plain_table(r)
+
+    # ── rope_postqk ──
+    r = _compare_rope_preqk_within(args.dir_multi, cu, args.num_copies,
+                                   args.layer, "rope_postqk",
+                                   fname="rope_postqk.pt")
+    all_results.append(r)
+    _print_within_plain_table(r)
+
+    # ── attn_outputs ──
+    r = _compare_plain_file_within(args.dir_multi, "attn_outputs.pt",
+                                   cu, args.num_copies, args.layer,
+                                   "attn_outputs")
     all_results.append(r)
     _print_within_plain_table(r)
 
