@@ -147,7 +147,15 @@ def _compare_plain_file_within(dir_multi: str, filename: str,
 def _compare_rope_preqk_within(dir_multi: str, cu: torch.Tensor,
                                n_copies: int, layer: int | None,
                                label: str, fname: str = "rope_preqk.pt") -> CheckResult:
-    """Pairwise comparison of ``{layer: {"query","key"}}`` dict within a single dump."""
+    return _compare_per_layer_kv_within(dir_multi, cu, n_copies, layer, label,
+                                        fname, "query", "key")
+
+
+def _compare_per_layer_kv_within(dir_multi: str, cu: torch.Tensor,
+                                 n_copies: int, layer: int | None,
+                                 label: str, fname: str,
+                                 field_a: str, field_b: str) -> CheckResult:
+    """Pairwise comparison of ``{layer: {field_a, field_b}}`` dict within a single dump."""
     d = _load_per_layer_dict(dir_multi, fname)
     if d is None:
         return CheckResult(name=label, passed=False,
@@ -166,17 +174,17 @@ def _compare_rope_preqk_within(dir_multi: str, cu: torch.Tensor,
     worst_layer: int | None = None
 
     for lyr in layers:
-        mq = d[lyr]["query"].float()
-        mk = d[lyr]["key"].float()
-        q_copies = [_extract_copy(mq, cu, i) for i in range(n_copies)]
-        k_copies = [_extract_copy(mk, cu, i) for i in range(n_copies)]
+        ma = d[lyr][field_a].float()
+        mb = d[lyr][field_b].float()
+        a_copies = [_extract_copy(ma, cu, i) for i in range(n_copies)]
+        b_copies = [_extract_copy(mb, cu, i) for i in range(n_copies)]
         layer_worst = 0.0
         layer_pair: tuple | None = None
         for i in range(n_copies):
             for j in range(i + 1, n_copies):
-                qm = _tensor_metrics(q_copies[i], q_copies[j])
-                km = _tensor_metrics(k_copies[i], k_copies[j])
-                w = max(qm["max_abs"], km["max_abs"])
+                am = _tensor_metrics(a_copies[i], a_copies[j])
+                bm = _tensor_metrics(b_copies[i], b_copies[j])
+                w = max(am["max_abs"], bm["max_abs"])
                 if w > layer_worst:
                     layer_worst = w
                     layer_pair = (i, j)
@@ -201,6 +209,56 @@ def _compare_rope_preqk_within(dir_multi: str, cu: torch.Tensor,
             "n_pairs": n_pairs,
         },
     )
+
+
+def _compare_single_tensor_within(dir_multi: str, filename: str,
+                                  cu: torch.Tensor, n_copies: int,
+                                  label: str) -> CheckResult:
+    """Pairwise compare a single packed tensor (e.g. logits.pt) within a dump."""
+    fp = os.path.join(dir_multi, filename)
+    if not os.path.exists(fp):
+        return CheckResult(name=label, passed=False,
+                           metrics={"error": f"{filename} missing"})
+    mt = torch.load(fp, weights_only=True).float()
+    copies = [_extract_copy(mt, cu, i) for i in range(n_copies)]
+    n_pairs = n_copies * (n_copies - 1) // 2
+    worst_md = 0.0
+    worst_pair = None
+    for i in range(n_copies):
+        for j in range(i + 1, n_copies):
+            m = _tensor_metrics(copies[i], copies[j])
+            if m["max_abs"] > worst_md:
+                worst_md = m["max_abs"]
+                worst_pair = (i, j)
+    return CheckResult(name=label, passed=worst_md == 0.0,
+                       metrics={"worst_max_abs": worst_md,
+                                "worst_pair": worst_pair, "n_pairs": n_pairs})
+
+
+def _compare_2d_tensor_within(dir_multi: str, filename: str,
+                              label: str) -> CheckResult:
+    """Pairwise compare 2D [B, L_max] rows within a dump."""
+    fp = os.path.join(dir_multi, filename)
+    if not os.path.exists(fp):
+        return CheckResult(name=label, passed=False,
+                           metrics={"error": f"{filename} missing"})
+    mt = torch.load(fp, weights_only=True).float()  # [B, L_max]
+    if mt.dim() < 2:
+        return CheckResult(name=label, passed=False,
+                           metrics={"error": "not 2D"})
+    B = mt.shape[0]
+    n_pairs = B * (B - 1) // 2
+    worst_md = 0.0
+    worst_pair = None
+    for i in range(B):
+        for j in range(i + 1, B):
+            m = _tensor_metrics(mt[i].reshape(-1), mt[j].reshape(-1))
+            if m["max_abs"] > worst_md:
+                worst_md = m["max_abs"]
+                worst_pair = (i, j)
+    return CheckResult(name=label, passed=worst_md == 0.0,
+                       metrics={"worst_max_abs": worst_md,
+                                "worst_pair": worst_pair, "n_pairs": n_pairs})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -279,6 +337,8 @@ def main():
                     help="Number of copies N")
     ap.add_argument("--layer", type=int, default=None,
                     help="Compare specific layer 1-indexed (default: all)")
+    ap.add_argument("--tag", default="old",
+                    help="2D file tag for logprobs/entropy (default: old)")
     ap.add_argument("--output", "-o", default=None,
                     help="Write JSON report to this path")
     args = ap.parse_args()
@@ -332,6 +392,47 @@ def main():
                                    "attn_outputs")
     all_results.append(r)
     _print_within_plain_table(r)
+
+    # ── full_kv (key + value) ──
+    r = _compare_per_layer_kv_within(args.dir_multi, cu, args.num_copies,
+                                     args.layer, "full_kv",
+                                     fname="full_kv.pt",
+                                     field_a="key", field_b="value")
+    all_results.append(r)
+    _print_within_plain_table(r)
+
+    # ── logits (single packed tensor) ──
+    r = _compare_single_tensor_within(args.dir_multi, "logits.pt",
+                                      cu, args.num_copies, "logits")
+    if r.metrics.get("error") is None:
+        all_results.append(r)
+        _print_within_plain_table(r)
+
+    # ── logprobs (2D) ──
+    r = _compare_2d_tensor_within(args.dir_multi,
+                                  f"logprobs_{args.tag}.pt",
+                                  f"logprobs_{args.tag}")
+    if r.metrics.get("error") is None:
+        all_results.append(r)
+        print(_SEP_SINGLE + f"\n  [{r.name}]  2D pairwise comparison")
+        print(_SEP_SINGLE)
+        print(f"  max_abs: {r.metrics.get('worst_max_abs', '—'):.3e}"
+              if isinstance(r.metrics.get("worst_max_abs"), float)
+              else f"  {r.metrics.get('error', '—')}")
+        print()
+
+    # ── entropy (2D) ──
+    r = _compare_2d_tensor_within(args.dir_multi,
+                                  f"entropy_{args.tag}.pt",
+                                  f"entropy_{args.tag}")
+    if r.metrics.get("error") is None:
+        all_results.append(r)
+        print(_SEP_SINGLE + f"\n  [{r.name}]  2D pairwise comparison")
+        print(_SEP_SINGLE)
+        print(f"  max_abs: {r.metrics.get('worst_max_abs', '—'):.3e}"
+              if isinstance(r.metrics.get("worst_max_abs"), float)
+              else f"  {r.metrics.get('error', '—')}")
+        print()
 
     # ── verdict ──
     all_passed = all(r.passed for r in all_results)

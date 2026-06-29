@@ -143,7 +143,16 @@ def _compare_rope_preqk(dir_single: str, dir_stacked: str,
                         cu_single: torch.Tensor, cu_stacked: torch.Tensor,
                         n_copies: int, layer: int | None,
                         label: str, fname: str = "rope_preqk.pt") -> CheckResult:
-    """Compare ``{layer: {"query", "key"}}`` dict file across copies."""
+    return _compare_per_layer_kv(dir_single, dir_stacked, cu_single, cu_stacked,
+                                 n_copies, layer, label, fname, "query", "key")
+
+
+def _compare_per_layer_kv(dir_single: str, dir_stacked: str,
+                          cu_single: torch.Tensor, cu_stacked: torch.Tensor,
+                          n_copies: int, layer: int | None,
+                          label: str, fname: str,
+                          field_a: str, field_b: str) -> CheckResult:
+    """Compare ``{layer: {field_a, field_b}}`` dict file across copies."""
     sd = _load_per_layer_dict(dir_single, fname)
     md = _load_per_layer_dict(dir_stacked, fname)
     if sd is None or md is None:
@@ -159,34 +168,93 @@ def _compare_rope_preqk(dir_single: str, dir_stacked: str,
     per_layer: dict = {}
     worst_md = 0.0
     for lyr in layers:
-        sq = sd[lyr]["query"].float()
-        sk = sd[lyr]["key"].float()
-        mq = md[lyr]["query"].float()
-        mk = md[lyr]["key"].float()
-        Tq, Tk = sq.shape[0], sk.shape[0]
+        sa = sd[lyr][field_a].float()
+        sb = sd[lyr][field_b].float()
+        ma = md[lyr][field_a].float()
+        mb = md[lyr][field_b].float()
+        Ta, Tb = sa.shape[0], sb.shape[0]
         layer_worst = 0.0
         layer_copies: list[dict] = []
         for i in range(n_copies):
-            cq = _extract_copy(mq, cu_stacked, i)
-            ck = _extract_copy(mk, cu_stacked, i)
-            if cq.shape[0] != Tq or ck.shape[0] != Tk:
+            ca = _extract_copy(ma, cu_stacked, i)
+            cb = _extract_copy(mb, cu_stacked, i)
+            if ca.shape[0] != Ta or cb.shape[0] != Tb:
                 layer_copies.append({"copy": i, "error":
-                                    f"length mismatch Q: single={Tq} copy={cq.shape[0]}"
-                                    f" K: single={Tk} copy={ck.shape[0]}"})
+                                    f"length mismatch {field_a}: single={Ta} copy={ca.shape[0]}"
+                                    f" {field_b}: single={Tb} copy={cb.shape[0]}"})
                 continue
-            qm = _tensor_metrics(sq, cq)
-            km = _tensor_metrics(sk, ck)
-            layer_copies.append({
-                "copy": i,
-                "Q": qm,
-                "K": km,
-            })
-            layer_worst = max(layer_worst, qm["max_abs"], km["max_abs"])
+            am = _tensor_metrics(sa, ca)
+            bm = _tensor_metrics(sb, cb)
+            layer_copies.append({"copy": i, field_a: am, field_b: bm})
+            layer_worst = max(layer_worst, am["max_abs"], bm["max_abs"])
         per_layer[lyr] = {"copies": layer_copies, "max_across_copies": layer_worst}
         worst_md = max(worst_md, layer_worst)
 
     return CheckResult(name=label, passed=worst_md < 1e-5,
                        metrics={"layers": per_layer, "worst_max_abs": worst_md})
+
+
+def _compare_single_tensor(dir_single: str, dir_stacked: str,
+                           filename: str, cu_single: torch.Tensor,
+                           cu_stacked: torch.Tensor,
+                           n_copies: int, label: str) -> CheckResult:
+    """Compare a single packed tensor (e.g. logits.pt) across copies."""
+    st = _load_per_layer_dict(dir_single, filename)  # not actually a dict
+    # Actually single-tensor files are not dicts; use _load_tensor pattern
+    fp_s = os.path.join(dir_single, filename)
+    fp_m = os.path.join(dir_stacked, filename)
+    if not os.path.exists(fp_s) or not os.path.exists(fp_m):
+        return CheckResult(name=label, passed=False,
+                           metrics={"error": f"{filename} missing in one or both dirs"})
+    single = torch.load(fp_s, weights_only=True).float()
+    multi  = torch.load(fp_m, weights_only=True).float()
+    T = single.shape[0]
+    copies: list[dict] = []
+    worst_md = 0.0
+    for i in range(n_copies):
+        ct = _extract_copy(multi, cu_stacked, i)
+        if ct.shape[0] != T:
+            copies.append({"copy": i, "error":
+                          f"length mismatch: single={T} copy={ct.shape[0]}"})
+            continue
+        m = _tensor_metrics(single, ct)
+        m["copy"] = i
+        copies.append(m)
+        worst_md = max(worst_md, m["max_abs"])
+    return CheckResult(name=label, passed=worst_md < 1e-5,
+                       metrics={"copies": copies, "worst_max_abs": worst_md})
+
+
+def _compare_2d_tensor(dir_single: str, dir_stacked: str,
+                       filename: str, label: str) -> CheckResult:
+    """Compare 2D [B, L_max] tensor (logprobs/entropy) row by row."""
+    fp_s = os.path.join(dir_single, filename)
+    fp_m = os.path.join(dir_stacked, filename)
+    if not os.path.exists(fp_s) or not os.path.exists(fp_m):
+        return CheckResult(name=label, passed=False,
+                           metrics={"error": f"{filename} missing"})
+    single = torch.load(fp_s, weights_only=True).float()  # [1, L_max]
+    multi  = torch.load(fp_m, weights_only=True).float()   # [N, L_max]
+    if single.dim() < 2 or multi.dim() < 2:
+        return CheckResult(name=label, passed=False,
+                           metrics={"error": "not 2D"})
+    B = multi.shape[0]
+    copies: list[dict] = []
+    worst_md = 0.0
+    for i in range(B):
+        # single is [1, L_max], copy i is multi[i, :] → [L_max]
+        m = _tensor_metrics(single.reshape(-1), multi[i].reshape(-1))
+        m["copy"] = i
+        copies.append(m)
+        worst_md = max(worst_md, m["max_abs"])
+    if single.shape[0] > 1:
+        # single also has multiple rows → compare all pairs
+        for i in range(single.shape[0]):
+            m = _tensor_metrics(single[i].reshape(-1), multi[i].reshape(-1))
+            copies[i] = {**copies[i], **m}
+            worst_md = max(worst_md, m["max_abs"])
+    return CheckResult(name=label, passed=worst_md < 1e-5,
+                       metrics={"copies": copies, "worst_max_abs": worst_md})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -298,6 +366,8 @@ def main():
                     help="Number of stacked copies N")
     ap.add_argument("--layer", type=int, default=None,
                     help="Compare specific layer 1-indexed (default: all)")
+    ap.add_argument("--tag", default="old",
+                    help="2D file tag for logprobs/entropy (default: old)")
     ap.add_argument("--output", "-o", default=None,
                     help="Write JSON report to this path")
     args = ap.parse_args()
@@ -357,6 +427,51 @@ def main():
                             args.num_copies, args.layer, "attn_outputs")
     all_results.append(r)
     _print_plain_table(r)
+
+    # ── full_kv (key + value) ──
+    r = _compare_per_layer_kv(args.dir_single, args.dir_stacked,
+                              cu_single, cu_stacked,
+                              args.num_copies, args.layer, "full_kv",
+                              fname="full_kv.pt", field_a="key", field_b="value")
+    all_results.append(r)
+    _print_rope_preqk_table(r, "key")
+    _print_rope_preqk_table(r, "value")
+
+    # ── logits (single packed tensor) ──
+    r = _compare_single_tensor(args.dir_single, args.dir_stacked,
+                               "logits.pt", cu_single, cu_stacked,
+                               args.num_copies, "logits")
+    if r.metrics.get("error") is None:
+        all_results.append(r)
+        _print_plain_table(r)
+
+    # ── logprobs (2D) ──
+    r = _compare_2d_tensor(args.dir_single, args.dir_stacked,
+                           f"logprobs_{args.tag}.pt", f"logprobs_{args.tag}")
+    if r.metrics.get("error") is None:
+        all_results.append(r)
+        print(_SEP_SINGLE + f"\n  [{r.name}]  2D per-row comparison")
+        print(_SEP_SINGLE)
+        m = r.metrics
+        copies = m.get("copies", [])
+        vals = [c.get("max_abs", float("nan")) for c in copies]
+        print(f"  copies: {len(copies)}, max_abs: {max(v for v in vals if not math.isnan(v)):.3e}"
+              if vals else "  no data")
+        print()
+
+    # ── entropy (2D) ──
+    r = _compare_2d_tensor(args.dir_single, args.dir_stacked,
+                           f"entropy_{args.tag}.pt", f"entropy_{args.tag}")
+    if r.metrics.get("error") is None:
+        all_results.append(r)
+        print(_SEP_SINGLE + f"\n  [{r.name}]  2D per-row comparison")
+        print(_SEP_SINGLE)
+        m = r.metrics
+        copies = m.get("copies", [])
+        vals = [c.get("max_abs", float("nan")) for c in copies]
+        print(f"  copies: {len(copies)}, max_abs: {max(v for v in vals if not math.isnan(v)):.3e}"
+              if vals else "  no data")
+        print()
 
     _print_summary(all_results)
 
