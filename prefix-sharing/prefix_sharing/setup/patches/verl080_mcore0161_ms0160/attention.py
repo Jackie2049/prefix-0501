@@ -102,8 +102,8 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                             self.layer_number, self.config.num_layers,
                         )
                     # _rope_caps = (qk_caps[post-RoPE], qkv_caps[pre-RoPE Q/K/V])
-                    # 与 ON 侧对称：ON 在 get_qkv+squeeze 之后 dump Q/K/V；OFF 这里用 hook
-                    # 截的 get_qkv 返回（pre-squeeze），手动 squeeze 后与 ON 同口径。
+                    # pre-RoPE Q/K/V 已由 megatron attention.py 侵入式 dump（line 1070 之后），
+                    # 这里只处理 post-RoPE Q/K（apply_rotary 返回）+ full_kv。
                     if _rope_caps is not None:
                         _qk_caps, _qkv_caps = _rope_caps
                     else:
@@ -115,23 +115,16 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                             self.layer_number, _q_post, _k_post,
                             self.config.num_layers, positions=_off_positions,
                         )
-                        # pre-RoPE Q/K + V：从 get_qkv 返回统一取（与 ON 同源）
+                        # full KV（post-RoPE K + V）：V 从 get_qkv 截（侵入式已在 megatron dump build_kv_input_v，
+                        # 这里 full_kv 另存一份 post-K + V 供 attn_kv 对比）
                         if _qkv_caps:
-                            _pre_q, _pre_k, _pre_v = _qkv_caps[-1][:3]
-                            # squeeze 到 [T, H, D]（与 ON 侧 squeeze 后 dump 一致）
-                            _sq = lambda _t: _t.squeeze(1) if _t.dim() > 2 else _t
-                            _pre_q, _pre_k, _pre_v = _sq(_pre_q), _sq(_pre_k), _sq(_pre_v)
-                            dump_rope_preqk_verl080(
-                                self.layer_number, _pre_q, _pre_k,
-                                self.config.num_layers,
-                            )
+                            _pre_v = _qkv_caps[-1][2]
+                            if _pre_v.dim() > 2:
+                                _pre_v = _pre_v.squeeze(1)
                             dump_full_kv_off(
                                 self.layer_number, _k_post, _pre_v,
                                 self.config.num_layers,
                             )
-                        else:
-                            print(f"[PS-diag] OFF preqkv L{self.layer_number}: get_qkv 未截获; skip",
-                                  flush=True)
                     else:
                         print(
                             f"[PS-diag] OFF rope_postqk L{self.layer_number}: "

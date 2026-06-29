@@ -1069,6 +1069,21 @@ class Attention(MegatronModule, ABC):
             value = value.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
+        # [PS-diag] OFF pre-RoPE Q/K/V dump — 侵入式，post-squeeze、pre-RoPE，
+        # 与 ON 侧（attention.py ON 分支 get_qkv+squeeze 之后 dump）完全对称。
+        import os as _ps_os
+        if _ps_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
+            try:
+                from prefix_sharing.tools.diagnostic_dump_verl080 import (
+                    dump_rope_preqk_verl080, dump_build_kv_input_v_on,
+                )
+                dump_rope_preqk_verl080(self.layer_number, query, key,
+                                        self.config.num_layers)
+                dump_build_kv_input_v_on(self.layer_number, value,
+                                         self.config.num_layers)
+            except Exception as _ps_e:
+                print(f"[PS-diag] OFF preqkv dump failed: {_ps_e}", flush=True)
+
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
