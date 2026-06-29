@@ -364,39 +364,37 @@ def dump_build_kv_input_v_on(layer_number: int, value: torch.Tensor,
 
 @contextlib.contextmanager
 def capture_rope_qk(attention_module):
-    """Hook apply_rotary_pos_emb（Q/K pre+post）+ get_query_key_value_tensors（V），全 in-context。
+    """Hook apply_rotary_pos_emb（post-RoPE Q/K）+ get_query_key_value_tensors（pre-RoPE Q/K/V）。
 
-    mcore ``Attention.forward`` THD prefill 每层调模块级 ``apply_rotary_pos_emb`` 两次（先 Q 后
-    K），把每次输入/返回存为 ``{"pre": t, "post": out}``。V 不走 rotary，所以单独 hook
-    ``attention_module.get_query_key_value_tensors``（实例级），截其返回的 V（第 3 个元素）。
+    两个 hook，全 in-context：
+      - get_qkv 返回值统一截 Q/K/V（pre-squeeze，与 ON 侧 get_qkv+squeeze 之后 dump 同源）。
+      - apply_rotary_pos_emb 截 post-RoPE Q/K（返回值）。
 
-    全部 in-context 截获（在 original_forward 内部），避免事后 re-call get_query_key_value_tensors
-    因 hidden_states 被 in-place 改写而失真——K 走 rotary hook 一向准确，V 之前用 re-call 才显得偏。
-
+    Q/K/V 都从 get_qkv 一次返回取（pre-RoPE），避免 ON 侧 Q/K/V 也走两个不对称来源。
     用法::
 
-        with capture_rope_qk(self) as (qk_caps, v_caps):
+        with capture_rope_qk(self) as (qk_caps, qkv_caps):
             result = original_forward(...)
-        # qk_caps[0]={"pre":Q_pre,"post":Q_post}, qk_caps[1]={...K...}; v_caps[-1]=V
+        # qk_caps[0]={"post":Q_post}, qk_caps[1]={"post":K_post}（apply_rotary 返回）
+        # qkv_caps[-1] = (Q_pre, K_pre, V_pre)（get_qkv 返回，pre-squeeze）
     """
     import megatron.core.transformer.attention as _attn_mod
     import types as _types
 
     _orig_arpe = _attn_mod.apply_rotary_pos_emb
-    _orig_get_qkv = type(attention_module).get_query_key_value_tensors  # 未绑定的类方法函数
-    qk_captures: list = []
-    v_captures: list = []
+    _orig_get_qkv = type(attention_module).get_query_key_value_tensors
+    qk_captures: list = []      # apply_rotary 返回（post-RoPE）
+    qkv_captures: list = []     # get_qkv 返回 (Q, K, V) pre-squeeze
 
     def _capturing_arpe(t, *args, **kwargs):
         out = _orig_arpe(t, *args, **kwargs)
-        qk_captures.append({"pre": t, "post": out})
+        qk_captures.append({"post": out})
         return out
 
     def _capturing_get_qkv(self_, *args, **kwargs):
-        # MethodType 绑定后 self_=attention_module；_orig_get_qkv 是未绑定函数，需显式传 self_
         out = _orig_get_qkv(self_, *args, **kwargs)
         try:
-            v_captures.append(out[2])  # (Q, K, V[, gate]) → V
+            qkv_captures.append(tuple(out[:3]))  # (Q, K, V)
         except Exception:
             pass
         return out
@@ -405,10 +403,10 @@ def capture_rope_qk(attention_module):
     attention_module.get_query_key_value_tensors = _types.MethodType(
         _capturing_get_qkv, attention_module)
     try:
-        yield qk_captures, v_captures
+        yield qk_captures, qkv_captures
     finally:
         _attn_mod.apply_rotary_pos_emb = _orig_arpe
         try:
-            del attention_module.get_query_key_value_tensors  # 还原：删实例属性，回落到类方法
+            del attention_module.get_query_key_value_tensors
         except AttributeError:
             pass

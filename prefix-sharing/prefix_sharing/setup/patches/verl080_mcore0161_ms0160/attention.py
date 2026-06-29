@@ -101,38 +101,36 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                             _q_pos_emb.index_select(0, _off_positions),
                             self.layer_number, self.config.num_layers,
                         )
-                    # OFF post-RoPE Q/K：直接用 hook 截获的真实张量
-                    # （original_forward 内部 apply_rotary_pos_emb 的返回值），
-                    # captures[0]=Q, captures[1]=K。不再 get_query_key_value_tensors + 重算 RoPE。
-                    # _rope_caps = (qk_captures, v_captures)，均 in-context 截获
+                    # _rope_caps = (qk_caps[post-RoPE], qkv_caps[pre-RoPE Q/K/V])
+                    # 与 ON 侧对称：ON 在 get_qkv+squeeze 之后 dump Q/K/V；OFF 这里用 hook
+                    # 截的 get_qkv 返回（pre-squeeze），手动 squeeze 后与 ON 同口径。
                     if _rope_caps is not None:
-                        _qk_caps, _v_caps = _rope_caps
+                        _qk_caps, _qkv_caps = _rope_caps
                     else:
-                        _qk_caps, _v_caps = None, None
+                        _qk_caps, _qkv_caps = None, None
+                    # post-RoPE Q/K（apply_rotary 返回）
                     if _qk_caps is not None and len(_qk_caps) >= 2:
-                        # 每个捕获是 {"pre": 旋转前, "post": 旋转后}
-                        _q_cap, _k_cap = _qk_caps[0], _qk_caps[1]
-                        # post-RoPE（旋转后）
+                        _q_post, _k_post = _qk_caps[0]["post"], _qk_caps[1]["post"]
                         dump_rope_postqk_verl080(
-                            self.layer_number, _q_cap["post"], _k_cap["post"],
+                            self.layer_number, _q_post, _k_post,
                             self.config.num_layers, positions=_off_positions,
                         )
-                        # pre-RoPE（旋转前，纯 QKV 投影）
-                        dump_rope_preqk_verl080(
-                            self.layer_number, _q_cap["pre"], _k_cap["pre"],
-                            self.config.num_layers,
-                        )
-                        # full KV（post-RoPE K + V，均 in-context 截获，不再事后 re-call）
-                        _off_v = _v_caps[-1] if _v_caps else None
-                        if _off_v is not None and _off_v.dim() > 2:
-                            _off_v = _off_v.squeeze(1)
-                        if _off_v is not None:
+                        # pre-RoPE Q/K + V：从 get_qkv 返回统一取（与 ON 同源）
+                        if _qkv_caps:
+                            _pre_q, _pre_k, _pre_v = _qkv_caps[-1][:3]
+                            # squeeze 到 [T, H, D]（与 ON 侧 squeeze 后 dump 一致）
+                            _sq = lambda _t: _t.squeeze(1) if _t.dim() > 2 else _t
+                            _pre_q, _pre_k, _pre_v = _sq(_pre_q), _sq(_pre_k), _sq(_pre_v)
+                            dump_rope_preqk_verl080(
+                                self.layer_number, _pre_q, _pre_k,
+                                self.config.num_layers,
+                            )
                             dump_full_kv_off(
-                                self.layer_number, _k_cap["post"], _off_v,
+                                self.layer_number, _k_post, _pre_v,
                                 self.config.num_layers,
                             )
                         else:
-                            print(f"[PS-diag] OFF full_kv L{self.layer_number}: V 未截获; skip",
+                            print(f"[PS-diag] OFF preqkv L{self.layer_number}: get_qkv 未截获; skip",
                                   flush=True)
                     else:
                         print(
