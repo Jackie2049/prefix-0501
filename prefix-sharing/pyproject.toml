@@ -1,3 +1,22 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "prefix-sharing"
+version = "0.1.0"
+description = "Prefix KV sharing for verl + Megatron RL training"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "PrefixSharing contributors"},
+]
+dependencies = [
+  "torch>=2.0",
+  "numpy>=1.21",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/unit_test", "tests/integrated_test", "tests/system_test"]
 pythonpath = ["."]

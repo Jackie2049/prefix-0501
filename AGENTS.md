@@ -1,4 +1,4 @@
-# PrefixAttention — 开发者规范
+# PrefixSharing — 开发者规范
 
 > 本文档是本仓库的顶层规范，说明目录结构、边界和开发约定。
 
@@ -9,7 +9,7 @@
 ## 2. 目录结构
 
 ```
-PrefixAttention/
+PrefixSharing/
 ├── dependency/       # verl / Megatron / MindSpeed 依赖快照
 └── prefix-sharing/   # prefix sharing 核心实现
 ```

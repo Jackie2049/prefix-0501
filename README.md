@@ -1,4 +1,4 @@
-# PrefixAttention
+# PrefixSharing
 
 在 verl + Megatron RL pipeline 中实现 prefix sharing，复用共享前缀的 KV 减少重复计算。
 
@@ -41,7 +41,7 @@ cd dependency/verl_cdd9014f && pip install --no-deps -v -e . && cd ../..
 ### NPU 环境
 
 ```bash
-export PYTHONPATH="/path/to/PrefixAttention/prefix-sharing:$PYTHONPATH"
+export PYTHONPATH="/path/to/PrefixSharing/prefix-sharing:$PYTHONPATH"
 export HYDRA_FULL_ERROR=1
 export VLLM_ASCEND_ENABLE_NZ=0       # NPU 专用：禁用 NZ 格式
 export ENABLE_PREFIX_SHARING=1        # 启用 prefix sharing
@@ -83,7 +83,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 ### GPU 环境
 
 ```bash
-export PYTHONPATH="/path/to/PrefixAttention/prefix-sharing:$PYTHONPATH"
+export PYTHONPATH="/path/to/PrefixSharing/prefix-sharing:$PYTHONPATH"
 export HYDRA_FULL_ERROR=1
 export ENABLE_PREFIX_SHARING=1          # 启用 prefix sharing
 
@@ -319,7 +319,7 @@ docker run -dit \
     -v /usr/sbin:/usr/sbin \
     -v /home:/home \
     -v /data:/data \
-    -v /path/to/PrefixAttention:/workspace/PrefixAttention \
+    -v /path/to/PrefixSharing:/workspace/PrefixSharing \
     quay.io/ascend/verl:verl-8.5.2-a3-ubuntu22.04-py3.11-qwen3-5 \
     /bin/bash
 
@@ -339,7 +339,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 ```bash
 # Megatron 训练栈 + 本项目 verl 快照（覆盖镜像内 verl）
-cd /workspace/PrefixAttention
+cd /workspace/PrefixSharing
 cd dependency/Megatron-Bridge_de93536e && pip install --no-deps -v -e . && cd ../..
 cd dependency/Megatron-LM-core_v0.16.1 && pip install --no-deps -v -e . && cd ../..
 cd dependency/MindSpeed_core_r0.16.0 && pip install --no-deps -v -e . && cd ../..
