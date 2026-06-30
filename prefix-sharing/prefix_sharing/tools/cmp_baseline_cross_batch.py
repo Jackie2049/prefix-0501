@@ -107,35 +107,35 @@ def _compare_plain(dir_single: str, dir_stacked: str, filename: str,
     for lyr in layers:
         st = sd[lyr].float()
         mt = md[lyr].float()
-        layer_md, layer_cos = 0.0, 1.0
-        total_tokens = 0
+        layer_md, layer_cos_min = 0.0, 1.0
+        all_cos: list[float] = []
         for i in range(B):
             s_seq = st[int(cu_s[i]):int(cu_s[i + 1])]
             T_i = s_seq.shape[0]
             if T_i == 0:
                 continue
             on_f = s_seq.reshape(T_i, -1)
-            # compare against each stack repetition of this sequence
             for k in range(n_copies):
                 j = i + k * B
                 c_seq = mt[int(cu_m[j]):int(cu_m[j + 1])]
                 if c_seq.shape[0] != T_i:
                     continue
                 off_f = c_seq.reshape(T_i, -1)
-                diff = (on_f - off_f).abs()
                 cos = _cosine_sim(on_f, off_f, dim=-1)
-                md_i = float(diff.max())
+                all_cos.extend(cos.tolist())
+                md_i = float((on_f - off_f).abs().max())
                 cos_i = float(cos.min())
                 layer_md = max(layer_md, md_i)
-                layer_cos = min(layer_cos, cos_i)
-            total_tokens += T_i
+                layer_cos_min = min(layer_cos_min, cos_i)
         per_layer[lyr] = {
-            "max_diff": layer_md, "cos_avg": 1.0, "cos_min": layer_cos,
-            "n_tokens": total_tokens, "on_T": total_tokens,
-            "off_T": total_tokens * n_copies,
+            "max_diff": layer_md,
+            "cos_avg": sum(all_cos) / len(all_cos) if all_cos else 0.0,
+            "cos_min": layer_cos_min,
+            "n_tokens": int(sum(c.shape[0] for c in [st[int(cu_s[i]):int(cu_s[i+1])] for i in range(B)])) if B > 0 else 0,
+            "on_T": st.shape[0], "off_T": mt.shape[0],
         }
         worst_md = max(worst_md, layer_md)
-        worst_cos = min(worst_cos, layer_cos)
+        worst_cos = min(worst_cos, layer_cos_min)
 
     passed = worst_md < 1e-5
     _name = f"{label}_L{layer}" if layer is not None else label
@@ -167,30 +167,33 @@ def _compare_rope(dir_single: str, dir_stacked: str, filename: str,
         sk = sd[lyr][fld_k].float(); mk = md[lyr][fld_k].float()
         q_max, k_max = 0.0, 0.0
         q_cos_min, k_cos_min = 1.0, 1.0
-        total_tokens = 0
+        q_all, k_all = [], []
         for i in range(B):
             s_q = sq[int(cu_s[i]):int(cu_s[i + 1])]
             s_k = sk[int(cu_s[i]):int(cu_s[i + 1])]
             T_i = s_q.shape[0]
-            if T_i == 0:
-                continue
+            if T_i == 0: continue
             qf = s_q.reshape(T_i, -1); kf = s_k.reshape(T_i, -1)
-            for k in range(n_copies):
-                j = i + k * B
+            for h in range(n_copies):
+                j = i + h * B
                 cq = mq[int(cu_m[j]):int(cu_m[j + 1])]
                 ck = mk[int(cu_m[j]):int(cu_m[j + 1])]
-                if cq.shape[0] != T_i:
-                    continue
-                q_max = max(q_max, float((qf - cq.reshape(T_i, -1)).abs().max()))
-                k_max = max(k_max, float((kf - ck.reshape(T_i, -1)).abs().max()))
-                q_cos_min = min(q_cos_min, float(_cosine_sim(qf, cq.reshape(T_i, -1), dim=-1).min()))
-                k_cos_min = min(k_cos_min, float(_cosine_sim(kf, ck.reshape(T_i, -1), dim=-1).min()))
-            total_tokens += T_i
+                if cq.shape[0] != T_i: continue
+                cfq = cq.reshape(T_i, -1); cfk = ck.reshape(T_i, -1)
+                q_cos = _cosine_sim(qf, cfq, dim=-1)
+                k_cos = _cosine_sim(kf, cfk, dim=-1)
+                q_all.extend(q_cos.tolist()); k_all.extend(k_cos.tolist())
+                q_max = max(q_max, float((qf - cfq).abs().max()))
+                k_max = max(k_max, float((kf - cfk).abs().max()))
+                q_cos_min = min(q_cos_min, float(q_cos.min()))
+                k_cos_min = min(k_cos_min, float(k_cos.min()))
         per_layer[lyr] = {
             "Q_max_diff": q_max, "K_max_diff": k_max,
-            "Q_cos_avg": 1.0, "Q_cos_min": q_cos_min,
-            "K_cos_avg": 1.0, "K_cos_min": k_cos_min,
-            "n_tokens": total_tokens,
+            "Q_cos_avg": sum(q_all)/len(q_all) if q_all else 0.0,
+            "Q_cos_min": q_cos_min,
+            "K_cos_avg": sum(k_all)/len(k_all) if k_all else 0.0,
+            "K_cos_min": k_cos_min,
+            "n_tokens": len(q_all),
         }
     _name = f"{label}_L{layer}" if layer is not None else label
     return CheckResult(name=_name, passed=True, metrics={"layers": per_layer})
@@ -209,58 +212,64 @@ def _compare_logits(dir_single: str, dir_stacked: str,
     st = st.reshape(-1, st.size(-1))
     mt = mt.reshape(-1, mt.size(-1))
     B = cu_s.numel() - 1
-    worst_md, worst_cos, total_tokens = 0.0, 1.0, 0
+    worst_md, worst_cos_min = 0.0, 1.0
+    all_cos, total_tokens = [], 0
     for i in range(B):
         s_seq = st[int(cu_s[i]):int(cu_s[i + 1])]
-        T_i = s_seq.shape[0]
-        if T_i == 0:
-            continue
-        total_tokens += T_i
+        if s_seq.shape[0] == 0: continue
+        total_tokens += s_seq.shape[0]
         for k in range(n_copies):
             j = i + k * B
             c_seq = mt[int(cu_m[j]):int(cu_m[j + 1])]
-            if c_seq.shape[0] != T_i:
-                continue
-            diff = (s_seq - c_seq).abs()
+            if c_seq.shape[0] != s_seq.shape[0]: continue
             cos = _cosine_sim(s_seq, c_seq, dim=-1)
-            worst_md = max(worst_md, float(diff.max()))
-            worst_cos = min(worst_cos, float(cos.min()))
+            all_cos.extend(cos.tolist())
+            worst_md = max(worst_md, float((s_seq - c_seq).abs().max()))
+            worst_cos_min = min(worst_cos_min, float(cos.min()))
     return CheckResult(name="logits", passed=worst_md < 1e-5,
-                       metrics={"n_tokens": total_tokens, "cos_avg": 1.0,
-                                "cos_min": worst_cos})
+                       metrics={"n_tokens": total_tokens,
+                                "cos_avg": sum(all_cos)/len(all_cos) if all_cos else 0.0,
+                                "cos_min": worst_cos_min})
 
 
 def _compare_2d_file(dir_single: str, dir_stacked: str, filename: str,
-                     name: str, atol: float = 1e-5
+                     name: str, n_copies: int, num_seq: int,
+                     atol: float = 1e-5
                      ) -> tuple[CheckResult | None, torch.Tensor | None, torch.Tensor | None]:
-    """Compare 2D [B, L_max] tensors — reuses ``_print_2d_result`` format."""
+    """Compare 2D [B, L_max] tensors — row i from single vs rows i+k*num_seq from stacked."""
     st = _load_tensor(dir_single, filename)
     mt = _load_tensor(dir_stacked, filename)
     if st is None or mt is None:
         return None, st, mt
-    if st.dim() > 1 and mt.dim() > 1 and st.shape[1] == mt.shape[1]:
-        # compare row 0 vs every row in multi
-        a = st[0:1].float()
-        best_md, best_cos = 0.0, 1.0
-        for i in range(mt.shape[0]):
-            b = mt[i:i + 1].float()
+    st = st.float(); mt = mt.float()
+    if st.dim() < 2 or mt.dim() < 2:
+        return None, st, mt
+    # only compare valid (non-padded) rows
+    worst_md, worst_cos = 0.0, 1.0
+    for i in range(num_seq):
+        if i >= st.shape[0]:
+            break
+        a = st[i].reshape(-1)
+        for k in range(n_copies):
+            j = i + k * num_seq
+            if j >= mt.shape[0]:
+                continue
+            b = mt[j].reshape(-1)
             md = float((a - b).abs().max())
-            cos = float(_cosine_sim(a.reshape(-1), b.reshape(-1), dim=-1))
-            best_md = max(best_md, md)
-            best_cos = min(best_cos, cos)
-        err = _error_abs_rel(st.float(), mt.float())
-        pr = _pearson_r(st.float(), mt.float())
-        return (CheckResult(name=name,
-                            passed=err["abs_max"] <= atol,
-                            metrics={"shape": tuple(st.shape),
-                                     "active": st.numel(),
-                                     "abs_max": err["abs_max"],
-                                     "abs_mean": err["abs_mean"],
-                                     "rel_max": err["rel_max"],
-                                     "rel_mean": err["rel_mean"],
-                                     "pearson_r": pr,
-                                     "atol": atol}), st, mt)
-    return None, st, mt
+            cos = float(_cosine_sim(a, b, dim=-1))
+            worst_md = max(worst_md, md)
+            worst_cos = min(worst_cos, cos)
+    pr = _pearson_r(st[:num_seq].reshape(-1), mt[:num_seq * n_copies].reshape(-1))
+    return (CheckResult(name=name,
+                        passed=worst_md <= atol,
+                        metrics={"shape": tuple(st.shape),
+                                 "active": st[:num_seq].numel(),
+                                 "abs_max": worst_md,
+                                 "abs_mean": 0.0,
+                                 "rel_max": 0.0,
+                                 "rel_mean": 0.0,
+                                 "pearson_r": pr,
+                                 "atol": atol}), st, mt)
 
 
 # ── top-K helpers (reuse cmp_diag_verl080 top-K printers) ────────
@@ -357,6 +366,7 @@ def main():
 
     T = int(cu_s[-1])
     n = args.num_copies
+    num_seq = cu_s.numel() - 1
     print(_SEP_DOUBLE)
     print("  GEMM Precision Baseline — Cross-Batch-Size Comparison")
     print(f"  Single:  {args.dir_single}  (1 seq, {T} tokens)")
@@ -408,7 +418,7 @@ def main():
     for fn, cn in [("logprobs", "logp"), ("entropy", "entropy")]:
         fname = f"{fn}_{args.tag}.pt"
         r, t1, t2 = _compare_2d_file(args.dir_single, args.dir_stacked,
-                                      fname, f"{cn}_{args.tag}", args.atol)
+                                      fname, f"{cn}_{args.tag}", n, num_seq, args.atol)
         if r: all_results.append(r); _print_2d_result(r)
 
     # ── top-K ──

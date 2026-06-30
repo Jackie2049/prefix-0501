@@ -73,17 +73,20 @@ def _get_layers(data: dict) -> list[int]:
 # ── comparison logic ─────────────────────────────────────────────
 
 def _worst_pairwise(copies: list[torch.Tensor]) -> dict:
-    """Pairwise compare all copies of the SAME length; return worst."""
-    worst_md, worst_cos = 0.0, 1.0
+    """Pairwise compare all copies of the SAME length; return worst + avg cos."""
+    worst_md, worst_cos_min = 0.0, 1.0
+    all_cos: list[float] = []
     for i in range(len(copies)):
         for j in range(i + 1, len(copies)):
             a = copies[i].reshape(copies[i].shape[0], -1).float()
             b = copies[j].reshape(copies[j].shape[0], -1).float()
+            cos = _cosine_sim(a, b, dim=-1)
+            all_cos.extend(cos.tolist())
             md = float((a - b).abs().max())
-            cos_min = float(_cosine_sim(a, b, dim=-1).min())
             worst_md = max(worst_md, md)
-            worst_cos = min(worst_cos, cos_min)
-    return {"max_diff": worst_md, "cos_min": worst_cos}
+            worst_cos_min = min(worst_cos_min, float(cos.min()))
+    return {"max_diff": worst_md, "cos_avg": sum(all_cos)/len(all_cos) if all_cos else 0.0,
+            "cos_min": worst_cos_min}
 
 
 def _group_by_len(copies: list[torch.Tensor]) -> dict[int, list[torch.Tensor]]:
@@ -112,20 +115,23 @@ def _compare_plain_within(dir_multi: str, filename: str,
         mt = d[lyr].float()
         copies = [mt[int(cu[i]):int(cu[i + 1])] for i in range(total_copies)]
         groups = _group_by_len(copies)
-        layer_md, layer_cos, total_tokens = 0.0, 1.0, 0
+        layer_md, layer_cos_min = 0.0, 1.0
+        all_cos_avg: list[float] = []
         for group_copies in groups.values():
             if len(group_copies) < 2:
                 continue
             w = _worst_pairwise(group_copies)
             layer_md = max(layer_md, w["max_diff"])
-            layer_cos = min(layer_cos, w["cos_min"])
-            total_tokens += group_copies[0].shape[0] * len(group_copies)
+            layer_cos_min = min(layer_cos_min, w["cos_min"])
+            all_cos_avg.append(w["cos_avg"])
         per_layer[lyr] = {
-            "max_diff": layer_md, "cos_avg": 1.0, "cos_min": layer_cos,
-            "n_tokens": total_tokens, "on_T": total_tokens, "off_T": total_tokens,
+            "max_diff": layer_md,
+            "cos_avg": sum(all_cos_avg)/len(all_cos_avg) if all_cos_avg else 0.0,
+            "cos_min": layer_cos_min,
+            "n_tokens": mt.shape[0], "on_T": mt.shape[0], "off_T": mt.shape[0],
         }
         worst_md = max(worst_md, layer_md)
-        worst_cos = min(worst_cos, layer_cos)
+        worst_cos = min(worst_cos, layer_cos_min)
     passed = worst_md == 0.0
     _name = f"{label}_L{layer}" if layer is not None else label
     return CheckResult(name=_name, passed=passed,
@@ -153,22 +159,27 @@ def _compare_rope_within(dir_multi: str, filename: str,
         k_copies = [mk[int(cu[i]):int(cu[i + 1])] for i in range(total_copies)]
         q_groups = _group_by_len(q_copies)
         k_groups = _group_by_len(k_copies)
-        qw = {"max_diff": 0.0, "cos_min": 1.0}
-        kw = {"max_diff": 0.0, "cos_min": 1.0}
+        qw = {"max_diff": 0.0, "cos_min": 1.0, "cos_avg": 0.0}
+        kw = {"max_diff": 0.0, "cos_min": 1.0, "cos_avg": 0.0}
+        q_avgs, k_avgs = [], []
         for g in q_groups.values():
             if len(g) >= 2:
                 w = _worst_pairwise(g)
                 qw["max_diff"] = max(qw["max_diff"], w["max_diff"])
                 qw["cos_min"] = min(qw["cos_min"], w["cos_min"])
+                q_avgs.append(w["cos_avg"])
         for g in k_groups.values():
             if len(g) >= 2:
                 w = _worst_pairwise(g)
                 kw["max_diff"] = max(kw["max_diff"], w["max_diff"])
                 kw["cos_min"] = min(kw["cos_min"], w["cos_min"])
+                k_avgs.append(w["cos_avg"])
         per_layer[lyr] = {
             "Q_max_diff": qw["max_diff"], "K_max_diff": kw["max_diff"],
-            "Q_cos_avg": 1.0, "Q_cos_min": qw["cos_min"],
-            "K_cos_avg": 1.0, "K_cos_min": kw["cos_min"],
+            "Q_cos_avg": sum(q_avgs)/len(q_avgs) if q_avgs else 0.0,
+            "Q_cos_min": qw["cos_min"],
+            "K_cos_avg": sum(k_avgs)/len(k_avgs) if k_avgs else 0.0,
+            "K_cos_min": kw["cos_min"],
             "n_tokens": sum(g[0].shape[0] * len(g) for g in q_groups.values()),
         }
     _name = f"{label}_L{layer}" if layer is not None else label
@@ -184,15 +195,18 @@ def _compare_logits_within(dir_multi: str, cu: torch.Tensor,
     mt = mt.reshape(-1, mt.size(-1))
     copies = [mt[int(cu[i]):int(cu[i + 1])] for i in range(total_copies)]
     groups = _group_by_len(copies)
-    worst_md, worst_cos = 0.0, 1.0
+    worst_md, worst_cos_min = 0.0, 1.0
+    all_cos_avg: list[float] = []
     for g in groups.values():
         if len(g) >= 2:
             w = _worst_pairwise(g)
             worst_md = max(worst_md, w["max_diff"])
-            worst_cos = min(worst_cos, w["cos_min"])
+            worst_cos_min = min(worst_cos_min, w["cos_min"])
+            all_cos_avg.append(w["cos_avg"])
     return CheckResult(name="logits", passed=worst_md == 0.0,
                        metrics={"n_tokens": copies[0].shape[0] if copies else 0,
-                                "cos_avg": 1.0, "cos_min": worst_cos})
+                                "cos_avg": sum(all_cos_avg)/len(all_cos_avg) if all_cos_avg else 0.0,
+                                "cos_min": worst_cos_min})
 
 
 # ── main ─────────────────────────────────────────────────────────
