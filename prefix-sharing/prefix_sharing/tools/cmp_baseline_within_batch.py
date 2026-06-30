@@ -33,11 +33,6 @@ from prefix_sharing.tools.cmp_diag_verl080 import (
     _pearson_r,
     _dump_json,
     _load_tensor,
-    _print_per_layer,
-    _print_rope_postqk_per_layer,
-    _print_rope_freqs,
-    _print_build_kv_input_v,
-    _print_hidden_states,
     _print_logits_packed,
     _print_2d_result,
     _print_topk_vec,
@@ -211,6 +206,53 @@ def _compare_logits_within(dir_multi: str, cu: torch.Tensor,
                                 "cos_min": worst_cos_min})
 
 
+# ── print wrappers ─────────────────────────────────────────────
+
+def _print_plain_baseline(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [{r.name}]  within-batch pairwise")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}\n"); return
+    layers = m.get("layers", {})
+    print(f"  {'LAYER':>6s}  {'MAXDIFF':>12s} {'COS_AVG':>10s} {'COS_MIN':>10s}  "
+          f"{'TOKENS':>8s}  {'STATUS':>8s}")
+    print(f"  {'─' * 6}  {'─' * 12} {'─' * 10} {'─' * 10}  {'─' * 8}  {'─' * 8}")
+    for lyr in sorted(layers):
+        d = layers[lyr]
+        if "max_diff" not in d:
+            print(f"  {lyr:>6d}  {d.get('error','')}"); continue
+        md = d["max_diff"]; ca = d.get("cos_avg", 0); cm = d.get("cos_min", 1)
+        ok = md == 0.0
+        print(f"  {lyr:>6d}  {md:>12.3e} {ca:>10.6f} {cm:>10.6f}  "
+              f"{d.get('n_tokens','—'):>8}  "
+              f"{'PASS' if ok else 'DIFF':>8s}")
+    print(f"\n  max_diff={m.get('max_diff')}  cos_min={m.get('cos_min')}  "
+          f"{_CHECK if r.passed else _CROSS}")
+    print()
+
+
+def _print_rope_baseline(r: CheckResult, label: str):
+    print(_SEP_SINGLE + f"\n  [{r.name}]  {label}  within-batch pairwise")
+    print(_SEP_SINGLE)
+    layers = r.metrics.get("layers")
+    if isinstance(layers, dict):
+        print(f"  {'LAYER':>6s}  {'Q_MAXDIFF':>12s} {'Q_COS_AVG':>12s} {'Q_COS_MIN':>12s}  "
+              f"{'K_MAXDIFF':>12s} {'K_COS_AVG':>12s} {'K_COS_MIN':>12s}  "
+              f"{'TOKENS':>8s}")
+        print(f"  {'─' * 6}  {'─' * 12} {'─' * 12} {'─' * 12}  "
+              f"{'─' * 12} {'─' * 12} {'─' * 12}  {'─' * 8}")
+        for lyr in sorted(layers.keys()):
+            d = layers[lyr]
+            if "error" in d:
+                print(f"  {lyr:>6d}  {d['error']}"); continue
+            print(f"  {lyr:>6d}  {d.get('Q_max_diff',0.0):>12.3e} {d.get('Q_cos_avg',0.0):>12.6e} "
+                  f"{d.get('Q_cos_min',0.0):>12.6e}  "
+                  f"{d.get('K_max_diff',0.0):>12.3e} {d.get('K_cos_avg',0.0):>12.6e} "
+                  f"{d.get('K_cos_min',0.0):>12.6e}  {d.get('n_tokens','—'):>8}")
+    print()
+
+
 # ── main ─────────────────────────────────────────────────────────
 
 def main():
@@ -257,37 +299,37 @@ def main():
     # ── hidden_states ──
     r = _compare_plain_within(args.dir_multi, "hidden_states.pt",
                               cu, total_copies, args.layer, "hidden_states")
-    if r: all_results.append(r); _print_hidden_states(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── build_kv_input_v ──
     r = _compare_plain_within(args.dir_multi, "build_kv_input_v.pt",
                               cu, total_copies, args.layer, "build_kv_input_v")
-    if r: all_results.append(r); _print_build_kv_input_v(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── rope_preqk ──
     r = _compare_rope_within(args.dir_multi, "rope_preqk.pt",
                              cu, total_copies, args.layer, "rope_preqk", "query", "key")
-    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
+    if r: all_results.append(r); _print_rope_baseline(r, r.name)
 
     # ── rope_freqs ──
     r = _compare_plain_within(args.dir_multi, "rope_freqs.pt",
                               cu, total_copies, args.layer, "rope_freqs")
-    if r: all_results.append(r); _print_rope_freqs(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── rope_postqk ──
     r = _compare_rope_within(args.dir_multi, "rope_postqk.pt",
                              cu, total_copies, args.layer, "rope_postqk", "query", "key")
-    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
+    if r: all_results.append(r); _print_rope_baseline(r, r.name)
 
     # ── attn_outputs ──
     r = _compare_plain_within(args.dir_multi, "attn_outputs.pt",
                               cu, total_copies, args.layer, "attn_outputs")
-    if r: all_results.append(r); _print_per_layer(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── full_kv ──
     r = _compare_rope_within(args.dir_multi, "full_kv.pt",
                              cu, total_copies, args.layer, "full_kv", "key", "value")
-    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
+    if r: all_results.append(r); _print_rope_baseline(r, r.name)
 
     # ── logits ──
     r = _compare_logits_within(args.dir_multi, cu, total_copies)

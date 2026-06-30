@@ -344,6 +344,54 @@ def _topk_rope(dir_single: str, dir_stacked: str,
                             topk, sort_err, f"{tag}_L{lyr}_token0")
 
 
+# ── print wrappers (replace ON/OFF labels with Single/Stacked) ──
+
+def _print_plain_baseline(r: CheckResult):
+    print(_SEP_SINGLE + f"\n  [{r.name}]  Single vs Stacked（per-seq aligned）")
+    print(_SEP_SINGLE)
+    m = r.metrics
+    if "error" in m:
+        print(f"  {_CROSS} {m['error']}\n"); return
+    layers = m.get("layers", {})
+    print(f"  {'LAYER':>6s}  {'MAXDIFF':>12s} {'COS_AVG':>10s} {'COS_MIN':>10s}  "
+          f"{'SNG_T':>8s} {'STK_T':>8s}  {'STATUS':>8s}")
+    print(f"  {'─' * 6}  {'─' * 12} {'─' * 10} {'─' * 10}  {'─' * 8} {'─' * 8}  {'─' * 8}")
+    for lyr in sorted(layers):
+        d = layers[lyr]
+        if "max_diff" not in d:
+            print(f"  {lyr:>6d}  {d.get('error','')}"); continue
+        md = d["max_diff"]; ca = d.get("cos_avg", 0); cm = d.get("cos_min", 1)
+        ok = md < 1e-5
+        print(f"  {lyr:>6d}  {md:>12.3e} {ca:>10.6f} {cm:>10.6f}  "
+              f"{d.get('on_T','—'):>8} {d.get('off_T','—'):>8}  "
+              f"{'OK' if ok else 'DIFF':>8s}")
+    print(f"\n  max_diff={m.get('max_diff')}  cos_min={m.get('cos_min')}  "
+          f"{_CHECK if r.passed else _CROSS}")
+    print()
+
+
+def _print_rope_baseline(r: CheckResult, label: str):
+    _sec = label
+    print(_SEP_SINGLE + f"\n  [{r.name}]  {_sec}  Single vs Stacked")
+    print(_SEP_SINGLE)
+    layers = r.metrics.get("layers")
+    if isinstance(layers, dict):
+        print(f"  {'LAYER':>6s}  {'Q_MAXDIFF':>12s} {'Q_COS_AVG':>12s} {'Q_COS_MIN':>12s}  "
+              f"{'K_MAXDIFF':>12s} {'K_COS_AVG':>12s} {'K_COS_MIN':>12s}  "
+              f"{'TOKENS':>8s}")
+        print(f"  {'─' * 6}  {'─' * 12} {'─' * 12} {'─' * 12}  "
+              f"{'─' * 12} {'─' * 12} {'─' * 12}  {'─' * 8}")
+        for lyr in sorted(layers.keys()):
+            d = layers[lyr]
+            if "error" in d:
+                print(f"  {lyr:>6d}  {d['error']}"); continue
+            print(f"  {lyr:>6d}  {d.get('Q_max_diff',0.0):>12.3e} {d.get('Q_cos_avg',0.0):>12.6e} "
+                  f"{d.get('Q_cos_min',0.0):>12.6e}  "
+                  f"{d.get('K_max_diff',0.0):>12.3e} {d.get('K_cos_avg',0.0):>12.6e} "
+                  f"{d.get('K_cos_min',0.0):>12.6e}  {d.get('n_tokens','—'):>8}")
+    print()
+
+
 # ── main ─────────────────────────────────────────────────────────
 
 def main():
@@ -393,37 +441,37 @@ def main():
     # ── hidden_states ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
                        "hidden_states.pt", cu_s, cu_m, n, args.layer, "hidden_states")
-    if r: all_results.append(r); _print_hidden_states(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── build_kv_input_v ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
                        "build_kv_input_v.pt", cu_s, cu_m, n, args.layer, "build_kv_input_v")
-    if r: all_results.append(r); _print_build_kv_input_v(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── rope_preqk ──
     r = _compare_rope(args.dir_single, args.dir_stacked, "rope_preqk.pt",
                       cu_s, cu_m, n, args.layer, "rope_preqk", "query", "key")
-    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
+    if r: all_results.append(r); _print_rope_baseline(r, "rope_preqk")
 
     # ── rope_freqs ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
                        "rope_freqs.pt", cu_s, cu_m, n, args.layer, "rope_freqs")
-    if r: all_results.append(r); _print_rope_freqs(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── rope_postqk ──
     r = _compare_rope(args.dir_single, args.dir_stacked, "rope_postqk.pt",
                       cu_s, cu_m, n, args.layer, "rope_postqk", "query", "key")
-    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
+    if r: all_results.append(r); _print_rope_baseline(r, "rope_postqk")
 
     # ── attn_outputs ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
                        "attn_outputs.pt", cu_s, cu_m, n, args.layer, "attn_outputs")
-    if r: all_results.append(r); _print_per_layer(r)
+    if r: all_results.append(r); _print_plain_baseline(r)
 
     # ── full_kv ──
     r = _compare_rope(args.dir_single, args.dir_stacked, "full_kv.pt",
                       cu_s, cu_m, n, args.layer, "full_kv", "key", "value")
-    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
+    if r: all_results.append(r); _print_rope_baseline(r, "full_kv")
 
     # ── logits ──
     r = _compare_logits(args.dir_single, args.dir_stacked, cu_s, cu_m, n)
