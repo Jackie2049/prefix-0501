@@ -106,14 +106,14 @@ def prefix_attention(
         f"built expanded kv: expanded_key_shape={tuple(expanded_key.shape)}, expanded_value_shape={tuple(expanded_value.shape)}"
     )
 
-    ######### prefix-sharing diag: ON expanded K/V dump（build_kv 输出，attention 实际用的完整 KV）#########
+            ##### [PS-diag] ON expanded K/V dump（build_kv 输出）#####
     try:
         from prefix_sharing.tools.diagnostic_dump_verl080 import dump_expanded_kv_on
         dump_expanded_kv_on(layer_id, expanded_key, expanded_value,
                             attention_module.config.num_layers)
     except Exception as _e:
         print(f"expanded_kv dump failed: {_e}", flush=True)
-    ######### prefix-sharing diag: ON expanded K/V dump end #########
+            ##### [PS-diag] ON expanded K/V dump end #####
 
     # 注意力计算
     core_attn_out = attention_backend.attention(
@@ -128,7 +128,7 @@ def prefix_attention(
     core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
     output = attention_module.linear_proj(core_attn_out)  # (tensor, bias) tuple
 
-    ######### prefix-sharing diag: ON attention_output (per-layer) #########
+            ##### [PS-diag] ON attention_output (per-layer) #####
     try:
         from prefix_sharing.tools.diagnostic_dump import dump_attn_on
         dump_attn_on(output[0], packed_seq_params, prefix_sharing_context.prefix_sharing_plan,
@@ -136,7 +136,7 @@ def prefix_attention(
                      attention_module.config.num_layers)
     except Exception as e:
         print(f"last-attn dump (ON) failed: {e}")
-    ######### prefix-sharing diag: ON attention_output (per-layer) #########
+            ##### [PS-diag] ON attention_output (per-layer) end #####
     # ---
 
     return output
@@ -315,14 +315,14 @@ def _apply_positioned_rope(
 
     if q_pos_emb is not None:
         q_freqs = q_pos_emb.index_select(0, positions)
-        ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
+                ##### [PS-diag] ON rope_freqs (per-layer) #####
         try:
             from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs
             dump_rope_freqs(q_freqs, attention_module.layer_number,
                                attention_module.config.num_layers)
         except Exception as e:
             print(f"rope_freqs dump failed: {e}")
-        ######### prefix-sharing diag: ON rope_freqs (per-layer) #########
+                ##### [PS-diag] ON rope_freqs (per-layer) end #####
         query = apply_rotary_pos_emb(
             query.unsqueeze(1),
             q_freqs,
@@ -336,7 +336,7 @@ def _apply_positioned_rope(
             **_rope_kwargs(cu_seqlens_kv),
         ).squeeze(1)
 
-    ######### prefix-sharing diag: ON post-RoPE Q/K dump (per-layer) #########
+    ##### [PS-diag] ON post-RoPE Q/K dump (per-layer) #####
     try:
         from prefix_sharing.tools.diagnostic_dump_verl080 import dump_rope_postqk_verl080
         dump_rope_postqk_verl080(
@@ -347,7 +347,7 @@ def _apply_positioned_rope(
         )
     except Exception as e:
         print(f"rope_postqk_layer dump failed: {e}")
-    ######### prefix-sharing diag: ON post-RoPE Q/K dump end #########
+    ##### [PS-diag] ON post-RoPE Q/K dump end #####
 
     return query, key
 

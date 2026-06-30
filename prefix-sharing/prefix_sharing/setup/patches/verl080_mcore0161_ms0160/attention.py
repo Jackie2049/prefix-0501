@@ -137,6 +137,7 @@ def patch_megatron_attention(original_forward: Any) -> Any:
                                       self.config.num_layers)
             except Exception as _e:
                 print(f"hidden_states dump failed: {_e}", flush=True)
+        # ##### [PS-diag] ON pre-RoPE Q/K/V dump end #####
 
         # delegate to verified integrations code
         from prefix_sharing.integrations.megatron_runtime import (

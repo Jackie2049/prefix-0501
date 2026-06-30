@@ -1069,8 +1069,7 @@ class Attention(MegatronModule, ABC):
             value = value.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
-        # [PS-diag] OFF pre-RoPE Q/K/V dump — 侵入式，post-squeeze、pre-RoPE，
-        # 与 ON 侧（attention.py ON 分支 get_qkv+squeeze 之后 dump）完全对称。
+        # ##### [PS-diag] OFF pre-RoPE Q/K/V dump（侵入式，post-squeeze、pre-RoPE）#####
         import os as _ps_os
         if _ps_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             try:
@@ -1085,6 +1084,7 @@ class Attention(MegatronModule, ABC):
                                       self.config.num_layers)
             except Exception as _ps_e:
                 print(f"[PS-diag] OFF preqkv dump failed: {_ps_e}", flush=True)
+        # ##### [PS-diag] OFF pre-RoPE Q/K/V dump end #####
 
         # ================================================
         # relative positional embedding (rotary embedding)
@@ -1143,9 +1143,7 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
-        # [PS-diag] OFF post-RoPE Q/K + full_kv dump — 侵入式，rotary block 之后、core attention 之前，
-        # 与 ON 侧（_apply_positioned_rope 返回后 dump rope_postqk；build_kv 后 dump expanded_kv）对称。
-        # 此处 query/key 是 post-RoPE，value 是 raw（未旋转），都在 scope。
+        # ##### [PS-diag] OFF post-RoPE Q/K + full_kv dump（侵入式，rotary block 之后）#####
         if _ps_os.environ.get("PREFIX_SHARING_DIAG_DUMP") is not None:
             try:
                 from prefix_sharing.tools.diagnostic_dump_verl080 import (
@@ -1157,6 +1155,7 @@ class Attention(MegatronModule, ABC):
                                  self.config.num_layers)
             except Exception as _ps_e2:
                 print(f"[PS-diag] OFF postqk/full_kv dump failed: {_ps_e2}", flush=True)
+        # ##### [PS-diag] OFF post-RoPE Q/K + full_kv dump end #####
 
         # ==================================
         # core attention computation
