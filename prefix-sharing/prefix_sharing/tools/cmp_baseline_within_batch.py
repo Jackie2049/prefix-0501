@@ -319,20 +319,22 @@ def main():
 
     # ── top-K ──
     if args.topk > 0:
-        # build_kv_input_v last-layer top-K
         d = _load_dict(args.dir_multi, "build_kv_input_v.pt")
         if d:
             lyr = max(int(k) for k in d.keys())
             mt = d[lyr].float()
-            copies = [_extract(mt, cu, i).reshape(mt.shape[0] // n, -1) for i in range(n)]
+            copies = [mt[int(cu[i]):int(cu[i+1])].reshape(-1) for i in range(total_copies)]
+            groups = _group_by_len(copies)
             worst_md = 0.0; worst_a = worst_b = None
-            for i in range(n):
-                for j in range(i + 1, n):
-                    md = float((copies[i] - copies[j]).abs().max())
-                    if md > worst_md:
-                        worst_md = md; worst_a = copies[i]; worst_b = copies[j]
+            for g in groups.values():
+                if len(g) < 2: continue
+                for i in range(len(g)):
+                    for j in range(i + 1, len(g)):
+                        md = float((g[i] - g[j]).abs().max())
+                        if md > worst_md:
+                            worst_md = md; worst_a = g[i]; worst_b = g[j]
             if worst_a is not None:
-                _print_topk_vec(worst_a[0].cpu(), worst_b[0].cpu(),
+                _print_topk_vec(worst_a.cpu(), worst_b.cpu(),
                                 args.topk, args.sort_err,
                                 f"build_kv_input_v_L{lyr}_token0")
 
