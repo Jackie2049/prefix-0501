@@ -82,12 +82,12 @@ def _get_layers(data: dict) -> list[int]:
 # ── comparison logic ─────────────────────────────────────────────
 
 def _compare_plain(dir_single: str, dir_stacked: str, filename: str,
-                   cu_stacked: torch.Tensor, n_copies: int,
-                   layer: int | None, label: str) -> CheckResult | None:
+                   cu_s: torch.Tensor, cu_m: torch.Tensor,
+                   n_copies: int, layer: int | None,
+                   label: str) -> CheckResult | None:
     """Compare ``{layer: [T, ...]}`` per-layer dicts across copies.
 
-    Aggregates N cross-batch comparisons into the same metrics structure
-    used by ``_print_build_kv_input_v`` / ``_print_hidden_states``.
+    Handles variable-length sequences by matching copies by sequence length.
     """
     sd = _load_dict(dir_single, filename)
     md = _load_dict(dir_stacked, filename)
@@ -99,39 +99,43 @@ def _compare_plain(dir_single: str, dir_stacked: str, filename: str,
     if not layers:
         return None
 
+    # single: B seqs, stacked: B*stack seqs
+    B = cu_s.numel() - 1
     per_layer: dict = {}
     worst_md = 0.0
     worst_cos = 1.0
     for lyr in layers:
-        st = sd[lyr].float()                         # [T_s, ...]
-        mt = md[lyr].float()                         # [T_m, ...]
-        T_s = st.shape[0]
-        on_f = st.reshape(T_s, -1)
-        # compare single vs every copy; take the WORST copy
-        copy_max_md = 0.0
-        copy_min_cos = 1.0
-        for i in range(n_copies):
-            ct = _extract(mt, cu_stacked, i)          # [T_s, ...]
-            off_f = ct.reshape(T_s, -1)
-            diff = (on_f - off_f).abs()
-            cos = _cosine_sim(on_f, off_f, dim=-1)
-            md_i = float(diff.max())
-            cos_i = float(cos.min())
-            if md_i > copy_max_md:
-                copy_max_md = md_i
-            if cos_i < copy_min_cos:
-                copy_min_cos = cos_i
-        cos_all = _cosine_sim(on_f, on_f.new_zeros((1,)))  # dummy, we use copy_min
+        st = sd[lyr].float()
+        mt = md[lyr].float()
+        layer_md, layer_cos = 0.0, 1.0
+        total_tokens = 0
+        for i in range(B):
+            s_seq = st[int(cu_s[i]):int(cu_s[i + 1])]
+            T_i = s_seq.shape[0]
+            if T_i == 0:
+                continue
+            on_f = s_seq.reshape(T_i, -1)
+            # compare against each stack repetition of this sequence
+            for k in range(n_copies):
+                j = i + k * B
+                c_seq = mt[int(cu_m[j]):int(cu_m[j + 1])]
+                if c_seq.shape[0] != T_i:
+                    continue
+                off_f = c_seq.reshape(T_i, -1)
+                diff = (on_f - off_f).abs()
+                cos = _cosine_sim(on_f, off_f, dim=-1)
+                md_i = float(diff.max())
+                cos_i = float(cos.min())
+                layer_md = max(layer_md, md_i)
+                layer_cos = min(layer_cos, cos_i)
+            total_tokens += T_i
         per_layer[lyr] = {
-            "max_diff": copy_max_md,
-            "cos_avg": float(_cosine_sim(on_f, off_f).mean()) if n_copies > 0 else 1.0,
-            "cos_min": copy_min_cos,
-            "n_tokens": T_s,
-            "on_T": T_s,
-            "off_T": T_s * n_copies,
+            "max_diff": layer_md, "cos_avg": 1.0, "cos_min": layer_cos,
+            "n_tokens": total_tokens, "on_T": total_tokens,
+            "off_T": total_tokens * n_copies,
         }
-        worst_md = max(worst_md, copy_max_md)
-        worst_cos = min(worst_cos, copy_min_cos)
+        worst_md = max(worst_md, layer_md)
+        worst_cos = min(worst_cos, layer_cos)
 
     passed = worst_md < 1e-5
     _name = f"{label}_L{layer}" if layer is not None else label
@@ -141,13 +145,11 @@ def _compare_plain(dir_single: str, dir_stacked: str, filename: str,
 
 
 def _compare_rope(dir_single: str, dir_stacked: str, filename: str,
-                  cu_stacked: torch.Tensor, n_copies: int,
-                  layer: int | None, label: str, fld_q: str, fld_k: str
+                  cu_s: torch.Tensor, cu_m: torch.Tensor,
+                  n_copies: int, layer: int | None,
+                  label: str, fld_q: str, fld_k: str
                   ) -> CheckResult | None:
-    """Compare ``{layer: {fld_q, fld_k}}`` dicts across copies.
-
-    Produces metrics structure compatible with ``_print_rope_postqk_per_layer``.
-    """
+    """Compare ``{layer: {fld_q, fld_k}}`` dicts across copies."""
     sd = _load_dict(dir_single, filename)
     md = _load_dict(dir_stacked, filename)
     if sd is None or md is None:
@@ -158,36 +160,45 @@ def _compare_rope(dir_single: str, dir_stacked: str, filename: str,
     if not layers:
         return None
 
+    B = cu_s.numel() - 1
     per_layer: dict = {}
     for lyr in layers:
-        sq = sd[lyr][fld_q].float()
-        sk = sd[lyr][fld_k].float()
-        mq = md[lyr][fld_q].float()
-        mk = md[lyr][fld_k].float()
-        Tq, Tk = sq.shape[0], sk.shape[0]
+        sq = sd[lyr][fld_q].float(); mq = md[lyr][fld_q].float()
+        sk = sd[lyr][fld_k].float(); mk = md[lyr][fld_k].float()
         q_max, k_max = 0.0, 0.0
         q_cos_min, k_cos_min = 1.0, 1.0
-        for i in range(n_copies):
-            cq = _extract(mq, cu_stacked, i)
-            ck = _extract(mk, cu_stacked, i)
-            qf = sq.reshape(Tq, -1); cf = cq.reshape(Tq, -1)
-            kf = sk.reshape(Tk, -1); kcf = ck.reshape(Tk, -1)
-            q_max = max(q_max, float((qf - cf).abs().max()))
-            k_max = max(k_max, float((kf - kcf).abs().max()))
-            q_cos_min = min(q_cos_min, float(_cosine_sim(qf, cf, dim=-1).min()))
-            k_cos_min = min(k_cos_min, float(_cosine_sim(kf, kcf, dim=-1).min()))
+        total_tokens = 0
+        for i in range(B):
+            s_q = sq[int(cu_s[i]):int(cu_s[i + 1])]
+            s_k = sk[int(cu_s[i]):int(cu_s[i + 1])]
+            T_i = s_q.shape[0]
+            if T_i == 0:
+                continue
+            qf = s_q.reshape(T_i, -1); kf = s_k.reshape(T_i, -1)
+            for k in range(n_copies):
+                j = i + k * B
+                cq = mq[int(cu_m[j]):int(cu_m[j + 1])]
+                ck = mk[int(cu_m[j]):int(cu_m[j + 1])]
+                if cq.shape[0] != T_i:
+                    continue
+                q_max = max(q_max, float((qf - cq.reshape(T_i, -1)).abs().max()))
+                k_max = max(k_max, float((kf - ck.reshape(T_i, -1)).abs().max()))
+                q_cos_min = min(q_cos_min, float(_cosine_sim(qf, cq.reshape(T_i, -1), dim=-1).min()))
+                k_cos_min = min(k_cos_min, float(_cosine_sim(kf, ck.reshape(T_i, -1), dim=-1).min()))
+            total_tokens += T_i
         per_layer[lyr] = {
             "Q_max_diff": q_max, "K_max_diff": k_max,
             "Q_cos_avg": 1.0, "Q_cos_min": q_cos_min,
             "K_cos_avg": 1.0, "K_cos_min": k_cos_min,
-            "n_tokens": Tq,
+            "n_tokens": total_tokens,
         }
     _name = f"{label}_L{layer}" if layer is not None else label
     return CheckResult(name=_name, passed=True, metrics={"layers": per_layer})
 
 
 def _compare_logits(dir_single: str, dir_stacked: str,
-                    cu_stacked: torch.Tensor, n_copies: int) -> CheckResult | None:
+                    cu_s: torch.Tensor, cu_m: torch.Tensor,
+                    n_copies: int) -> CheckResult | None:
     """Compare packed logits across copies."""
     fp_s = os.path.join(dir_single, "logits.pt")
     fp_m = os.path.join(dir_stacked, "logits.pt")
@@ -197,18 +208,25 @@ def _compare_logits(dir_single: str, dir_stacked: str,
     mt = torch.load(fp_m, weights_only=True).float()
     st = st.reshape(-1, st.size(-1))
     mt = mt.reshape(-1, mt.size(-1))
-    T_s = st.shape[0]
-    worst_md, worst_cos = 0.0, 1.0
-    for i in range(n_copies):
-        ct = _extract(mt, cu_stacked, i)
-        ct = ct.reshape(-1, ct.size(-1))
-        diff = (st - ct).abs()
-        cos = _cosine_sim(st, ct, dim=-1)
-        worst_md = max(worst_md, float(diff.max()))
-        worst_cos = min(worst_cos, float(cos.min()))
-    return CheckResult(name="logits",
-                       passed=worst_md < 1e-5,
-                       metrics={"n_tokens": T_s, "cos_avg": 1.0,
+    B = cu_s.numel() - 1
+    worst_md, worst_cos, total_tokens = 0.0, 1.0, 0
+    for i in range(B):
+        s_seq = st[int(cu_s[i]):int(cu_s[i + 1])]
+        T_i = s_seq.shape[0]
+        if T_i == 0:
+            continue
+        total_tokens += T_i
+        for k in range(n_copies):
+            j = i + k * B
+            c_seq = mt[int(cu_m[j]):int(cu_m[j + 1])]
+            if c_seq.shape[0] != T_i:
+                continue
+            diff = (s_seq - c_seq).abs()
+            cos = _cosine_sim(s_seq, c_seq, dim=-1)
+            worst_md = max(worst_md, float(diff.max()))
+            worst_cos = min(worst_cos, float(cos.min()))
+    return CheckResult(name="logits", passed=worst_md < 1e-5,
+                       metrics={"n_tokens": total_tokens, "cos_avg": 1.0,
                                 "cos_min": worst_cos})
 
 
@@ -248,58 +266,58 @@ def _compare_2d_file(dir_single: str, dir_stacked: str, filename: str,
 # ── top-K helpers (reuse cmp_diag_verl080 top-K printers) ────────
 
 def _topk_per_layer(dir_single: str, dir_stacked: str,
-                    cu_stacked: torch.Tensor, n_copies: int,
+                    cu_s: torch.Tensor, cu_m: torch.Tensor, n_copies: int,
                     filename: str, label: str,
                     topk: int, sort_err: str):
-    """Print top-K worst dims for a per-layer plain file (build_kv_input_v / hidden_states)."""
+    """Print top-K worst dims for a per-layer plain file."""
     sd = _load_dict(dir_single, filename)
     md = _load_dict(dir_stacked, filename)
     if sd is None or md is None:
         return
     lyr = max(int(k) for k in sd.keys())
-    st = sd[lyr].float()
-    mt = md[lyr].float()
-    worst_md = 0.0
-    worst_on = worst_off = None
-    for i in range(n_copies):
-        ct = _extract(mt, cu_stacked, i)
-        on_f = st.reshape(st.shape[0], -1)
-        off_f = ct.reshape(ct.shape[0], -1)
-        md = float((on_f - off_f).abs().max())
-        if md > worst_md:
-            worst_md = md
-            worst_on = on_f
-            worst_off = off_f
+    st = sd[lyr].float(); mt = md[lyr].float()
+    B = cu_s.numel() - 1
+    worst_md = 0.0; worst_on = worst_off = None
+    for i in range(B):
+        s_seq = st[int(cu_s[i]):int(cu_s[i + 1])]
+        if s_seq.shape[0] == 0: continue
+        on_f = s_seq.reshape(s_seq.shape[0], -1)
+        for k in range(n_copies):
+            j = i + k * B
+            ct = mt[int(cu_m[j]):int(cu_m[j + 1])]
+            if ct.shape[0] != s_seq.shape[0]: continue
+            off_f = ct.reshape(ct.shape[0], -1)
+            md = float((on_f - off_f).abs().max())
+            if md > worst_md: worst_md = md; worst_on = on_f; worst_off = off_f
     if worst_on is not None:
-        # take first token's vector
         _print_topk_vec(worst_on[0].cpu(), worst_off[0].cpu(),
                         topk, sort_err, f"{label}_L{lyr}_token0")
 
 
 def _topk_rope(dir_single: str, dir_stacked: str,
-               cu_stacked: torch.Tensor, n_copies: int,
+               cu_s: torch.Tensor, cu_m: torch.Tensor, n_copies: int,
                filename: str, fld_q: str, fld_k: str,
                label: str, topk: int, sort_err: str):
-    """Print top-K worst dims for a rope-pre/post file."""
+    """Print top-K worst dims for a rope file."""
     sd = _load_dict(dir_single, filename)
     md = _load_dict(dir_stacked, filename)
-    if sd is None or md is None:
-        return
+    if sd is None or md is None: return
     lyr = max(int(k) for k in sd.keys())
+    B = cu_s.numel() - 1
     for fld, tag in [(fld_q, f"{label}_Q"), (fld_k, f"{label}_K")]:
-        sq = sd[lyr][fld].float()
-        mq = md[lyr][fld].float()
-        on_f = sq.reshape(sq.shape[0], -1)
-        worst_md = 0.0
-        worst_on = worst_off = None
-        for i in range(n_copies):
-            cq = _extract(mq, cu_stacked, i)
-            off_f = cq.reshape(cq.shape[0], -1)
-            md = float((on_f - off_f).abs().max())
-            if md > worst_md:
-                worst_md = md
-                worst_on = on_f
-                worst_off = off_f
+        sq = sd[lyr][fld].float(); mq = md[lyr][fld].float()
+        worst_md = 0.0; worst_on = worst_off = None
+        for i in range(B):
+            s_seq = sq[int(cu_s[i]):int(cu_s[i + 1])]
+            if s_seq.shape[0] == 0: continue
+            on_f = s_seq.reshape(s_seq.shape[0], -1)
+            for k in range(n_copies):
+                j = i + k * B
+                ct = mq[int(cu_m[j]):int(cu_m[j + 1])]
+                if ct.shape[0] != s_seq.shape[0]: continue
+                off_f = ct.reshape(ct.shape[0], -1)
+                md = float((on_f - off_f).abs().max())
+                if md > worst_md: worst_md = md; worst_on = on_f; worst_off = off_f
         if worst_on is not None:
             _print_topk_vec(worst_on[0].cpu(), worst_off[0].cpu(),
                             topk, sort_err, f"{tag}_L{lyr}_token0")
@@ -349,41 +367,41 @@ def main():
 
     # ── hidden_states ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
-                       "hidden_states.pt", cu_m, n, args.layer, "hidden_states")
+                       "hidden_states.pt", cu_s, cu_m, n, args.layer, "hidden_states")
     if r: all_results.append(r); _print_hidden_states(r)
 
     # ── build_kv_input_v ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
-                       "build_kv_input_v.pt", cu_m, n, args.layer, "build_kv_input_v")
+                       "build_kv_input_v.pt", cu_s, cu_m, n, args.layer, "build_kv_input_v")
     if r: all_results.append(r); _print_build_kv_input_v(r)
 
     # ── rope_preqk ──
     r = _compare_rope(args.dir_single, args.dir_stacked, "rope_preqk.pt",
-                      cu_m, n, args.layer, "rope_preqk", "query", "key")
+                      cu_s, cu_m, n, args.layer, "rope_preqk", "query", "key")
     if r: all_results.append(r); _print_rope_postqk_per_layer(r)
 
     # ── rope_freqs ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
-                       "rope_freqs.pt", cu_m, n, args.layer, "rope_freqs")
+                       "rope_freqs.pt", cu_s, cu_m, n, args.layer, "rope_freqs")
     if r: all_results.append(r); _print_rope_freqs(r)
 
     # ── rope_postqk ──
     r = _compare_rope(args.dir_single, args.dir_stacked, "rope_postqk.pt",
-                      cu_m, n, args.layer, "rope_postqk", "query", "key")
+                      cu_s, cu_m, n, args.layer, "rope_postqk", "query", "key")
     if r: all_results.append(r); _print_rope_postqk_per_layer(r)
 
     # ── attn_outputs ──
     r = _compare_plain(args.dir_single, args.dir_stacked,
-                       "attn_outputs.pt", cu_m, n, args.layer, "attn_outputs")
+                       "attn_outputs.pt", cu_s, cu_m, n, args.layer, "attn_outputs")
     if r: all_results.append(r); _print_per_layer(r)
 
     # ── full_kv ──
     r = _compare_rope(args.dir_single, args.dir_stacked, "full_kv.pt",
-                      cu_m, n, args.layer, "full_kv", "key", "value")
+                      cu_s, cu_m, n, args.layer, "full_kv", "key", "value")
     if r: all_results.append(r); _print_rope_postqk_per_layer(r)
 
     # ── logits ──
-    r = _compare_logits(args.dir_single, args.dir_stacked, cu_m, n)
+    r = _compare_logits(args.dir_single, args.dir_stacked, cu_s, cu_m, n)
     if r: all_results.append(r); _print_logits_packed(r)
 
     # ── 2D: logprobs + entropy ──
@@ -395,13 +413,13 @@ def main():
 
     # ── top-K ──
     if args.topk > 0:
-        _topk_per_layer(args.dir_single, args.dir_stacked, cu_m, n,
+        _topk_per_layer(args.dir_single, args.dir_stacked, cu_s, cu_m, n,
                         "build_kv_input_v.pt", "build_kv_input_v",
                         args.topk, args.sort_err)
-        _topk_rope(args.dir_single, args.dir_stacked, cu_m, n,
+        _topk_rope(args.dir_single, args.dir_stacked, cu_s, cu_m, n,
                    "rope_preqk.pt", "query", "key", "rope_preqk",
                    args.topk, args.sort_err)
-        _topk_rope(args.dir_single, args.dir_stacked, cu_m, n,
+        _topk_rope(args.dir_single, args.dir_stacked, cu_s, cu_m, n,
                    "rope_postqk.pt", "query", "key", "rope_postqk",
                    args.topk, args.sort_err)
 
