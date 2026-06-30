@@ -1,10 +1,30 @@
 # PrefixSharing
 
-在 `verl + Megatron` RL 训练 pipeline 中复用共享前缀的 KV cache，减少 step/tree 模式下多条轨迹间的冗余前向计算。精度与独立前向完全一致。
+This is a Python module to reuse KV activations across sequence samples (or trajectories) during Forward/Backward pass of verl + Megatron-LM RL pipeline. 
+Redundant KV computation and memory of common prefix sub-sequences is commonly seen in GRPO-style / Step-wise /  Tree-wise rollout, while PrefixSharing eliminates them entirely and preserves gradient semantics.
 
 ## 1. Installation
 
-安装依赖快照（Qwen3.5 配套）：
+### 1.1 Install PrefixSharing
+
+To install this module:
+
+```bash
+cd prefix-sharing && pip install -e .
+```
+
+### 1.2 Prepare Environments
+
+This module is developed and tested on the following environment. For a first-time out-of-the-box experience, it is highly recommended to use these dependency versions:
+
+| Dependency       | Version    |
+|------------------|------------|
+| verl             | cdd9014f   |
+| Megatron-LM core | v0.16.1    |
+| MindSpeed core   | r0.16.0    |
+| Megatron-Bridge  | de93536e   |
+
+Depite from installing the above environment using pip or other installation tools, users can also install from source code under `dependency/`, where above version snapshots are stored.
 
 ```bash
 cd dependency/Megatron-Bridge_de93536e   && pip install --no-deps -v -e .
@@ -13,53 +33,43 @@ cd dependency/MindSpeed_core_r0.16.0     && pip install --no-deps -v -e .
 cd dependency/verl_cdd9014f              && pip install --no-deps -v -e .
 ```
 
-安装本模块：
-
-```bash
-cd prefix-sharing && pip install -e .
-```
-
-> 各依赖版本：verl_cdd9014f + Megatron-LM core_v0.16.1 + MindSpeed core_r0.16.0 + Megatron-Bridge de93536e。
-
 ## 2. Quick Start
 
-准备数据：从 HuggingFace 下载 [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k)，按 [verl 数据准备指引](https://verl.readthedocs.io/en/latest/preparation/prepare_data.html) 转为 parquet 格式。
+### 2.1 Integrating PrefixSharing
 
-下载模型权重：https://huggingface.co/Qwen/Qwen2.5-0.5B
+Integrating PrefixSharing into verl + Megaton-LM pipeline is straightforward: the only operation required is to import the package inside verl:
+
+```python
+import prefix_sharing
+```
+
+This activates the patches under `prefix-sharing/setup/`, which use Python's monkey patch to dynamically modify corresponding functions in verl and Megatron-LM. `dependency/verl_cdd9014f/verl/workers/engine/megatron/transformer_impl.py:1039` provides an example.
+
+### 2.2 Run Your First Demo!
+
+Prepare data: download [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) from HuggingFace and convert it to parquet format following the [verl data preparation guide](https://verl.readthedocs.io/en/latest/preparation/prepare_data.html).
+
+Prepare model weights: download [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) from HuggingFace as usual.
+
+Now is time to try-out PrefixSharing. To enable or disable this feature, just setup environment variable `ENABLE_PREFIX_SHARING` and run a verl training script as following:
 
 ```bash
-# 开启 Prefix Sharing
+# to enable PrefixSharing
 ENABLE_PREFIX_SHARING=1 bash examples/run_prefix_sharing.sh
 
-# 关闭（基线对比）
+# to disable PrefixSharing
 ENABLE_PREFIX_SHARING=0 bash examples/run_prefix_sharing.sh
 ```
-
-> 首次跑先设置 `trainer.total_training_steps=1`、`trainer.total_epochs=1` 验证环境可用。
-
-## 3. Architecture
-
-```
-Core（前缀检测/复用计划/Store）→ Backends（attention 执行）→ Integrations（verl/Megatron 适配）
-```
-
-模块化分层，核心语义与框架无关。
-
-## 4. Dependencies
-
-| 依赖 | 版本 |
-|------|------|
-| verl | cdd9014f |
-| Megatron-LM core | v0.16.1 |
-| MindSpeed core | r0.16.0 |
-| Megatron-Bridge | de93536e |
 
 ## 5. Citation
 
 ```bibtex
 @misc{prefixsharing2026,
-  title={PrefixSharing: Prefix KV Sharing for verl + Megatron RL Training},
+  title={PrefixSharing: Sharing Prefix Activations for Efficient RL Training}
+  author={PrefixSharing Contributors},
   year={2026},
+  howpublished={\url{https://github.com/your-org/PrefixSharing}},
+  note={GitHub repository},
 }
 ```
 
