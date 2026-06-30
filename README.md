@@ -68,7 +68,7 @@ ENABLE_PREFIX_SHARING=0 bash examples/run_prefix_sharing.sh
   title={PrefixSharing: Sharing Prefix Activations for Efficient RL Training}
   author={PrefixSharing Team},
   year={2026},
-  howpublished={\url{https://github.com/your-org/PrefixSharing}},
+  howpublished={\url{https://github.com/Jackie2049/PrefixSharing/tree/release-to-developers}},
   note={GitHub repository},
 }
 ```
