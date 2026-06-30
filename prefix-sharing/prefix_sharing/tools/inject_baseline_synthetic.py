@@ -22,10 +22,9 @@ import torch
 def patch_baseline_synthetic(
     trainer,
     json_path: str,
-    batch_size: int,
     max_prompt_length: int,
     max_response_length: int,
-    num_seq: int | None = None,
+    num_seq: int = 1,
     stack: int = 1,
     seed: int = 42,
     num_workers: int = 8,
@@ -39,21 +38,15 @@ def patch_baseline_synthetic(
     Args:
         trainer: RayPPOTrainer instance.
         json_path: Path to JSON with input_ids.
-        batch_size: gen_batch_size from config (used as num_seq if num_seq is None).
         max_prompt_length: Prompt length.
         max_response_length: Response length.
-        num_seq: Override for number of sequences. Reads
-                 ``PREFIX_SHARING_BASELINE_NUM_SEQ`` env var.  Falls back to
-                 ``batch_size`` when env is absent and ``num_seq`` is None.
+        num_seq: Number of distinct sequences (env: BASELINE_NUM_SEQ).
         stack: How many times to tile the shuffled batch (env: BASELINE_STACK).
         seed: Shuffle seed (env: BASELINE_SEED).
         num_workers: Agent loop workers for chunk() divisibility.
     """
     from prefix_sharing.tools.inject_synthetic_prefix import _build_synthetic_batch, _load_base_tokens
     from verl.protocol import DataProto
-
-    if num_seq is None:
-        num_seq = int(os.environ.get("PREFIX_SHARING_BASELINE_NUM_SEQ", str(batch_size)))
 
     base_tokens = _load_base_tokens(json_path)
 
