@@ -51,6 +51,7 @@ from prefix_sharing.tools.cmp_diag_verl080 import (
     _print_topk_vec,
     _print_topk_2d,
     _print_summary,
+    _print_shapes,
 )
 
 
@@ -383,6 +384,9 @@ def main():
     print(f"  Single:  {args.dir_single}  (1 seq, {T} tokens)")
     print(f"  Stacked: {args.dir_stacked}  ({n} copies, {n * T} tokens)")
     print(_SEP_DOUBLE)
+
+    # shape diagnostics
+    _print_shapes(args.dir_single, args.dir_stacked, args.tag)
 
     all_results: list[CheckResult] = []
 

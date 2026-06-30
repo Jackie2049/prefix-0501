@@ -43,6 +43,7 @@ from prefix_sharing.tools.cmp_diag_verl080 import (
     _print_topk_vec,
     _print_topk_2d,
     _print_summary,
+    _print_shapes,
 )
 
 
@@ -248,6 +249,8 @@ def main():
     print(f"  Directory: {args.dir_multi}  ({total_copies} sequences)")
     print(f"  Lengths: {lengths}")
     print(_SEP_DOUBLE)
+
+    _print_shapes(args.dir_multi, args.dir_multi, args.tag)
 
     all_results: list[CheckResult] = []
 
