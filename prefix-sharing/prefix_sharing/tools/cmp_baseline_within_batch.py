@@ -381,10 +381,11 @@ def main():
 
     # ── top-K ──
     if args.topk > 0:
-        # 2D top-K: compare row 0 vs row 1 (should be identical if same seq)
+        # 2D top-K: compare row 0 vs row _num_seq (stack copies of same seq)
         for label, st2d in _2d_within:
-            if st2d.shape[0] >= 2:
-                _print_topk_2d(st2d[:1].cpu(), st2d[1:2].cpu(), None,
+            ns = _num_seq if _num_seq > 0 and (st2d.shape[0] % _num_seq == 0) else st2d.shape[0]
+            if st2d.shape[0] >= ns + 1:
+                _print_topk_2d(st2d[:1].cpu(), st2d[ns:ns+1].cpu(), None,
                                args.topk, args.sort_err, label)
         # build_kv_input_v top-K
         d = _load_dict(args.dir_multi, "build_kv_input_v.pt")
