@@ -263,7 +263,9 @@ def main():
     ap.add_argument("--dir-multi", required=True,
                     help="Multi-copy dump directory (batch=[A x N])")
     ap.add_argument("--num-copies", type=int, default=None,
-                    help="Number of copies N (auto-detected from cu_seqlens if omitted)")
+                    help="Total sequences in batch (auto-detected from cu_seqlens)")
+    ap.add_argument("--num-seq", type=int, default=None,
+                    help="Distinct sequences before stacking (required for 2D within-batch)")
     ap.add_argument("--layer", type=int, default=None,
                     help="Compare specific layer 1-indexed (default: all)")
     ap.add_argument("--tag", default="old",
@@ -337,18 +339,25 @@ def main():
 
     # ── 2D: logprobs + entropy ──
     _2d_within: list[tuple[str, torch.Tensor]] = []
+    _num_seq = args.num_seq if args.num_seq else (total_copies // (args.num_copies or total_copies) if args.num_copies else total_copies)
     for fn, cn in [("logprobs", "logp"), ("entropy", "entropy")]:
         fname = f"{fn}_{args.tag}.pt"
         st = _load_tensor(args.dir_multi, fname)
         if st is not None and st.dim() >= 2:
             B = st.shape[0]
+            stack = B // _num_seq if _num_seq > 0 and B % _num_seq == 0 else 1
             all_abs, all_rel = [], []
             worst_md, worst_cos, worst_rel = 0.0, 1.0, 0.0
-            for i in range(B):
-                for j in range(i + 1, B):
-                    a = st[i].float().reshape(-1)
+            # only compare stack copies of the SAME sequence (i vs i+k*num_seq)
+            for i in range(_num_seq):
+                if i >= B: break
+                a = st[i].float().reshape(-1)
+                for k in range(1, stack):
+                    j = i + k * _num_seq
+                    if j >= B: continue
                     b = st[j].float().reshape(-1)
-                    diff = (a - b).abs(); rel = diff / a.abs().clamp(min=1e-8)
+                    diff = (a - b).abs()
+                    rel = diff / a.abs().clamp(min=1e-8)
                     all_abs.extend(diff.tolist()); all_rel.extend(rel.tolist())
                     md = float(diff.max()); rm = float(rel.max())
                     worst_md = max(worst_md, md)
@@ -357,13 +366,14 @@ def main():
             r = CheckResult(name=f"{cn}_{args.tag}",
                             passed=worst_md == 0.0,
                             metrics={"shape": tuple(st.shape),
-                                     "active": st.numel(),
+                                     "active": _num_seq * st.shape[1] if st.dim() >= 2 else st.numel(),
                                      "abs_max": worst_md,
                                      "abs_mean": sum(all_abs)/len(all_abs) if all_abs else 0.0,
                                      "rel_max": worst_rel,
                                      "rel_mean": sum(all_rel)/len(all_rel) if all_rel else 0.0,
-                                     "pearson_r": _pearson_r(st[:B//2].float().reshape(-1),
-                                                             st[B//2:].float().reshape(-1)),
+                                     "pearson_r": _pearson_r(st[:_num_seq].float().reshape(-1),
+                                                             st[_num_seq:2*_num_seq].float().reshape(-1))
+                                     if B >= 2*_num_seq else 1.0,
                                      "atol": args.atol})
             all_results.append(r)
             _print_2d_result(r)
