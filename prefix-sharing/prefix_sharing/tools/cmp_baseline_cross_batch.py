@@ -321,7 +321,11 @@ def _topk_rope(dir_single: str, dir_stacked: str,
     lyr = max(int(k) for k in sd.keys())
     B = cu_s.numel() - 1
     for fld, tag in [(fld_q, f"{label}_Q"), (fld_k, f"{label}_K")]:
-        sq = sd[lyr][fld].float(); mq = md[lyr][fld].float()
+        try:
+            sq = sd[lyr][fld].float()
+            mq = md[lyr][fld].float()
+        except (KeyError, TypeError, AttributeError) as e:
+            print(f"  [top-K skip] {label} {fld}: {e}"); continue
         worst_md = 0.0; worst_on = worst_off = None
         for i in range(B):
             s_seq = sq[int(cu_s[i]):int(cu_s[i + 1])]
