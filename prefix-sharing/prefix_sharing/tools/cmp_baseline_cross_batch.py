@@ -236,7 +236,7 @@ def _compare_2d_file(dir_single: str, dir_stacked: str, filename: str,
                      name: str, n_copies: int, num_seq: int,
                      atol: float = 1e-5
                      ) -> tuple[CheckResult | None, torch.Tensor | None, torch.Tensor | None]:
-    """Compare 2D [B, L_max] tensors — row i from single vs rows i+k*num_seq from stacked."""
+    """Compare 2D [B, L_max] — row i from single vs rows i+k*num_seq from stacked."""
     st = _load_tensor(dir_single, filename)
     mt = _load_tensor(dir_stacked, filename)
     if st is None or mt is None:
@@ -244,31 +244,38 @@ def _compare_2d_file(dir_single: str, dir_stacked: str, filename: str,
     st = st.float(); mt = mt.float()
     if st.dim() < 2 or mt.dim() < 2:
         return None, st, mt
-    # only compare valid (non-padded) rows
-    worst_md, worst_cos = 0.0, 1.0
+    worst_md, worst_cos, worst_rel = 0.0, 1.0, 0.0
+    all_abs, all_rel = [], []
+    pearson_pairs = []
     for i in range(num_seq):
-        if i >= st.shape[0]:
-            break
+        if i >= st.shape[0]: break
         a = st[i].reshape(-1)
         for k in range(n_copies):
             j = i + k * num_seq
-            if j >= mt.shape[0]:
-                continue
+            if j >= mt.shape[0]: continue
             b = mt[j].reshape(-1)
-            md = float((a - b).abs().max())
+            diff = (a - b).abs()
+            rel = diff / a.abs().clamp(min=1e-8)
+            md = float(diff.max())
+            rm = float(rel.max())
             cos = float(_cosine_sim(a, b, dim=-1))
+            all_abs.extend(diff.tolist()); all_rel.extend(rel.tolist())
             worst_md = max(worst_md, md)
+            worst_rel = max(worst_rel, rm)
             worst_cos = min(worst_cos, cos)
-    pr = _pearson_r(st[:num_seq].reshape(-1), mt[:num_seq * n_copies].reshape(-1))
+            pearson_pairs.append((a, b))
+    # pearson: take up to 10 pairs
+    pr_vals = [_pearson_r(a, b) for a, b in pearson_pairs[:10]]
+    pr = sum(v for v in pr_vals if not (v != v)) / max(1, sum(1 for v in pr_vals if not (v != v)))
     return (CheckResult(name=name,
                         passed=worst_md <= atol,
                         metrics={"shape": tuple(st.shape),
                                  "active": st[:num_seq].numel(),
                                  "abs_max": worst_md,
-                                 "abs_mean": 0.0,
-                                 "rel_max": 0.0,
-                                 "rel_mean": 0.0,
-                                 "pearson_r": pr,
+                                 "abs_mean": sum(all_abs)/len(all_abs) if all_abs else 0.0,
+                                 "rel_max": worst_rel,
+                                 "rel_mean": sum(all_rel)/len(all_rel) if all_rel else 0.0,
+                                 "pearson_r": pr if pr_vals else 0.0,
                                  "atol": atol}), st, mt)
 
 
@@ -415,11 +422,14 @@ def main():
     if r: all_results.append(r); _print_logits_packed(r)
 
     # ── 2D: logprobs + entropy ──
+    _2d_results: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     for fn, cn in [("logprobs", "logp"), ("entropy", "entropy")]:
         fname = f"{fn}_{args.tag}.pt"
         r, t1, t2 = _compare_2d_file(args.dir_single, args.dir_stacked,
                                       fname, f"{cn}_{args.tag}", n, num_seq, args.atol)
         if r: all_results.append(r); _print_2d_result(r)
+        if t1 is not None and t2 is not None:
+            _2d_results.append((f"{cn}_{args.tag}", t1, t2))
 
     # ── top-K ──
     if args.topk > 0:
@@ -432,6 +442,14 @@ def main():
         _topk_rope(args.dir_single, args.dir_stacked, cu_s, cu_m, n,
                    "rope_postqk.pt", "query", "key", "rope_postqk",
                    args.topk, args.sort_err)
+        # 2D top-K: compare row 0 from single vs row 0 from stacked (same shuffled seq)
+        for label, st, mt in _2d_results:
+            if st.dim() >= 2 and mt.dim() >= 2 and st.shape[1] == mt.shape[1]:
+                # align: single row i vs stacked row i (first copy of each sequence)
+                t1 = st[:num_seq]; t2 = mt[:num_seq]
+                if t1.shape == t2.shape:
+                    _print_topk_2d(t1.cpu(), t2.cpu(), None,
+                                   args.topk, args.sort_err, label)
 
     _print_summary(all_results)
 

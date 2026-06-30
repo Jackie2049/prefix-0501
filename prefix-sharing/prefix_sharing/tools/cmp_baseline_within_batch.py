@@ -41,6 +41,7 @@ from prefix_sharing.tools.cmp_diag_verl080 import (
     _print_logits_packed,
     _print_2d_result,
     _print_topk_vec,
+    _print_topk_2d,
     _print_summary,
 )
 
@@ -290,35 +291,47 @@ def main():
     if r: all_results.append(r); _print_logits_packed(r)
 
     # ── 2D: logprobs + entropy ──
+    _2d_within: list[tuple[str, torch.Tensor]] = []
     for fn, cn in [("logprobs", "logp"), ("entropy", "entropy")]:
         fname = f"{fn}_{args.tag}.pt"
         st = _load_tensor(args.dir_multi, fname)
         if st is not None and st.dim() >= 2:
             B = st.shape[0]
-            worst_md, worst_cos = 0.0, 1.0
+            all_abs, all_rel = [], []
+            worst_md, worst_cos, worst_rel = 0.0, 1.0, 0.0
             for i in range(B):
                 for j in range(i + 1, B):
                     a = st[i].float().reshape(-1)
                     b = st[j].float().reshape(-1)
-                    md = float((a - b).abs().max())
-                    cos = float(_cosine_sim(a, b, dim=-1))
+                    diff = (a - b).abs(); rel = diff / a.abs().clamp(min=1e-8)
+                    all_abs.extend(diff.tolist()); all_rel.extend(rel.tolist())
+                    md = float(diff.max()); rm = float(rel.max())
                     worst_md = max(worst_md, md)
-                    worst_cos = min(worst_cos, cos)
+                    worst_rel = max(worst_rel, rm)
+                    worst_cos = min(worst_cos, float(_cosine_sim(a, b, dim=-1)))
             r = CheckResult(name=f"{cn}_{args.tag}",
                             passed=worst_md == 0.0,
                             metrics={"shape": tuple(st.shape),
                                      "active": st.numel(),
                                      "abs_max": worst_md,
-                                     "abs_mean": 0.0,
-                                     "rel_max": 0.0,
-                                     "rel_mean": 0.0,
-                                     "pearson_r": 1.0,
+                                     "abs_mean": sum(all_abs)/len(all_abs) if all_abs else 0.0,
+                                     "rel_max": worst_rel,
+                                     "rel_mean": sum(all_rel)/len(all_rel) if all_rel else 0.0,
+                                     "pearson_r": _pearson_r(st[:B//2].float().reshape(-1),
+                                                             st[B//2:].float().reshape(-1)),
                                      "atol": args.atol})
             all_results.append(r)
             _print_2d_result(r)
+            _2d_within.append((f"{cn}_{args.tag}", st))
 
     # ── top-K ──
     if args.topk > 0:
+        # 2D top-K: compare row 0 vs row 1 (should be identical if same seq)
+        for label, st2d in _2d_within:
+            if st2d.shape[0] >= 2:
+                _print_topk_2d(st2d[:1].cpu(), st2d[1:2].cpu(), None,
+                               args.topk, args.sort_err, label)
+        # build_kv_input_v top-K
         d = _load_dict(args.dir_multi, "build_kv_input_v.pt")
         if d:
             lyr = max(int(k) for k in d.keys())
