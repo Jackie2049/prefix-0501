@@ -2,31 +2,31 @@
 # PrefixSharing demo — Qwen2.5-0.5B, GSM8K, 1 GPU
 #
 # Usage:
-#   bash examples/run_prefix_sharing.sh       # with prefix sharing (default)
-#   ENABLE_PREFIX_SHARING=1 bash examples/run_prefix_sharing.sh   # explicit on
-#   ENABLE_PREFIX_SHARING=0 bash examples/run_prefix_sharing.sh   # baseline对比
+#   bash examples/run_verl_training.sh                    # with prefix sharing (default)
+#   ENABLE_PREFIX_SHARING=1 bash examples/run_verl_training.sh   # explicit on
+#   ENABLE_PREFIX_SHARING=0 bash examples/run_verl_training.sh   # baseline comparison
 
 set -euo pipefail
 
-# ── 前置条件 ────────────────────────────────────────────────
-# 1. 安装 dependency 配套：
+# ── Prerequisites ─────────────────────────────────────────────
+# 1. Install dependency snapshots:
 #    cd dependency/Megatron-Bridge_de93536e   && pip install --no-deps -v -e .
 #    cd dependency/Megatron-LM-core_v0.16.1   && pip install --no-deps -v -e .
 #    cd dependency/MindSpeed_core_r0.16.0     && pip install --no-deps -v -e .
 #    cd dependency/verl_cdd9014f              && pip install --no-deps -v -e .
-# 2. 安装本模块：
+# 2. Install this module:
 #    cd prefix-sharing && pip install -e .
-# 3. 准备 GSM8K 数据（见 README Quick Start）
-# 4. 下载 Qwen2.5-0.5B 权重
+# 3. Prepare GSM8K dataset (see README Quick Start)
+# 4. Download Qwen2.5-0.5B weights
 #    https://huggingface.co/Qwen/Qwen2.5-0.5B
 
-# ── 用户可配置参数 ──────────────────────────────────────────
+# ── User-configurable parameters ──────────────────────────────
 MODEL_PATH=${MODEL_PATH:-/path/to/Qwen2.5-0.5B}
 TRAIN_FILE=${TRAIN_FILE:-/path/to/gsm8k/train.parquet}
 TEST_FILE=${TEST_FILE:-/path/to/gsm8k/test.parquet}
 ENABLE_PREFIX_SHARING=${ENABLE_PREFIX_SHARING:-1}
 
-# ── 路径设置（假设脚本从仓库根目录执行）────────────────────
+# ── Path setup (assume script is executed from repo root) ─────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 export PYTHONPATH="${PROJECT_DIR}/prefix-sharing:${PYTHONPATH}"
@@ -40,7 +40,7 @@ echo " Model          : ${MODEL_PATH}"
 echo " PS enabled     : ${ENABLE_PREFIX_SHARING}"
 echo "=============================="
 
-# ── 启动训练 ────────────────────────────────────────────────
+# ── Launch training ───────────────────────────────────────────
 python3 -m verl.trainer.main_ppo \
     --config-name='ppo_megatron_trainer' \
     algorithm.adv_estimator=grpo \
