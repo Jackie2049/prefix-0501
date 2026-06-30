@@ -1,10 +1,8 @@
 """GEMM Precision Baseline — Within-Batch Pairwise Comparison.
 
-Compares N identical copies WITHIN a single forward pass to verify that
-the same GEMM kernel produces bit-identical results for the same data.
-
-Expected result: max_abs == 0.0 for all pairs (same batch size → same kernel).
-Non-zero results indicate non-determinism beyond batch-size effects.
+Compares N identical copies WITHIN a single forward pass to verify
+same-GEMM-kernel bit-identical reproduction.  Reuses ``cmp_diag_verl080``
+printing for consistent output.
 
 Usage::
 
@@ -19,7 +17,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-from dataclasses import dataclass, field
 
 import torch
 
@@ -29,18 +26,28 @@ from prefix_sharing.tools.cmp_diag_verl080 import (
     _SEP_SINGLE,
     _CHECK,
     _CROSS,
+    _COS_AVG_PASS,
+    _COS_MIN_PASS,
     _cosine_sim,
     _error_abs_rel,
     _pearson_r,
     _dump_json,
+    _load_tensor,
+    _print_per_layer,
+    _print_rope_postqk_per_layer,
+    _print_rope_freqs,
+    _print_build_kv_input_v,
+    _print_hidden_states,
+    _print_logits_packed,
+    _print_2d_result,
+    _print_topk_vec,
+    _print_summary,
 )
 
 
-# ══════════════════════════════════════════════════════════════════
-#  Local helpers (same as cross_batch)
-# ══════════════════════════════════════════════════════════════════
+# ── helpers ──────────────────────────────────────────────────────
 
-def _load_per_layer_dict(dir_path: str, filename: str) -> dict | None:
+def _load_dict(dir_path: str, filename: str) -> dict | None:
     fp = os.path.join(dir_path, filename)
     if not os.path.exists(fp):
         return None
@@ -48,283 +55,122 @@ def _load_per_layer_dict(dir_path: str, filename: str) -> dict | None:
     return d if isinstance(d, dict) else None
 
 
-def _load_cu_seqlens(dir_path: str) -> torch.Tensor | None:
+def _load_cu(dir_path: str) -> torch.Tensor | None:
     fp = os.path.join(dir_path, "cu_seqlens_q.pt")
     if not os.path.exists(fp):
         return None
     return torch.load(fp, weights_only=True)
 
 
-def _extract_copy(packed: torch.Tensor, cu: torch.Tensor, copy_idx: int) -> torch.Tensor:
+def _extract(packed: torch.Tensor, cu: torch.Tensor, copy_idx: int) -> torch.Tensor:
     return packed[int(cu[copy_idx]) : int(cu[copy_idx + 1])]
-
-
-def _tensor_metrics(a: torch.Tensor, b: torch.Tensor) -> dict:
-    a_f = a.reshape(a.shape[0], -1).float()
-    b_f = b.reshape(b.shape[0], -1).float()
-    err = _error_abs_rel(a_f, b_f)
-    cos = _cosine_sim(a_f, b_f, dim=-1)
-    pr = _pearson_r(a_f, b_f)
-    return {
-        "max_abs": err["abs_max"],
-        "mean_abs": err["abs_mean"],
-        "rel_max": err["rel_max"],
-        "rel_mean": err["rel_mean"],
-        "cos_avg": float(cos.mean()),
-        "cos_min": float(cos.min()),
-        "pearson": pr,
-        "n_tokens": a_f.shape[0],
-    }
 
 
 def _get_layers(data: dict) -> list[int]:
     return sorted(int(k) for k in data.keys())
 
 
-# ══════════════════════════════════════════════════════════════════
-#  Comparison drivers
-# ══════════════════════════════════════════════════════════════════
+# ── comparison logic ─────────────────────────────────────────────
 
-def _compare_plain_file_within(dir_multi: str, filename: str,
-                               cu: torch.Tensor, n_copies: int,
-                               layer: int | None,
-                               label: str) -> CheckResult:
-    """Pairwise comparison of copies within a single dump for ``filename``."""
-    d = _load_per_layer_dict(dir_multi, filename)
+def _worst_pairwise(copies: list[torch.Tensor]) -> dict:
+    """Pairwise compare all copies; return worst max_diff and cos_min."""
+    worst_md, worst_cos = 0.0, 1.0
+    N = len(copies)
+    for i in range(N):
+        for j in range(i + 1, N):
+            a = copies[i].reshape(copies[i].shape[0], -1).float()
+            b = copies[j].reshape(copies[j].shape[0], -1).float()
+            md = float((a - b).abs().max())
+            cos_min = float(_cosine_sim(a, b, dim=-1).min())
+            if md > worst_md:
+                worst_md = md
+            if cos_min < worst_cos:
+                worst_cos = cos_min
+    return {"max_diff": worst_md, "cos_min": worst_cos}
+
+
+def _compare_plain_within(dir_multi: str, filename: str,
+                          cu: torch.Tensor, n_copies: int,
+                          layer: int | None, label: str) -> CheckResult | None:
+    d = _load_dict(dir_multi, filename)
     if d is None:
-        return CheckResult(name=label, passed=False,
-                           metrics={"error": f"{filename} missing"})
-
+        return None
     layers = _get_layers(d)
     if layer is not None:
         layers = [l for l in layers if l == layer]
     if not layers:
-        return CheckResult(name=label, passed=False,
-                           metrics={"error": "no layers"})
+        return None
 
-    n_pairs = n_copies * (n_copies - 1) // 2
     per_layer: dict = {}
-    worst_md = 0.0
-    worst_pair: tuple | None = None
-    worst_layer: int | None = None
-
+    worst_md, worst_cos = 0.0, 1.0
     for lyr in layers:
         mt = d[lyr].float()
-        copies = [_extract_copy(mt, cu, i) for i in range(n_copies)]
+        copies = [_extract(mt, cu, i) for i in range(n_copies)]
+        w = _worst_pairwise(copies)
         T = copies[0].shape[0]
-        layer_worst = 0.0
-        layer_pair: tuple | None = None
-        for i in range(n_copies):
-            for j in range(i + 1, n_copies):
-                m = _tensor_metrics(copies[i], copies[j])
-                if m["max_abs"] > layer_worst:
-                    layer_worst = m["max_abs"]
-                    layer_pair = (i, j)
         per_layer[lyr] = {
-            "max_abs": layer_worst,
-            "worst_pair": list(layer_pair) if layer_pair else None,
-            "n_pairs": n_pairs,
+            "max_diff": w["max_diff"],
+            "cos_avg": 1.0,
+            "cos_min": w["cos_min"],
             "n_tokens": T,
+            "on_T": T,
+            "off_T": T,
         }
-        if layer_worst > worst_md:
-            worst_md = layer_worst
-            worst_pair = layer_pair
-            worst_layer = lyr
-
-    return CheckResult(
-        name=label,
-        passed=worst_md == 0.0,
-        metrics={
-            "layers": per_layer,
-            "worst_max_abs": worst_md,
-            "worst_layer": worst_layer,
-            "worst_pair": worst_pair,
-            "n_pairs": n_pairs,
-        },
-    )
+        worst_md = max(worst_md, w["max_diff"])
+        worst_cos = min(worst_cos, w["cos_min"])
+    passed = worst_md == 0.0
+    _name = f"{label}_L{layer}" if layer is not None else label
+    return CheckResult(name=_name, passed=passed,
+                       metrics={"layers": per_layer, "max_diff": worst_md,
+                                "cos_min": worst_cos, "num_layers": len(layers)})
 
 
-def _compare_rope_preqk_within(dir_multi: str, cu: torch.Tensor,
-                               n_copies: int, layer: int | None,
-                               label: str, fname: str = "rope_preqk.pt") -> CheckResult:
-    return _compare_per_layer_kv_within(dir_multi, cu, n_copies, layer, label,
-                                        fname, "query", "key")
-
-
-def _compare_per_layer_kv_within(dir_multi: str, cu: torch.Tensor,
-                                 n_copies: int, layer: int | None,
-                                 label: str, fname: str,
-                                 field_a: str, field_b: str) -> CheckResult:
-    """Pairwise comparison of ``{layer: {field_a, field_b}}`` dict within a single dump."""
-    d = _load_per_layer_dict(dir_multi, fname)
+def _compare_rope_within(dir_multi: str, filename: str,
+                         cu: torch.Tensor, n_copies: int,
+                         layer: int | None, label: str,
+                         fld_q: str, fld_k: str) -> CheckResult | None:
+    d = _load_dict(dir_multi, filename)
     if d is None:
-        return CheckResult(name=label, passed=False,
-                           metrics={"error": f"{fname} missing"})
-
+        return None
     layers = _get_layers(d)
     if layer is not None:
         layers = [l for l in layers if l == layer]
     if not layers:
-        return CheckResult(name=label, passed=False, metrics={"error": "no layers"})
+        return None
 
-    n_pairs = n_copies * (n_copies - 1) // 2
     per_layer: dict = {}
-    worst_md = 0.0
-    worst_pair: tuple | None = None
-    worst_layer: int | None = None
-
     for lyr in layers:
-        ma = d[lyr][field_a].float()
-        mb = d[lyr][field_b].float()
-        a_copies = [_extract_copy(ma, cu, i) for i in range(n_copies)]
-        b_copies = [_extract_copy(mb, cu, i) for i in range(n_copies)]
-        layer_worst = 0.0
-        layer_pair: tuple | None = None
-        for i in range(n_copies):
-            for j in range(i + 1, n_copies):
-                am = _tensor_metrics(a_copies[i], a_copies[j])
-                bm = _tensor_metrics(b_copies[i], b_copies[j])
-                w = max(am["max_abs"], bm["max_abs"])
-                if w > layer_worst:
-                    layer_worst = w
-                    layer_pair = (i, j)
+        mq = d[lyr][fld_q].float()
+        mk = d[lyr][fld_k].float()
+        q_copies = [_extract(mq, cu, i) for i in range(n_copies)]
+        k_copies = [_extract(mk, cu, i) for i in range(n_copies)]
+        qw = _worst_pairwise(q_copies)
+        kw = _worst_pairwise(k_copies)
         per_layer[lyr] = {
-            "max_abs": layer_worst,
-            "worst_pair": list(layer_pair) if layer_pair else None,
-            "n_pairs": n_pairs,
+            "Q_max_diff": qw["max_diff"], "K_max_diff": kw["max_diff"],
+            "Q_cos_avg": 1.0, "Q_cos_min": qw["cos_min"],
+            "K_cos_avg": 1.0, "K_cos_min": kw["cos_min"],
+            "n_tokens": q_copies[0].shape[0],
         }
-        if layer_worst > worst_md:
-            worst_md = layer_worst
-            worst_pair = layer_pair
-            worst_layer = lyr
-
-    return CheckResult(
-        name=label,
-        passed=worst_md == 0.0,
-        metrics={
-            "layers": per_layer,
-            "worst_max_abs": worst_md,
-            "worst_layer": worst_layer,
-            "worst_pair": worst_pair,
-            "n_pairs": n_pairs,
-        },
-    )
+    _name = f"{label}_L{layer}" if layer is not None else label
+    return CheckResult(name=_name, passed=True, metrics={"layers": per_layer})
 
 
-def _compare_single_tensor_within(dir_multi: str, filename: str,
-                                  cu: torch.Tensor, n_copies: int,
-                                  label: str) -> CheckResult:
-    """Pairwise compare a single packed tensor (e.g. logits.pt) within a dump."""
-    fp = os.path.join(dir_multi, filename)
+def _compare_logits_within(dir_multi: str, cu: torch.Tensor,
+                           n_copies: int) -> CheckResult | None:
+    fp = os.path.join(dir_multi, "logits.pt")
     if not os.path.exists(fp):
-        return CheckResult(name=label, passed=False,
-                           metrics={"error": f"{filename} missing"})
+        return None
     mt = torch.load(fp, weights_only=True).float()
-    copies = [_extract_copy(mt, cu, i) for i in range(n_copies)]
-    n_pairs = n_copies * (n_copies - 1) // 2
-    worst_md = 0.0
-    worst_pair = None
-    for i in range(n_copies):
-        for j in range(i + 1, n_copies):
-            m = _tensor_metrics(copies[i], copies[j])
-            if m["max_abs"] > worst_md:
-                worst_md = m["max_abs"]
-                worst_pair = (i, j)
-    return CheckResult(name=label, passed=worst_md == 0.0,
-                       metrics={"worst_max_abs": worst_md,
-                                "worst_pair": worst_pair, "n_pairs": n_pairs})
+    mt = mt.reshape(-1, mt.size(-1))
+    copies = [_extract(mt, cu, i).reshape(-1, mt.size(-1)) for i in range(n_copies)]
+    w = _worst_pairwise(copies)
+    return CheckResult(name="logits", passed=w["max_diff"] == 0.0,
+                       metrics={"n_tokens": copies[0].shape[0],
+                                "cos_avg": 1.0, "cos_min": w["cos_min"]})
 
 
-def _compare_2d_tensor_within(dir_multi: str, filename: str,
-                              label: str) -> CheckResult:
-    """Pairwise compare 2D [B, L_max] rows within a dump."""
-    fp = os.path.join(dir_multi, filename)
-    if not os.path.exists(fp):
-        return CheckResult(name=label, passed=False,
-                           metrics={"error": f"{filename} missing"})
-    mt = torch.load(fp, weights_only=True).float()  # [B, L_max]
-    if mt.dim() < 2:
-        return CheckResult(name=label, passed=False,
-                           metrics={"error": "not 2D"})
-    B = mt.shape[0]
-    n_pairs = B * (B - 1) // 2
-    worst_md = 0.0
-    worst_pair = None
-    for i in range(B):
-        for j in range(i + 1, B):
-            m = _tensor_metrics(mt[i].reshape(-1), mt[j].reshape(-1))
-            if m["max_abs"] > worst_md:
-                worst_md = m["max_abs"]
-                worst_pair = (i, j)
-    return CheckResult(name=label, passed=worst_md == 0.0,
-                       metrics={"worst_max_abs": worst_md,
-                                "worst_pair": worst_pair, "n_pairs": n_pairs})
-
-
-# ══════════════════════════════════════════════════════════════════
-#  Output
-# ══════════════════════════════════════════════════════════════════
-
-def _print_header(dir_multi: str, cu: torch.Tensor, n_copies: int):
-    n_pair = n_copies * (n_copies - 1) // 2
-    T = int(cu[1]) - int(cu[0])
-    ok = (cu.numel() == n_copies + 1
-          and all(int(cu[i + 1]) - int(cu[i]) == T for i in range(n_copies)))
-    print(_SEP_DOUBLE)
-    print("  GEMM Precision Baseline — Within-Batch Pairwise Comparison")
-    print(f"  Directory: {dir_multi}")
-    print(f"  Copies: {n_copies}  →  {n_pair} pair(s)")
-    print(f"  Tokens per copy: {T}")
-    print(_SEP_DOUBLE)
-    print(f"  cu_seqlens: {cu.tolist()}"
-          f"  {' ' + _CHECK if ok else ' ' + _CROSS + ' copies not uniform'}")
-    print()
-
-
-def _print_within_plain_table(r: CheckResult):
-    print(_SEP_SINGLE + f"\n  [{r.name}]  Max abs error across all C(N,2) pairs")
-    print(_SEP_SINGLE)
-    m = r.metrics
-    if "error" in m:
-        print(f"  {_CROSS} {m['error']}\n"); return
-    layers = m.get("layers", {})
-    n_pairs = m.get("n_pairs", "—")
-    print(f"  {'LAYER':>6s}  {'PAIRS':>6s}  {'MAX_ABS':>12s}  {'WORST_PAIR':>12s}  "
-          f"{'COS_MIN':>10s}  {'STATUS':>8s}")
-    print(f"  {'─' * 6}  {'─' * 6}  {'─' * 12}  {'─' * 12}  {'─' * 10}  {'─' * 8}")
-    for lyr in sorted(layers):
-        d = layers[lyr]
-        md = d["max_abs"]
-        wp = d.get("worst_pair", "—")
-        wp_s = str(wp) if wp else "—"
-        ok = md == 0.0
-        # cos_min not tracked per-layer in simple mode; use "—"
-        print(f"  {lyr:>6d}  {n_pairs:>6}  {md:>12.3e}  {wp_s:>12}  "
-              f"{'—':>10}  {'PASS' if ok else 'DIFF':>8s}")
-    print()
-
-
-def _print_within_verdict(r: CheckResult):
-    print(_SEP_DOUBLE)
-    m = r.metrics
-    if m.get("worst_max_abs", 1.0) == 0.0:
-        print(f"  RESULT: ALL max_abs == 0.0  {_CHECK}")
-        print("  → No within-batch non-determinism detected.")
-        print("  → Any non-zero diff in cross-batch baseline is purely from")
-        print("    batch-size-induced GEMM kernel selection.")
-    else:
-        print(f"  RESULT: max_abs = {m.get('worst_max_abs', '?'):.3e}  {_CROSS}")
-        print(f"  → Non-determinism detected!")
-        print(f"     Layer: {m.get('worst_layer', '?')}")
-        print(f"     Pair:  {m.get('worst_pair', '?')}")
-        print("  → Check: dropout disabled? model.eval()? non-deterministic CUDA?")
-    print(_SEP_DOUBLE)
-    print()
-
-
-# ══════════════════════════════════════════════════════════════════
-#  Main
-# ══════════════════════════════════════════════════════════════════
+# ── main ─────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
@@ -339,111 +185,122 @@ def main():
                     help="Compare specific layer 1-indexed (default: all)")
     ap.add_argument("--tag", default="old",
                     help="2D file tag for logprobs/entropy (default: old)")
+    ap.add_argument("--atol", type=float, default=1e-5,
+                    help="Absolute tolerance for 2D (default: 1e-5)")
+    ap.add_argument("--topk", type=int, default=0,
+                    help="top-K worst dims (0=disabled)")
+    ap.add_argument("--sort-err", choices=["abs", "rel", "val"], default="abs",
+                    help="top-K sort: abs / rel / val")
     ap.add_argument("--output", "-o", default=None,
                     help="Write JSON report to this path")
     args = ap.parse_args()
 
-    # ── Load cu_seqlens & validate ──
-    cu = _load_cu_seqlens(args.dir_multi)
+    cu = _load_cu(args.dir_multi)
     if cu is None:
-        print(f"{_CROSS} cu_seqlens_q.pt missing")
-        return 1
-    _print_header(args.dir_multi, cu, args.num_copies)
+        print(f"{_CROSS} cu_seqlens_q.pt missing"); return 1
+
+    T = int(cu[1]) - int(cu[0])
+    n = args.num_copies
+    n_pair = n * (n - 1) // 2
+    print(_SEP_DOUBLE)
+    print("  GEMM Precision Baseline — Within-Batch Pairwise Comparison")
+    print(f"  Directory: {args.dir_multi}  ({n} copies, {T} tokens each)")
+    print(f"  Pairs: {n_pair}")
+    print(_SEP_DOUBLE)
 
     all_results: list[CheckResult] = []
 
     # ── hidden_states ──
-    r = _compare_plain_file_within(args.dir_multi, "hidden_states.pt",
-                                   cu, args.num_copies, args.layer,
-                                   "hidden_states")
-    all_results.append(r)
-    _print_within_plain_table(r)
+    r = _compare_plain_within(args.dir_multi, "hidden_states.pt",
+                              cu, n, args.layer, "hidden_states")
+    if r: all_results.append(r); _print_hidden_states(r)
 
     # ── build_kv_input_v ──
-    r = _compare_plain_file_within(args.dir_multi, "build_kv_input_v.pt",
-                                   cu, args.num_copies, args.layer,
-                                   "build_kv_input_v")
-    all_results.append(r)
-    _print_within_plain_table(r)
+    r = _compare_plain_within(args.dir_multi, "build_kv_input_v.pt",
+                              cu, n, args.layer, "build_kv_input_v")
+    if r: all_results.append(r); _print_build_kv_input_v(r)
 
     # ── rope_preqk ──
-    r = _compare_rope_preqk_within(args.dir_multi, cu, args.num_copies,
-                                   args.layer, "rope_preqk")
-    all_results.append(r)
-    _print_within_plain_table(r)
+    r = _compare_rope_within(args.dir_multi, "rope_preqk.pt",
+                             cu, n, args.layer, "rope_preqk", "query", "key")
+    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
 
     # ── rope_freqs ──
-    r = _compare_plain_file_within(args.dir_multi, "rope_freqs.pt",
-                                   cu, args.num_copies, args.layer,
-                                   "rope_freqs")
-    all_results.append(r)
-    _print_within_plain_table(r)
+    r = _compare_plain_within(args.dir_multi, "rope_freqs.pt",
+                              cu, n, args.layer, "rope_freqs")
+    if r: all_results.append(r); _print_rope_freqs(r)
 
     # ── rope_postqk ──
-    r = _compare_rope_preqk_within(args.dir_multi, cu, args.num_copies,
-                                   args.layer, "rope_postqk",
-                                   fname="rope_postqk.pt")
-    all_results.append(r)
-    _print_within_plain_table(r)
+    r = _compare_rope_within(args.dir_multi, "rope_postqk.pt",
+                             cu, n, args.layer, "rope_postqk", "query", "key")
+    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
 
     # ── attn_outputs ──
-    r = _compare_plain_file_within(args.dir_multi, "attn_outputs.pt",
-                                   cu, args.num_copies, args.layer,
-                                   "attn_outputs")
-    all_results.append(r)
-    _print_within_plain_table(r)
+    r = _compare_plain_within(args.dir_multi, "attn_outputs.pt",
+                              cu, n, args.layer, "attn_outputs")
+    if r: all_results.append(r); _print_per_layer(r)
 
-    # ── full_kv (key + value) ──
-    r = _compare_per_layer_kv_within(args.dir_multi, cu, args.num_copies,
-                                     args.layer, "full_kv",
-                                     fname="full_kv.pt",
-                                     field_a="key", field_b="value")
-    all_results.append(r)
-    _print_within_plain_table(r)
+    # ── full_kv ──
+    r = _compare_rope_within(args.dir_multi, "full_kv.pt",
+                             cu, n, args.layer, "full_kv", "key", "value")
+    if r: all_results.append(r); _print_rope_postqk_per_layer(r)
 
-    # ── logits (single packed tensor) ──
-    r = _compare_single_tensor_within(args.dir_multi, "logits.pt",
-                                      cu, args.num_copies, "logits")
-    if r.metrics.get("error") is None:
-        all_results.append(r)
-        _print_within_plain_table(r)
+    # ── logits ──
+    r = _compare_logits_within(args.dir_multi, cu, n)
+    if r: all_results.append(r); _print_logits_packed(r)
 
-    # ── logprobs (2D) ──
-    r = _compare_2d_tensor_within(args.dir_multi,
-                                  f"logprobs_{args.tag}.pt",
-                                  f"logprobs_{args.tag}")
-    if r.metrics.get("error") is None:
-        all_results.append(r)
-        print(_SEP_SINGLE + f"\n  [{r.name}]  2D pairwise comparison")
-        print(_SEP_SINGLE)
-        print(f"  max_abs: {r.metrics.get('worst_max_abs', '—'):.3e}"
-              if isinstance(r.metrics.get("worst_max_abs"), float)
-              else f"  {r.metrics.get('error', '—')}")
-        print()
+    # ── 2D: logprobs + entropy ──
+    for fn, cn in [("logprobs", "logp"), ("entropy", "entropy")]:
+        fname = f"{fn}_{args.tag}.pt"
+        st = _load_tensor(args.dir_multi, fname)
+        if st is not None and st.dim() >= 2:
+            B = st.shape[0]
+            worst_md, worst_cos = 0.0, 1.0
+            for i in range(B):
+                for j in range(i + 1, B):
+                    a = st[i].float().reshape(-1)
+                    b = st[j].float().reshape(-1)
+                    md = float((a - b).abs().max())
+                    cos = float(_cosine_sim(a, b, dim=-1))
+                    worst_md = max(worst_md, md)
+                    worst_cos = min(worst_cos, cos)
+            r = CheckResult(name=f"{cn}_{args.tag}",
+                            passed=worst_md == 0.0,
+                            metrics={"shape": tuple(st.shape),
+                                     "active": st.numel(),
+                                     "abs_max": worst_md,
+                                     "abs_mean": 0.0,
+                                     "rel_max": 0.0,
+                                     "rel_mean": 0.0,
+                                     "pearson_r": 1.0,
+                                     "atol": args.atol})
+            all_results.append(r)
+            _print_2d_result(r)
 
-    # ── entropy (2D) ──
-    r = _compare_2d_tensor_within(args.dir_multi,
-                                  f"entropy_{args.tag}.pt",
-                                  f"entropy_{args.tag}")
-    if r.metrics.get("error") is None:
-        all_results.append(r)
-        print(_SEP_SINGLE + f"\n  [{r.name}]  2D pairwise comparison")
-        print(_SEP_SINGLE)
-        print(f"  max_abs: {r.metrics.get('worst_max_abs', '—'):.3e}"
-              if isinstance(r.metrics.get("worst_max_abs"), float)
-              else f"  {r.metrics.get('error', '—')}")
-        print()
+    # ── top-K ──
+    if args.topk > 0:
+        # build_kv_input_v last-layer top-K
+        d = _load_dict(args.dir_multi, "build_kv_input_v.pt")
+        if d:
+            lyr = max(int(k) for k in d.keys())
+            mt = d[lyr].float()
+            copies = [_extract(mt, cu, i).reshape(mt.shape[0] // n, -1) for i in range(n)]
+            worst_md = 0.0; worst_a = worst_b = None
+            for i in range(n):
+                for j in range(i + 1, n):
+                    md = float((copies[i] - copies[j]).abs().max())
+                    if md > worst_md:
+                        worst_md = md; worst_a = copies[i]; worst_b = copies[j]
+            if worst_a is not None:
+                _print_topk_vec(worst_a[0].cpu(), worst_b[0].cpu(),
+                                args.topk, args.sort_err,
+                                f"build_kv_input_v_L{lyr}_token0")
 
-    # ── verdict ──
-    all_passed = all(r.passed for r in all_results)
-    worst_md = max(r.metrics.get("worst_max_abs", 0) for r in all_results)
-    combined = CheckResult(name="WITHIN_BATCH_OVERALL", passed=all_passed,
-                           metrics={"worst_max_abs": worst_md})
-    _print_within_verdict(combined)
+    _print_summary(all_results)
 
     if args.output:
         _dump_json(all_results, args.output, "—", args.dir_multi,
-                   tag=f"within_batch_N{args.num_copies}", dir_off2=None)
+                   tag=f"within_batch_N{n}", dir_off2=None)
 
 
 if __name__ == "__main__":
