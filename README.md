@@ -66,7 +66,7 @@ ENABLE_PREFIX_SHARING=0 bash examples/run_prefix_sharing.sh
 ```bibtex
 @misc{prefixsharing2026,
   title={PrefixSharing: Sharing Prefix Activations for Efficient RL Training}
-  author={PrefixSharing Contributors},
+  author={PrefixSharing Team},
   year={2026},
   howpublished={\url{https://github.com/your-org/PrefixSharing}},
   note={GitHub repository},

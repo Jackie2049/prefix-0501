@@ -37,7 +37,7 @@ echo "=============================="
 echo " PrefixSharing Demo"
 echo " GPU count      : 1"
 echo " Model          : ${MODEL_PATH}"
-echo " PS enabled     : ${ENABLE_PREFIX_SHARING}"
+echo " Feature switch : ${ENABLE_PREFIX_SHARING}"
 echo "=============================="
 
 # ── Launch training ───────────────────────────────────────────
