@@ -147,8 +147,8 @@ def _vec_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
 # ════════════════════════════════════════════════════════════════
 
 def _load_tensor(dir_path: str, filename: str) -> torch.Tensor | None:
-    fp = os.path.join(dir_path, filename)
-    return torch.load(fp, weights_only=True).float() if os.path.exists(fp) else None
+    filepath = os.path.join(dir_path, filename)
+    return torch.load(filepath, weights_only=True).float() if os.path.exists(filepath) else None
 
 
 def _load_manifest(dir_path: str) -> dict | None:
@@ -157,11 +157,11 @@ def _load_manifest(dir_path: str) -> dict | None:
     Returns None when absent (single-card or pre-manifest dumps) → callers fall
     back to tp_size==1 behavior (plain filenames, single-card compatible).
     """
-    fp = os.path.join(dir_path, "parallel_info.json")
-    if not os.path.exists(fp):
+    manifest_filepath = os.path.join(dir_path, "parallel_info.json")
+    if not os.path.exists(manifest_filepath):
         return None
     try:
-        with open(fp, encoding="utf-8") as f:
+        with open(manifest_filepath, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -183,44 +183,44 @@ def _load_logits(dir_path: str, manifest: dict | None = None) -> torch.Tensor | 
     if tp_size <= 1:
         return _load_tensor(dir_path, "logits.pt")
     shards = []
-    for t in range(tp_size):
-        s = _load_tensor(dir_path, f"logits_tp{t}.pt")
-        if s is None:
+    for tp_rank in range(tp_size):
+        shard_tensor = _load_tensor(dir_path, f"logits_tp{tp_rank}.pt")
+        if shard_tensor is None:
             return None
-        shards.append(s)
+        shards.append(shard_tensor)
     return torch.cat(shards, dim=-1)
 
 
 def _load_packed_meta(dir_path: str,
                       cu_fname: str = "cu_seqlens_q.pt") -> dict | None:
     """加载 cu_seqlens + prefix_lens（suffix 对齐所需）。"""
-    fp = os.path.join(dir_path, cu_fname)
-    if not os.path.exists(fp):
-        fp = os.path.join(dir_path, "cu_seqlens_q.pt")
-        if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, cu_fname)
+    if not os.path.exists(filepath):
+        filepath = os.path.join(dir_path, "cu_seqlens_q.pt")
+        if not os.path.exists(filepath):
             return None
-    pl_fp = os.path.join(dir_path, "prefix_lens.pt")
-    if not os.path.exists(pl_fp):
+    prefix_lens_filepath = os.path.join(dir_path, "prefix_lens.pt")
+    if not os.path.exists(prefix_lens_filepath):
         return None
-    return {"cu_seqlens": torch.load(fp, weights_only=True),
-            "prefix_lens": torch.load(pl_fp, weights_only=True)}
+    return {"cu_seqlens": torch.load(filepath, weights_only=True),
+            "prefix_lens": torch.load(prefix_lens_filepath, weights_only=True)}
 
 
 def _load_attn_output(dir_path: str, layer: int) -> torch.Tensor | None:
     """加载单层 attn_output（attn_outputs.pt = dict {layer: tensor}）。"""
-    fp = os.path.join(dir_path, "attn_outputs.pt")
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, "attn_outputs.pt")
+    if not os.path.exists(filepath):
         return None
-    d = torch.load(fp, weights_only=True)
-    return d.get(layer) if isinstance(d, dict) else None
+    attn_dict = torch.load(filepath, weights_only=True)
+    return attn_dict.get(layer) if isinstance(attn_dict, dict) else None
 
 
 def _get_num_layers(dir_path: str) -> int:
-    fp = os.path.join(dir_path, "attn_outputs.pt")
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, "attn_outputs.pt")
+    if not os.path.exists(filepath):
         return 0
-    d = torch.load(fp, weights_only=True)
-    return max(d.keys()) if isinstance(d, dict) and d else 0
+    attn_dict = torch.load(filepath, weights_only=True)
+    return max(attn_dict.keys()) if isinstance(attn_dict, dict) and attn_dict else 0
 
 
 # ════════════════════════════════════════════════════════════════
@@ -331,15 +331,15 @@ def _cos_for_layer(a: torch.Tensor, b: torch.Tensor,
 
 def _build_attn_align_mask(dir_on: str, dir_off: str) -> torch.Tensor | None:
     """从 OFF cu_seqlens + ON prefix_lens 构建 suffix 对齐 mask（None=无法构建）。"""
-    ma = _load_packed_meta(dir_on)
-    mb = _load_packed_meta(dir_off)
-    if ma is None or mb is None:
+    meta_on = _load_packed_meta(dir_on)
+    meta_off = _load_packed_meta(dir_off)
+    if meta_on is None or meta_off is None:
         return None
-    cu_off = mb["cu_seqlens"]
+    cu_off = meta_off["cu_seqlens"]
     T = int(cu_off[-1]) if cu_off.numel() > 0 else 0
     if T == 0:
         return None
-    return _build_alignment_mask(cu_off, ma["prefix_lens"], T)
+    return _build_alignment_mask(cu_off, meta_on["prefix_lens"], T)
 
 
 def cmp_attn_layer(dir_on: str, dir_off: str,
@@ -366,18 +366,18 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
                            passed=d["cos_avg"] > _COS_AVG_PASS
                            and d["cos_min"] > _COS_MIN_PASS, metrics=d)
 
-    fa = os.path.join(dir_on, "attn_outputs.pt")
-    fb = os.path.join(dir_off, "attn_outputs.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "attn_outputs.pt")
+    filepath_off = os.path.join(dir_off, "attn_outputs.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    da = torch.load(fa, weights_only=True)
-    db = torch.load(fb, weights_only=True)
-    if not isinstance(da, dict) or not isinstance(db, dict):
+    attn_dict_on = torch.load(filepath_on, weights_only=True)
+    attn_dict_off = torch.load(filepath_off, weights_only=True)
+    if not isinstance(attn_dict_on, dict) or not isinstance(attn_dict_off, dict):
         return None
 
     results = {}
-    for layer_idx in sorted(set(da.keys()) & set(db.keys())):
-        a, b = da[layer_idx], db[layer_idx]
+    for layer_idx in sorted(set(attn_dict_on.keys()) & set(attn_dict_off.keys())):
+        a, b = attn_dict_on[layer_idx], attn_dict_off[layer_idx]
         need = align_mask is not None and a.shape[0] != b.shape[0]
         try:
             results[layer_idx] = _cos_for_layer(a, b, align_mask if need else None)
@@ -453,10 +453,10 @@ def _load_rope_postqk(dir_path: str, layer: int, fname: str = "rope_postqk.pt"
 
     Returns ``(query, key)`` or ``(None, None)``.
     """
-    fp = os.path.join(dir_path, fname)
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, fname)
+    if not os.path.exists(filepath):
         return None, None
-    d = torch.load(fp, weights_only=True)
+    d = torch.load(filepath, weights_only=True)
     if not isinstance(d, dict):
         return None, None
     entry = d.get(layer)
@@ -513,18 +513,18 @@ def _cmp_rope_stage_layer(dir_on: str, dir_off: str, layer: int | None,
         return CheckResult(name=f"{label}_L{layer}", passed=ok, metrics=d)
 
     # All layers
-    fa = os.path.join(dir_on, fname)
-    fb = os.path.join(dir_off, fname)
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, fname)
+    filepath_off = os.path.join(dir_off, fname)
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    da = torch.load(fa, weights_only=True)
-    db = torch.load(fb, weights_only=True)
-    if not isinstance(da, dict) or not isinstance(db, dict):
+    attn_dict_on = torch.load(filepath_on, weights_only=True)
+    attn_dict_off = torch.load(filepath_off, weights_only=True)
+    if not isinstance(attn_dict_on, dict) or not isinstance(attn_dict_off, dict):
         return None
 
     results = {}
-    for layer_idx in sorted(set(da.keys()) & set(db.keys())):
-        ea, eb = da[layer_idx], db[layer_idx]
+    for layer_idx in sorted(set(attn_dict_on.keys()) & set(attn_dict_off.keys())):
+        ea, eb = attn_dict_on[layer_idx], attn_dict_off[layer_idx]
         qa, ka = ea.get("query"), ea.get("key")
         qb, kb = eb.get("query"), eb.get("key")
         if qa is None or qb is None:
@@ -700,12 +700,12 @@ def _load_rope_freqs_vec_at_pos(dir_on: str, dir_off: str, layer: int, pos: int,
 
     供 top-K 跨 stage 对齐用（freqs dim = Q/K dim % D，角度按 head_dim 共享）。
     """
-    fa = os.path.join(dir_on, "rope_freqs.pt")
-    fb = os.path.join(dir_off, "rope_freqs.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "rope_freqs.pt")
+    filepath_off = os.path.join(dir_off, "rope_freqs.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None, None
-    on_dict = torch.load(fa, weights_only=True)
-    off_dict = torch.load(fb, weights_only=True)
+    on_dict = torch.load(filepath_on, weights_only=True)
+    off_dict = torch.load(filepath_off, weights_only=True)
     if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
         return None, None
     if layer not in on_dict or layer not in off_dict:
@@ -717,7 +717,7 @@ def _load_rope_freqs_vec_at_pos(dir_on: str, dir_off: str, layer: int, pos: int,
     aligned_result = _align_rope_freqs_layer(on_dict[layer], off_dict[layer], align_mask)
     if aligned_result is None:
         return None, None
-    on_a, off_a = _aligned
+    on_a, off_a = aligned_result
     if pos < 0 or pos >= on_a.shape[0]:
         return None, None
     return on_a[pos].reshape(-1), off_a[pos].reshape(-1)
@@ -731,12 +731,12 @@ def cmp_rope_freqs(dir_on: str, dir_off: str,
     suffix 对齐后逐元素比。角度是 RoPE 输入，应精确相等（max_diff==0）。
     ``layer`` 给定则只比该层。
     """
-    fa = os.path.join(dir_on, "rope_freqs.pt")
-    fb = os.path.join(dir_off, "rope_freqs.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "rope_freqs.pt")
+    filepath_off = os.path.join(dir_off, "rope_freqs.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    on_dict = torch.load(fa, weights_only=True)
-    off_dict = torch.load(fb, weights_only=True)
+    on_dict = torch.load(filepath_on, weights_only=True)
+    off_dict = torch.load(filepath_off, weights_only=True)
     if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
         return None
 
@@ -759,7 +759,7 @@ def cmp_rope_freqs(dir_on: str, dir_off: str,
         aligned_result = _align_rope_freqs_layer(on_dict[layer_idx], off_dict[layer_idx], align_mask)
         if aligned_result is None:
             continue
-        on_a, off_a = _aligned
+        on_a, off_a = aligned_result
         diff = (on_a - off_a).abs()                                  # [N,1,1,D]
         md = float(diff.max())
         max_diff = max(max_diff, md)
@@ -791,12 +791,12 @@ def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
     取 ``layer``（默认最后一层）对齐后第 ``pos`` 个 token 的角度向量 [D]，比 ON/OFF。
     角度是 RoPE 输入，应逐元素相等 → max_abs 应为 0。
     """
-    fa = os.path.join(dir_on, "rope_freqs.pt")
-    fb = os.path.join(dir_off, "rope_freqs.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "rope_freqs.pt")
+    filepath_off = os.path.join(dir_off, "rope_freqs.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    on_dict = torch.load(fa, weights_only=True)
-    off_dict = torch.load(fb, weights_only=True)
+    on_dict = torch.load(filepath_on, weights_only=True)
+    off_dict = torch.load(filepath_off, weights_only=True)
     if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
         return None
     common = set(on_dict.keys()) & set(off_dict.keys())
@@ -813,7 +813,7 @@ def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
     aligned_result = _align_rope_freqs_layer(on_dict[rf_layer], off_dict[rf_layer], align_mask)
     if aligned_result is None:
         return CheckResult(name=result_name, metrics={"error": "对齐失败"})
-    on_a, off_a = _aligned
+    on_a, off_a = aligned_result
     n = on_a.shape[0]
     if pos < 0 or pos >= n:
         return CheckResult(name=result_name,
@@ -831,13 +831,13 @@ def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
 def _load_attn_kv(dir_path: str, layer: int,
                   fname: str) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """load {key, value} for a layer from fname. Returns (key, value) or (None, None)."""
-    fp = os.path.join(dir_path, fname)
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, fname)
+    if not os.path.exists(filepath):
         return None, None
-    d = torch.load(fp, weights_only=True)
-    if not isinstance(d, dict):
+    kv_dict = torch.load(filepath, weights_only=True)
+    if not isinstance(kv_dict, dict):
         return None, None
-    entry = d.get(layer)
+    entry = kv_dict.get(layer)
     if entry is None:
         return None, None
     return entry.get("key"), entry.get("value")
@@ -862,7 +862,7 @@ def cmp_attn_kv(dir_on: str, dir_off: str,
     layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
     if layer is not None:
         layers = [l for l in layers if l == layer]
-    resultresult_name = f"attn_kv_L{layer}" if layer is not None else "attn_kv"
+    result_name = f"attn_kv_L{layer}" if layer is not None else "attn_kv"
     if not layers:
         return CheckResult(name=result_name, passed=False,
                            metrics={"error": f"layer {layer} 不在双方 attn_kv 中"})
@@ -942,12 +942,12 @@ def cmp_build_kv_input_v(dir_on: str, dir_off: str,
     应逐元素相同——若不同则问题在 QKV 投影阶段（hidden_states / QKV 权重）。
     ON_T vs OFF_T 还能看出 ON 有没有把 hidden_states 裁成 suffix-only。
     """
-    fa = os.path.join(dir_on, "build_kv_input_v.pt")
-    fb = os.path.join(dir_off, "build_kv_input_v.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "build_kv_input_v.pt")
+    filepath_off = os.path.join(dir_off, "build_kv_input_v.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    on_dict = torch.load(fa, weights_only=True)
-    off_dict = torch.load(fb, weights_only=True)
+    on_dict = torch.load(filepath_on, weights_only=True)
+    off_dict = torch.load(filepath_off, weights_only=True)
     if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
         return None
     layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
@@ -1022,12 +1022,12 @@ def cmp_hidden_states(dir_on: str, dir_off: str,
     这是 QKV 投影的 INPUT。如果 hidden_states 一致但 V 不一致 → GEMM 精度差异；
     如果 hidden_states 就不一致 → 根因在上游（embedding / input_layernorm）。
     """
-    fa = os.path.join(dir_on, "hidden_states.pt")
-    fb = os.path.join(dir_off, "hidden_states.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "hidden_states.pt")
+    filepath_off = os.path.join(dir_off, "hidden_states.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    on_dict = torch.load(fa, weights_only=True)
-    off_dict = torch.load(fb, weights_only=True)
+    on_dict = torch.load(filepath_on, weights_only=True)
+    off_dict = torch.load(filepath_off, weights_only=True)
     if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
         return None
     layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
@@ -1103,10 +1103,10 @@ def _load_mask_2d(dir_path: str, mask_kind: str, tag: str) -> torch.Tensor | Non
     if mask_kind == "none":
         return None
     fname = f"{mask_kind}_mask_{tag}.pt"  # label_mask_{tag} / attention_mask_{tag}
-    fp = os.path.join(dir_path, fname)
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, fname)
+    if not os.path.exists(filepath):
         return None
-    return torch.load(fp, weights_only=True).to(torch.bool)
+    return torch.load(filepath, weights_only=True).to(torch.bool)
 
 
 def _resolve_mask(dir_off: str, mask_kind: str, tag: str,
@@ -1172,18 +1172,18 @@ def cmp_2d(dir_on: str, dir_off: str, filename: str, name: str,
 # ════════════════════════════════════════════════════════════════
 
 def _shape_of(dir_path: str, filename: str) -> str:
-    fp = os.path.join(dir_path, filename)
-    if not os.path.exists(fp):
+    filepath = os.path.join(dir_path, filename)
+    if not os.path.exists(filepath):
         return "(missing)"
     try:
-        obj = torch.load(fp, weights_only=True)
+        obj = torch.load(filepath, weights_only=True)
         if isinstance(obj, dict):
             # per-layer dict（attn_outputs / rope_freqs_*）：显示层数 + 首层 shape
             sample = next(iter(obj.values())) if obj else None
             # rope_postqk.pt：每层值是 {"query","key"[,"positions"]} dict，取 query 的 shape 代表
             if isinstance(sample, dict):
-                _q = sample.get("query")
-                sample_shape = f",Q{tuple(_q.shape)}" if _q is not None else ""
+                query_tensor = sample.get("query")
+                sample_shape = f",Q{tuple(query_tensor.shape)}" if query_tensor is not None else ""
             elif sample is not None:
                 sample_shape = f",{tuple(sample.shape)}"
             else:
