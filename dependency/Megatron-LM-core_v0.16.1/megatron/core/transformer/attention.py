@@ -1082,8 +1082,8 @@ class Attention(MegatronModule, ABC):
                                          self.config.num_layers)
                 dump_hidden_states_on(self.layer_number, hidden_states,
                                       self.config.num_layers)
-            except Exception as _ps_e:
-                print(f"[PS-diag] OFF preqkv dump failed: {_ps_e}", flush=True)
+            except Exception as exc:
+                print(f"[PS-diag] OFF preqkv dump failed: {exc}", flush=True)
         # ##### [PS-diag] OFF pre-RoPE Q/K/V dump end #####
 
         # ================================================
@@ -1153,8 +1153,8 @@ class Attention(MegatronModule, ABC):
                                          self.config.num_layers)
                 dump_full_kv_off(self.layer_number, key, value,
                                  self.config.num_layers)
-            except Exception as _ps_e2:
-                print(f"[PS-diag] OFF postqk/full_kv dump failed: {_ps_e2}", flush=True)
+            except Exception as exc:
+                print(f"[PS-diag] OFF postqk/full_kv dump failed: {exc}", flush=True)
         # ##### [PS-diag] OFF post-RoPE Q/K + full_kv dump end #####
 
         # ==================================

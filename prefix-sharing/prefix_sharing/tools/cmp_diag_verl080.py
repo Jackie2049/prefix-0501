@@ -306,11 +306,11 @@ def _aligned_vec_at_pos(
     return on[pos].contiguous(), off[pos].contiguous()
 
 
-def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
+def _logits_ensure_token_major(logits_on: torch.Tensor, logits_off: torch.Tensor
                                ) -> tuple[torch.Tensor, torch.Tensor]:
     """确保 logits 为 2D [N, V]（token-major），vocab 在最后一维。"""
-    return (lo.reshape(-1, lo.size(-1)).contiguous(),
-            lf.reshape(-1, lf.size(-1)).contiguous())
+    return (logits_on.reshape(-1, logits_on.size(-1)).contiguous(),
+            logits_off.reshape(-1, logits_off.size(-1)).contiguous())
 
 
 # ════════════════════════════════════════════════════════════════
@@ -376,13 +376,13 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
         return None
 
     results = {}
-    for lyr in sorted(set(da.keys()) & set(db.keys())):
-        a, b = da[lyr], db[lyr]
+    for layer_idx in sorted(set(da.keys()) & set(db.keys())):
+        a, b = da[layer_idx], db[layer_idx]
         need = align_mask is not None and a.shape[0] != b.shape[0]
         try:
-            results[lyr] = _cos_for_layer(a, b, align_mask if need else None)
+            results[layer_idx] = _cos_for_layer(a, b, align_mask if need else None)
         except ValueError as e:
-            results[lyr] = {"error": str(e)}
+            results[layer_idx] = {"error": str(e)}
     return CheckResult(name="attn_per_layer", passed=True,
                        metrics={"layers": results})
 
@@ -421,9 +421,9 @@ def cmp_packed_token(dir_on: str, dir_off: str,
                 name=f"attn_L{attn_layer}_pos{pos}",
                 metrics=_vec_metrics(vecs[0], vecs[1])))
 
-    lo = _load_logits(dir_on)
-    lf = _load_logits(dir_off)
-    vecs = _aligned_vec_at_pos(lo, lf, False, pos, align_mask)
+    logits_on = _load_logits(dir_on)
+    logits_off = _load_logits(dir_off)
+    vecs = _aligned_vec_at_pos(logits_on, logits_off, False, pos, align_mask)
     if vecs is None:
         results.append(CheckResult(
             name=f"logits_pos{pos}",
@@ -523,18 +523,18 @@ def _cmp_rope_stage_layer(dir_on: str, dir_off: str, layer: int | None,
         return None
 
     results = {}
-    for lyr in sorted(set(da.keys()) & set(db.keys())):
-        ea, eb = da[lyr], db[lyr]
+    for layer_idx in sorted(set(da.keys()) & set(db.keys())):
+        ea, eb = da[layer_idx], db[layer_idx]
         qa, ka = ea.get("query"), ea.get("key")
         qb, kb = eb.get("query"), eb.get("key")
         if qa is None or qb is None:
             continue
         need = align_mask is not None and qa.shape[0] != qb.shape[0]
         try:
-            results[lyr] = _rope_postqk_cos_for_layer(qa, ka, qb, kb,
+            results[layer_idx] = _rope_postqk_cos_for_layer(qa, ka, qb, kb,
                                                     align_mask if need else None)
         except ValueError as e:
-            results[lyr] = {"error": str(e)}
+            results[layer_idx] = {"error": str(e)}
     return CheckResult(name=f"{label}_per_layer", passed=True,
                        metrics={"layers": results})
 
@@ -636,7 +636,7 @@ def cmp_rope_postqk_token(dir_on: str, dir_off: str,
     """Q/K packed[pos] 对比（**suffix 对齐后**），单 stage。
 
     stage="pre" → rope_preqk.pt（旋转前），stage="post" → rope_postqk.pt（旋转后）。
-    对 Q、K 分别输出 {label}_L{lyr}_Q_pos{pos} / {label}_L{lyr}_K_pos{pos}。
+    对 Q、K 分别输出 {label}_L{layer_idx}_Q_pos{pos} / {label}_L{layer_idx}_K_pos{pos}。
     调用方按 pre → rope_freqs → post 顺序分别调用。
     """
     if stage == "pre":
@@ -648,27 +648,27 @@ def cmp_rope_postqk_token(dir_on: str, dir_off: str,
 
 def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     """全 packed logits suffix 对齐 + per-token cosine。"""
-    lo = _load_logits(dir_on)
-    lf = _load_logits(dir_off)
-    if lo is None or lf is None:
+    logits_on = _load_logits(dir_on)
+    logits_off = _load_logits(dir_off)
+    if logits_on is None or logits_off is None:
         return None
-    lo, lf = _logits_ensure_token_major(lo, lf)
+    logits_on, logits_off = _logits_ensure_token_major(logits_on, logits_off)
 
-    ma = _load_packed_meta(dir_on, "cu_seqlens_q_logits.pt")
-    mb = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
-    if ma is None or mb is None:
+    meta_on = _load_packed_meta(dir_on, "cu_seqlens_q_logits.pt")
+    meta_off = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    if meta_on is None or meta_off is None:
         return None
-    T_off = int(mb["cu_seqlens"][-1]) if mb["cu_seqlens"].numel() > 0 else 0
-    if T_off == 0 or lo.shape[0] == 0 or lf.shape[0] == 0:
+    total_off_tokens = int(meta_off["cu_seqlens"][-1]) if meta_off["cu_seqlens"].numel() > 0 else 0
+    if total_off_tokens == 0 or logits_on.shape[0] == 0 or logits_off.shape[0] == 0:
         return None
 
-    align_mask = _build_alignment_mask(mb["cu_seqlens"], ma["prefix_lens"], T_off)
+    align_mask = _build_alignment_mask(meta_off["cu_seqlens"], meta_on["prefix_lens"], total_off_tokens)
     try:
-        on_aligned, off_aligned = _align_packed(lo, lf, align_mask)
+        on_aligned, off_aligned = _align_packed(logits_on, logits_off, align_mask)
     except ValueError as e:
         return CheckResult(name="logits", passed=False,
                            metrics={"error": str(e),
-                                    "n_on": lo.shape[0], "n_off": lf.shape[0]})
+                                    "n_on": logits_on.shape[0], "n_off": logits_off.shape[0]})
 
     cos = _cosine_sim(on_aligned, off_aligned, dim=-1)
     cos_avg, cos_min = float(cos.mean()), float(cos.min())
@@ -714,8 +714,8 @@ def _load_rope_freqs_vec_at_pos(dir_on: str, dir_off: str, layer: int, pos: int,
         align_mask = _build_attn_align_mask(dir_on, dir_off)
     if align_mask is None:
         return None, None
-    _aligned = _align_rope_freqs_layer(on_dict[layer], off_dict[layer], align_mask)
-    if _aligned is None:
+    aligned_result = _align_rope_freqs_layer(on_dict[layer], off_dict[layer], align_mask)
+    if aligned_result is None:
         return None, None
     on_a, off_a = _aligned
     if pos < 0 or pos >= on_a.shape[0]:
@@ -743,21 +743,21 @@ def cmp_rope_freqs(dir_on: str, dir_off: str,
     layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
     if layer is not None:
         layers = [l for l in layers if l == layer]
-    _name = f"rope_freqs_L{layer}" if layer is not None else "rope_freqs"
+    result_name = f"rope_freqs_L{layer}" if layer is not None else "rope_freqs"
     if not layers:
-        return CheckResult(name=_name, passed=False,
+        return CheckResult(name=result_name, passed=False,
                            metrics={"error": f"layer {layer} 不在双方 rope_freqs 中"})
 
     align_mask = _build_attn_align_mask(dir_on, dir_off)
     if align_mask is None:
-        return CheckResult(name=_name, passed=False,
+        return CheckResult(name=result_name, passed=False,
                            metrics={"error": "cu_seqlens/prefix_lens 缺失"})
 
     max_diff = 0.0
     mismatches: list[dict] = []
-    for lyr in layers:
-        _aligned = _align_rope_freqs_layer(on_dict[lyr], off_dict[lyr], align_mask)
-        if _aligned is None:
+    for layer_idx in layers:
+        aligned_result = _align_rope_freqs_layer(on_dict[layer_idx], off_dict[layer_idx], align_mask)
+        if aligned_result is None:
             continue
         on_a, off_a = _aligned
         diff = (on_a - off_a).abs()                                  # [N,1,1,D]
@@ -770,7 +770,7 @@ def cmp_rope_freqs(dir_on: str, dir_off: str,
                 t = int(t)
                 d = int(token_diff.indices[t])
                 mismatches.append({
-                    "layer": lyr, "token_idx": t, "dim": d,
+                    "layer": layer_idx, "token_idx": t, "dim": d,
                     "on_val": float(on_a[t, 0, 0, d]),
                     "off_val": float(off_a[t, 0, 0, d]),
                     "diff": float(token_diff.values[t]),
@@ -780,7 +780,7 @@ def cmp_rope_freqs(dir_on: str, dir_off: str,
     if mismatches:
         metrics["mismatches"] = mismatches[:20]
         metrics["total_mismatches"] = len(mismatches)
-    return CheckResult(name=_name, passed=max_diff == 0.0, metrics=metrics)
+    return CheckResult(name=result_name, passed=max_diff == 0.0, metrics=metrics)
 
 
 def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
@@ -801,27 +801,27 @@ def cmp_rope_freqs_token(dir_on: str, dir_off: str, pos: int,
         return None
     common = set(on_dict.keys()) & set(off_dict.keys())
     rf_layer = layer if layer is not None else (max(common) if common else 0)
-    _name = f"rope_freqs_L{rf_layer}_pos{pos}"
+    result_name = f"rope_freqs_L{rf_layer}_pos{pos}"
     if rf_layer not in on_dict or rf_layer not in off_dict:
-        return CheckResult(name=_name, metrics={"error": f"layer {rf_layer} 缺失"})
+        return CheckResult(name=result_name, metrics={"error": f"layer {rf_layer} 缺失"})
 
     if align_mask is None:
         align_mask = _build_attn_align_mask(dir_on, dir_off)
     if align_mask is None:
-        return CheckResult(name=_name, metrics={"error": "cu_seqlens/prefix_lens 缺失"})
+        return CheckResult(name=result_name, metrics={"error": "cu_seqlens/prefix_lens 缺失"})
 
-    _aligned = _align_rope_freqs_layer(on_dict[rf_layer], off_dict[rf_layer], align_mask)
-    if _aligned is None:
-        return CheckResult(name=_name, metrics={"error": "对齐失败"})
+    aligned_result = _align_rope_freqs_layer(on_dict[rf_layer], off_dict[rf_layer], align_mask)
+    if aligned_result is None:
+        return CheckResult(name=result_name, metrics={"error": "对齐失败"})
     on_a, off_a = _aligned
     n = on_a.shape[0]
     if pos < 0 or pos >= n:
-        return CheckResult(name=_name,
+        return CheckResult(name=result_name,
                            metrics={"error": f"pos {pos} 越界: 对齐后 token 数={n}"})
     on_vec = on_a[pos].reshape(-1)
     off_vec = off_a[pos].reshape(-1)
     m = _vec_metrics(on_vec, off_vec)
-    return CheckResult(name=_name, passed=m["max_abs"] == 0.0, metrics=m)
+    return CheckResult(name=result_name, passed=m["max_abs"] == 0.0, metrics=m)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -851,49 +851,53 @@ def cmp_attn_kv(dir_on: str, dir_off: str,
     完整 KV）。相同 → attention 输入一致，attention_output 差异必来自 attention 计算/mask；
     不同 → bug 在 build_kv 的 prefix 复用（store/expand）。
     """
-    fa = os.path.join(dir_on, "expanded_kv.pt")
-    fb = os.path.join(dir_off, "full_kv.pt")
-    if not os.path.exists(fa) or not os.path.exists(fb):
+    filepath_on = os.path.join(dir_on, "expanded_kv.pt")
+    filepath_off = os.path.join(dir_off, "full_kv.pt")
+    if not os.path.exists(filepath_on) or not os.path.exists(filepath_off):
         return None
-    on_dict = torch.load(fa, weights_only=True)
-    off_dict = torch.load(fb, weights_only=True)
+    on_dict = torch.load(filepath_on, weights_only=True)
+    off_dict = torch.load(filepath_off, weights_only=True)
     if not isinstance(on_dict, dict) or not isinstance(off_dict, dict):
         return None
     layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
     if layer is not None:
         layers = [l for l in layers if l == layer]
-    _name = f"attn_kv_L{layer}" if layer is not None else "attn_kv"
+    resultresult_name = f"attn_kv_L{layer}" if layer is not None else "attn_kv"
     if not layers:
-        return CheckResult(name=_name, passed=False,
+        return CheckResult(name=result_name, passed=False,
                            metrics={"error": f"layer {layer} 不在双方 attn_kv 中"})
 
     per_layer: dict = {}
     worst = {"max_diff": 0.0, "cos_min": 1.0}
-    for lyr in layers:
-        ek, ev = on_dict[lyr].get("key"), on_dict[lyr].get("value")
-        fk, fv = off_dict[lyr].get("key"), off_dict[lyr].get("value")
-        d: dict = {}
-        for _tag, (_a, _b) in [("K", (ek, fk)), ("V", (ev, fv))]:
-            if _a is None or _b is None:
-                d[_tag] = {"error": "缺失"}
+    for layer_idx in layers:
+        on_key = on_dict[layer_idx].get("key")
+        on_value = on_dict[layer_idx].get("value")
+        off_key = off_dict[layer_idx].get("key")
+        off_value = off_dict[layer_idx].get("value")
+        entry_result: dict = {}
+        for kv_type, (on_kv, off_kv) in [("K", (on_key, off_key)), ("V", (on_value, off_value))]:
+            if on_kv is None or off_kv is None:
+                entry_result[kv_type] = {"error": "缺失"}
                 continue
-            if _a.shape != _b.shape:
-                d[_tag] = {"error": f"shape mismatch ON{tuple(_a.shape)} vs OFF{tuple(_b.shape)}"}
+            if on_kv.shape != off_kv.shape:
+                entry_result[kv_type] = {
+                    "error": f"shape mismatch ON{tuple(on_kv.shape)} vs OFF{tuple(off_kv.shape)}"}
                 continue
-            _af = _a.reshape(_a.shape[0], -1).float()
-            _bf = _b.reshape(_b.shape[0], -1).float()
-            _diff = (_af - _bf).abs()
-            _cos = _cosine_sim(_af, _bf, dim=-1)
-            _md = float(_diff.max())
-            d[_tag] = {"max_diff": _md,
-                       "cos_avg": float(_cos.mean()), "cos_min": float(_cos.min()),
-                       "n_tokens": _af.shape[0]}
-            worst["max_diff"] = max(worst["max_diff"], _md)
-            worst["cos_min"] = min(worst["cos_min"], float(_cos.min()))
-        per_layer[lyr] = d
+            on_flat = on_kv.reshape(on_kv.shape[0], -1).float()
+            off_flat = off_kv.reshape(off_kv.shape[0], -1).float()
+            element_diff = (on_flat - off_flat).abs()
+            token_cos = _cosine_sim(on_flat, off_flat, dim=-1)
+            max_elem_diff = float(element_diff.max())
+            entry_result[kv_type] = {
+                "max_diff": max_elem_diff,
+                "cos_avg": float(token_cos.mean()), "cos_min": float(token_cos.min()),
+                "n_tokens": on_flat.shape[0]}
+            worst["max_diff"] = max(worst["max_diff"], max_elem_diff)
+            worst["cos_min"] = min(worst["cos_min"], float(token_cos.min()))
+        per_layer[layer_idx] = entry_result
     # expanded 应精确等于 full → 阈值极严
     passed = worst["max_diff"] < 1e-5 and worst["cos_min"] > 0.9999
-    return CheckResult(name=_name, passed=passed,
+    return CheckResult(name=result_name, passed=passed,
                        metrics={"layers": per_layer, "max_diff": worst["max_diff"],
                                 "cos_min": worst["cos_min"], "num_layers": len(layers)})
 
@@ -909,18 +913,18 @@ def _print_attn_kv(r: CheckResult):
           f"{'V_MAXDIFF':>12s} {'V_COS':>10s}  {'STATUS':>8s}")
     print(f"  {'─' * 6}  {'─' * 12} {'─' * 10}  {'─' * 12} {'─' * 10}  {'─' * 8}")
     bad = []
-    for lyr in sorted(layers):
-        d = layers[lyr]
+    for layer_idx in sorted(layers):
+        d = layers[layer_idx]
         kd, vd = d.get("K", {}), d.get("V", {})
         if "error" in kd or "error" in vd:
-            print(f"  {lyr:>6d}  K:{kd.get('error','')}  V:{vd.get('error','')}")
-            bad.append(lyr); continue
+            print(f"  {layer_idx:>6d}  K:{kd.get('error','')}  V:{vd.get('error','')}")
+            bad.append(layer_idx); continue
         kmd, kcos = kd["max_diff"], kd["cos_avg"]
         vmd, vcos = vd["max_diff"], vd["cos_avg"]
         ok = kmd < 1e-5 and vmd < 1e-5
         if not ok:
-            bad.append(lyr)
-        print(f"  {lyr:>6d}  {kmd:>12.3e} {kcos:>10.6f}  "
+            bad.append(layer_idx)
+        print(f"  {layer_idx:>6d}  {kmd:>12.3e} {kcos:>10.6f}  "
               f"{vmd:>12.3e} {vcos:>10.6f}  {'OK' if ok else 'DIFF':>8s}")
     print(f"\n  max_diff={m.get('max_diff')}  cos_min={m.get('cos_min')}  "
           f"{_CHECK if r.passed else _CROSS} "
@@ -949,19 +953,19 @@ def cmp_build_kv_input_v(dir_on: str, dir_off: str,
     layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
     if layer is not None:
         layers = [l for l in layers if l == layer]
-    _name = f"build_kv_input_v_L{layer}" if layer is not None else "build_kv_input_v"
+    result_name = f"build_kv_input_v_L{layer}" if layer is not None else "build_kv_input_v"
     if not layers:
-        return CheckResult(name=_name, passed=False, metrics={"error": "no layers"})
+        return CheckResult(name=result_name, passed=False, metrics={"error": "no layers"})
 
     align_mask = _build_attn_align_mask(dir_on, dir_off)
     per_layer: dict = {}
     worst_md = 0.0
     worst_cos = 1.0
-    for lyr in layers:
-        on_v = on_dict[lyr]
-        off_v = off_dict[lyr]
+    for layer_idx in layers:
+        on_v = on_dict[layer_idx]
+        off_v = off_dict[layer_idx]
         if on_v is None or off_v is None:
-            per_layer[lyr] = {"error": "缺失"}; continue
+            per_layer[layer_idx] = {"error": "缺失"}; continue
         on_f = on_v.reshape(on_v.shape[0], -1).float()
         off_f = off_v.reshape(off_v.shape[0], -1).float()
         on_T, off_T = int(on_v.shape[0]), int(off_v.shape[0])
@@ -969,18 +973,18 @@ def cmp_build_kv_input_v(dir_on: str, dir_off: str,
             try:
                 on_f, off_f = _align_packed(on_f, off_f, align_mask)
             except ValueError as e:
-                per_layer[lyr] = {"error": str(e), "on_T": on_T, "off_T": off_T}
+                per_layer[layer_idx] = {"error": str(e), "on_T": on_T, "off_T": off_T}
                 continue
         diff = (on_f - off_f).abs()
         cos = _cosine_sim(on_f, off_f, dim=-1)
         md = float(diff.max())
-        per_layer[lyr] = {"max_diff": md, "cos_avg": float(cos.mean()),
+        per_layer[layer_idx] = {"max_diff": md, "cos_avg": float(cos.mean()),
                           "cos_min": float(cos.min()), "n_tokens": on_f.shape[0],
                           "on_T": on_T, "off_T": off_T}
         worst_md = max(worst_md, md)
         worst_cos = min(worst_cos, float(cos.min()))
     passed = worst_md < 1e-5
-    return CheckResult(name=_name, passed=passed,
+    return CheckResult(name=result_name, passed=passed,
                        metrics={"layers": per_layer, "max_diff": worst_md, "cos_min": worst_cos})
 
 
@@ -994,15 +998,15 @@ def _print_build_kv_input_v(r: CheckResult):
     print(f"  {'LAYER':>6s}  {'MAXDIFF':>12s} {'COS':>10s}  "
           f"{'ON_T':>8s} {'OFF_T':>8s}  {'STATUS':>8s}")
     print(f"  {'─' * 6}  {'─' * 12} {'─' * 10}  {'─' * 8} {'─' * 8}  {'─' * 8}")
-    for lyr in sorted(layers):
-        d = layers[lyr]
+    for layer_idx in sorted(layers):
+        d = layers[layer_idx]
         if "max_diff" not in d:
-            print(f"  {lyr:>6d}  {d.get('error', '')}  ON_T={d.get('on_T')} OFF_T={d.get('off_T')}")
+            print(f"  {layer_idx:>6d}  {d.get('error', '')}  ON_T={d.get('on_T')} OFF_T={d.get('off_T')}")
             continue
         md, cos = d["max_diff"], d["cos_avg"]
         ok = md < 1e-5
         _crop = " (cropped)" if d.get("on_T") != d.get("off_T") else ""
-        print(f"  {lyr:>6d}  {md:>12.3e} {cos:>10.6f}  "
+        print(f"  {layer_idx:>6d}  {md:>12.3e} {cos:>10.6f}  "
               f"{d.get('on_T', '—'):>8} {d.get('off_T', '—'):>8}  "
               f"{'OK' if ok else 'DIFF':>8s}{_crop}")
     print(f"\n  max_diff={m.get('max_diff')}  cos_min={m.get('cos_min')}  "
@@ -1029,19 +1033,19 @@ def cmp_hidden_states(dir_on: str, dir_off: str,
     layers = sorted(set(on_dict.keys()) & set(off_dict.keys()))
     if layer is not None:
         layers = [l for l in layers if l == layer]
-    _name = f"hidden_states_L{layer}" if layer is not None else "hidden_states"
+    result_name = f"hidden_states_L{layer}" if layer is not None else "hidden_states"
     if not layers:
-        return CheckResult(name=_name, passed=False, metrics={"error": "no layers"})
+        return CheckResult(name=result_name, passed=False, metrics={"error": "no layers"})
 
     align_mask = _build_attn_align_mask(dir_on, dir_off)
     per_layer: dict = {}
     worst_md = 0.0
     worst_cos = 1.0
-    for lyr in layers:
-        on_hs = on_dict[lyr]
-        off_hs = off_dict[lyr]
+    for layer_idx in layers:
+        on_hs = on_dict[layer_idx]
+        off_hs = off_dict[layer_idx]
         if on_hs is None or off_hs is None:
-            per_layer[lyr] = {"error": "缺失"}; continue
+            per_layer[layer_idx] = {"error": "缺失"}; continue
         on_f = on_hs.reshape(on_hs.shape[0], -1).float()
         off_f = off_hs.reshape(off_hs.shape[0], -1).float()
         on_T, off_T = int(on_hs.shape[0]), int(off_hs.shape[0])
@@ -1049,18 +1053,18 @@ def cmp_hidden_states(dir_on: str, dir_off: str,
             try:
                 on_f, off_f = _align_packed(on_f, off_f, align_mask)
             except ValueError as e:
-                per_layer[lyr] = {"error": str(e), "on_T": on_T, "off_T": off_T}
+                per_layer[layer_idx] = {"error": str(e), "on_T": on_T, "off_T": off_T}
                 continue
         diff = (on_f - off_f).abs()
         cos = _cosine_sim(on_f, off_f, dim=-1)
         md = float(diff.max())
-        per_layer[lyr] = {"max_diff": md, "cos_avg": float(cos.mean()),
+        per_layer[layer_idx] = {"max_diff": md, "cos_avg": float(cos.mean()),
                           "cos_min": float(cos.min()), "n_tokens": on_f.shape[0],
                           "on_T": on_T, "off_T": off_T}
         worst_md = max(worst_md, md)
         worst_cos = min(worst_cos, float(cos.min()))
     passed = worst_md < 1e-5
-    return CheckResult(name=_name, passed=passed,
+    return CheckResult(name=result_name, passed=passed,
                        metrics={"layers": per_layer, "max_diff": worst_md, "cos_min": worst_cos})
 
 
@@ -1074,14 +1078,14 @@ def _print_hidden_states(r: CheckResult):
     print(f"  {'LAYER':>6s}  {'MAXDIFF':>12s} {'COS':>10s}  "
           f"{'ON_T':>8s} {'OFF_T':>8s}  {'STATUS':>8s}")
     print(f"  {'─' * 6}  {'─' * 12} {'─' * 10}  {'─' * 8} {'─' * 8}  {'─' * 8}")
-    for lyr in sorted(layers):
-        d = layers[lyr]
+    for layer_idx in sorted(layers):
+        d = layers[layer_idx]
         if "max_diff" not in d:
-            print(f"  {lyr:>6d}  {d.get('error', '')}  ON_T={d.get('on_T')} OFF_T={d.get('off_T')}")
+            print(f"  {layer_idx:>6d}  {d.get('error', '')}  ON_T={d.get('on_T')} OFF_T={d.get('off_T')}")
             continue
         md, cos = d["max_diff"], d["cos_avg"]
         ok = md < 1e-5
-        print(f"  {lyr:>6d}  {md:>12.3e} {cos:>10.6f}  "
+        print(f"  {layer_idx:>6d}  {md:>12.3e} {cos:>10.6f}  "
               f"{d.get('on_T', '—'):>8} {d.get('off_T', '—'):>8}  "
               f"{'OK' if ok else 'DIFF':>8s}")
     print(f"\n  max_diff={m.get('max_diff')}  cos_min={m.get('cos_min')}  "
@@ -1317,17 +1321,17 @@ def _print_per_layer(r: CheckResult):
               f"{'TOKENS':>8s}  {'STATUS':>8s}")
         print(f"  {'─' * 6}  {'─' * 14}  {'─' * 14}  {'─' * 8}  {'─' * 8}")
         bad = []
-        for lyr in sorted(layers.keys()):
-            d = layers[lyr]
+        for layer_idx in sorted(layers.keys()):
+            d = layers[layer_idx]
             if "error" in d:
-                print(f"  {lyr:>6d}  {d['error']}")
-                bad.append(lyr)
+                print(f"  {layer_idx:>6d}  {d['error']}")
+                bad.append(layer_idx)
                 continue
             ok = d["cos_avg"] > _COS_AVG_PASS and d["cos_min"] > _COS_MIN_PASS
-            print(f"  {lyr:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
+            print(f"  {layer_idx:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
                   f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
             if not ok:
-                bad.append(lyr)
+                bad.append(layer_idx)
         if bad:
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
     elif "cos_avg" in r.metrics:
@@ -1353,20 +1357,20 @@ def _print_rope_postqk_per_layer(r: CheckResult):
         print(f"  {'─' * 6}  {'─' * 12}  {'─' * 12}  {'─' * 12}  {'─' * 12}  "
               f"{'─' * 8}  {'─' * 8}")
         bad = []
-        for lyr in sorted(layers.keys()):
-            d = layers[lyr]
+        for layer_idx in sorted(layers.keys()):
+            d = layers[layer_idx]
             if "error" in d:
-                print(f"  {lyr:>6d}  {d['error']}")
-                bad.append(lyr)
+                print(f"  {layer_idx:>6d}  {d['error']}")
+                bad.append(layer_idx)
                 continue
             ok = (d["Q_cos_avg"] > _COS_AVG_PASS and d["Q_cos_min"] > _COS_MIN_PASS
                   and d["K_cos_avg"] > _COS_AVG_PASS and d["K_cos_min"] > _COS_MIN_PASS)
-            print(f"  {lyr:>6d}  {d.get('Q_max_diff', 0.0):>12.3e}  "
+            print(f"  {layer_idx:>6d}  {d.get('Q_max_diff', 0.0):>12.3e}  "
                   f"{d['Q_cos_avg']:>12.6e}  "
                   f"{d.get('K_max_diff', 0.0):>12.3e}  {d['K_cos_avg']:>12.6e}  "
                   f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
             if not ok:
-                bad.append(lyr)
+                bad.append(layer_idx)
         if bad:
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
         print(f"  （Q/K max_diff 与 build_kv_input_v 的 V max_diff 同口径，可直接对比）")
@@ -1659,9 +1663,9 @@ def main():
             if vecs is not None:
                 _print_topk_vec(vecs[0].cpu(), vecs[1].cpu(), args.topk, "val",
                                 f"attn_L{attn_layer}_pos{pos}")
-        lo = _load_logits(args.dir_on)
-        lf = _load_logits(args.dir_off)
-        vecs = _aligned_vec_at_pos(lo, lf, False, pos, align_mask)
+        logits_on = _load_logits(args.dir_on)
+        logits_off = _load_logits(args.dir_off)
+        vecs = _aligned_vec_at_pos(logits_on, logits_off, False, pos, align_mask)
         if vecs is not None:
             _print_topk_vec(vecs[0].cpu(), vecs[1].cpu(), args.topk,
                             "val", f"logits_pos{pos}", show_rel=False)

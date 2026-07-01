@@ -201,7 +201,7 @@ def _first_token_metrics(a_vec: torch.Tensor, b_vec: torch.Tensor) -> dict:
             "cos": cos, "pearson": pr}
 
 
-def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
+def _logits_first_token(logits_on: torch.Tensor, logits_off: torch.Tensor
                         ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Extract first token's full-vocab vector from ON/OFF logits.
 
@@ -210,21 +210,21 @@ def _logits_first_token(lo: torch.Tensor, lf: torch.Tensor
     output_layer → [S, B, V//tp] → model returns [B, S, V//tp]).
     """
     # Flatten all leading batch/token dims into N, keep V as last dim
-    lo_2d = lo.reshape(-1, lo.size(-1))
-    lf_2d = lf.reshape(-1, lf.size(-1))
+    on_flat = logits_on.reshape(-1, logits_on.size(-1))
+    off_flat = logits_off.reshape(-1, logits_off.size(-1))
     # First token = first row → full-vocab vector [V]
-    return lo_2d[0, :].contiguous(), lf_2d[0, :].contiguous()
+    return on_flat[0, :].contiguous(), off_flat[0, :].contiguous()
 
 
-def _logits_ensure_token_major(lo: torch.Tensor, lf: torch.Tensor
+def _logits_ensure_token_major(logits_on: torch.Tensor, logits_off: torch.Tensor
                                ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ensure logits are 2D [N, V] for packed alignment.
 
     Vocab is always the last dim (verified from Megatron model forward).
     Batch dim on leading axes is flattened into N.
     """
-    return (lo.reshape(-1, lo.size(-1)).contiguous(),
-            lf.reshape(-1, lf.size(-1)).contiguous())
+    return (logits_on.reshape(-1, logits_on.size(-1)).contiguous(),
+            logits_off.reshape(-1, logits_off.size(-1)).contiguous())
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -421,9 +421,9 @@ def cmp_rope_postqk(dir_on: str, dir_off: str) -> CheckResult | None:
     first_row_len = 0
     num_layers = len(la)
 
-    for lyr in sorted(la):
-        on_entry = a[lyr]
-        off_entry = b[lyr]
+    for layer_idx in sorted(la):
+        on_entry = a[layer_idx]
+        off_entry = b[layer_idx]
         on_q, on_k = on_entry["query"], on_entry["key"]
         off_q, off_k = off_entry["query"], off_entry["key"]
         on_pos = on_entry.get("positions")
@@ -549,18 +549,18 @@ def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
 
     max_diff = 0.0
     mismatches: list[dict] = []  # [{layer, token_idx, dim, on_val, off_val, diff}]
-    for lyr in sorted(la):
-        on_freqs = on_dict[lyr]                          # [T_on, 1, 1, D]
+    for layer_idx in sorted(la):
+        on_freqs = on_dict[layer_idx]                          # [T_on, 1, 1, D]
         # Reconstruct OFF per-token for this layer
         off_freqs = torch.cat(
-            [off_dict[lyr][:s, :, :, :] for s in seqlens], dim=0)  # [T_off, 1, 1, D]
+            [off_dict[layer_idx][:s, :, :, :] for s in seqlens], dim=0)  # [T_off, 1, 1, D]
 
         try:
             on_aligned, off_aligned = _align_packed(
                 on_freqs, off_freqs, align_mask)
         except ValueError as e:
             return CheckResult(name="rope_freqs", passed=False,
-                               metrics={"error": f"align failed L{lyr}: {e}"})
+                               metrics={"error": f"align failed L{layer_idx}: {e}"})
 
         diff = (on_aligned - off_aligned).abs()                # [N, 1, 1, D]
         md = float(diff.max())
@@ -574,7 +574,7 @@ def cmp_rope_freqs(dir_on: str, dir_off: str) -> CheckResult | None:
                 t = int(t)
                 d = int(token_diff.indices[t])
                 mismatches.append({
-                    "layer": lyr,
+                    "layer": layer_idx,
                     "token_idx": t,
                     "dim": d,
                     "on_val": float(on_aligned[t, 0, 0, d]),
@@ -602,7 +602,7 @@ def _per_layer_cos(dir_on: str, dir_off: str, layer: int | None) -> dict | None:
     extract the matching suffix region from OFF before comparison.
     """
 
-    def _cos_for_layer(a, b, lyr, need_align, align_mask):
+    def _cos_for_layer(a, b, layer_idx, need_align, align_mask):
         if a.dim() == 3:
             a, b = a.squeeze(1), b.squeeze(1)
         if need_align and a.shape[0] != b.shape[0]:
@@ -659,8 +659,8 @@ def _per_layer_cos(dir_on: str, dir_off: str, layer: int | None) -> dict | None:
         T = int(mb["cu_seqlens"][-1]) if mb and mb["cu_seqlens"].numel() > 0 else 0
         if T > 0:
             # Check if any layer has shape mismatch
-            for lyr in da:
-                if lyr in db and da[lyr].shape != db[lyr].shape:
+            for layer_idx in da:
+                if layer_idx in db and da[layer_idx].shape != db[layer_idx].shape:
                     need_align = True
                     break
             if need_align:
@@ -675,8 +675,8 @@ def _per_layer_cos(dir_on: str, dir_off: str, layer: int | None) -> dict | None:
                         mb["cu_seqlens"], ma["prefix_lens"], T)
 
     results = {}
-    for lyr in sorted(set(da.keys()) & set(db.keys())):
-        results[lyr] = _cos_for_layer(da[lyr], db[lyr], lyr, need_align, align_mask)
+    for layer_idx in sorted(set(da.keys()) & set(db.keys())):
+        results[layer_idx] = _cos_for_layer(da[layer_idx], db[layer_idx], layer_idx, need_align, align_mask)
     return results
 
 
@@ -686,8 +686,8 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
     if r is None:
         return None
     if "cos_avg" in r:
-        lyr = r["layer"]
-        return CheckResult(name=f"attn_L{lyr}",
+        layer_idx = r["layer"]
+        return CheckResult(name=f"attn_L{layer_idx}",
                            passed=r["cos_avg"] > 0.9999 and r["cos_min"] > 0.999,
                            metrics=r)
     return CheckResult(name="attn_per_layer", passed=True,
@@ -712,22 +712,22 @@ def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
         a = _load_attn_output(dir_on, last)
         b = _load_attn_output(dir_off, last)
         if a is not None and b is not None:
-            a0 = a.squeeze(1) if a.dim() == 3 else a
-            b0 = b.squeeze(1) if b.dim() == 3 else b
-            ft = _first_token_metrics(a0[0], b0[0])
-            results.append(CheckResult(name="first_token_attn", metrics=ft))
+            on_token0 = a.squeeze(1) if a.dim() == 3 else a
+            off_token0 = b.squeeze(1) if b.dim() == 3 else b
+            metrics = _first_token_metrics(on_token0[0], off_token0[0])
+            results.append(CheckResult(name="first_token_attn", metrics=metrics))
 
     # logits — packed[0], auto-detect [N,V] vs [V,N] format
-    lo = _load_tensor(dir_on,  "logits.pt")
-    lf = _load_tensor(dir_off, "logits.pt")
-    if lo is not None and lf is not None:
-        lo_first, lf_first = _logits_first_token(lo, lf)
-        if lo_first is not None:
-            ft = _first_token_metrics(lo_first, lf_first)
-            results.append(CheckResult(name="first_token_logits", metrics=ft))
+    logits_on = _load_tensor(dir_on,  "logits.pt")
+    logits_off = _load_tensor(dir_off, "logits.pt")
+    if logits_on is not None and logits_off is not None:
+        logits_on_first, logits_off_first = _logits_first_token(logits_on, logits_off)
+        if logits_on_first is not None:
+            metrics = _first_token_metrics(logits_on_first, logits_off_first)
+            results.append(CheckResult(name="first_token_logits", metrics=metrics))
         else:
             _log.warning("first_token_logits skipped: cannot determine token dim "
-                         "(ON %s, OFF %s)", _fmt_shape(lo.shape), _fmt_shape(lf.shape))
+                         "(ON %s, OFF %s)", _fmt_shape(logits_on.shape), _fmt_shape(logits_off.shape))
 
     return results
 
@@ -743,22 +743,22 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     with OFF (full-sequence) logits, same alignment logic as attn_output
     per-layer comparison.
     """
-    lo = _load_tensor(dir_on,  "logits.pt")
-    lf = _load_tensor(dir_off, "logits.pt")
-    if lo is None or lf is None:
+    logits_on = _load_tensor(dir_on,  "logits.pt")
+    logits_off = _load_tensor(dir_off, "logits.pt")
+    if logits_on is None or logits_off is None:
         return None
 
     # Logits may be [N,V] or [V,N] — ensure token-major [N,V] for alignment
-    lo, lf = _logits_ensure_token_major(lo, lf)
+    logits_on, logits_off = _logits_ensure_token_major(logits_on, logits_off)
 
     # Metadata for logits uses cu_seqlens_q_logits.pt
-    ma = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
-    mb = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
-    if ma is None or mb is None:
+    meta_on = _load_packed_meta(dir_on,  "cu_seqlens_q_logits.pt")
+    meta_off = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    if meta_on is None or meta_off is None:
         return None
 
-    T_off = int(mb["cu_seqlens"][-1]) if mb["cu_seqlens"].numel() > 0 else 0
-    if T_off == 0 or lo.shape[0] == 0 or lf.shape[0] == 0:
+    total_off_tokens = int(meta_off["cu_seqlens"][-1]) if meta_off["cu_seqlens"].numel() > 0 else 0
+    if total_off_tokens == 0 or logits_on.shape[0] == 0 or logits_off.shape[0] == 0:
         return None
 
     # Build alignment mask (same logic as attn_output all-layers)
@@ -766,19 +766,19 @@ def cmp_logits_packed(dir_on: str, dir_off: str) -> CheckResult | None:
     mask_off_2d = _load_attention_mask_2d(dir_off)
     if mask_on_2d is not None and mask_off_2d is not None:
         align_mask = _build_alignment_mask_from_2d(
-            mask_on_2d, mask_off_2d, mb["cu_seqlens"], T_off)
+            mask_on_2d, mask_off_2d, meta_off["cu_seqlens"], total_off_tokens)
     else:
         align_mask = _build_alignment_mask(
-            mb["cu_seqlens"], ma["prefix_lens"], T_off)
+            meta_off["cu_seqlens"], meta_on["prefix_lens"], total_off_tokens)
 
     # Align: extract suffix-only region from OFF
     try:
-        on_aligned, off_aligned = _align_packed(lo, lf, align_mask)
+        on_aligned, off_aligned = _align_packed(logits_on, logits_off, align_mask)
     except ValueError as e:
         return CheckResult(name="logits", passed=False,
                            metrics={"error": str(e),
-                                    "n_on": lo.shape[0],
-                                    "n_off": lf.shape[0]})
+                                    "n_on": logits_on.shape[0],
+                                    "n_off": logits_off.shape[0]})
 
     n_tokens = on_aligned.shape[0]
 
@@ -905,13 +905,13 @@ def _print_per_layer(r: CheckResult):
         print(f"  {'LAYER':>6s}  {'COS_AVG':>14s}  {'COS_MIN':>14s}  {'TOKENS':>8s}  {'STATUS':>8s}")
         print(f"  {'─'*6}  {'─'*14}  {'─'*14}  {'─'*8}  {'─'*8}")
         bad = []
-        for lyr in sorted(layers.keys()):
-            d = layers[lyr]
+        for layer_idx in sorted(layers.keys()):
+            d = layers[layer_idx]
             ok = d["cos_avg"] > 0.9999 and d["cos_min"] > 0.999
-            print(f"  {lyr:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
+            print(f"  {layer_idx:>6d}  {d['cos_avg']:>14.6e}  {d['cos_min']:>14.6e}  "
                   f"{d['n_tokens']:>8d}  {'PASS' if ok else 'WARN':>8s}")
             if not ok:
-                bad.append(lyr)
+                bad.append(layer_idx)
         if bad:
             print(f"\n  ⚠ First deviating layer: {bad[0]}")
     elif "cos_avg" in r.metrics:
@@ -1139,20 +1139,20 @@ def main():
                 a = _load_attn_output(args.dir_on, last)
                 b = _load_attn_output(args.dir_off, last)
                 if a is not None and b is not None:
-                    a0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
-                    b0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
-                    _print_topk_vec(a0, b0, args.topk, "val",
+                    on_token0 = (a.squeeze(1) if a.dim() == 3 else a)[0].cpu()
+                    off_token0 = (b.squeeze(1) if b.dim() == 3 else b)[0].cpu()
+                    _print_topk_vec(on_token0, off_token0, args.topk, "val",
                                     "first_token_attn")
             # first_token_logits — per-dim top-K (real = ON signed value,
             # so positive logits — the tokens actually selectable by
             # sampling — surface first, not the large-magnitude negatives)
-            lo = _load_tensor(args.dir_on,  "logits.pt")
-            lf = _load_tensor(args.dir_off, "logits.pt")
-            if lo is not None and lf is not None:
-                ft = _logits_first_token(lo, lf)
-                if ft is not None:
-                    _print_topk_vec(ft[0].cpu(), ft[1].cpu(), args.topk,
-                                    "real", "first_token_logits")
+            logits_on = _load_tensor(args.dir_on,  "logits.pt")
+            logits_off = _load_tensor(args.dir_off, "logits.pt")
+            if logits_on is not None and logits_off is not None:
+                first_token_pair = _logits_first_token(logits_on, logits_off)
+                if first_token_pair is not None:
+                    _print_topk_vec(first_token_pair[0].cpu(), first_token_pair[1].cpu(),
+                                    args.topk, "real", "first_token_logits")
 
     # ── ④b Logits (full packed alignment via attention_mask + dual pointer) ──
     if not stop:

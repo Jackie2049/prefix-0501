@@ -111,8 +111,8 @@ def prefix_attention(
         from prefix_sharing.tools.diagnostic_dump_verl080 import dump_expanded_kv_on
         dump_expanded_kv_on(layer_id, expanded_key, expanded_value,
                             attention_module.config.num_layers)
-    except Exception as _e:
-        print(f"expanded_kv dump failed: {_e}", flush=True)
+    except Exception as exc:
+        print(f"expanded_kv dump failed: {exc}", flush=True)
             ##### [PS-diag] ON expanded K/V dump end #####
 
     # 注意力计算
@@ -134,8 +134,8 @@ def prefix_attention(
         dump_attn_on(output[0], packed_seq_params, prefix_sharing_context.prefix_sharing_plan,
                      attention_module.layer_number,
                      attention_module.config.num_layers)
-    except Exception as e:
-        print(f"last-attn dump (ON) failed: {e}")
+    except Exception as exc:
+        print(f"last-attn dump (ON) failed: {exc}")
             ##### [PS-diag] ON attention_output (per-layer) end #####
     # ---
 
@@ -320,8 +320,8 @@ def _apply_positioned_rope(
             from prefix_sharing.tools.diagnostic_dump import dump_rope_freqs
             dump_rope_freqs(q_freqs, attention_module.layer_number,
                                attention_module.config.num_layers)
-        except Exception as e:
-            print(f"rope_freqs dump failed: {e}")
+        except Exception as exc:
+            print(f"rope_freqs dump failed: {exc}")
                 ##### [PS-diag] ON rope_freqs (per-layer) end #####
         query = apply_rotary_pos_emb(
             query.unsqueeze(1),
@@ -345,8 +345,8 @@ def _apply_positioned_rope(
             attention_module.config.num_layers,
             positions=packed_position_ids,
         )
-    except Exception as e:
-        print(f"rope_postqk_layer dump failed: {e}")
+    except Exception as exc:
+        print(f"rope_postqk_layer dump failed: {exc}")
     ##### [PS-diag] ON post-RoPE Q/K dump end #####
 
     return query, key

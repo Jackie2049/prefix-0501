@@ -31,6 +31,9 @@ import torch
 from prefix_sharing.tools.diagnostic_dump import (
     _get_dump_dir,
     _save_tensor,
+    _stage_last_layer,
+    _pp_suffix,
+    _cached_parallel_info,
 )
 
 
@@ -159,12 +162,16 @@ def dump_logits_verl080(logits: torch.Tensor) -> None:
     _save_tensor("logits.pt", logits, dump_dir, scope="tp_vocab")
 
 
-def dump_logprobs_2d_verl080(logp_2d: torch.Tensor, tag: str) -> None:
-    """存 2D log_probs ``[B, L_max]``，文件名 ``logprobs_{tag}.pt``。"""
+def dump_logprobs_2d_verl080(logp_2d: torch.Tensor, tag: str,
+                           scope: str = "global") -> None:
+    """存 2D log_probs ``[B, L_max]``，文件名 ``logprobs_{tag}.pt``。
+
+    ``scope="pp_last"`` 时仅最后一个 PP stage 落盘（多卡下 logprobs 只在末 stage 产生）。
+    """
     dump_dir = _get_dump_dir()
     if dump_dir is None:
         return
-    _save_tensor(f"logprobs_{tag}.pt", logp_2d, dump_dir)
+    _save_tensor(f"logprobs_{tag}.pt", logp_2d, dump_dir, scope=scope)
 
 
 def dump_attention_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
@@ -198,12 +205,16 @@ def dump_label_mask_verl080(mask_2d: torch.Tensor, tag: str) -> None:
     _save_tensor(f"label_mask_{tag}.pt", mask_2d.to(torch.bool), dump_dir)
 
 
-def dump_entropy_2d_verl080(ent_2d: torch.Tensor | None, tag: str) -> None:
-    """存 2D entropy ``[B, L_max]``，文件名 ``entropy_{tag}.pt``。``None`` 时跳过。"""
+def dump_entropy_2d_verl080(ent_2d: torch.Tensor | None, tag: str,
+                           scope: str = "global") -> None:
+    """存 2D entropy ``[B, L_max]``，文件名 ``entropy_{tag}.pt``。``None`` 时跳过。
+
+    ``scope="pp_last"`` 时仅最后一个 PP stage 落盘（多卡下 entropy 只在末 stage 产生）。
+    """
     dump_dir = _get_dump_dir()
     if dump_dir is None or ent_2d is None:
         return
-    _save_tensor(f"entropy_{tag}.pt", ent_2d, dump_dir)
+    _save_tensor(f"entropy_{tag}.pt", ent_2d, dump_dir, scope=scope)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -238,25 +249,32 @@ def dump_rope_postqk_verl080(layer_number: int,
     if positions is not None:
         entry["positions"] = positions.detach().cpu().clone()
     _ROPE_POSTQK_BUFFER[layer_number] = entry
-    if layer_number == num_layers:
+    if layer_number == _stage_last_layer(num_layers):
         _flush_dict_buffer("rope_postqk.pt", _ROPE_POSTQK_BUFFER, dump_dir)
         _ROPE_POSTQK_BUFFER = None
 
 
 def _flush_dict_buffer(fname: str, buffer: dict, dump_dir: str) -> None:
-    """rank0 直接 torch.save 一个 dict buffer。
+    """rank0 直接 torch.save 一个 dict buffer。PP-aware gating + suffix。
 
     不能用 _save_tensor：它对入参做 .detach().cpu().clone()，dict 没 .detach() →
     AttributeError 被其 except 吞掉，文件永不写盘（rope_postqk.pt 曾因此丢失）。
     entries 应在插入时已 detach().cpu().clone()。仿 _flush_attn_buffer。
+
+    Under PP, each stage's tp_rank==0 writes with ``_pp{r}`` suffix;
+    assembly later merges all stage files.
     """
     import os as _os
-    from prefix_sharing.tools.diagnostic_dump import _rank0_only
-    if _rank0_only():
-        try:
-            torch.save(buffer, _os.path.join(dump_dir, fname))
-        except Exception as _e:
-            print(f"[PS-diag] {fname} save failed: {_e}", flush=True)
+    from prefix_sharing.tools.diagnostic_dump import _should_write_for_scope
+    if not _should_write_for_scope("pp_stage"):
+        return
+    try:
+        stem, sep, ext = fname.rpartition(".")
+        pp_sfx = _pp_suffix()
+        fname_pp = f"{stem}{pp_sfx}{sep}{ext}" if sep else f"{fname}{pp_sfx}"
+        torch.save(buffer, _os.path.join(dump_dir, fname_pp))
+    except Exception as _e:
+        print(f"[PS-diag] {fname} save failed: {_e}", flush=True)
 
 
 _ROPE_PREQK_BUFFER: dict[int, dict] | None = None
@@ -283,7 +301,7 @@ def dump_rope_preqk_verl080(layer_number: int,
         "query": query.detach().cpu().clone(),
         "key": key.detach().cpu().clone(),
     }
-    if layer_number == num_layers:
+    if layer_number == _stage_last_layer(num_layers):
         _flush_dict_buffer("rope_preqk.pt", _ROPE_PREQK_BUFFER, dump_dir)
         _ROPE_PREQK_BUFFER = None
 
@@ -309,7 +327,7 @@ def dump_expanded_kv_on(layer_number: int, expanded_key: torch.Tensor,
         "key": expanded_key.detach().cpu().clone(),
         "value": expanded_value.detach().cpu().clone(),
     }
-    if layer_number == num_layers:
+    if layer_number == _stage_last_layer(num_layers):
         _flush_dict_buffer("expanded_kv.pt", _EXPANDED_KV_BUFFER, dump_dir)
         _EXPANDED_KV_BUFFER = None
 
@@ -334,7 +352,7 @@ def dump_full_kv_off(layer_number: int, key: torch.Tensor, value: torch.Tensor,
         "key": key.detach().cpu().clone(),
         "value": value.detach().cpu().clone(),
     }
-    if layer_number == num_layers:
+    if layer_number == _stage_last_layer(num_layers):
         _flush_dict_buffer("full_kv.pt", _FULL_KV_BUFFER, dump_dir)
         _FULL_KV_BUFFER = None
 
@@ -357,7 +375,7 @@ def dump_build_kv_input_v_on(layer_number: int, value: torch.Tensor,
     if _BUILD_KV_INPUT_V_BUFFER is None:
         _BUILD_KV_INPUT_V_BUFFER = {}
     _BUILD_KV_INPUT_V_BUFFER[layer_number] = value.detach().cpu().clone()
-    if layer_number == num_layers:
+    if layer_number == _stage_last_layer(num_layers):
         _flush_dict_buffer("build_kv_input_v.pt", _BUILD_KV_INPUT_V_BUFFER, dump_dir)
         _BUILD_KV_INPUT_V_BUFFER = None
 
@@ -379,7 +397,7 @@ def dump_hidden_states_on(layer_number: int, hidden_states: torch.Tensor,
     if _HIDDEN_STATES_BUFFER is None:
         _HIDDEN_STATES_BUFFER = {}
     _HIDDEN_STATES_BUFFER[layer_number] = hidden_states.detach().cpu().clone()
-    if layer_number == num_layers:
+    if layer_number == _stage_last_layer(num_layers):
         _flush_dict_buffer("hidden_states.pt", _HIDDEN_STATES_BUFFER, dump_dir)
         _HIDDEN_STATES_BUFFER = None
 
