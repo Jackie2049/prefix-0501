@@ -156,6 +156,26 @@ def assemble(input_dir: str, output_dir: str) -> None:
             shutil.copy2(src, os.path.join(output_dir, "logits.pt"))
             print("  [copy] logits.pt")
 
+    # ── Rewrite manifest: assembled output is single-card ──────────
+    # parallel_info.json was copied verbatim from raw dump and still
+    # records tp_size/pp_size > 1.  The assembled directory has merged
+    # all shards → update to tp_size=1 / pp_size=1 so cmp_diag reads
+    # plain ``logits.pt`` (not ``logits_tp0.pt``), etc.
+    if is_multi_rank:
+        manifest_out_path = os.path.join(output_dir, "parallel_info.json")
+        if os.path.exists(manifest_out_path):
+            with open(manifest_out_path, encoding="utf-8") as f:
+                manifest_out = json.load(f)
+            manifest_out["tp_size"] = 1
+            manifest_out["pp_size"] = 1
+            manifest_out["cp_size"] = 1
+            # all scopes are now "global" — no sharding in assembled output
+            for stem in manifest_out.get("scopes", {}):
+                manifest_out["scopes"][stem] = "global"
+            with open(manifest_out_path, "w", encoding="utf-8") as f:
+                json.dump(manifest_out, f, indent=2, ensure_ascii=False)
+            print("  [update] parallel_info.json → tp=1 pp=1")
+
     # ── Summary ───────────────────────────────────────────────────
     n_files = len(os.listdir(output_dir))
     print(f"\n[assemble] done — {n_files} files written to {output_dir}")
